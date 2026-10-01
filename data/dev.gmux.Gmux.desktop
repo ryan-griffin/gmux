@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Gmux
+Comment=Terminal workspaces with split panes
+Exec=gmux
+Icon=dev.gmux.Gmux
+Terminal=false
+Type=Application
+Categories=GNOME;GTK;System;TerminalEmulator;
+Keywords=terminal;shell;workspace;agent;ghostty;
+StartupNotify=true
+StartupWMClass=dev.gmux.Gmux

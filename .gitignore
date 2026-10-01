@@ -1,0 +1,6 @@
+/target/
+/.deps/
+/artifacts/
+*.log
+__pycache__/
+*.py[cod]

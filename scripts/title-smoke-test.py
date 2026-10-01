@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Test pane titles against real foreground jobs and OSC output.
+
+Run on a native display with GTK_A11Y=none dbus-run-session -- python3
+scripts/title-smoke-test.py. Shell hooks and application settings are isolated.
+"""
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+
+root = Path(__file__).resolve().parent.parent
+artifacts = root / "artifacts"
+artifacts.mkdir(exist_ok=True)
+
+
+def wait_for(predicate):
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        try:
+            if result := predicate():
+                return result
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
+        time.sleep(0.05)
+    raise AssertionError("Timed out waiting for title update")
+
+
+with tempfile.TemporaryDirectory(prefix="gmux-title-") as temp:
+    temp = Path(temp)
+    shell = temp / "shell"
+    shell.write_text("#!/bin/sh\nexec /bin/bash --noprofile --norc -i\n")
+    shell.chmod(0o700)
+    job = temp / "job.py"
+    job.write_text("""import os, sys, time
+mode = sys.argv[1]
+if mode != 'silent':
+    os.write(1, b'\\x1b]2;OpenCode\\x07')
+if mode == 'clear':
+    time.sleep(0.7)
+    os.write(1, b'\\x1b]2;\\x07')
+if mode == 'exec':
+    time.sleep(0.7)
+    os.execl('/usr/bin/sleep', 'sleep', '30')
+time.sleep(30)
+""")
+    env = os.environ.copy()
+    env.update(XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell),
+               GMUX_SOCKET=str(temp / "gmux.sock"), GTK_A11Y="none",
+               PS1="GMUX_TEST> ", PROMPT_COMMAND="")
+
+    def rpc(method, **params):
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(6)
+            connection.connect(env["GMUX_SOCKET"])
+            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
+            result = json.loads(connection.makefile("rb").readline())
+            assert "error" not in result, result
+            return result
+
+    def title(pane):
+        return next(p for w in rpc("list")["tabs"] for p in w["panes"]
+                    if p["id"] == pane)["title"]
+
+    def expect(pane, expected):
+        wait_for(lambda: title(pane) == expected)
+
+    def run(pane, command):
+        rpc("send", pane=pane, text=command, paste=True, enter=True)
+
+    def interrupt(pane):
+        rpc("send", pane=pane, text="\x03")
+        expect(pane, "gmux")
+
+    def ready(pane):
+        run(pane, "printf 'GMUX_READY\\n'")
+        wait_for(lambda: "GMUX_READY" in rpc("read", pane=pane)["text"].splitlines())
+
+    with (artifacts / "title-smoke.log").open("w") as log:
+        app = subprocess.Popen([str(root / "target/debug/gmux"), "--directory", str(root)],
+                               env=env, cwd=root, stdout=log, stderr=log)
+        try:
+            tab = wait_for(lambda: rpc("list")["tabs"])[0]
+            pane = tab["active_pane"]
+            ready(pane)
+            expect(pane, "gmux")
+            for mode in ["title", "title", "clear", "exec"]:
+                run(pane, f"python3 {shlex.quote(str(job))} {mode}")
+                expect(pane, "OpenCode")
+                if mode == "clear":
+                    expect(pane, "python3")
+                if mode == "exec":
+                    expect(pane, "sleep")
+                interrupt(pane)
+            run(pane, "sleep 30")
+            expect(pane, "sleep")
+            interrupt(pane)
+            # Reproduce the report with the actual monitor when installed.
+            if shutil.which("btop"):
+                run(pane, "btop")
+                expect(pane, "btop")
+                interrupt(pane)
+            second = rpc("split", pane=pane)["pane"]
+            ready(second)
+            run(pane, f"python3 {shlex.quote(str(job))} title")
+            expect(pane, "OpenCode")
+            run(second, "sleep 30")
+            expect(second, "sleep")
+            assert title(pane) == "OpenCode", "Other panes must keep their own title"
+            wait_for(lambda: rpc("list")["tabs"][0]["name"] == "sleep")
+            rpc("focus", pane=pane)
+            wait_for(lambda: rpc("list")["tabs"][0]["name"] == "OpenCode")
+            rpc("focus", pane=second)
+            interrupt(pane)
+            interrupt(second)
+            subdir = temp / "changed-directory"
+            subdir.mkdir()
+            run(second, f"cd {shlex.quote(str(subdir))}")
+            expect(second, "changed-directory")
+            wait_for(lambda: rpc("list")["tabs"][0]["name"] == "changed-directory")
+            named = rpc("new", name="Pinned title", directory=str(root))
+            ready(named["pane"])
+            run(named["pane"], f"python3 {shlex.quote(str(job))} title")
+            expect(named["pane"], "OpenCode")
+            assert next(t for t in rpc("list")["tabs"] if t["id"] == named["tab"])["name"] == "Pinned title"
+            interrupt(named["pane"])
+            print("PASS: foreground titles, repeated OSC titles, empty title reset, exec, "
+                  "silent commands, shell directory fallback, independent split titles, "
+                  "tab titles following the selected pane, and explicit tab names")
+        finally:
+            app.terminate()
+            app.wait(timeout=10)

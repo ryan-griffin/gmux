@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/dev/gmux/Gmux/icons">
+    <file alias="scalable/actions/gmux-branch-symbolic.svg">icons/branch-symbolic.svg</file>
+  </gresource>
+</gresources>

@@ -1,0 +1,54 @@
+/* Keep Adwaita's colors and controls for the tab rows and terminal canvas. */
+.list-row-content { padding: 10px 6px; }
+.tab-unread { background: var(--accent-bg-color); border-radius: 50%; }
+.tab-content { padding: 6px; }
+/* Match entry icons: a 16px target with opacity feedback, without a button fill. */
+entry.terminal-find > button {
+  min-width: 16px;
+  min-height: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: inherit;
+  opacity: 0.7;
+}
+entry.terminal-find > button:hover { opacity: 1; }
+entry.terminal-find > button:active { opacity: 0.8; }
+@media (prefers-contrast: more) {
+  entry.terminal-find > button { opacity: 0.85; }
+  entry.terminal-find > button:hover { opacity: 1; }
+  entry.terminal-find > button:active { opacity: 0.9; }
+}
+/* Match AdwTabOverview: native .card shadow and a white inset thumbnail outline. */
+.terminal-pane {
+  border: none;
+  outline: 1px solid rgb(255 255 255 / 7%);
+  outline-offset: -1px;
+}
+@media (prefers-contrast: more) {
+  .terminal-pane {
+    outline-color: rgb(255 255 255 / 30%);
+  }
+}
+.terminal-pane { background: var(--terminal-bg); color: var(--terminal-fg); }
+.terminal-canvas { margin: 3px; }
+/* Clip only the contents, allowing the card shadow to extend outside the pane. */
+.pane-clip { border-radius: inherit; }
+/* Fade inactive contents over the pane's own opaque terminal background. */
+.pane-content { opacity: 0.85; }
+.terminal-pane.active-pane .pane-content { opacity: 1; }
+/* Keep a 6px inset and match AdwTabBar's 24px flat close button. */
+.pane-toolbar { padding: 6px; }
+.pane-close { min-width: 24px; min-height: 24px; padding: 0; }
+.pane-size {
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  font-variant-numeric: tabular-nums;
+}
+.pane-status { padding: 3px 6px; }
+/* Pane outlines define the split. Keep a draggable gutter without a second line. */
+paned.tab-split > separator { min-width: 6px; min-height: 6px; background: none; border: none; box-shadow: none; }
