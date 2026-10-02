@@ -2,6 +2,26 @@
 .list-row-content { padding: 10px 6px; }
 .tab-unread { background: var(--accent-bg-color); border-radius: 50%; }
 .tab-content { padding: 6px; }
+/* Give the empty-state split button pill proportions, retaining Adwaita's states. */
+splitbutton.empty-tab-button { border-radius: 9999px; }
+splitbutton.empty-tab-button > button {
+  padding: 10px 32px;
+  border-radius: 9999px;
+}
+splitbutton.empty-tab-button > menubutton > button {
+  padding: 10px 12px;
+  border-radius: 9999px;
+}
+splitbutton.empty-tab-button > button:dir(ltr),
+splitbutton.empty-tab-button > menubutton > button:dir(rtl) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+splitbutton.empty-tab-button > button:dir(rtl),
+splitbutton.empty-tab-button > menubutton > button:dir(ltr) {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
 /* Match entry icons: a 16px target with opacity feedback, without a button fill. */
 entry.terminal-find > button {
   min-width: 16px;

@@ -25,6 +25,9 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 pub fn directory_name(path: &Path) -> String {
+    if path == home() {
+        return "~".into();
+    }
     path.file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()

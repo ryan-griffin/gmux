@@ -124,7 +124,7 @@ impl Ui {
         });
         self.empty.set_description(Some(&match filter {
             TabFilter::Workspace(_) => format!("Open a tab to start a terminal in {title}."),
-            _ => "Open a new tab, or add a workspace for a project.".into(),
+            _ => "Open a tab to start a terminal.".into(),
         }));
         self.refresh_sidebar();
         self.dirty.set(true);
@@ -207,6 +207,7 @@ impl Ui {
             new_tabs.append_item(&item);
         }
         self.new_tab_button.set_menu_model(Some(&new_tabs));
+        self.empty_new_tab_button.set_menu_model(Some(&new_tabs));
         let changing = self.changing.replace(true);
         for tab in self.tabs.borrow().iter() {
             let workspace_name = tab

@@ -64,6 +64,7 @@ pub struct Ui {
     filter_title: adw::WindowTitle,
     workspace_filter: gtk::MenuButton,
     new_tab_button: adw::SplitButton,
+    empty_new_tab_button: adw::SplitButton,
     empty: adw::StatusPage,
     search: gtk::SearchBar,
     search_field: FindField,
@@ -328,24 +329,18 @@ impl Ui {
         let empty = adw::StatusPage::builder()
             .icon_name("utilities-terminal-symbolic")
             .title("No Tabs")
-            .description("Open a new tab, or add a workspace for a project.")
+            .description("Open a tab to start a terminal.")
             .build();
-        let empty_actions = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        empty_actions.set_halign(gtk::Align::Center);
-        let open = gtk::Button::builder()
+        let open = adw::SplitButton::builder()
             .label("New Tab")
             .action_name("win.new")
+            .tooltip_text("New tab (Ctrl+Shift+T)")
+            .dropdown_tooltip("New tab options")
+            .halign(gtk::Align::Center)
             .build();
         open.add_css_class("suggested-action");
-        open.add_css_class("pill");
-        let create = gtk::Button::builder()
-            .label("Add Workspace…")
-            .action_name("win.new-workspace")
-            .build();
-        create.add_css_class("pill");
-        empty_actions.append(&open);
-        empty_actions.append(&create);
-        empty.set_child(Some(&empty_actions));
+        open.add_css_class("empty-tab-button");
+        empty.set_child(Some(&open));
         stack.add_named(&empty, Some("empty"));
         content_box.append(&stack);
         content_view.set_content(Some(&content_box));
@@ -384,6 +379,7 @@ impl Ui {
             filter_title,
             workspace_filter,
             new_tab_button: new,
+            empty_new_tab_button: open,
             empty,
             search,
             search_field,
