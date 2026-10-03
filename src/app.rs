@@ -67,8 +67,7 @@ pub struct Ui {
     filter: Cell<TabFilter>,
     filter_title: adw::WindowTitle,
     workspace_filter: gtk::MenuButton,
-    new_tab_button: adw::SplitButton,
-    empty_new_tab_button: adw::SplitButton,
+    new_tab_menu: gio::Menu,
     empty: adw::StatusPage,
     search: gtk::SearchBar,
     search_field: FindField,
@@ -248,13 +247,17 @@ impl Ui {
             .tooltip_text("Filter tabs by workspace")
             .build();
         workspace_filter.add_css_class("flat");
+        crate::menu::setup_menu_button(&workspace_filter, "Workspace Filter");
         sidebar_header.set_title_widget(Some(&workspace_filter));
+        let new_tab_menu = gio::Menu::new();
         let new = adw::SplitButton::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("New tab (Ctrl+Shift+T)")
             .dropdown_tooltip("New tab options")
             .action_name("win.new")
+            .menu_model(&new_tab_menu)
             .build();
+        crate::menu::setup_split_button(&new, "New tab options");
         sidebar_header.pack_start(&new);
         sidebar_view.add_top_bar(&sidebar_header);
         let sidebar = gtk::ListBox::new();
@@ -294,7 +297,8 @@ impl Ui {
         header.pack_start(&toggle);
         let heading = adw::WindowTitle::new("Gmux", "");
         header.set_title_widget(Some(&heading));
-        header.pack_end(&menu_button());
+        header.pack_end(&main_menu_button(&new_tab_menu));
+        header.pack_end(&terminal_menu_button());
         content_view.add_top_bar(&header);
         let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let search = gtk::SearchBar::new();
@@ -351,12 +355,14 @@ impl Ui {
         let open = adw::SplitButton::builder()
             .label("New Tab")
             .action_name("win.new")
+            .menu_model(&new_tab_menu)
             .tooltip_text("New tab (Ctrl+Shift+T)")
             .dropdown_tooltip("New tab options")
             .halign(gtk::Align::Center)
             .build();
         open.add_css_class("suggested-action");
         open.add_css_class("empty-tab-button");
+        crate::menu::setup_split_button(&open, "New tab options");
         empty.set_child(Some(&open));
         stack.add_named(&empty, Some("empty"));
         content_box.append(&stack);
@@ -396,8 +402,7 @@ impl Ui {
             filter: Cell::new(TabFilter::All),
             filter_title,
             workspace_filter,
-            new_tab_button: new,
-            empty_new_tab_button: open,
+            new_tab_menu,
             empty,
             search,
             search_field,
@@ -450,6 +455,20 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         ui.sidebar.connect_row_selected(move |_, row| {
             if let (Some(ui), Some(row)) = (weak.upgrade(), row)
+                && !ui.changing.get()
+                && let Ok(id) = row.widget_name().parse()
+                && id != ui.active.get()
+            {
+                let focused = row.has_focus();
+                ui.switch(id);
+                if focused && row.is_mapped() {
+                    row.grab_focus();
+                }
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        ui.sidebar.connect_row_activated(move |_, row| {
+            if let Some(ui) = weak.upgrade()
                 && !ui.changing.get()
                 && let Ok(id) = row.widget_name().parse()
             {
@@ -866,6 +885,7 @@ impl Ui {
         row_box.append(&metadata);
         row.set_child(Some(&row_box));
         let menu = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+        crate::menu::setup_popover(&menu, "Tab Actions");
         menu.set_has_arrow(false);
         menu.set_halign(gtk::Align::Start);
         menu.set_position(gtk::PositionType::Bottom);
@@ -873,8 +893,9 @@ impl Ui {
         let click = gtk::GestureClick::new();
         click.set_button(3);
         let popover = menu.downgrade();
-        click.connect_pressed(move |_, _, x, y| {
+        click.connect_pressed(move |gesture, _, x, y| {
             if let Some(menu) = popover.upgrade() {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
                 menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 0, 0)));
                 menu.popup();
             }
@@ -895,9 +916,7 @@ impl Ui {
         let keys = gtk::EventControllerKey::new();
         let popover = menu.downgrade();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
-            if key == gdk::Key::Menu
-                || (key == gdk::Key::F10 && modifiers.contains(gdk::ModifierType::SHIFT_MASK))
-            {
+            if crate::menu::context_menu_shortcut(key, modifiers) {
                 if let Some(menu) = popover.upgrade() {
                     menu.set_pointing_to(None);
                     menu.popup();
@@ -1473,6 +1492,7 @@ impl Ui {
             ("split-right", &["<Control><Shift>d"]),
             ("split-down", &["<Control><Shift>e"]),
             ("close", &["<Control><Shift>w"]),
+            ("close-active-tab", &[]),
             ("copy", &["<Control><Shift>c"]),
             ("paste", &["<Control><Shift>v"]),
             ("find", &["<Control><Shift>f"]),
@@ -1482,7 +1502,7 @@ impl Ui {
             ("previous-tab", &["<Control><Shift>Tab", "<Control>Page_Up"]),
             ("next-pane", &["<Control><Shift>Right"]),
             ("previous-pane", &["<Control><Shift>Left"]),
-            ("zoom-in", &["<Control>plus", "<Control>equal"]),
+            ("zoom-in", ZOOM_IN_SHORTCUTS),
             ("zoom-out", &["<Control>minus"]),
             ("zoom-reset", &["<Control>0"]),
             ("preferences", &["<Control>comma"]),
@@ -1494,7 +1514,44 @@ impl Ui {
             ("new-workspace", &[]),
             ("manage-workspaces", &[]),
         ] {
-            let action = gio::SimpleAction::new(name, None);
+            let state = match name {
+                "sidebar" => Some(self.split.shows_sidebar()),
+                "fullscreen" => Some(self.window.is_fullscreen()),
+                _ => None,
+            };
+            let action = match state {
+                Some(state) => gio::SimpleAction::new_stateful(name, None, &state.to_variant()),
+                None => gio::SimpleAction::new(name, None),
+            };
+            if state.is_some() {
+                let weak = Rc::downgrade(self);
+                action.connect_change_state(move |_, value| {
+                    if let (Some(ui), Some(enabled)) =
+                        (weak.upgrade(), value.and_then(|value| value.get::<bool>()))
+                    {
+                        match name {
+                            "sidebar" => ui.split.set_show_sidebar(enabled),
+                            "fullscreen" if enabled => ui.window.fullscreen(),
+                            "fullscreen" => ui.window.unfullscreen(),
+                            _ => (),
+                        }
+                    }
+                });
+                let weak = action.downgrade();
+                if name == "sidebar" {
+                    self.split.connect_show_sidebar_notify(move |split| {
+                        if let Some(action) = weak.upgrade() {
+                            action.set_state(&split.shows_sidebar().to_variant());
+                        }
+                    });
+                } else {
+                    self.window.connect_fullscreened_notify(move |window| {
+                        if let Some(action) = weak.upgrade() {
+                            action.set_state(&window.is_fullscreen().to_variant());
+                        }
+                    });
+                }
+            }
             let weak = Rc::downgrade(self);
             action.connect_activate(move |_, _| {
                 if let Some(ui) = weak.upgrade() {
@@ -1615,6 +1672,7 @@ impl Ui {
                         self.request_close(p.id);
                     }
                 }
+                "close-active-tab" => self.request_close_tab(self.active.get()),
                 "copy" => {
                     if let Some(p) = self.active_pane()
                         && !p.copy()
@@ -2562,6 +2620,7 @@ const TAB_ACTIONS: &[&str] = &[
     "split-right",
     "split-down",
     "close",
+    "close-active-tab",
     "copy",
     "paste",
     "find",
@@ -2574,6 +2633,7 @@ const TAB_ACTIONS: &[&str] = &[
     "zoom-out",
     "zoom-reset",
 ];
+const ZOOM_IN_SHORTCUTS: &[&str] = &["<Control>plus", "<Control>equal"];
 fn announce_command(search: &gtk::SearchEntry, row: &gtk::ListBoxRow) {
     if let Some(row) = row.downcast_ref::<adw::ActionRow>() {
         search.announce(&row.title(), gtk::AccessibleAnnouncementPriority::Medium);
@@ -2586,25 +2646,58 @@ fn icon_button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
         .action_name(action)
         .build()
 }
-fn menu_button() -> gtk::MenuButton {
+fn main_menu_button(tabs: &gio::Menu) -> gtk::MenuButton {
+    let menu = gio::Menu::new();
+    menu.append_section(None, tabs);
+    let visibility = gio::Menu::new();
+    visibility.append(Some("Show _Tabs"), Some("win.sidebar"));
+    visibility.append(Some("_Fullscreen"), Some("win.fullscreen"));
+    menu.append_section(None, &visibility);
+    let tools = gio::Menu::new();
+    tools.append(Some("_Manage Workspaces…"), Some("win.manage-workspaces"));
+    tools.append(Some("_Commands…"), Some("win.palette"));
+    // Keep Quit available because closing the window leaves the daemon running.
+    // This deliberately differs from the HIG's usual primary-menu guidance.
+    tools.append(Some("_Quit Gmux"), Some("win.quit"));
+    menu.append_section(None, &tools);
+    let app = gio::Menu::new();
+    app.append(Some("_Preferences"), Some("win.preferences"));
+    app.append(Some("_Keyboard Shortcuts"), Some("win.shortcuts"));
+    app.append(Some("_About Gmux"), Some("win.about"));
+    menu.append_section(None, &app);
+    let button = menu_button("open-menu-symbolic", "Main Menu", &menu);
+    button.set_primary(true);
+    button
+}
+fn terminal_menu_button() -> gtk::MenuButton {
     let menu = gio::Menu::new();
     let terminal = gio::Menu::new();
-    terminal.append(Some("Split right"), Some("win.split-right"));
-    terminal.append(Some("Split down"), Some("win.split-down"));
-    terminal.append(Some("Find in terminal…"), Some("win.find"));
-    terminal.append(Some("Commands…"), Some("win.palette"));
+    terminal.append(Some("Split _Right"), Some("win.split-right"));
+    terminal.append(Some("Split _Down"), Some("win.split-down"));
+    terminal.append(Some("_Find in Terminal…"), Some("win.find"));
     menu.append_section(None, &terminal);
-    let app = gio::Menu::new();
-    app.append(Some("Preferences"), Some("win.preferences"));
-    app.append(Some("Keyboard shortcuts"), Some("win.shortcuts"));
-    app.append(Some("About Gmux"), Some("win.about"));
-    app.append(Some("Quit Gmux"), Some("win.quit"));
-    menu.append_section(None, &app);
-    gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .tooltip_text("Main menu")
-        .menu_model(&menu)
-        .build()
+    let zoom = gio::Menu::new();
+    let zoom_in = gio::MenuItem::new(Some("_Zoom In"), Some("win.zoom-in"));
+    // GTK does not infer a displayed accelerator for alternative shortcuts.
+    zoom_in.set_attribute_value("accel", Some(&ZOOM_IN_SHORTCUTS[0].to_variant()));
+    zoom.append_item(&zoom_in);
+    zoom.append(Some("Zoom _Out"), Some("win.zoom-out"));
+    zoom.append(Some("Re_set Zoom"), Some("win.zoom-reset"));
+    menu.append_section(None, &zoom);
+    let close = gio::Menu::new();
+    close.append(Some("Close _Pane"), Some("win.close"));
+    close.append(Some("Close _Tab"), Some("win.close-active-tab"));
+    menu.append_section(None, &close);
+    menu_button("view-more-symbolic", "Terminal Actions", &menu)
+}
+fn menu_button(icon: &str, label: &'static str, menu: &gio::Menu) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .icon_name(icon)
+        .tooltip_text(label)
+        .menu_model(menu)
+        .build();
+    crate::menu::setup_menu_button(&button, label);
+    button
 }
 fn apply_appearance(settings: &Settings) {
     adw::StyleManager::default().set_color_scheme(match settings.appearance.as_str() {

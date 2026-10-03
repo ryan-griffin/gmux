@@ -145,6 +145,13 @@ mod imp {
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
             self.parent_size_allocate(width, height, baseline);
             self.obj().sync_adjustment();
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Some(popover) = widget.downcast_ref::<gtk::Popover>() {
+                    popover.present();
+                }
+            }
         }
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             if let Some(callback) = &*self.callback.borrow() {

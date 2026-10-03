@@ -5,6 +5,7 @@ mod branch;
 mod commands;
 mod find_field;
 mod font;
+mod menu;
 mod render;
 mod renderer;
 mod terminal;

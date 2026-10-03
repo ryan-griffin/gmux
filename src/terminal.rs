@@ -10,13 +10,26 @@ use gmux::{
     remote::SessionHandle,
     session::{ScreenSnapshot, SessionUpdate},
 };
-use gtk::{gdk, glib, graphene, pango, prelude::*};
+use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
 use std::{
     cell::{Cell as ValueCell, RefCell},
     path::PathBuf,
     rc::Rc,
     time::Duration,
 };
+
+const CONTEXT_MENU_SECTIONS: &[&[(&str, &str)]] = &[
+    &[
+        ("_Copy", "terminal.copy"),
+        ("_Paste", "terminal.paste"),
+        ("_Find…", "win.find"),
+    ],
+    &[
+        ("Split _Right", "win.split-right"),
+        ("Split _Down", "win.split-down"),
+    ],
+    &[("C_lose Pane", "win.close")],
+];
 
 pub struct Terminal {
     pub id: u64,
@@ -28,6 +41,9 @@ pub struct Terminal {
     size_label: gtk::Label,
     size_revealer: gtk::Revealer,
     scroller: gtk::ScrolledWindow,
+    context_menu: gtk::PopoverMenu,
+    copy_action: gio::SimpleAction,
+    paste_action: gio::SimpleAction,
     session: SessionHandle,
     selection: RefCell<Option<(usize, usize)>>,
     drag_origin: ValueCell<(f64, f64)>,
@@ -100,6 +116,35 @@ impl Terminal {
         area.set_cursor_from_name(Some("text"));
         area.set_tooltip_text(Some("Terminal"));
         area.update_property(&[gtk::accessible::Property::Label("Terminal")]);
+        let menu = gio::Menu::new();
+        for entries in CONTEXT_MENU_SECTIONS {
+            let section = gio::Menu::new();
+            for &(label, action) in *entries {
+                let item = gio::MenuItem::new(Some(label), Some(action));
+                if let Some(name) = action.strip_prefix("terminal.")
+                    && let Some(accel) = application
+                        .accels_for_action(&format!("win.{name}"))
+                        .first()
+                {
+                    item.set_attribute_value("accel", Some(&accel.to_variant()));
+                }
+                section.append_item(&item);
+            }
+            menu.append_section(None, &section);
+        }
+        let context_menu = gtk::PopoverMenu::from_model(Some(&menu));
+        crate::menu::setup_popover(&context_menu, "Terminal Actions");
+        context_menu.set_has_arrow(false);
+        context_menu.set_halign(gtk::Align::Start);
+        context_menu.set_position(gtk::PositionType::Bottom);
+        context_menu.set_cursor_from_name(Some("default"));
+        context_menu.set_parent(&area);
+        let copy_action = gio::SimpleAction::new("copy", None);
+        let paste_action = gio::SimpleAction::new("paste", None);
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&copy_action);
+        actions.add_action(&paste_action);
+        area.insert_action_group("terminal", Some(&actions));
         let scroller = gtk::ScrolledWindow::builder()
             .child(&area)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -143,6 +188,9 @@ impl Terminal {
             size_label,
             size_revealer,
             scroller,
+            context_menu,
+            copy_action,
+            paste_action,
             session,
             selection: RefCell::new(None),
             drag_origin: ValueCell::new((0.0, 0.0)),
@@ -170,12 +218,26 @@ impl Terminal {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         terminal.refresh_theme();
+        let weak = Rc::downgrade(&terminal);
+        terminal.copy_action.connect_activate(move |_, _| {
+            if let Some(t) = weak.upgrade() {
+                t.copy();
+            }
+        });
+        let weak = Rc::downgrade(&terminal);
+        terminal.paste_action.connect_activate(move |_, _| {
+            if let Some(t) = weak.upgrade() {
+                t.paste();
+            }
+        });
         let focus_click = gtk::GestureClick::new();
         focus_click.set_button(0);
         focus_click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(&terminal);
         focus_click.connect_pressed(move |_, _, _, _| {
-            if let Some(t) = weak.upgrade() {
+            if let Some(t) = weak.upgrade()
+                && !t.context_menu.is_visible()
+            {
                 t.area.grab_focus();
             }
         });
@@ -247,6 +309,18 @@ impl Terminal {
             let Some(t) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            if t.context_menu.is_visible() {
+                return glib::Propagation::Proceed;
+            }
+            if crate::menu::context_menu_shortcut(key, modifiers) {
+                let (cw, ch) = t.metrics.get();
+                let session = t.session.borrow();
+                let frame = session.snapshot().frame;
+                let position = (frame.cursor_x as f64 * cw, frame.cursor_y as f64 * ch);
+                drop(session);
+                t.show_context_menu(position.0, position.1);
+                return glib::Propagation::Stop;
+            }
             if application_shortcut(controller, &press_shortcuts) {
                 return glib::Propagation::Proceed;
             }
@@ -301,10 +375,13 @@ impl Terminal {
         key.connect_key_released(move |controller, key, _, modifiers| {
             if application_shortcut(controller, &shortcuts)
                 || scroll_shortcut(key, modifiers).is_some()
+                || crate::menu::context_menu_shortcut(key, modifiers)
             {
                 return;
             }
-            if let Some(t) = weak.upgrade() {
+            if let Some(t) = weak.upgrade()
+                && !t.context_menu.is_visible()
+            {
                 t.key_input(
                     key.name().as_deref().unwrap_or(""),
                     key.to_unicode().map(|c| c as u32).unwrap_or(0),
@@ -322,6 +399,17 @@ impl Terminal {
         click.connect_pressed(move |gesture, _, x, y| {
             if let Some(t) = weak.upgrade() {
                 let state = gesture.current_event_state();
+                if t.context_menu.is_visible() {
+                    return;
+                }
+                if gesture.current_button() == 3
+                    && (state.contains(gdk::ModifierType::SHIFT_MASK)
+                        || !t.session.borrow().mode(0))
+                {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    t.show_context_menu(x, y);
+                    return;
+                }
                 if !state.contains(gdk::ModifierType::SHIFT_MASK) && t.session.borrow().mode(0) {
                     let button = match gesture.current_button() {
                         1 => 1,
@@ -445,6 +533,24 @@ impl Terminal {
         });
         canvas.add_controller(scroll);
         terminal
+    }
+    fn show_context_menu(&self, x: f64, y: f64) {
+        self.area.grab_focus();
+        self.copy_action
+            .set_enabled(self.selection.borrow().is_some());
+        self.paste_action.set_enabled(
+            self.area
+                .clipboard()
+                .formats()
+                .contains_type(String::static_type()),
+        );
+        self.context_menu.set_pointing_to(Some(&gdk::Rectangle::new(
+            x.round().clamp(0.0, self.area.width().max(1) as f64 - 1.0) as i32,
+            y.round().clamp(0.0, self.area.height().max(1) as f64 - 1.0) as i32,
+            1,
+            1,
+        )));
+        self.context_menu.popup();
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         self.session.borrow().send(bytes)
@@ -858,6 +964,7 @@ fn mods(m: gdk::ModifierType) -> u16 {
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.context_menu.unparent();
         if let Some(timer) = self.size_timer.get_mut().take() {
             timer.remove();
         }

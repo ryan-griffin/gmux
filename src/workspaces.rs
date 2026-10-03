@@ -147,7 +147,7 @@ impl Ui {
         let catalog = self.catalog.borrow();
         let menu = gio::Menu::new();
         let filters = gio::Menu::new();
-        for (label, target) in [("All Tabs", "all"), ("No Workspace", "unassigned")] {
+        for (label, target) in [("_All Tabs", "all"), ("_No Workspace", "unassigned")] {
             let item = gio::MenuItem::new(Some(label), None);
             item.set_action_and_target_value(
                 Some("win.workspace-filter"),
@@ -157,8 +157,10 @@ impl Ui {
         }
         menu.append_section(None, &filters);
         let workspaces = gio::Menu::new();
+        let mut mnemonics = HashSet::from(['a', 'n', 'w', 'm']);
         for workspace in &catalog.workspaces {
-            let item = gio::MenuItem::new(Some(&workspace.name), None);
+            let label = crate::menu::mnemonic_label(&workspace.name, &mut mnemonics);
+            let item = gio::MenuItem::new(Some(&label), None);
             item.set_action_and_target_value(
                 Some("win.workspace-filter"),
                 Some(&workspace.id.to_string().to_variant()),
@@ -169,16 +171,20 @@ impl Ui {
             menu.append_section(Some("Workspaces"), &workspaces);
         }
         let manage = gio::Menu::new();
-        manage.append(Some("Add Workspace…"), Some("win.new-workspace"));
-        manage.append(Some("Manage Workspaces…"), Some("win.manage-workspaces"));
+        manage.append(Some("Add _Workspace…"), Some("win.new-workspace"));
+        manage.append(Some("_Manage Workspaces…"), Some("win.manage-workspaces"));
         menu.append_section(None, &manage);
         self.workspace_filter.set_menu_model(Some(&menu));
-        let new_tabs = gio::Menu::new();
-        new_tabs.append(Some("New Tab"), Some("win.new"));
-        new_tabs.append(Some("New Tab in Directory…"), Some("win.open-folder"));
+        let new_tabs = &self.new_tab_menu;
+        new_tabs.remove_all();
+        new_tabs.append(Some("_New Tab"), Some("win.new"));
+        new_tabs.append(Some("New Tab in _Directory…"), Some("win.open-folder"));
         let destinations = gio::Menu::new();
+        // Keep the submenu's back-button mnemonic available.
+        let mut mnemonics = HashSet::from(['s']);
         for workspace in &catalog.workspaces {
-            let item = gio::MenuItem::new(Some(&workspace.name), None);
+            let label = crate::menu::mnemonic_label(&workspace.name, &mut mnemonics);
+            let item = gio::MenuItem::new(Some(&label), None);
             item.set_action_and_target_value(
                 Some("win.new-tab-workspace"),
                 Some(&workspace.id.to_variant()),
@@ -194,17 +200,15 @@ impl Ui {
             action.set_enabled(has_workspaces);
         }
         if has_workspaces {
-            new_tabs.append_submenu(Some("New Tab in Workspace"), &destinations);
+            new_tabs.append_submenu(Some("New Tab in Work_space"), &destinations);
         } else {
-            let item = gio::MenuItem::new(Some("New Tab in Workspace"), None);
+            let item = gio::MenuItem::new(Some("New Tab in Work_space"), None);
             item.set_action_and_target_value(
                 Some("win.new-tab-workspace"),
                 Some(&0u64.to_variant()),
             );
             new_tabs.append_item(&item);
         }
-        self.new_tab_button.set_menu_model(Some(&new_tabs));
-        self.empty_new_tab_button.set_menu_model(Some(&new_tabs));
         let changing = self.changing.replace(true);
         for tab in self.tabs.borrow().iter() {
             let workspace_name = tab
@@ -226,16 +230,19 @@ impl Ui {
                 tab.workspace_label.set_tooltip_text(None);
             }
             let menu = gio::Menu::new();
-            let rename = gio::MenuItem::new(Some("Rename Tab…"), None);
+            let rename = gio::MenuItem::new(Some("_Rename Tab…"), None);
             rename.set_action_and_target_value(Some("win.rename-tab"), Some(&tab.id.to_variant()));
             menu.append_item(&rename);
+            let membership = gio::Menu::new();
             let destinations = gio::Menu::new();
+            let mut mnemonics = HashSet::from(['m']);
             for workspace in catalog
                 .workspaces
                 .iter()
                 .filter(|workspace| Some(workspace.id) != tab.workspace)
             {
-                let item = gio::MenuItem::new(Some(&workspace.name), None);
+                let label = crate::menu::mnemonic_label(&workspace.name, &mut mnemonics);
+                let item = gio::MenuItem::new(Some(&label), None);
                 item.set_action_and_target_value(
                     Some("win.assign-tab"),
                     Some(&(tab.id, workspace.id).to_variant()),
@@ -243,27 +250,30 @@ impl Ui {
                 destinations.append_item(&item);
             }
             if destinations.n_items() > 0 {
-                menu.append_submenu(Some("Move to Workspace"), &destinations);
+                membership.append_submenu(Some("_Move to Workspace"), &destinations);
             } else {
-                menu.append(Some("Move to Workspace"), Some("tab.move-unavailable"));
+                membership.append(Some("_Move to Workspace"), Some("tab.move-unavailable"));
             }
             if tab.workspace.is_some() {
-                let unassign = gio::MenuItem::new(Some("Remove from Workspace"), None);
+                let unassign = gio::MenuItem::new(Some("Remove _from Workspace"), None);
                 unassign.set_action_and_target_value(
                     Some("win.assign-tab"),
                     Some(&(tab.id, 0u64).to_variant()),
                 );
-                menu.append_item(&unassign);
+                membership.append_item(&unassign);
             }
-            let create = gio::MenuItem::new(Some("New Workspace…"), None);
+            let create = gio::MenuItem::new(Some("Move to _New Workspace…"), None);
             create.set_action_and_target_value(
                 Some("win.new-workspace-for-tab"),
                 Some(&tab.id.to_variant()),
             );
-            menu.append_item(&create);
-            let close = gio::MenuItem::new(Some("Close Tab"), None);
+            membership.append_item(&create);
+            menu.append_section(None, &membership);
+            let closing = gio::Menu::new();
+            let close = gio::MenuItem::new(Some("_Close Tab"), None);
             close.set_action_and_target_value(Some("win.close-tab"), Some(&tab.id.to_variant()));
-            menu.append_item(&close);
+            closing.append_item(&close);
+            menu.append_section(None, &closing);
             tab.menu.set_menu_model(Some(&menu));
         }
         self.changing.set(changing);

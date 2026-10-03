@@ -31,7 +31,13 @@ Pass another installation prefix as the script's first argument.
 
 Closing the window keeps panes and commands running in a headless daemon. Reopen Gmux to reconnect to the same terminals. Use **Quit Gmux**, Ctrl+Shift+Q, or `gmux quit` to stop them.
 
-Create tabs with the plus button. Use the sidebar filter to add or manage workspaces. Sidebar visibility is remembered when you reopen Gmux. Right-click a tab to rename it or move it to a workspace; middle-click to close it. Deleting a workspace keeps its tabs open and unassigned. Exiting a shell closes its pane.
+Create tabs with the plus button. Manage Workspaces in the main menu lets you add, edit, or remove saved workspaces. The sidebar filter also offers workspace management. Sidebar visibility is remembered when you reopen Gmux. Right-click a tab to rename it, move it to an existing or new workspace, or remove its workspace membership; middle-click to close it. Deleting a workspace keeps its tabs open and unassigned. Exiting a shell closes its pane.
+
+The main menu also creates tabs, including in a chosen directory or workspace. New Tab in Workspace lists saved workspaces and is disabled when none exist. Show Tabs and Fullscreen are checked items. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
+
+The three-dot Terminal Actions menu in the content header contains Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both ask for confirmation when processes are running. This menu is available with the sidebar hidden.
+
+Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close Pane. In apps that capture mouse input, use Shift+right-click to open the menu. The Menu key and Shift+F10 also open it.
 
 | Action | Shortcut |
 | --- | --- |
@@ -43,6 +49,7 @@ Create tabs with the plus button. Use the sidebar filter to add or manage worksp
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
 | Find in visible terminal | Ctrl+Shift+F |
 | Commands | Ctrl+Shift+P |
+| Main menu | F10 |
 | Preferences | Ctrl+, |
 
 The app's Keyboard Shortcuts dialog lists the remaining shortcuts. Settings and saved layouts live in `~/.config/gmux/`, or `$XDG_CONFIG_HOME/gmux/`. After the daemon stops, restored tabs start fresh shells. Scrollback currently survives window closure, but not daemon shutdown or a reboot.

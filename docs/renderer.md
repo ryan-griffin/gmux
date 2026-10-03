@@ -81,6 +81,8 @@ GTK_A11Y=none GSK_RENDERER=cairo dbus-run-session -- python3 scripts/renderer-sm
 GTK_A11Y=none dbus-run-session -- python3 scripts/terminal-renderer-smoke-test.py
 python3 scripts/terminal-input-smoke-test.py
 python3 scripts/terminal-scrollbar-smoke-test.py
+python3 scripts/terminal-context-menu-smoke-test.py
+python3 scripts/main-menu-smoke-test.py
 ```
 
 `renderer-check` compares batched text with GTK's independent Pango layout
@@ -106,7 +108,30 @@ Ctrl+Shift+C, and the Wayland clipboard. Pointer coordinates come from colored
 markers in composited frames, including the compositor's window placement.
 No test input reaches the user's desktop.
 
-This test and the application benchmark need Mutter with `--headless`,
+The terminal context menu test uses the same isolated compositor. It checks
+accessible menu names, Copy and Paste availability, selection preservation,
+clipboard contents, Find focus, keyboard navigation and activation, mnemonics,
+pane-specific split and close actions, busy-process confirmation, and the
+Shift+right-click override in mouse-tracking applications. Pointer motion and
+wheel input must stay in the open menu. Set
+`GMUX_REVIEW_APPEARANCE=light` to check the light style or
+`ADW_DEBUG_HIGH_CONTRAST=1` to check Adwaita's high-contrast style.
+
+The main menu test checks accessible item names, unavailable terminal actions
+in an empty window, tab creation with the sidebar hidden, workspace destinations
+and starting directories, workspace menu updates and mnemonics, directory selection
+cancellation, zoom, keyboard mnemonics, standard dialogs, and busy-process Quit
+confirmation. It checks the separate Terminal Actions menu, active-pane splits,
+Find focus, pane closure, and whole-tab closure with busy-process confirmations.
+Show Tabs and Fullscreen checkmarks must also follow changes made through keyboard
+shortcuts. It accepts the same appearance settings and saves main-menu, workspace,
+and terminal-menu screenshots under `artifacts/`. It also checks workspace
+management with the sidebar hidden, radio states and mnemonics in the workspace
+filter, both New Tab dropdowns, and keyboard and pointer invocation of tab context
+menus. Workspace commands must target the clicked tab, preserve its panes, and
+leave unrelated tabs alone.
+
+These native tests and the application benchmark need Mutter with `--headless`,
 `--no-x11`, and `--virtual-monitor` support, PipeWire, WirePlumber 0.5+, and
 `dbus-run-session`. Python needs PyGObject and introspection data for GDK 4,
 AT-SPI 2, GStreamer 1.0, and GstVideo 1.0. GStreamer needs `pipewiresrc` and
