@@ -5,6 +5,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREFIX");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=data/gmux.gresource.xml");
+    println!("cargo:rerun-if-changed=data/dev.gmux.Gmux.svg");
+    println!("cargo:rerun-if-changed=data/dev.gmux.Gmux-symbolic.svg");
     println!("cargo:rerun-if-changed=data/icons/branch-symbolic.svg");
     let resources = PathBuf::from(env::var("OUT_DIR").unwrap()).join("gmux.gresource");
     let status = Command::new("glib-compile-resources")

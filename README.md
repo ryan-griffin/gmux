@@ -73,6 +73,8 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Native regression tests are in [scripts/](scripts/). The [keyboard and clipboard test](docs/renderer.md#validation) runs in an isolated Wayland compositor with XWayland disabled. See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
 
+Run `python3 scripts/icon-smoke-test.py` to check the app icons with GdkPixbuf's format detection and SVG loader. This check requires PyGObject and the GdkPixbuf SVG loader, and runs without a display.
+
 Terminal processes and state live in a GTK-independent [session manager](docs/terminal-sessions.md). A headless daemon owns that manager and sends changed rows to the GTK frontend.
 
 Gmux uses Ghostty's terminal engine with Pango font shaping and GSK rendering. GTK selects a GPU backend or its software backend; see the [renderer design and benchmarks](docs/renderer.md). Terminal image protocols are not supported; Find and selection currently operate on the visible viewport.
@@ -81,4 +83,4 @@ The [application benchmark](docs/performance.md) measures frontend and daemon CP
 
 ## License
 
-[MIT](LICENSE). The bundled branch icon is [CC0](data/icons/COPYING.md). Ghostty and the GNOME libraries retain their own licenses.
+[MIT](LICENSE). The app icon adapts GNOME Console's artwork under [GPL-3.0-or-later](data/icons/COPYING.Console); see the [icon credits](data/icons/README.md). The bundled branch icon is [CC0](data/icons/COPYING.md). Ghostty and the GNOME libraries retain their own licenses.
