@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 from notification_server import NotificationServer
 
 parser = argparse.ArgumentParser()
@@ -58,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         if directory:
             command.extend(["--directory", str(directory)])
         process = subprocess.Popen(command, cwd=root, env=env, stdout=logfile, stderr=logfile)
-        wait_for(lambda: (temp / "gmux.sock").exists() or process.poll() is not None)
+        wait_for(lambda: ((temp / "gmux.sock.ui").exists() and rpc("daemon-info")["attached"]) or process.poll() is not None)
         assert process.poll() is None, "Application failed to start; see artifacts/smoke.log"
         return process
 
@@ -86,6 +88,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         app = start()
         assert state()["tabs"] == [], "First launch should stay empty"
         assert state()["active_tab"] is None
+        assert rpc("renderer-info")["terminal"] is None
         assert "error" in rpc("read")
         for name in ["next-pane", "previous-pane", "rename", "split-right", "find"]:
             assert "error" in rpc("action", name=name), f"{name} should be unavailable when empty"
@@ -100,6 +103,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         first = initial["tabs"][0]
         assert len(initial["tabs"]) == 1 and len(first["panes"]) == 1
         pane = first["active_pane"]
+        assert rpc("renderer-info", pane=pane)["terminal"] == "gsk"
         time.sleep(0.5)
         send(pane, "printf '\\033[32mGMUX_PTY_OK\\033[0m\\n'")
         wait_for(lambda: "GMUX_PTY_OK" in rpc("read", pane=pane).get("text", ""))
@@ -178,18 +182,21 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         app.terminate()
         app.wait(timeout=10)
         assert app.returncode == 0
-        assert not (temp / "gmux.sock").exists(), "Socket was not removed on shutdown"
+        assert (temp / "gmux.sock").exists(), "Closing the frontend must leave the daemon running"
         app = start()
         restored = state()
         assert len(restored["tabs"]) == 1
-        assert not any(w["unread"] for w in restored["tabs"]), "Unread indicators should not persist across launches"
         for old, new_tab in zip(expected["tabs"], restored["tabs"]):
             assert old["id"] == new_tab["id"]
             if old["id"] == new["tab"]:
                 assert new_tab["name"] == "Smoke project", "Explicit tab names should survive restore"
             assert old["layout"] == new_tab["layout"]
             assert [p["directory"] for p in old["panes"]] == [p["directory"] for p in new_tab["panes"]]
-            assert not any(p["exited"] for p in new_tab["panes"]), "Restored panes should start fresh shells"
+            old_panes = {p["id"]: p for p in old["panes"]}
+            for pane in new_tab["panes"]:
+                focused = new_tab["id"] == restored["active_tab"] and pane["id"] == new_tab["active_pane"]
+                assert pane["unread"] == (old_panes[pane["id"]]["unread"] and not focused), "Reopening must preserve unread alerts in unfocused panes"
+            assert not any(p["exited"] for p in new_tab["panes"]), "Reattached panes should keep live shells"
         for w in restored["tabs"]:
             for p in w["panes"]:
                 assert rpc("close", pane=p["id"]).get("ok")
@@ -222,6 +229,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
                 app.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 app.kill()
+        stop_daemon(env["GMUX_SOCKET"])
         if daemon:
             daemon.terminate()
             daemon.wait(timeout=5)

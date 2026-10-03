@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 import gi
 
 gi.require_version("Atspi", "2.0")
@@ -94,7 +96,7 @@ with (artifacts / "find-smoke.log").open("w") as log:
                             assert "error" not in result, result
                             return result
 
-                    wait_for(lambda: (temp / "socket").exists())
+                    wait_for(lambda: rpc("daemon-info")["attached"])
                     first = rpc("new", name="Find Test")
                     time.sleep(0.5)
                     rpc("send", pane=first["pane"], text="printf '\\033[2J\\033[HAlpha beta ALPHA\\nalpha\\n'", paste=True, enter=True)
@@ -170,6 +172,7 @@ with (artifacts / "find-smoke.log").open("w") as log:
                 finally:
                     app.terminate()
                     app.wait(timeout=8)
+                    stop_daemon(env["GMUX_SOCKET"])
     finally:
         registry.terminate()
         registry.wait(timeout=8)

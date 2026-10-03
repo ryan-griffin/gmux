@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 import gi
 
 gi.require_version("GdkPixbuf", "2.0")
@@ -58,6 +60,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-resize-") as directory:
     shell.chmod(0o700)
     env = dict(os.environ, XDG_CONFIG_HOME=str(temp / "config"),
                GMUX_SOCKET=str(temp / "socket"), SHELL=str(shell), GTK_A11Y="none")
+
+    # Keep occluded test windows accepting resize configures from the compositor.
+    env["GDK_DEBUG"] = env.get("GDK_DEBUG", "") + ":no-vsync"
 
     def rpc(method, **params):
         with socket.socket(socket.AF_UNIX) as connection:
@@ -110,3 +115,4 @@ with tempfile.TemporaryDirectory(prefix="gmux-resize-") as directory:
         finally:
             app.terminate()
             app.wait(timeout=8)
+            stop_daemon(env["GMUX_SOCKET"])

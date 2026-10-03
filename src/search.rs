@@ -1,4 +1,4 @@
-use crate::engine::Cell;
+use crate::Cell;
 use std::ops::Range;
 
 #[derive(Default)]
@@ -7,6 +7,7 @@ pub struct Search {
     matches: Vec<Range<usize>>,
     current: usize,
     highlights: Vec<u8>,
+    highlights_dirty: bool,
 }
 
 impl Search {
@@ -16,10 +17,12 @@ impl Search {
             self.query = query;
             self.matches.clear();
             self.current = 0;
+            self.highlights_dirty = true;
         }
     }
 
     pub fn refresh(&mut self, cells: &[Cell], cols: usize) {
+        self.highlights_dirty = true;
         if self.query.is_empty() || cols == 0 {
             self.matches.clear();
             self.current = 0;
@@ -70,6 +73,7 @@ impl Search {
             } else {
                 (self.current + 1) % total
             };
+            self.highlights_dirty = true;
         }
     }
 
@@ -80,6 +84,12 @@ impl Search {
 
     // 0: no match, 1: another match, 2: the current match.
     pub fn highlights(&mut self, len: usize) -> &[u8] {
+        if self.matches.is_empty() {
+            return &[];
+        }
+        if !self.highlights_dirty && self.highlights.len() == len {
+            return &self.highlights;
+        }
         self.highlights.resize(len, 0);
         self.highlights.fill(0);
         for (index, range) in self.matches.iter().enumerate() {
@@ -89,6 +99,7 @@ impl Search {
                 }
             }
         }
+        self.highlights_dirty = false;
         &self.highlights
     }
 }
@@ -164,6 +175,43 @@ mod tests {
                 .highlights(engine.cells.len())
                 .iter()
                 .all(|&x| x == 0)
+        );
+    }
+    #[test]
+    fn highlights_follow_navigation_query_changes_and_viewport_updates() {
+        let mut engine = screen("one one", 12, 2);
+        let mut search = Search::default();
+        search.set_query("one");
+        search.refresh(&engine.cells, 12);
+        assert_eq!(
+            &search.highlights(engine.cells.len())[..7],
+            &[2, 2, 2, 0, 1, 1, 1]
+        );
+        search.advance(false);
+        assert_eq!(
+            &search.highlights(engine.cells.len())[..7],
+            &[1, 1, 1, 0, 2, 2, 2]
+        );
+        engine.write(b"\x1b[1;1Hxxx");
+        engine.snapshot().unwrap();
+        search.refresh(&engine.cells, 12);
+        assert_eq!(
+            &search.highlights(engine.cells.len())[..7],
+            &[0, 0, 0, 0, 2, 2, 2]
+        );
+        search.set_query("");
+        search.refresh(&engine.cells, 12);
+        assert!(
+            search
+                .highlights(engine.cells.len())
+                .iter()
+                .all(|&value| value == 0)
+        );
+        search.set_query("xxx");
+        search.refresh(&engine.cells, 12);
+        assert_eq!(
+            &search.highlights(engine.cells.len())[..7],
+            &[2, 2, 2, 0, 0, 0, 0]
         );
     }
 }

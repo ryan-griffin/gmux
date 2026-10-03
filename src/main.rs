@@ -3,18 +3,15 @@
 mod app;
 mod branch;
 mod commands;
-mod engine;
 mod find_field;
 mod font;
-mod ipc;
-mod model;
 mod render;
-mod search;
+mod renderer;
 mod terminal;
-mod theme;
-mod title;
+mod terminal_canvas;
 
 use clap::{Parser, Subcommand};
+use gmux::{ipc, model, search, theme};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -94,6 +91,8 @@ enum Command {
     },
     /// Save a PNG of the application window.
     Screenshot { path: PathBuf },
+    /// Stop the daemon and terminate all terminal processes.
+    Quit,
     /// Send a raw JSON request to the local socket API.
     Rpc { request: String },
 }
@@ -113,6 +112,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if let Some(command) = cli.command {
         let request = match command {
+            Command::Quit => json!({"method":"quit"}),
             Command::List => json!({"method":"list"}),
             Command::New {
                 name,

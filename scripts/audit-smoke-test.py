@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 root = Path(__file__).resolve().parent.parent
@@ -36,7 +38,9 @@ def wait_for(predicate, timeout=8):
 with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
     temp = Path(temp)
     shell = temp / "shell"
-    shell.write_text("#!/bin/sh\nexec /bin/bash --noprofile --norc -i\n")
+    rcfile = temp / "bashrc"
+    rcfile.write_text("PS1='GMUX_AUDIT> '\nPROMPT_COMMAND=''\n")
+    shell.write_text(f"#!/bin/sh\nexec /bin/bash --noprofile --rcfile {shlex.quote(str(rcfile))} -i\n")
     shell.chmod(0o700)
     env = os.environ.copy()
     env.update(XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell),
@@ -74,6 +78,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
         app = subprocess.Popen([str(root / "target/debug/gmux"), "--directory", str(root)],
                                env=env, cwd=root, stdout=log, stderr=log)
         try:
+            wait_for(lambda: rpc("daemon-info")["attached"])
             first = wait_for(lambda: state()["tabs"])[0]
             a = first["active_pane"]
             b = rpc("split", pane=a)["pane"]
@@ -163,6 +168,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
         finally:
             app.terminate()
             app.wait(timeout=10)
+            stop_daemon(env["GMUX_SOCKET"])
 
         session_path = temp / "config/gmux/session.json"
         saved = json.loads(session_path.read_text())
@@ -177,6 +183,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
                                stdout=log, stderr=log)
         try:
             def restore():
+                wait_for(lambda: rpc("daemon-info")["attached"])
                 def restored():
                     assert app.poll() is None, "Invalid saved IDs crashed the application"
                     return state()["tabs"]
@@ -193,8 +200,22 @@ with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
             def exit_last_tab():
                 for current in state()["tabs"]:
                     for pane in current["panes"]:
+                        # Bash can flush queued input during startup. A restored
+                        # pane exists before its new shell is ready for commands.
+                        try:
+                            wait_for(lambda: "GMUX_AUDIT>" in rpc("read", pane=pane["id"])["text"])
+                        except AssertionError:
+                            print("Shell not ready:", pane, rpc("read", pane=pane["id"]), flush=True)
+                            raise
                         run(pane["id"], "exit")
-                wait_for(lambda: state()["tabs"] == [])
+                try:
+                    wait_for(lambda: state()["tabs"] == [])
+                except AssertionError:
+                    print("Panes remaining after exit:", state(), flush=True)
+                    for current in state()["tabs"]:
+                        for pane in current["panes"]:
+                            print("Remaining pane output:", pane["id"], rpc("read", pane=pane["id"]), flush=True)
+                    raise
                 assert state()["active_tab"] is None
                 assert app.poll() is None, "Exiting the last pane should leave the app's empty state open"
                 assert state()["workspaces"], "Exiting shells must not delete workspace definitions"
@@ -204,4 +225,5 @@ with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
             if app.poll() is None:
                 app.terminate()
                 app.wait(timeout=10)
+                stop_daemon(env["GMUX_SOCKET"])
     assert not failures, failures

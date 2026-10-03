@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
@@ -64,12 +66,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-workspaces-") as directory:
 
     def start(log):
         app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+        wait_for(lambda: rpc("daemon-info")["attached"])
         wait_for(state)
         return app
 
     def stop(app):
         app.terminate()
         app.wait(timeout=8)
+        stop_daemon(env["GMUX_SOCKET"])
         wait_for(lambda: not (temp / "socket").exists())
 
     project = temp / "project"

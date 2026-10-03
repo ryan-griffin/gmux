@@ -3,7 +3,7 @@
 A GNOME terminal inspired by [cmux](https://cmux.com/), built with Rust, GTK 4, libadwaita, and libghostty-vt.
 
 - Flat, searchable tab sidebar with workspace filters and Git branch information.
-- Split terminal panes, session layout restoration, and a command palette.
+- Split terminal panes, background sessions, layout restoration, and a command palette.
 - Adwaita light and dark themes, GNOME's monospace font, and configurable cursor and pane title bars.
 - Desktop notifications with unread indicators and a local CLI for shell automation.
 
@@ -29,7 +29,9 @@ Pass another installation prefix as the script's first argument.
 
 ## Use
 
-Create tabs with the plus button. Use the sidebar filter to add or manage workspaces. Right-click a tab to rename it or move it to a workspace; middle-click to close it. Deleting a workspace keeps its tabs open and unassigned. Exiting a shell closes its pane.
+Closing the window keeps panes and commands running in a headless daemon. Reopen Gmux to reconnect to the same terminals. Use **Quit Gmux**, Ctrl+Shift+Q, or `gmux quit` to stop them.
+
+Create tabs with the plus button. Use the sidebar filter to add or manage workspaces. Sidebar visibility is remembered when you reopen Gmux. Right-click a tab to rename it or move it to a workspace; middle-click to close it. Deleting a workspace keeps its tabs open and unassigned. Exiting a shell closes its pane.
 
 | Action | Shortcut |
 | --- | --- |
@@ -43,11 +45,11 @@ Create tabs with the plus button. Use the sidebar filter to add or manage worksp
 | Commands | Ctrl+Shift+P |
 | Preferences | Ctrl+, |
 
-The app's Keyboard Shortcuts dialog lists the remaining shortcuts. Settings and saved layouts live in `~/.config/gmux/`, or `$XDG_CONFIG_HOME/gmux/`. Restored tabs start fresh shells.
+The app's Keyboard Shortcuts dialog lists the remaining shortcuts. Settings and saved layouts live in `~/.config/gmux/`, or `$XDG_CONFIG_HOME/gmux/`. After the daemon stops, restored tabs start fresh shells. Scrollback currently survives window closure, but not daemon shutdown or a reboot.
 
 ## Shell automation
 
-With Gmux running, use `gmux` inside a pane or `target/debug/gmux` from another terminal:
+With the Gmux daemon running, including while its window is closed, use `gmux` inside a pane or `target/debug/gmux` from another terminal:
 
 ```sh
 gmux list
@@ -69,9 +71,13 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Native regression tests are in [scripts/](scripts/). See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
+Native regression tests are in [scripts/](scripts/). The [keyboard and clipboard test](docs/renderer.md#validation) runs in an isolated Wayland compositor with XWayland disabled. See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
 
-Gmux uses a custom Pango/Cairo renderer with Ghostty's terminal engine. Terminal image protocols are not supported; Find and selection currently operate on the visible viewport.
+Terminal processes and state live in a GTK-independent [session manager](docs/terminal-sessions.md). A headless daemon owns that manager and sends changed rows to the GTK frontend.
+
+Gmux uses Ghostty's terminal engine with Pango font shaping and GSK rendering. GTK selects a GPU backend or its software backend; see the [renderer design and benchmarks](docs/renderer.md). Terminal image protocols are not supported; Find and selection currently operate on the visible viewport.
+
+The [application benchmark](docs/performance.md) measures frontend and daemon CPU, resident memory, and native Wayland input-to-composited-frame latency with several busy panes.
 
 ## License
 

@@ -115,6 +115,7 @@ pub struct Settings {
     pub font: String,
     pub font_size: f64,
     pub appearance: String,
+    pub show_sidebar: bool,
     pub show_pane_titles: bool,
     pub cursor_style: CursorStyle,
     pub restore: bool,
@@ -128,6 +129,7 @@ impl Default for Settings {
             font: "Monospace".into(),
             font_size: 11.0,
             appearance: "system".into(),
+            show_sidebar: true,
             show_pane_titles: true,
             cursor_style: CursorStyle::default(),
             restore: true,
@@ -158,7 +160,7 @@ impl SavedTab {
         Ok(())
     }
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Session {
     pub tabs: Vec<SavedTab>,
     pub filter: TabFilter,

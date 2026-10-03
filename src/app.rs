@@ -5,13 +5,16 @@ use crate::{
     font, ipc,
     model::{self, Layout, SavedTab, Session, Settings, TabFilter, WorkspaceCatalog},
     terminal::Terminal,
+    theme::Theme,
 };
 use adw::prelude::*;
+use gmux::remote::SessionManager;
 use gtk::{gdk, gio, glib, pango};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
+    os::fd::AsRawFd,
     path::PathBuf,
     rc::Rc,
     time::Duration,
@@ -59,6 +62,7 @@ pub struct Ui {
     settings: Rc<RefCell<Settings>>,
     desktop_settings: Option<gio::Settings>,
     tabs: RefCell<Vec<Tab>>,
+    sessions: RefCell<SessionManager>,
     catalog: RefCell<WorkspaceCatalog>,
     filter: Cell<TabFilter>,
     filter_title: adw::WindowTitle,
@@ -78,7 +82,17 @@ pub struct Ui {
     changing: Cell<bool>,
     dirty: Cell<bool>,
     server: ipc::Server,
+    wake: ipc::Wake,
+    update_source: RefCell<Option<glib::SourceId>>,
     branches: BranchWorker,
+}
+
+impl Drop for Ui {
+    fn drop(&mut self) {
+        if let Some(source) = self.update_source.get_mut().take() {
+            source.remove();
+        }
+    }
 }
 
 pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
@@ -157,8 +171,11 @@ pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
         anyhow::bail!("{error}");
     }
     if let Some(ui) = holder.borrow_mut().take() {
-        ui.save_session();
+        if !ui.sessions.borrow().disconnected() {
+            ui.save_session();
+        }
         ui.tabs.borrow_mut().clear();
+        ui.sessions.borrow_mut().clear();
     }
     anyhow::ensure!(code == glib::ExitCode::SUCCESS, "Gmux exited with {code:?}");
     Ok(())
@@ -175,7 +192,10 @@ impl Ui {
             settings.borrow_mut().system_font = desktop.string(font::KEY).to_string();
         }
         apply_appearance(&settings.borrow());
-        let saved_session = model::load::<Session>("session.json");
+        let wake = ipc::Wake::new()?;
+        let server = ipc::Server::start_at(ipc::companion_path(".ui"), wake.clone())?;
+        let sessions = SessionManager::connect(wake.clone())?;
+        let saved_session = sessions.saved_session()?;
         let mut catalog = model::load::<WorkspaceCatalog>("workspaces.json");
         let mut ids = HashSet::new();
         catalog.workspaces.retain(|workspace| {
@@ -184,12 +204,7 @@ impl Ui {
                 && !workspace.name.trim().is_empty()
                 && ids.insert(workspace.id)
         });
-        let session = if settings.borrow().restore && directory.is_none() {
-            saved_session
-        } else {
-            Session::default()
-        };
-        let server = ipc::Server::start()?;
+        let session = saved_session;
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Gmux")
@@ -216,6 +231,8 @@ impl Ui {
             .min_sidebar_width(220.0)
             .max_sidebar_width(280.0)
             .sidebar_width_fraction(0.23)
+            .pin_sidebar(true)
+            .show_sidebar(settings.borrow().show_sidebar)
             .build();
         // OverlaySplitView styles this pane; the GTK "sidebar" class adds a second border.
         let sidebar_view = adw::ToolbarView::new();
@@ -365,6 +382,7 @@ impl Ui {
             settings,
             desktop_settings,
             tabs: RefCell::new(Vec::new()),
+            sessions: RefCell::new(sessions),
             next_id: Cell::new(
                 catalog
                     .workspaces
@@ -392,10 +410,22 @@ impl Ui {
             changing: Cell::new(false),
             dirty: Cell::new(false),
             server,
+            wake: wake.clone(),
+            update_source: RefCell::new(None),
             branches: BranchWorker::new(),
         });
         ui.install_actions();
         ui.refresh_workspace_ui();
+        let weak = Rc::downgrade(&ui);
+        ui.split.connect_show_sidebar_notify(move |split| {
+            if let Some(ui) = weak.upgrade() {
+                let visible = split.shows_sidebar();
+                if ui.settings.borrow().show_sidebar != visible {
+                    ui.settings.borrow_mut().show_sidebar = visible;
+                    ui.persist_settings();
+                }
+            }
+        });
         if let Some(desktop) = &ui.desktop_settings {
             let weak = Rc::downgrade(&ui);
             desktop.connect_changed(Some(font::KEY), move |desktop, _| {
@@ -524,7 +554,8 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         ui.window.connect_close_request(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.request_quit();
+                ui.save_session();
+                ui.app.quit();
             }
             glib::Propagation::Stop
         });
@@ -568,40 +599,62 @@ impl Ui {
             ui.window.maximize();
         }
         let weak = Rc::downgrade(&ui);
-        glib::timeout_add_local(Duration::from_millis(16), move || {
-            let Some(ui) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let panes = ui
-                .tabs
-                .borrow()
-                .iter()
-                .flat_map(|w| w.panes.values().cloned().map(move |p| (w.id, p)))
-                .collect::<Vec<_>>();
-            for (tab, pane) in panes {
-                for message in pane.tick() {
-                    ui.notify(tab, pane.id, message);
-                }
-                if pane.exited.get()
-                    && let Err(error) = ui.close_pane(pane.id)
-                {
-                    ui.message(&error.to_string());
-                }
-            }
-            for _ in 0..16 {
-                let Ok(request) = ui.server.receiver.try_recv() else {
-                    break;
+        let source =
+            glib_unix::unix_fd_add_local(wake.as_raw_fd(), glib::IOCondition::IN, move |_, _| {
+                wake.drain();
+                let Some(ui) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
                 };
-                let response = ui
-                    .handle_request(request.body)
-                    .unwrap_or_else(|error| json!({"error":error.to_string()}));
-                let _ = request.reply.try_send(response);
-            }
-            if ui.search.is_search_mode() {
-                ui.update_search_count();
-            }
-            glib::ControlFlow::Continue
-        });
+                let updates = ui.sessions.borrow_mut().poll();
+                if ui.sessions.borrow().disconnected() {
+                    ui.app.quit();
+                    return glib::ControlFlow::Continue;
+                }
+                for (id, update) in updates {
+                    let pane = ui
+                        .tabs
+                        .borrow()
+                        .iter()
+                        .find_map(|tab| tab.panes.get(&id).map(|pane| (tab.id, pane.clone())));
+                    let Some((tab, pane)) = pane else {
+                        continue;
+                    };
+                    if update.directory_changed {
+                        ui.dirty.set(true);
+                    }
+                    pane.tick(&update);
+                    if let Some(unread) = update.unread {
+                        ui.set_unread(pane.id, unread);
+                    }
+                    for message in update.notifications {
+                        ui.notify(tab, pane.id, message);
+                    }
+                    if pane.exited()
+                        && let Err(error) = ui.close_pane(pane.id)
+                    {
+                        ui.message(&error.to_string());
+                    }
+                }
+                for _ in 0..16 {
+                    let Ok(request) = ui.server.receiver.try_recv() else {
+                        if ui.search.is_search_mode() {
+                            ui.update_search_count();
+                        }
+                        return glib::ControlFlow::Continue;
+                    };
+                    let response = ui
+                        .handle_request(request.body)
+                        .unwrap_or_else(|error| json!({"error":error.to_string()}));
+                    if ui.dirty.replace(false) {
+                        ui.save_session();
+                    }
+                    let _ = request.reply.try_send(response);
+                }
+                // Requests already queued when the fd was drained need another turn.
+                ui.wake.notify();
+                glib::ControlFlow::Continue
+            });
+        *ui.update_source.borrow_mut() = Some(source);
         let weak = Rc::downgrade(&ui);
         glib::timeout_add_local(Duration::from_secs(2), move || {
             let Some(ui) = weak.upgrade() else {
@@ -641,15 +694,20 @@ impl Ui {
                 ui.request_close(id);
             }
         });
-        Terminal::new(
+        let session = self.sessions.borrow_mut().spawn(
             id,
             tab,
             directory,
+            self.settings.borrow().cursor_style,
+            &Theme::adwaita(adw::StyleManager::default().is_dark()),
+        )?;
+        Ok(Terminal::new(
+            session,
             self.settings.clone(),
             focus,
             close,
             self.app.upcast_ref(),
-        )
+        ))
     }
     fn new_tab(self: &Rc<Self>, directory: PathBuf, name: Option<String>) -> anyhow::Result<u64> {
         self.create_tab(directory, name, self.selected_workspace())
@@ -688,6 +746,7 @@ impl Ui {
             true,
         )?;
         self.switch(tab);
+        self.save_session();
         Ok(tab)
     }
     fn restore_tab(self: &Rc<Self>, saved: SavedTab, prepend: bool) -> anyhow::Result<()> {
@@ -723,7 +782,17 @@ impl Ui {
                 .cloned()
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(model::home);
-            panes.insert(id, self.terminal(id, saved.id, directory)?);
+            match self.terminal(id, saved.id, directory) {
+                Ok(terminal) => {
+                    panes.insert(id, terminal);
+                }
+                Err(error) => {
+                    for id in panes.keys() {
+                        self.sessions.borrow_mut().close(*id);
+                    }
+                    return Err(error);
+                }
+            }
         }
         let active = if panes.contains_key(&saved.active) {
             saved.active
@@ -847,6 +916,11 @@ impl Ui {
             self.sidebar.append(&row);
         }
         let position = if prepend { 0 } else { self.tabs.borrow().len() };
+        let unread: HashSet<_> = panes
+            .iter()
+            .filter_map(|(&id, pane)| pane.unread().then_some(id))
+            .collect();
+        unread_indicator.set_visible(!unread.is_empty());
         self.tabs.borrow_mut().insert(
             position,
             Tab {
@@ -871,7 +945,7 @@ impl Ui {
                 path_label,
                 branch_label,
                 branch_box,
-                unread: HashSet::new(),
+                unread,
                 unread_indicator,
                 menu,
                 branch_directory: PathBuf::new(),
@@ -944,6 +1018,7 @@ impl Ui {
             )
         };
         self.active.set(id);
+        self.subscribe_visible();
         self.update_tab_actions(true);
         self.changing.set(true);
         self.sidebar.select_row(Some(&row));
@@ -960,7 +1035,7 @@ impl Ui {
                 }
             }
             self.heading
-                .set_subtitle(&model::display_path(&p.directory.borrow()));
+                .set_subtitle(&model::display_path(&p.directory()));
             p.search(&self.search_entry.text());
             p.area.grab_focus();
             self.mark_read(p.id);
@@ -981,6 +1056,7 @@ impl Ui {
     }
     fn show_empty(&self) {
         self.active.set(0);
+        self.subscribe_visible();
         self.changing.set(true);
         self.sidebar.select_row(None::<&gtk::ListBoxRow>);
         self.changing.set(false);
@@ -991,6 +1067,19 @@ impl Ui {
         self.search.set_search_mode(false);
         self.update_tab_actions(false);
         self.dirty.set(true);
+    }
+    fn subscribe_visible(&self) {
+        let visible = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.id == self.active.get())
+            .into_iter()
+            .flat_map(|tab| tab.panes.keys().copied())
+            .collect();
+        if let Err(error) = self.sessions.borrow_mut().set_visible(visible) {
+            eprintln!("{error}");
+        }
     }
     fn focus_pane(self: &Rc<Self>, id: u64) {
         // GtkStack may briefly restore the previous pane's focus when showing
@@ -1016,7 +1105,7 @@ impl Ui {
         self.dirty.set(true);
         if let Some(p) = self.active_pane() {
             self.heading
-                .set_subtitle(&model::display_path(&p.directory.borrow()));
+                .set_subtitle(&model::display_path(&p.directory()));
             self.refresh_search();
         }
     }
@@ -1100,7 +1189,7 @@ impl Ui {
             "A tab can have at most 24 panes"
         );
         let new_id = self.next()?;
-        let terminal = self.terminal(new_id, tab, pane.directory.borrow().clone())?;
+        let terminal = self.terminal(new_id, tab, pane.directory())?;
         {
             let mut tabs = self.tabs.borrow_mut();
             let w = tabs.iter_mut().find(|w| w.id == tab).unwrap();
@@ -1112,6 +1201,7 @@ impl Ui {
         self.switch(tab);
         terminal.area.grab_focus();
         self.dirty.set(true);
+        self.save_session();
         Ok(new_id)
     }
     fn close_pane(self: &Rc<Self>, id: u64) -> anyhow::Result<()> {
@@ -1122,6 +1212,7 @@ impl Ui {
             .find(|w| w.panes.contains_key(&id))
             .map(|w| w.id)
             .ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?;
+        self.sessions.borrow_mut().close(id);
         let was_active = self.active.get() == tab;
         let remaining = {
             let mut tabs = self.tabs.borrow_mut();
@@ -1184,6 +1275,7 @@ impl Ui {
         }
         self.refresh_sidebar();
         self.dirty.set(true);
+        self.save_session();
         Ok(())
     }
     fn request_close(self: &Rc<Self>, id: u64) {
@@ -1218,34 +1310,38 @@ impl Ui {
             .iter()
             .any(|w| w.panes.values().any(|p| p.busy()));
         if !busy {
-            self.save_session();
-            self.app.quit();
+            self.stop_daemon();
             return;
         }
-        let dialog = adw::AlertDialog::builder().heading("Close Gmux?").body("Processes are still running. Closing Gmux will stop them. Your tab layout will be saved.").build();
+        let dialog = adw::AlertDialog::builder().heading("Quit Gmux?").body("Processes are still running. Quitting will stop the daemon and all terminals. Your tab layout will be saved.").build();
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("quit", "Close Gmux");
+        dialog.add_response("quit", "Quit Gmux");
         dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
         dialog.set_close_response("cancel");
         dialog.set_default_response(Some("cancel"));
         let weak = Rc::downgrade(self);
         dialog.connect_response(Some("quit"), move |_, _| {
             if let Some(ui) = weak.upgrade() {
-                ui.save_session();
-                ui.app.quit();
+                ui.stop_daemon();
             }
         });
         dialog.present(Some(&self.window));
+    }
+    fn stop_daemon(&self) {
+        self.save_session();
+        if let Err(error) = self.sessions.borrow().shutdown() {
+            self.message(&error.to_string());
+            return;
+        }
+        self.app.quit();
     }
     fn message(&self, message: &str) {
         self.toast.add_toast(adw::Toast::new(message));
     }
     fn notify(&self, tab: u64, pane: u64, message: String) {
         let name = {
-            let mut tabs = self.tabs.borrow_mut();
-            if let Some(w) = tabs.iter_mut().find(|w| w.id == tab) {
-                w.unread.insert(pane);
-                w.unread_indicator.set_visible(true);
+            let tabs = self.tabs.borrow();
+            if let Some(w) = tabs.iter().find(|w| w.id == tab) {
                 w.name.clone()
             } else {
                 "Terminal".into()
@@ -1263,12 +1359,26 @@ impl Ui {
         self.app.send_notification(None, &notification);
     }
     fn mark_read(&self, pane: u64) {
-        for w in self.tabs.borrow_mut().iter_mut() {
-            if w.unread.remove(&pane) {
-                w.unread_indicator.set_visible(!w.unread.is_empty());
-                break;
-            }
+        if self.set_unread(pane, false) {
+            self.sessions.borrow_mut().mark_read(pane);
         }
+    }
+    fn set_unread(&self, pane: u64, unread: bool) -> bool {
+        for w in self.tabs.borrow_mut().iter_mut() {
+            if !w.panes.contains_key(&pane) {
+                continue;
+            }
+            let changed = if unread {
+                w.unread.insert(pane)
+            } else {
+                w.unread.remove(&pane)
+            };
+            if changed {
+                w.unread_indicator.set_visible(!w.unread.is_empty());
+            }
+            return changed;
+        }
+        false
     }
     fn jump_to_pane(self: &Rc<Self>, id: u64) {
         if let Ok(p) = self.pane(Some(id)) {
@@ -1291,15 +1401,8 @@ impl Ui {
         let mut jobs = Vec::new();
         let catalog = self.catalog.borrow();
         for w in self.tabs.borrow_mut().iter_mut() {
-            for p in w.panes.values() {
-                let old = p.directory.borrow().clone();
-                p.refresh_directory();
-                if old != *p.directory.borrow() {
-                    self.dirty.set(true);
-                }
-            }
             if let Some(p) = w.panes.get(&w.active) {
-                let path = p.directory.borrow().clone();
+                let path = p.directory();
                 let display = model::display_path(&path);
                 let workspace = w.workspace.and_then(|id| {
                     catalog
@@ -1355,15 +1458,11 @@ impl Ui {
                     workspace: w.workspace,
                     layout: w.layout.borrow().clone(),
                     active: w.active,
-                    directories: w
-                        .panes
-                        .iter()
-                        .map(|(&id, p)| (id, p.directory.borrow().clone()))
-                        .collect(),
+                    directories: w.panes.iter().map(|(&id, p)| (id, p.directory())).collect(),
                 })
                 .collect(),
         };
-        if let Err(e) = model::save("session.json", &session) {
+        if let Err(e) = self.sessions.borrow().save(&session) {
             eprintln!("Could not save session: {e}");
         }
     }
@@ -1814,7 +1913,7 @@ impl Ui {
         page.add(&font_group);
         let behavior = adw::PreferencesGroup::builder()
             .title("Tabs")
-            .description("Restore the layout and directories with fresh shells when Gmux starts.")
+            .description("Reopening the window reconnects to running terminals. Restore tabs and directories with fresh shells after the background daemon stops.")
             .build();
         let restore = adw::SwitchRow::builder()
             .title("Restore tabs")
@@ -1847,10 +1946,13 @@ impl Ui {
     }
     fn save_settings(&self) {
         apply_appearance(&self.settings.borrow());
+        self.persist_settings();
+        self.redraw_terminals();
+    }
+    fn persist_settings(&self) {
         if let Err(e) = model::save("settings.json", &*self.settings.borrow()) {
             self.message(&e.to_string());
         }
-        self.redraw_terminals();
     }
     fn redraw_terminals(&self) {
         for w in self.tabs.borrow().iter() {
@@ -2141,12 +2243,35 @@ impl Ui {
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
         let pane_id = request.get("pane").and_then(Value::as_u64);
         match method {
+            "detach" => {
+                let window = self.window.clone();
+                glib::timeout_add_local_once(Duration::from_millis(50), move || {
+                    window.close();
+                });
+                Ok(json!({"ok":true}))
+            }
+            "renderer-info" => {
+                let pane = if pane_id.is_some() {
+                    Some(self.pane(pane_id)?)
+                } else {
+                    self.active_pane()
+                };
+                Ok(json!({
+                    "terminal": pane.as_ref().map(|pane| pane.renderer_name()),
+                    "gtk": self.window.renderer().map(|renderer| renderer.type_().name().to_string()),
+                    "display": gtk::prelude::WidgetExt::display(&self.window).type_().name(),
+                    "window_active": self.window.is_active(),
+                    "viewport": pane.map(|pane| pane.renderer_geometry()),
+                }))
+            }
             "list" => {
                 let tabs = self.tabs.borrow();
                 Ok(json!({
                     "active_tab": (self.active.get() != 0).then_some(self.active.get()),
                     "filter": self.filter.get(),
                     "tab_search": self.sidebar_search.text().as_str(),
+                    "sidebar_visible": self.split.shows_sidebar(),
+                    "sidebar_collapsed": self.split.is_collapsed(),
                     "workspaces": self.catalog.borrow().workspaces.iter().map(|workspace| json!({
                         "id": workspace.id, "name": workspace.name, "directory": workspace.directory,
                         "tabs": tabs.iter().filter(|tab| tab.workspace == Some(workspace.id)).count(),
@@ -2159,7 +2284,7 @@ impl Ui {
                         "layout": *tab.layout.borrow(),
                         "panes": tab.layout.borrow().ids().iter().filter_map(|id| tab.panes.get(id))
                             .map(|pane| json!({"id": pane.id, "title": pane.title.text().to_string(),
-                                "directory": *pane.directory.borrow(), "exited": pane.exited.get(),
+                                "directory": pane.directory(), "exited": pane.exited(),
                                 "unread": tab.unread.contains(&pane.id)})).collect::<Vec<_>>()
                     })).collect::<Vec<_>>()
                 }))
@@ -2306,22 +2431,6 @@ impl Ui {
                 Ok(json!({"ok":true}))
             }
             "read" => Ok(json!({"text":self.pane(pane_id)?.text()?})),
-            "notify" => {
-                let pane = self.pane(pane_id)?;
-                let message = request
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("notify requires a message"))?;
-                let tab = self
-                    .tabs
-                    .borrow()
-                    .iter()
-                    .find(|w| w.panes.contains_key(&pane.id))
-                    .unwrap()
-                    .id;
-                self.notify(tab, pane.id, message.to_string());
-                Ok(json!({"ok":true}))
-            }
             "focus" => {
                 if let Some(pane) = pane_id {
                     self.pane(Some(pane))?;
@@ -2489,6 +2598,7 @@ fn menu_button() -> gtk::MenuButton {
     app.append(Some("Preferences"), Some("win.preferences"));
     app.append(Some("Keyboard shortcuts"), Some("win.shortcuts"));
     app.append(Some("About Gmux"), Some("win.about"));
+    app.append(Some("Quit Gmux"), Some("win.quit"));
     menu.append_section(None, &app);
     gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")

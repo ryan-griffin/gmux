@@ -2,7 +2,6 @@
 #include <ghostty/vt.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <time.h>
 
 // Keep the moving libghostty ABI on this side of the Rust boundary.

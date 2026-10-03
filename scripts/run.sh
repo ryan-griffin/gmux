@@ -4,4 +4,5 @@ cd "$(dirname "$0")/.."
 if [[ ! -f .deps/ghostty/include/ghostty/vt/terminal.h && -z ${GHOSTTY_PREFIX:-} ]]; then
     ./scripts/bootstrap-ghostty.sh
 fi
-exec cargo run -- "$@"
+cargo build --locked --bins
+exec target/debug/gmux "$@"

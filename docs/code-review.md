@@ -21,7 +21,7 @@ The Find field remains a small compound widget because it places the match count
 
 ## Library integration and performance
 
-The GTK, libadwaita, Pango/Cairo, GLib Unix, and PTY Rust bindings were checked against their current stable releases. GTK 4.22 and libadwaita 1.9 feature levels now expose current API deprecations during compilation. Deprecated Rust API use is denied, with one documented exception below. The build was checked with GTK 4.22.5 and libadwaita 1.9.4.
+The GTK, libadwaita, Pango, GLib Unix, and PTY Rust bindings were checked against their current stable releases. GTK 4.22 and libadwaita 1.9 feature levels now expose current API deprecations during compilation. Deprecated Rust API use is denied, with one documented exception below. The build was checked with GTK 4.22.5 and libadwaita 1.9.4.
 
 The Ghostty revision remains pinned because its terminal C API is still changing. The bridge now uses that revision's dirty-row iterator to update the persistent cell buffer. Search tracks the buffer revision so another reader cannot consume an update before Find sees it. Glyph-cache lookups no longer allocate a string for every displayed cell.
 
@@ -33,7 +33,7 @@ Git branch refreshes use one persistent worker with at most one batch in flight.
 
 Terminal keyboard handlers now match the application's registered accelerators with `GdkKeyEvent.matches` for both presses and releases. The previous hardcoded checks swallowed unbound Ctrl+Shift key presses and leaked some shortcut releases into programs using extended keyboard reporting. Local scrollback shortcuts also reserve their releases. GDK handles keyboard groups and consumed modifiers when matching shortcuts.
 
-Font measurement and cached glyph layouts now share the terminal widget's Pango context. Metrics are measured once per font or context change. The cache also checks the context identity and serial, so reparenting and GTK text-setting changes invalidate it. Ordinary redraws no longer create a measurement layout.
+Font measurement and glyph shaping share the terminal widget's Pango context. Metrics are measured once per font or context change. The cache also checks the context identity and serial, so reparenting and GTK text-setting changes invalidate it. Ordinary redraws no longer create a measurement layout.
 
 Find reuses its match and highlight buffers and the text-to-cell mapping storage across rows. ASCII matching avoids per-cell lowercase string allocations. The Find controls only update when the query presence, match count, or selected match changes. Keyboard, pointer, and title buffers use stack storage before allocating their final result.
 
@@ -43,11 +43,13 @@ Underline and strikethrough rendering now includes blank cells and wide-characte
 
 The screenshot diagnostic still uses deprecated GTK calls for the window's CSS background and frame. `GtkWidgetPaintable` returns cached content when the compositor pauses an occluded window, which fails the existing fresh-screenshot regression test. The exception is confined to `capture_window`; normal application controls use current APIs.
 
-The terminal still uses Pango/Cairo rather than Ghostty's GPU renderer. Terminal image protocols and the full GTK accessible text interface remain outside the current implementation. Search and selection operate on the visible viewport.
+Terminal rendering now uses [GSK nodes with Pango shaping](renderer.md). Terminal image protocols and the full GTK accessible text interface remain outside the current implementation. Search and selection operate on the visible viewport.
 
-PTY output, process titles, and socket requests still use the existing 16 ms GTK update loop. Moving these to event-driven sources would be a larger change and needs separate idle-CPU profiling and lifecycle checks.
+The [headless daemon](terminal-sessions.md) owns event-driven PTY I/O and process state. Stream packets and GUI requests now wake a GLib file-descriptor source; the frontend has no periodic update poll. A two-second settings and Git refresh remains.
 
 ## Validation
+
+These results describe the earlier UI review. Current renderer and lifecycle checks are documented in [the renderer notes](renderer.md) and [the daemon notes](terminal-sessions.md).
 
 `cargo fmt --check`, `cargo build --locked`, all 36 unit tests, and Clippy with warnings denied passed. New tests cover dirty-row updates, synchronized output and its timeout, paste encoding with queued device replies, bounded Git refreshes, and command search. Command search tests cover related terms, word order, typo edits, relevance ranking, and unrelated or oversized queries.
 
@@ -55,9 +57,62 @@ Native smoke tests passed for PTYs, notifications, session restore, workspace fi
 
 The follow-up review reran the native regression suite and checked pane-title visibility through AT-SPI. Command sizing and complete selected-row visibility passed in light and dark appearances. Real GTK key events verified that Ctrl-minus changes the PTY size without sending a release packet to a program using Kitty keyboard reporting, while unbound Ctrl+Shift+U sends both its press and release. Shift+Page Up/Down produces no stray release packets. Native screenshots verified decorations on spaces and wide characters. Workspace restore now checks the saved split layout before and after drawing it.
 
-Find's native test keeps its own frame clock running with `GDK_DEBUG=no-vsync`. This avoids waiting indefinitely for a reveal animation when the compositor pauses an occluded test window. The application retains normal frame pacing.
+Find and sidebar native tests keep their own frame clocks running with `GDK_DEBUG=no-vsync`. This avoids waiting indefinitely for layout or reveal transitions when the compositor pauses an occluded test window. The application retains normal frame pacing. The Commands test refreshes AT-SPI state before checking focus, avoiding a cached state captured before GTK transfers focus.
 
 The Commands regression test captures real AT-SPI announcement events, checks the search-to-list relation, and verifies related terms, typo matching, ranking, disabled matches, equal row heights, and retained focus in light and dark mode. Real GTK keyboard events also verified command activation and Escape dismissal. Orca speech output has not been tested.
+
+## Daemon and renderer cleanup
+
+The frontend processes received pane updates through an event-driven source
+instead of polling every 16 ms. Tab and layout changes update
+viewport subscriptions, with retries after temporary command-queue backpressure.
+Resize indicators have independent timers. Periodic directory checks use
+streamed metadata; split and busy-job checks still request fresh process state.
+
+The daemon reuses its polling collections, updates its retained viewport only
+for changed rows, and encodes packets into the socket output buffer. Process
+metadata is rebuilt for panes with activity and during the once-a-second refresh.
+Partial writes compact the buffer after enough data has been consumed. Rendering
+caches font descriptions and search highlights and generates terminal graphics
+in one pass. Cached frontend snapshots are infallible, and terminal text extraction
+uses one string instead of allocating strings for individual rows.
+
+Validation passed 37 library tests, 11 application tests, the example tests,
+Clippy with warnings denied, and release builds for both binaries and examples.
+All 14 native checks passed, including all three GTK rendering backends,
+background reconnects, resizing, font changes, Find, workspaces, notifications,
+Vim/top, actual keyboard and clipboard input, and pane lifecycle checks. The
+detached idle daemon again consumed zero CPU ticks during the smoke test.
+These checks verify behavior; they do not measure overall FPS or GPU memory.
+
+The subsequent reliability pass unified unread state in the daemon and bounded
+both CLI and OSC alert queues to the latest 64 messages per pane. Reading a pane
+acknowledges a specific alert sequence, so old packets cannot restore read
+indicators and stale acknowledgements cannot discard new alerts. Reconnects keep
+unread state even after queued desktop alerts have been delivered.
+
+The historical [application benchmark comparison](performance.md#historical-xwayland-comparison)
+measured the preceding polling build and the event-driven build using XWayland
+input synthesis and window readback. It excluded physical display scanout and
+normal compositor frame pacing.
+
+The reliability pass passed 40 library tests, 11 application tests, the example
+tests, Clippy with warnings denied, and release builds for both binaries.
+Native checks passed for notification queues and unread acknowledgements,
+sidebar restoration, Find, resizing, fonts, workspaces, titles, Vim/top,
+keyboard and clipboard input, command accessibility, pane lifecycle, and
+frontend reconnects. The benchmark completed two comparisons with reversed
+build order; the detached idle daemon consumed zero CPU ticks in all four runs.
+
+The input test and application benchmark now run in an isolated headless Mutter
+Wayland compositor with XWayland disabled. They send native keyboard and pointer
+input and observe composited PipeWire frames. The input test passed terminal
+accessibility, keyboard input, pointer selection, Ctrl+Shift+C, and clipboard
+contents. The benchmark completed all five workload scenarios with normal GTK
+frame pacing. Its latency includes compositor presentation and capture overhead,
+so it cannot be compared directly with the historical XWayland measurements.
+All 40 library tests, 11 application tests, eight example tests, formatting,
+Clippy with warnings denied, and debug and release binary builds passed.
 
 ## References
 

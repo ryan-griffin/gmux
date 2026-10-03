@@ -2,6 +2,7 @@
 name = "gmux"
 version = "0.1.0"
 edition = "2024"
+default-run = "gmux"
 description = "A GNOME terminal with workspaces, split panes, and agent notifications"
 license = "MIT"
 build = "build.rs"
@@ -16,7 +17,7 @@ serde_json = "1"
 portable-pty = "0.9"
 libc = "0.2"
 directories = "6"
-pangocairo = "0.22"
+glib = "0.22"
 glib-unix = "0.22"
 
 [build-dependencies]

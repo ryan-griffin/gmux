@@ -1,6 +1,6 @@
 // Adwaita and Adwaita Dark, from the theme collection distributed with Ghostty:
 // https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Theme {
     pub dark: bool,
     pub background: [u8; 3],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check native sidebar search, workspace filters, and terminal focus.
+"""Check native sidebar search, visibility restoration, and terminal focus.
 
 Run with GTK_A11Y=none GDK_BACKEND=wayland dbus-run-session -- python3
 scripts/sidebar-search-smoke-test.py. Uses temporary settings and directories.
@@ -11,6 +11,8 @@ import socket
 import subprocess
 import tempfile
 import time
+
+from daemon_test_support import stop_daemon
 
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
@@ -41,6 +43,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
     shell.chmod(0o700)
     env = dict(os.environ, XDG_CONFIG_HOME=str(temp / "config"),
                GMUX_SOCKET=str(temp / "socket"), SHELL=str(shell), GTK_A11Y="none")
+    # Keep layout and overlay transitions running in an occluded test window.
+    env["GDK_DEBUG"] = env.get("GDK_DEBUG", "") + ":no-vsync"
     project = temp / "project-a"
     project.mkdir()
     src = project / "src"
@@ -77,17 +81,21 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
 
     def start(log):
         app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+        wait_for(lambda: rpc("daemon-info")["attached"])
         wait_for(state)
+        wait_for(lambda: rpc("renderer-info")["gtk"])
         return app
 
     def stop(app):
         app.terminate()
         app.wait(timeout=8)
+        stop_daemon(env["GMUX_SOCKET"])
         wait_for(lambda: not (temp / "socket").exists())
 
     with (artifacts / "sidebar-search-smoke.log").open("w") as log:
         app = start(log)
         try:
+            assert state()["sidebar_visible"], "The sidebar should be open by default"
             search("missing tab", [])
             assert state()["active_tab"] is None
             capture("sidebar-search-empty-unchanged")
@@ -151,13 +159,46 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
             assert state()["active_tab"] is None, "Typing must not replace the empty page"
             rpc("focus", tab=database["tab"])
             assert state()["active_tab"] == database["tab"]
+            rpc("action", name="sidebar")
+            assert not state()["sidebar_visible"]
         finally:
             stop(app)
         app = start(log)
         try:
+            assert not state()["sidebar_visible"], "A full restart must restore a hidden sidebar"
             assert state()["tab_search"] == "", "Search text should not hide restored tabs"
             assert all(tab["visible"] for tab in state()["tabs"])
             capture("sidebar-search-restored")
+            daemon_pid = rpc("daemon-info")["pid"]
+            for width in [1120, 620]:
+                rpc("resize", width=width, height=740)
+                wait_for(lambda: state()["sidebar_collapsed"] == (width == 620))
+                assert not state()["sidebar_visible"], "Resizing must preserve the hidden sidebar"
+                for shown in [False, True]:
+                    if state()["sidebar_visible"] != shown:
+                        rpc("action", name="sidebar")
+                    assert state()["sidebar_visible"] == shown
+                    assert json.loads((config / "settings.json").read_text())["show_sidebar"] == shown
+                    rpc("detach")
+                    assert app.wait(timeout=8) == 0
+                    wait_for(lambda: not rpc("daemon-info")["attached"])
+                    app = start(log)
+                    wait_for(lambda: state()["sidebar_collapsed"] == (width == 620))
+                    assert state()["sidebar_visible"] == shown, "Window reopening must restore sidebar visibility"
+                    assert rpc("daemon-info")["pid"] == daemon_pid
+                    assert tab(database["tab"])["active_pane"] == database["pane"]
+                if width == 1120:
+                    rpc("action", name="sidebar")
+            capture("sidebar-open-restored-narrow")
         finally:
             stop(app)
-        print("PASS: native title/workspace/directory/branch search, case-insensitive words across fields, combined workspace filters, no-match states, preserving terminal focus and unread alerts, navigation, revealing hidden panes and new tabs, membership updates, shell exit, and restored tabs")
+        app = start(log)
+        try:
+            assert state()["sidebar_visible"], "A full restart must restore an open sidebar"
+            assert state()["sidebar_collapsed"], "The narrow window should also be restored"
+            rpc("resize", width=1120, height=740)
+            wait_for(lambda: not state()["sidebar_collapsed"])
+            assert state()["sidebar_visible"], "Resizing must preserve the open sidebar"
+        finally:
+            stop(app)
+        print("PASS: native title/workspace/directory/branch search, case-insensitive words across fields, combined workspace filters, no-match states, preserving terminal focus and unread alerts, navigation, revealing hidden panes and new tabs, membership updates, shell exit, restored tabs, and open/closed sidebar restoration across window reopening, daemon restarts, and narrow/wide layouts")

@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Cell {
     pub text: [u8; 64],
@@ -28,7 +28,7 @@ impl Cell {
         std::str::from_utf8(&self.text[..end]).unwrap_or("\u{fffd}")
     }
 }
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[repr(C)]
 pub struct Frame {
     pub cols: u16,
@@ -48,8 +48,8 @@ struct Events {
     title_changed: bool,
 }
 unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usize) {
-    // The C engine calls synchronously on the UI thread. Its userdata is a
-    // stable Box owned by Engine and lives until after gmux_engine_free.
+    // The C engine calls synchronously on the thread owning the session.
+    // Its userdata is a stable Box owned by Engine, valid until gmux_engine_free.
     let events = unsafe { &mut *ud.cast::<Events>() };
     let bytes = if len == 0 {
         &[]
@@ -247,28 +247,23 @@ impl Engine {
     }
     pub fn text(&mut self) -> anyhow::Result<String> {
         self.snapshot()?;
-        Ok(self
-            .cells
-            .chunks(self.frame.cols as usize)
-            .map(|row| {
-                row.iter()
-                    .map(|cell| {
-                        if cell.flags & 64 != 0 {
-                            ""
-                        } else if cell.text().is_empty() {
-                            " "
-                        } else {
-                            cell.text()
-                        }
-                    })
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim_end()
-            .to_string())
+        let mut text = String::with_capacity(self.cells.len());
+        for (index, row) in self.cells.chunks(self.frame.cols as usize).enumerate() {
+            if index > 0 {
+                text.push('\n');
+            }
+            let start = text.len();
+            for cell in row {
+                if cell.flags & 64 != 0 {
+                    continue;
+                }
+                let glyph = cell.text();
+                text.push_str(if glyph.is_empty() { " " } else { glyph });
+            }
+            text.truncate(start + text[start..].trim_end().len());
+        }
+        text.truncate(text.trim_end().len());
+        Ok(text)
     }
     pub fn mouse(
         &mut self,
@@ -307,6 +302,13 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reading_text_preserves_blank_rows_indentation_and_unicode() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(20, 7, 8, 16).unwrap();
+        engine.write("\r\n  界é   \r\n\r\n second  \r\n\r\n".as_bytes());
+        assert_eq!(engine.text().unwrap(), "\n  界é\n\n second");
+    }
     #[test]
     fn paste_uses_terminal_modes_and_preserves_queued_device_replies() {
         let mut engine = Engine::new().unwrap();

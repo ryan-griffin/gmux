@@ -10,10 +10,7 @@ impl Ui {
         if query.trim().is_empty() {
             return true;
         }
-        let directory = tab
-            .panes
-            .get(&tab.active)
-            .map(|pane| pane.directory.borrow().clone());
+        let directory = tab.panes.get(&tab.active).map(|pane| pane.directory());
         let searchable = format!(
             "{}\n{}\n{}\n{}\n{}",
             tab.name,
@@ -371,7 +368,7 @@ impl Ui {
                 .iter()
                 .find(|tab| tab.id == id)
                 .and_then(|tab| tab.panes.get(&tab.active))
-                .map(|pane| pane.directory.borrow().clone())
+                .map(|pane| pane.directory())
         });
         let dialog = adw::Dialog::builder()
             .title(if existing.is_some() {

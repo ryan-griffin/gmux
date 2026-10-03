@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
@@ -70,6 +72,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-font-") as temp:
             settings_path.write_text(json.dumps(settings))
             process = subprocess.Popen([str(root / "target/debug/gmux"), "--directory", str(root)],
                                        env=env, cwd=root, stdout=log, stderr=log)
+            wait_for(lambda: rpc("daemon-info")["attached"])
             wait_for(lambda: rpc("list")["tabs"])
             time.sleep(0.5)
             return process
@@ -100,6 +103,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-font-") as temp:
             assert app.poll() is None, "Font updates must also work while Preferences is open"
             app.terminate()
             app.wait(timeout=10)
+            stop_daemon(env["GMUX_SOCKET"])
             # An explicit custom font must remain stable when GNOME changes.
             app = start(dict(use_system_font=False, font="Monospace", font_size=12))
             pane = rpc("list")["tabs"][0]["active_pane"]
@@ -112,3 +116,4 @@ with tempfile.TemporaryDirectory(prefix="gmux-font-") as temp:
             if app and app.poll() is None:
                 app.terminate()
                 app.wait(timeout=10)
+                stop_daemon(env["GMUX_SOCKET"])

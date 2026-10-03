@@ -7,6 +7,7 @@ if [[ ! -f "$gmux_ghostty_prefix/include/ghostty/vt/terminal.h" ]]; then
     ./scripts/bootstrap-ghostty.sh
 fi
 cargo build --release --locked
+install -Dm755 target/release/gmux-daemon "$gmux_install_prefix/bin/gmux-daemon"
 install -Dm755 target/release/gmux "$gmux_install_prefix/bin/gmux"
 mkdir -p "$gmux_install_prefix/lib/gmux"
 cp -L "$gmux_ghostty_prefix/lib/libghostty-vt.so" "$gmux_install_prefix/lib/gmux/libghostty-vt.so.0"

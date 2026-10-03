@@ -1,0 +1,180 @@
+//! Versioned viewport packets: JSON metadata followed by fixed-width cell rows.
+use crate::{Cell, Frame};
+use serde::{Deserialize, Serialize};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
+
+pub(crate) const VERSION: u32 = 2;
+pub(crate) const MAX_PACKET: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CELLS: usize = 131_072;
+const CELL_BYTES: usize = 71;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Metadata {
+    pub id: u64,
+    pub directory: PathBuf,
+    pub title: String,
+    pub size: (u16, u16),
+    pub exited: bool,
+    /// Sequence of the most recent unread alert; zero after acknowledgement.
+    pub unread: u64,
+    pub busy: bool,
+    pub modes: [bool; 2],
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Header {
+    pub meta: Metadata,
+    pub frame: Option<Frame>,
+    pub rows: Vec<u16>,
+    pub notifications: Vec<String>,
+    pub error: Option<String>,
+}
+
+pub(crate) struct Packet {
+    pub header: Header,
+    pub cells: Vec<Cell>,
+}
+
+impl Packet {
+    pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
+        let header = serde_json::to_vec(&self.header)?;
+        let size = 4 + header.len() + self.cells.len() * CELL_BYTES;
+        anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
+        bytes.reserve(size + 4);
+        bytes.extend_from_slice(&(size as u32).to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        for cell in &self.cells {
+            bytes.extend_from_slice(&cell.text);
+            bytes.extend_from_slice(&cell.fg);
+            bytes.extend_from_slice(&cell.bg);
+            bytes.push(cell.flags);
+        }
+        Ok(())
+    }
+
+    pub fn read(reader: &mut impl Read) -> anyhow::Result<Self> {
+        let mut size = [0; 4];
+        reader.read_exact(&mut size)?;
+        let size = u32::from_le_bytes(size) as usize;
+        anyhow::ensure!(
+            (4..=MAX_PACKET).contains(&size),
+            "Invalid viewport packet size"
+        );
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes)?;
+        let header_size = u32::from_le_bytes(bytes[..4].try_into()?) as usize;
+        anyhow::ensure!(header_size <= size - 4, "Invalid viewport header size");
+        let header: Header = serde_json::from_slice(&bytes[4..4 + header_size])?;
+        let data = &bytes[4 + header_size..];
+        let expected = if let Some(frame) = header.frame {
+            let cols = frame.cols as usize;
+            let rows = frame.rows as usize;
+            anyhow::ensure!(
+                cols > 0 && rows > 0 && cols * rows <= MAX_CELLS,
+                "Invalid viewport dimensions"
+            );
+            anyhow::ensure!(
+                header.rows.len() <= rows
+                    && header.rows.windows(2).all(|r| r[0] < r[1])
+                    && header.rows.iter().all(|r| (*r as usize) < rows),
+                "Invalid viewport row indices"
+            );
+            header.rows.len() * cols
+        } else {
+            anyhow::ensure!(header.rows.is_empty(), "Rows require a frame");
+            0
+        };
+        anyhow::ensure!(
+            data.len() == expected * CELL_BYTES,
+            "Invalid viewport cell data"
+        );
+        let cells = data
+            .as_chunks::<CELL_BYTES>()
+            .0
+            .iter()
+            .map(|bytes| Cell {
+                text: bytes[..64].try_into().unwrap(),
+                fg: bytes[64..67].try_into().unwrap(),
+                bg: bytes[67..70].try_into().unwrap(),
+                flags: bytes[70],
+            })
+            .collect();
+        Ok(Self { header, cells })
+    }
+}
+
+pub(crate) fn command(writer: &mut impl Write, request: &serde_json::Value) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(request)?;
+    anyhow::ensure!(bytes.len() <= 1_048_576, "Frontend command is too large");
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn packet() -> Packet {
+        let mut cell = Cell::default();
+        cell.text[..5].copy_from_slice("界é".as_bytes());
+        cell.fg = [1, 2, 3];
+        cell.flags = 65;
+        Packet {
+            header: Header {
+                meta: Metadata {
+                    id: 1,
+                    directory: PathBuf::from("/tmp"),
+                    title: "shell".into(),
+                    size: (2, 3),
+                    exited: false,
+                    unread: 0,
+                    busy: false,
+                    modes: [false, true],
+                },
+                frame: Some(Frame {
+                    cols: 2,
+                    rows: 3,
+                    ..Frame::default()
+                }),
+                rows: vec![1],
+                notifications: vec!["alert".into()],
+                error: None,
+            },
+            cells: vec![cell, Cell::default()],
+        }
+    }
+    #[test]
+    fn binary_rows_round_trip_without_losing_cell_flags_or_unicode() {
+        let packet = packet();
+        let mut encoded = Vec::new();
+        packet.encode_into(&mut encoded).unwrap();
+        let decoded = Packet::read(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.header.meta, packet.header.meta);
+        assert_eq!(decoded.header.rows, vec![1]);
+        assert!(decoded.cells == packet.cells);
+        assert_eq!(decoded.header.notifications, vec!["alert"]);
+        packet.encode_into(&mut encoded).unwrap();
+        let mut reader = &encoded[..];
+        for _ in 0..2 {
+            assert!(Packet::read(&mut reader).unwrap().cells == packet.cells);
+        }
+        assert!(reader.is_empty());
+    }
+    #[test]
+    fn malformed_packets_are_rejected_before_applying_rows() {
+        let mut packet = packet();
+        packet.header.rows = vec![3];
+        let mut encoded = Vec::new();
+        packet.encode_into(&mut encoded).unwrap();
+        assert!(Packet::read(&mut &encoded[..]).is_err());
+        packet.header.rows = vec![1, 1];
+        encoded.clear();
+        packet.encode_into(&mut encoded).unwrap();
+        assert!(Packet::read(&mut &encoded[..]).is_err());
+        assert!(Packet::read(&mut &u32::MAX.to_le_bytes()[..]).is_err());
+    }
+}

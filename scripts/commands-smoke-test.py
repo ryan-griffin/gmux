@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 import gi
 
 gi.require_version("Atspi", "2.0")
@@ -28,8 +30,11 @@ def wait_for(predicate):
     while time.monotonic() < deadline:
         while context.pending():
             context.iteration(False)
-        if result := predicate():
-            return result
+        try:
+            if result := predicate():
+                return result
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
         time.sleep(0.05)
     raise AssertionError("Timed out waiting for command dialog state")
 
@@ -41,6 +46,12 @@ def descendants(obj):
         child = obj.get_child_at_index(index)
         if child:
             yield from descendants(child)
+
+
+def focused(obj):
+    # State can be cached before GTK transfers focus to the search entry.
+    obj.clear_cache()
+    return obj.get_state_set().contains(Atspi.StateType.FOCUSED)
 
 
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -55,8 +66,9 @@ registry = subprocess.Popen(
 )
 app = None
 listener = None
+test_directory = tempfile.TemporaryDirectory(prefix="gmux-commands-", delete=False)
 try:
-    with tempfile.TemporaryDirectory(prefix="gmux-commands-") as directory:
+    with test_directory as directory:
         temp = Path(directory)
         config = temp / "config/gmux"
         config.mkdir(parents=True)
@@ -69,8 +81,6 @@ try:
         with (artifacts / f"commands-{appearance}.log").open("w") as log:
             app = subprocess.Popen([str(root / "target/debug/gmux")], env=env,
                                    stdout=log, stderr=log)
-            wait_for(lambda: (temp / "socket").exists())
-
             def rpc(method, **params):
                 with socket.socket(socket.AF_UNIX) as connection:
                     connection.settimeout(5)
@@ -80,6 +90,7 @@ try:
                     assert "error" not in result, result
                     return result
 
+            wait_for(lambda: rpc("daemon-info")["attached"])
             desktop = Atspi.get_desktop(0)
 
             def find(name, role=None):
@@ -97,7 +108,7 @@ try:
             rpc("action", name="palette")
             entry = wait_for(lambda: find("Search commands", "entry")
                             or find("Search commands", "text"))
-            wait_for(lambda: entry.get_state_set().contains(Atspi.StateType.FOCUSED))
+            wait_for(lambda: focused(entry))
             first = wait_for(lambda: find("New Tab", "list item"))
             command_list = first.get_parent()
             selection = command_list.get_selection_iface()
@@ -116,7 +127,7 @@ try:
                 assert entry.get_editable_text_iface().set_text_contents(query)
                 wait_for(lambda: selected(name))
                 wait_for(lambda: ("Search commands", name) in announcements)
-                assert entry.get_state_set().contains(Atspi.StateType.FOCUSED)
+                assert focused(entry)
 
             # Disabled matches remain visible but cannot be selected or run.
             announcements.clear()
@@ -151,7 +162,7 @@ try:
                 assert selection.select_child(row.get_index_in_parent())
                 wait_for(lambda: ("Search commands", name) in announcements)
                 assert selected(name)
-                assert entry.get_state_set().contains(Atspi.StateType.FOCUSED)
+                assert focused(entry)
             rpc("screenshot", path=str(artifacts / f"commands-{appearance}.png"))
 
             announcements.clear()
@@ -169,5 +180,7 @@ finally:
     if app and app.poll() is None:
         app.terminate()
         app.wait(timeout=8)
+        stop_daemon(env["GMUX_SOCKET"])
     registry.terminate()
     registry.wait(timeout=8)
+    test_directory.cleanup()

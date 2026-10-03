@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import time
 
+from daemon_test_support import stop_daemon
+
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
@@ -135,3 +137,4 @@ time.sleep(30)
         finally:
             app.terminate()
             app.wait(timeout=10)
+            stop_daemon(env["GMUX_SOCKET"])
