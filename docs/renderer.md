@@ -43,8 +43,24 @@ emoji. Text-node foreground alpha alone does not affect every color glyph. See t
 [GSK text-node constructor](https://docs.gtk.org/gsk4/ctor.TextNode.new.html).
 
 Sources are `src/renderer.rs`, `src/render.rs`, and `src/terminal_canvas.rs`.
+`TerminalCanvas` implements `GtkScrollable` inside a `GtkScrolledWindow`. Its
+vertical adjustment measures Ghostty's scrollback in logical pixels using the
+current cell height. GTK handles wheel and touchpad scrolling, including momentum,
+and supplies the libadwaita scrollbar styling, overlay indicators, and drag controls.
+The canvas converts pixel positions to terminal rows and preserves fractional
+motion across daemon acknowledgements. Font zoom changes the pixel range without
+changing touchpad sensitivity. Mouse-tracking applications receive wheel buttons;
+touchpad deltas accumulate a cell height before sending each button.
+Each pane has its own adjustment, and panes without scrollback hide their bars.
+Scroll input redraws immediately when clearing a selection; updated terminal
+content draws when its daemon frame arrives. The native input test covers flick
+momentum and rapid reversals as well as wheel input and small touchpad movements.
 GTK manages GPU glyph and texture caches. Cached rows retain an additional
 viewport cell copy, about 333 KiB for 120 × 40 cells, plus render nodes and glyphs.
+When rows shift, the renderer verifies their overlapping content and moves the
+existing row caches. It rebuilds incoming rows and any rows whose selection,
+search, cursor, or device-pixel alignment changed. Fractional scale checks compare
+these reused rows against a freshly rendered viewport.
 Whole-process resident memory is measured in the [application benchmark](performance.md).
 GPU memory has not been measured.
 
@@ -64,6 +80,7 @@ GTK_A11Y=none GSK_RENDERER=gl dbus-run-session -- python3 scripts/renderer-smoke
 GTK_A11Y=none GSK_RENDERER=cairo dbus-run-session -- python3 scripts/renderer-smoke-test.py
 GTK_A11Y=none dbus-run-session -- python3 scripts/terminal-renderer-smoke-test.py
 python3 scripts/terminal-input-smoke-test.py
+python3 scripts/terminal-scrollbar-smoke-test.py
 ```
 
 `renderer-check` compares batched text with GTK's independent Pango layout
@@ -136,7 +153,7 @@ unchanged, one-row, and scrolling updates. GTK's
 [rendernode benchmarking documentation](https://docs.gtk.org/gtk4/gtk4-rendernode-tool.html)
 explains the distinction between submission and completed GPU rendering.
 
-Current release results use the same 120 × 40 grid and Monospace 12 font,
+Reference release results before row-cache reuse use the same 120 × 40 grid and Monospace 12 font,
 with 60 measured frames after warmup. Native test applications were closed
 during these runs. Median times below are milliseconds; total includes
 scene preparation, completed rendering, and texture readback. Reports are
@@ -157,6 +174,22 @@ in `artifacts/renderer-release-vulkan/` and `artifacts/renderer-release-gl/`.
 Timings vary between runs. The earlier prototype comparison below records
 the original decision to use GSK; the current benchmark can compare GTK
 backends on other machines.
+
+Row-cache reuse was compared with the preceding build in the isolated Wayland
+fixture using Vulkan, Monospace 12, a 120 × 40 grid, and 60 measured frames after
+five warmups. Two comparisons reversed the build order. The table averages the
+two per-run medians for CPU scene preparation, in milliseconds.
+
+| Scrolling fixture | Before reuse | After reuse |
+| --- | ---: | ---: |
+| ASCII | 1.37 | 0.32 |
+| Mixed Unicode and styles | 5.44 | 1.00 |
+| Colored application | 5.11 | 1.02 |
+
+Each scrolling frame rebuilt one row instead of 40. Preparation time fell by
+about 76% to 82%; these measurements describe scene preparation rather than
+application FPS or total CPU use. Raw reports are in
+`artifacts/renderer-scroll-before-{1,2}/` and `artifacts/renderer-scroll-after-{1,2}/`.
 
 Before removing the Cairo path, the prototype comparison recorded the following
 median milliseconds for preparation plus rendering and readback. These historical

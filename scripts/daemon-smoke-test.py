@@ -133,7 +133,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=2)
+        command("attach", version=3)
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header
@@ -157,6 +157,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         header, cells = screen(hidden, lambda header, cells: len(header["rows"]) > 0)
         text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 71))
         assert b"hidden 1" in text, "Daemon must retain scrollback while hidden"
+        assert header["frame"]["scrollback"]["offset"] == 0
+        assert header["frame"]["scrollback"]["total"] > header["frame"]["rows"]
+        command("scroll-to", pane=hidden, row=12, serial=42)
+        header, cells = screen(hidden, lambda header, cells: header["scroll_serial"] == 42)
+        assert header["frame"]["scrollback"]["offset"] == 12
         stream.close()
         stream = None
         wait_for(lambda: not rpc("daemon-info")["attached"])

@@ -21,12 +21,13 @@ use std::{
 pub struct Terminal {
     pub id: u64,
     pub root: gtk::Box,
-    pub area: gtk::Widget,
+    pub area: TerminalCanvas,
     pub title: gtk::Label,
     title_bar: gtk::CenterBox,
     status: gtk::Label,
     size_label: gtk::Label,
     size_revealer: gtk::Revealer,
+    scroller: gtk::ScrolledWindow,
     session: SessionHandle,
     selection: RefCell<Option<(usize, usize)>>,
     drag_origin: ValueCell<(f64, f64)>,
@@ -94,13 +95,20 @@ impl Terminal {
         close.set_valign(gtk::Align::Center);
         toolbar.set_end_widget(Some(&close));
         content.append(&toolbar);
-        let area: gtk::Widget = TerminalCanvas::new().upcast();
+        let area = TerminalCanvas::new();
         area.add_css_class("terminal-canvas");
         area.set_cursor_from_name(Some("text"));
         area.set_tooltip_text(Some("Terminal"));
         area.update_property(&[gtk::accessible::Property::Label("Terminal")]);
-        let canvas = gtk::Overlay::builder()
+        let scroller = gtk::ScrolledWindow::builder()
             .child(&area)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        let canvas = gtk::Overlay::builder()
+            .child(&scroller)
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -134,6 +142,7 @@ impl Terminal {
             status,
             size_label,
             size_revealer,
+            scroller,
             session,
             selection: RefCell::new(None),
             drag_origin: ValueCell::new((0.0, 0.0)),
@@ -161,18 +170,33 @@ impl Terminal {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         terminal.refresh_theme();
+        let focus_click = gtk::GestureClick::new();
+        focus_click.set_button(0);
+        focus_click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(&terminal);
-        terminal
-            .area
-            .downcast_ref::<TerminalCanvas>()
-            .unwrap()
-            .set_snapshot_func(move |snapshot, w, h| {
-                if let Some(t) = weak.upgrade() {
-                    t.paint(w, h, |renderer, scene, font, context| {
-                        renderer.snapshot(snapshot, scene, font, context);
-                    });
+        focus_click.connect_pressed(move |_, _, _, _| {
+            if let Some(t) = weak.upgrade() {
+                t.area.grab_focus();
+            }
+        });
+        canvas.add_controller(focus_click);
+        let weak = Rc::downgrade(&terminal);
+        terminal.area.set_scroll_func(move |row| {
+            if let Some(t) = weak.upgrade() {
+                if t.selection.borrow_mut().take().is_some() {
+                    t.area.queue_draw();
                 }
-            });
+                t.session.borrow().scroll_to(row);
+            }
+        });
+        let weak = Rc::downgrade(&terminal);
+        terminal.area.set_snapshot_func(move |snapshot, w, h| {
+            if let Some(t) = weak.upgrade() {
+                t.paint(w, h, |renderer, scene, font, context| {
+                    renderer.snapshot(snapshot, scene, font, context);
+                });
+            }
+        });
         let focus = gtk::EventControllerFocus::new();
         let weak = Rc::downgrade(&terminal);
         focus.connect_enter(move |_| {
@@ -380,22 +404,46 @@ impl Terminal {
         });
         terminal.area.add_controller(middle);
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let mouse_scroll = Rc::new(ValueCell::new(0.0_f64));
+        let pending = mouse_scroll.clone();
+        scroll.connect_scroll_begin(move |_| pending.set(0.0));
         let weak = Rc::downgrade(&terminal);
         scroll.connect_scroll(move |controller, _, dy| {
             if let Some(t) = weak.upgrade() {
                 let state = controller.current_event_state();
-                if t.session.borrow().mode(0) && !state.contains(gdk::ModifierType::SHIFT_MASK) {
+                // Shift bypasses terminal mouse tracking and scrolls history.
+                // GtkScrolledWindow otherwise redirects Shift-wheel horizontally.
+                if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                    let pixels = if controller.unit() == gdk::ScrollUnit::Surface {
+                        dy
+                    } else {
+                        dy * 3.0 * t.metrics.get().1
+                    };
+                    let adjustment = t.scroller.vadjustment();
+                    adjustment.set_value(adjustment.value() + pixels);
+                    return glib::Propagation::Stop;
+                }
+                if t.session.borrow().mode(0) {
+                    let delta = if controller.unit() == gdk::ScrollUnit::Surface {
+                        dy / t.metrics.get().1
+                    } else {
+                        dy
+                    };
+                    let accumulated = mouse_scroll.get() + delta;
+                    let steps = accumulated.trunc() as isize;
+                    mouse_scroll.set(accumulated - steps as f64);
                     // Mouse buttons four and five represent the wheel.
-                    for _ in 0..(dy.abs().ceil() as usize).clamp(1, 8) {
-                        t.mouse(0, if dy < 0.0 { 4 } else { 5 }, state);
+                    for _ in 0..steps.unsigned_abs().min(8) {
+                        t.mouse(0, if steps < 0 { 4 } else { 5 }, state);
                     }
-                } else {
-                    t.scroll((dy * 3.0).round() as isize);
+                    return glib::Propagation::Stop;
                 }
             }
-            glib::Propagation::Stop
+            // Let GtkScrolledWindow apply its native wheel and touchpad behavior.
+            glib::Propagation::Proceed
         });
-        terminal.area.add_controller(scroll);
+        canvas.add_controller(scroll);
         terminal
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -435,6 +483,8 @@ impl Terminal {
                 let session = self.session.borrow();
                 let screen = session.snapshot();
                 self.refresh_search_frame(&screen);
+                self.area
+                    .set_scrollback(screen.frame.scrollback, session.scroll_pending());
                 screen.frame
             };
             self.sync_chrome(frame);
@@ -562,10 +612,25 @@ impl Terminal {
         let (scale, origin) = self.surface_position();
         let (cw, ch) = self.metrics.get();
         let (cols, rows) = self.grid.get();
+        let scrollbar = self.scroller.vscrollbar();
+        let scrollbar_origin = scrollbar
+            .compute_point(&self.area, &graphene::Point::new(0.0, 0.0))
+            .map(|point| [origin.0 + point.x() as f64, origin.1 + point.y() as f64]);
+        let adjustment = self.scroller.vadjustment();
+        let session = self.session.borrow();
         serde_json::json!({
             "width": self.area.width(), "height": self.area.height(),
             "cols": cols, "rows": rows, "cell_width": cw, "cell_height": ch,
             "scale": scale, "origin": [origin.0, origin.1], "focused": self.area.has_focus(),
+            "scrollback": session.snapshot().frame.scrollback,
+            "scroll_pending": session.scroll_pending(),
+            "scrollbar": {
+                "visible": scrollbar.is_mapped(),
+                "origin": scrollbar_origin,
+                "width": scrollbar.width(), "height": scrollbar.height(),
+                "value": adjustment.value(), "upper": adjustment.upper(),
+                "page_size": adjustment.page_size(),
+            },
         })
     }
     pub fn copy(&self) -> bool {
@@ -608,9 +673,10 @@ impl Terminal {
         });
     }
     pub fn scroll(&self, delta: isize) {
-        self.selection.borrow_mut().take();
+        if self.selection.borrow_mut().take().is_some() {
+            self.area.queue_draw();
+        }
         self.session.borrow_mut().scroll(delta, false);
-        self.area.queue_draw();
     }
     pub fn search(&self, query: &str) {
         let mut search = self.search.borrow_mut();
@@ -676,8 +742,11 @@ impl Terminal {
             layout.set_font_description(Some(&font));
             layout.set_text("M");
             let (width, height) = layout.pixel_size();
-            self.metrics
-                .set((width.max(1) as f64, (height + 2).max(1) as f64));
+            let row_height = (height + 2).max(1) as f64;
+            self.metrics.set((width.max(1) as f64, row_height));
+            // Updating adjustments can resize the scrollbar. Leave the snapshot first.
+            let canvas = self.area.clone();
+            glib::idle_add_local_once(move || canvas.set_row_height(row_height));
             *self.render_font.borrow_mut() =
                 Some((font.clone(), context.clone(), context.serial()));
         }

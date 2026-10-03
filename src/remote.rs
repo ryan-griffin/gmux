@@ -8,7 +8,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
+    cell::{Cell as ValueCell, RefCell},
     collections::{HashMap, HashSet},
     io::BufReader,
     os::unix::net::UnixStream,
@@ -239,6 +239,9 @@ impl SessionManager {
             ],
             revision: 0,
             read_through: 0,
+            scroll_serial: ValueCell::new(0),
+            scroll_acknowledged: 0,
+            pending_scroll: ValueCell::new(None),
         }));
         self.sessions.insert(id, handle.clone());
         Ok(handle)
@@ -247,6 +250,9 @@ impl SessionManager {
         // A full command queue must not lose a tab's viewport subscription.
         let _ = self.subscribe();
         self.flush_reads();
+        for session in self.sessions.values() {
+            session.borrow().flush_scroll();
+        }
         let mut updates: HashMap<u64, SessionUpdate> = HashMap::new();
         for _ in 0..256 {
             match self.receiver.try_recv() {
@@ -271,6 +277,7 @@ impl SessionManager {
                                     );
                             }
                             session.frame = frame;
+                            session.scroll_acknowledged = packet.header.scroll_serial;
                             if !packet.header.rows.is_empty() {
                                 session.revision = session.revision.wrapping_add(1);
                             }
@@ -325,6 +332,9 @@ pub struct RemoteSession {
     cells: Vec<Cell>,
     revision: u64,
     read_through: u64,
+    scroll_serial: ValueCell<u64>,
+    scroll_acknowledged: u64,
+    pending_scroll: ValueCell<Option<u64>>,
 }
 impl RemoteSession {
     fn command(&self, mut request: Value) -> anyhow::Result<()> {
@@ -408,6 +418,23 @@ impl RemoteSession {
             eprintln!("{e}");
         }
     }
+    pub fn scroll_to(&self, row: u64) {
+        self.scroll_serial.set(self.scroll_serial.get() + 1);
+        self.pending_scroll.set(Some(row));
+        self.flush_scroll();
+    }
+    fn flush_scroll(&self) {
+        if let Some(row) = self.pending_scroll.get()
+            && self
+                .command(json!({"method":"scroll-to","row":row,"serial":self.scroll_serial.get()}))
+                .is_ok()
+        {
+            self.pending_scroll.set(None);
+        }
+    }
+    pub fn scroll_pending(&self) -> bool {
+        self.scroll_acknowledged < self.scroll_serial.get()
+    }
     pub fn set_cursor_style(&self, style: CursorStyle) -> anyhow::Result<()> {
         self.command(json!({"method":"style","style":style}))
     }
@@ -477,6 +504,9 @@ mod tests {
             cells: vec![Cell::default(); 4],
             revision: 0,
             read_through: 0,
+            scroll_serial: ValueCell::new(0),
+            scroll_acknowledged: 0,
+            pending_scroll: ValueCell::new(None),
         }));
         (
             SessionManager {
@@ -506,6 +536,7 @@ mod tests {
                 header: Header {
                     meta,
                     frame: None,
+                    scroll_serial: 0,
                     rows: vec![],
                     notifications: vec!["ready".into()],
                     error: None,
@@ -540,6 +571,7 @@ mod tests {
                     header: Header {
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
+                        scroll_serial: 0,
                         rows: vec![row],
                         notifications: vec![],
                         error: None,
@@ -561,6 +593,56 @@ mod tests {
             ["a", "a", "b", "b"]
         );
     }
+    #[test]
+    fn scroll_requests_coalesce_under_backpressure_and_ignore_stale_acknowledgements() {
+        let (mut manager, sender, session) = manager();
+        let (socket, _) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(1);
+        commands.send(json!({"method":"input"})).unwrap();
+        let connection = Rc::new(Connection { commands, socket });
+        manager.connection = connection.clone();
+        session.borrow_mut().connection = connection;
+        session.borrow().scroll_to(10);
+        session.borrow().scroll_to(20);
+        assert!(session.borrow().scroll_pending());
+        assert_eq!(receiver.try_recv().unwrap()["method"], "input");
+        manager.poll();
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            json!({"method":"scroll-to","pane":1,"row":20,"serial":2})
+        );
+        for serial in [1, 2] {
+            let mut frame = session.borrow().frame;
+            frame.scrollback = crate::Scrollback {
+                total: 100,
+                offset: serial * 10,
+                len: 2,
+            };
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: session.borrow().meta.clone(),
+                        frame: Some(frame),
+                        scroll_serial: serial,
+                        rows: vec![],
+                        notifications: vec![],
+                        error: None,
+                    },
+                    cells: vec![],
+                }))
+                .unwrap();
+            assert!(manager.poll()[&1].changed);
+            assert_eq!(session.borrow().scroll_pending(), serial < 2);
+            assert_eq!(session.borrow().snapshot().revision, 0);
+            assert_eq!(
+                session.borrow().snapshot().frame.scrollback.offset,
+                serial * 10
+            );
+        }
+        manager.poll();
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn viewport_subscription_retries_after_command_backpressure() {
         let (mut manager, _sender, _session) = manager();
@@ -594,6 +676,7 @@ mod tests {
                     header: Header {
                         meta,
                         frame: None,
+                        scroll_serial: 0,
                         rows: vec![],
                         notifications: vec![],
                         error: None,

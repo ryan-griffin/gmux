@@ -302,6 +302,84 @@ fn validate_cache(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &
     }
 }
 
+fn validate_scroll_cache(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    let theme = Theme::adwaita(true);
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        for origin in [(0.0, 0.0), (0.25, 0.5)] {
+            let mut renderer = Renderer::new();
+            let mut cells = fixture(theme);
+            let mut highlights = vec![0; cells.len()];
+            for (step, delta) in [0_isize, 1, -1, 3, -2, 7, -7].into_iter().enumerate() {
+                if delta > 0 {
+                    cells.rotate_left(delta as usize * 40);
+                } else if delta < 0 {
+                    cells.rotate_right(delta.unsigned_abs() * 40);
+                }
+                // Incoming rows contain new content rather than wrapping old rows.
+                for row in 0..delta.unsigned_abs() {
+                    let y = if delta > 0 {
+                        8 - delta as usize + row
+                    } else {
+                        row
+                    };
+                    cells[y * 40] = cell(&format!("{step}"), theme, 8 | 16);
+                    cells[y * 40].bg = [35 + step as u8, 45, 55];
+                }
+                let mut scene = scene(&cells, theme);
+                scene.metrics.1 = 21.0;
+                scene.height = 168;
+                scene.scale = scale;
+                scene.origin = origin;
+                if step >= 2 {
+                    scene.selection = Some((42, 85));
+                    highlights.fill(0);
+                    highlights[step * 40 + 3] = 1;
+                    highlights[step * 40 + 4] = 2;
+                    scene.matches = &highlights;
+                    scene.frame.cursor_visible = 1;
+                    scene.frame.cursor_style = 1;
+                    scene.frame.cursor_x = 6;
+                    scene.frame.cursor_y = step as u16;
+                }
+                let (cached, stats) = node(&mut renderer, &scene, font, context);
+                if step == 1 && (scale == 1.0 || scale == 2.0) {
+                    assert_eq!(stats.rebuilt_rows, 1, "Scrolling should reuse seven rows");
+                }
+                let fresh = node(&mut Renderer::new(), &scene, font, context).0;
+                assert_eq!(
+                    pixels(&render(gpu, &cached, &scene)),
+                    pixels(&render(gpu, &fresh, &scene)),
+                    "Scrolled cache differs at step {step}, scale {scale}, origin {origin:?}"
+                );
+            }
+        }
+    }
+    // Matching one edge row is insufficient evidence that the viewport scrolled.
+    for (target, source) in [(0, 1), (7, 6)] {
+        let cells = fixture(theme);
+        let mut renderer = Renderer::new();
+        node(&mut renderer, &scene(&cells, theme), font, context);
+        let mut edited = cells.clone();
+        edited[target * 40..(target + 1) * 40]
+            .copy_from_slice(&cells[source * 40..(source + 1) * 40]);
+        let scene = scene(&edited, theme);
+        let (cached, stats) = node(&mut renderer, &scene, font, context);
+        assert_eq!(
+            stats.rebuilt_rows, 1,
+            "An edge edit must preserve other cached rows"
+        );
+        let fresh = node(&mut Renderer::new(), &scene, font, context).0;
+        assert_eq!(
+            pixels(&render(gpu, &cached, &scene)),
+            pixels(&render(gpu, &fresh, &scene))
+        );
+    }
+}
+
 fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
     let theme = Theme::adwaita(true);
     for scale in [1.0, 1.25, 1.5, 2.0] {
@@ -507,12 +585,13 @@ fn main() -> anyhow::Result<()> {
     }
     let font = pango::FontDescription::from_string("Monospace 12");
     validate_cache(&gpu, &font, &context);
+    validate_scroll_cache(&gpu, &font, &context);
     validate_geometry(&gpu, &font, &context);
     std::fs::write(
         options.output.join("checks.json"),
         serde_json::to_string_pretty(&json!({
             "gtk_renderer": gpu.type_().name(), "glyph_cases": cases,
-            "checks": ["independent layout agreement", "row invalidation", "bounded glyph cache",
+            "checks": ["independent layout agreement", "row invalidation", "scroll cache reuse", "bounded glyph cache",
                        "font and context changes", "fractional blocks", "selection and search",
                        "concealed text", "blank and wide decorations", "wide cursor", "background batching"]
         }))?,

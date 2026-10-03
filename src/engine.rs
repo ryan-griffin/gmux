@@ -40,6 +40,14 @@ pub struct Frame {
     pub background: [u8; 3],
     pub foreground: [u8; 3],
     pub cursor: [u8; 3],
+    pub scrollback: Scrollback,
+}
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(C)]
+pub struct Scrollback {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
 }
 #[derive(Default)]
 struct Events {
@@ -89,6 +97,7 @@ unsafe extern "C" {
         cap: usize,
     ) -> i32;
     fn gmux_engine_scroll(engine: *mut c_void, delta: isize, bottom: bool);
+    fn gmux_engine_scroll_to(engine: *mut c_void, row: u64);
     fn gmux_engine_expire_render_hold(engine: *mut c_void) -> bool;
     fn gmux_engine_string(engine: *mut c_void, pwd: i32, out: *mut u8, cap: usize) -> usize;
     fn gmux_engine_mode(engine: *mut c_void, mode: i32) -> i32;
@@ -196,6 +205,9 @@ impl Engine {
     }
     pub fn scroll(&mut self, delta: isize, bottom: bool) {
         unsafe { gmux_engine_scroll(self.raw.as_ptr(), delta, bottom) }
+    }
+    pub fn scroll_to(&mut self, row: u64) {
+        unsafe { gmux_engine_scroll_to(self.raw.as_ptr(), row) }
     }
     pub fn metadata(&self, pwd: bool) -> String {
         let mut out = [0; 8192];
@@ -362,6 +374,114 @@ mod tests {
         assert_eq!(engine.text().unwrap(), "next");
         engine.resize(100, 30, 8, 16).unwrap();
         assert_eq!(engine.text().unwrap(), "unfinished");
+    }
+
+    #[test]
+    fn scrollbar_rows_round_trip_and_follow_output_and_screen_changes() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 3, 8, 16).unwrap();
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 3,
+                offset: 0,
+                len: 3
+            }
+        );
+        engine.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 5,
+                offset: 2,
+                len: 3
+            }
+        );
+        engine.scroll_to(1);
+        assert_eq!(engine.text().unwrap(), "two\nthree\nfour");
+        assert_eq!(engine.frame.scrollback.offset, 1);
+        engine.write(b"\r\nsix");
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 6,
+                offset: 1,
+                len: 3
+            }
+        );
+        engine.scroll_to(u64::MAX);
+        assert_eq!(engine.text().unwrap(), "four\nfive\nsix");
+        assert_eq!(engine.frame.scrollback.offset, 3);
+        engine.write(b"\x1b[?1049halternate");
+        engine.scroll_to(100);
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 3,
+                offset: 0,
+                len: 3
+            }
+        );
+        engine.write(b"\x1b[?1049l");
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 6,
+                offset: 3,
+                len: 3
+            }
+        );
+        engine.resize(12, 4, 8, 16).unwrap();
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 6,
+                offset: 2,
+                len: 4
+            }
+        );
+        engine.write(b"\x1b[3J");
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 4,
+                offset: 0,
+                len: 4
+            }
+        );
+    }
+
+    #[test]
+    fn synchronized_output_holds_scrollback_metadata_with_the_visible_frame() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 3, 8, 16).unwrap();
+        engine.write(b"one\r\ntwo\r\nthree\x1b[?2026h\r\nfour\r\nfive");
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 3,
+                offset: 0,
+                len: 3
+            }
+        );
+        engine.write(b"\x1b[?2026l");
+        engine.snapshot().unwrap();
+        assert_eq!(
+            engine.frame.scrollback,
+            Scrollback {
+                total: 5,
+                offset: 2,
+                len: 3
+            }
+        );
     }
 
     #[test]

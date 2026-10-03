@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             stream = socket.socket(socket.AF_UNIX)
             stream.settimeout(6)
             stream.connect(env["GMUX_SOCKET"] + ".stream")
-            command("attach", version=2)
+            command("attach", version=3)
 
         def command(method, **params):
             stream.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())

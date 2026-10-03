@@ -77,6 +77,11 @@ Only panes in the displayed tab subscribe to viewport updates. Hidden and
 unattached panes continue parsing output and answering terminal requests without
 automatic viewport extraction. An explicit `gmux read` still extracts text.
 Each packet carries JSON metadata and binary terminal cells for changed rows.
+Frame metadata includes the total scrollable rows, viewport offset, and visible
+row count. Native GTK scrollbars use these values without copying the history.
+Thumb movement sends an absolute row and request serial. The frontend keeps the
+requested position until the daemon acknowledges it, and retries the latest
+position if its command queue is full.
 Initial attachment, a new subscription, and changed dimensions send a full
 viewport. Subsequent packets compare rows against the last transmitted cells.
 The frontend applies packets in order before rendering. The daemon still scans

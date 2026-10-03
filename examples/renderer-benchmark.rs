@@ -196,7 +196,7 @@ fn main() -> anyhow::Result<()> {
                     let expected = match workload {
                         "static" => 0,
                         "single-row" => 1,
-                        _ => options.rows as usize,
+                        _ => 1,
                     };
                     assert_eq!(
                         stats.rebuilt_rows, expected,

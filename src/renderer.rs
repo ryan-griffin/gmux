@@ -198,6 +198,7 @@ struct CachedRow {
     highlights: Vec<u8>,
     selection: Option<(usize, usize)>,
     cursor: Option<(usize, usize, [u8; 3])>,
+    pixel_phase: f64,
     background: Option<gsk::RenderNode>,
     foreground: Option<gsk::RenderNode>,
 }
@@ -220,6 +221,44 @@ impl Renderer {
         self.font = None;
         self.rows.clear();
         self.appearance = None;
+    }
+
+    fn reuse_scrolled_rows(&mut self, cells: &[Cell], cols: usize) {
+        let rows = self.rows.len();
+        if rows < 2 || cols == 0 || cells.len() != rows * cols {
+            return;
+        }
+        let first = &cells[..cols];
+        let last = &cells[(rows - 1) * cols..];
+        // Verify the overlap before moving caches, so repeated or edited rows
+        // cannot turn an ordinary update into a full viewport rebuild.
+        if self.rows[0].cells != first
+            && let Some(delta) = self.rows[1..]
+                .iter()
+                .position(|row| row.cells == first)
+                .map(|index| index + 1)
+            && self.rows[delta..]
+                .iter()
+                .zip(cells.chunks_exact(cols))
+                .all(|(row, cells)| row.cells == cells)
+        {
+            self.rows.rotate_left(delta);
+            return;
+        }
+        if self.rows[rows - 1].cells != last
+            && let Some(index) = self.rows[..rows - 1]
+                .iter()
+                .rposition(|row| row.cells == last)
+        {
+            let delta = rows - 1 - index;
+            if self.rows[..rows - delta]
+                .iter()
+                .zip(cells.chunks_exact(cols).skip(delta))
+                .all(|(row, cells)| row.cells == cells)
+            {
+                self.rows.rotate_right(delta);
+            }
+        }
     }
 
     pub fn snapshot(
@@ -269,6 +308,7 @@ impl Renderer {
             (0.0, 0.0, scene.width as f64, scene.height as f64),
         );
         let cols = scene.frame.cols as usize;
+        self.reuse_scrolled_rows(scene.cells, cols);
         let mut stats = RenderStats::default();
         for (y, cells) in scene.cells.chunks(cols).enumerate() {
             let base = y * cols;
@@ -282,10 +322,13 @@ impl Renderer {
                 )
             });
             let row = &mut self.rows[y];
+            // Rectangle snapping depends on the row's position in device pixels.
+            let pixel_phase = (y as f64 * scene.metrics.1 * scene.scale).fract();
             if row.cells != cells
                 || row.highlights != highlights
                 || row.selection != selection
                 || row.cursor != cursor
+                || row.pixel_phase != pixel_phase
             {
                 let background = gtk::Snapshot::new();
                 // Adjacent backgrounds share a node, which keeps full-screen
@@ -422,6 +465,7 @@ impl Renderer {
                 row.highlights.extend_from_slice(highlights);
                 row.selection = selection;
                 row.cursor = cursor;
+                row.pixel_phase = pixel_phase;
                 stats.rebuilt_rows += 1;
             }
             if let Some(node) = &row.background {

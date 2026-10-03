@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 pub(crate) const MAX_PACKET: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_CELLS: usize = 131_072;
 const CELL_BYTES: usize = 71;
@@ -28,6 +28,7 @@ pub(crate) struct Metadata {
 pub(crate) struct Header {
     pub meta: Metadata,
     pub frame: Option<Frame>,
+    pub scroll_serial: u64,
     pub rows: Vec<u16>,
     pub notifications: Vec<String>,
     pub error: Option<String>,
@@ -135,9 +136,15 @@ mod tests {
                     busy: false,
                     modes: [false, true],
                 },
+                scroll_serial: 42,
                 frame: Some(Frame {
                     cols: 2,
                     rows: 3,
+                    scrollback: crate::Scrollback {
+                        total: 500,
+                        offset: 200,
+                        len: 3,
+                    },
                     ..Frame::default()
                 }),
                 rows: vec![1],
@@ -155,6 +162,11 @@ mod tests {
         let decoded = Packet::read(&mut &encoded[..]).unwrap();
         assert_eq!(decoded.header.meta, packet.header.meta);
         assert_eq!(decoded.header.rows, vec![1]);
+        assert_eq!(decoded.header.scroll_serial, 42);
+        assert_eq!(
+            decoded.header.frame.unwrap().scrollback,
+            packet.header.frame.unwrap().scrollback
+        );
         assert!(decoded.cells == packet.cells);
         assert_eq!(decoded.header.notifications, vec!["alert"]);
         packet.encode_into(&mut encoded).unwrap();

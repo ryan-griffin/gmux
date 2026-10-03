@@ -51,6 +51,10 @@ def ensure_wayland_session():
             "wireplumber.profiles = { video-only = { hardware.video-capture = disabled } }\n")
         for name in ("GDK_DEBUG", "WAYLAND_SOCKET", "AT_SPI_BUS_ADDRESS"):
             env.pop(name, None)
+        # The isolated compositor owns these tests; avoid starting desktop portals
+        # whose document FUSE mount can outlive the private D-Bus session.
+        env["GDK_DEBUG"] = "no-portals"
+        env["ADW_DISABLE_PORTAL"] = "1"
         command = ["dbus-run-session", "--", sys.executable, __file__, str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
         artifacts = Path(__file__).resolve().parent.parent / "artifacts"
         artifacts.mkdir(exist_ok=True)

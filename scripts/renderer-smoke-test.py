@@ -39,7 +39,7 @@ for result in report["results"]:
         ["gtk4-rendernode-tool", "info", str(output / f"{prefix}.node")], text=True)
     assert not re.search(r"^\s+cairo:\s+[1-9]", info, re.MULTILINE), info
     assert re.search(r"^\s+text:\s+[1-9]", info, re.MULTILINE), info
-    rows = dict(static=0, **{"single-row": 1, "full-screen": report["rows"]})
+    rows = dict(static=0, **{"single-row": 1, "full-screen": 1})
     assert result["rebuilt_rows"] == report["frames"] * rows[result["workload"]], result
     assert result["cached_glyphs"] <= 4096, result
 

@@ -360,6 +360,9 @@ impl TerminalSession {
     pub fn scroll(&mut self, delta: isize, bottom: bool) {
         self.engine.scroll(delta, bottom);
     }
+    pub fn scroll_to(&mut self, row: u64) {
+        self.engine.scroll_to(row);
+    }
 
     pub fn paste(&mut self, text: &str, clipboard: bool) -> anyhow::Result<Vec<u8>> {
         self.engine.paste(text, clipboard)

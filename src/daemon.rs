@@ -38,6 +38,7 @@ struct Frontend {
     visible: HashSet<u64>,
     screens: HashMap<u64, SentScreen>,
     metadata: HashMap<u64, Metadata>,
+    scroll_serials: HashMap<u64, u64>,
 }
 impl Frontend {
     fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
@@ -273,6 +274,7 @@ impl Daemon {
         if let Some(frontend) = &mut self.frontend {
             frontend.screens.remove(&id);
             frontend.metadata.remove(&id);
+            frontend.scroll_serials.remove(&id);
         }
         self.state.tabs.retain_mut(|tab| {
             if !tab.layout.ids().contains(&id) {
@@ -802,6 +804,20 @@ impl Daemon {
                 request["delta"].as_i64().unwrap_or(0) as isize,
                 request["bottom"].as_bool().unwrap_or(false),
             ),
+            "scroll-to" => {
+                let row = request["row"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("scroll-to requires a row"))?;
+                let serial = request["serial"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("scroll-to requires a serial"))?;
+                session.scroll_to(row);
+                self.frontend
+                    .as_mut()
+                    .unwrap()
+                    .scroll_serials
+                    .insert(id, serial);
+            }
             "theme" => session.set_theme(&serde_json::from_value(request["theme"].clone())?)?,
             "style" => session.set_cursor_style(serde_json::from_value::<CursorStyle>(
                 request["style"].clone(),
@@ -894,6 +910,7 @@ impl Daemon {
                 header: Header {
                     meta,
                     frame,
+                    scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
                     rows,
                     notifications: notify,
                     error,
@@ -1069,6 +1086,7 @@ pub fn run() -> anyhow::Result<()> {
                             visible: HashSet::new(),
                             screens: HashMap::new(),
                             metadata: HashMap::new(),
+                            scroll_serials: HashMap::new(),
                         });
                         next_metadata = Instant::now();
                     }
@@ -1259,6 +1277,7 @@ mod tests {
             visible: HashSet::new(),
             screens: HashMap::new(),
             metadata: HashMap::new(),
+            scroll_serials: HashMap::new(),
         };
         let packet = |text| {
             let mut cell = Cell::default();
@@ -1275,6 +1294,7 @@ mod tests {
                         busy: false,
                         modes: [false; 2],
                     },
+                    scroll_serial: 0,
                     frame: Some(Frame {
                         cols: 80,
                         rows: 24,

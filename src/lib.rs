@@ -11,4 +11,4 @@ pub mod theme;
 mod title;
 mod transport;
 
-pub use engine::{Cell, Frame};
+pub use engine::{Cell, Frame, Scrollback};

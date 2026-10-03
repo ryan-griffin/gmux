@@ -11,13 +11,18 @@ typedef struct {
     uint8_t flags; // bold, italic, faint, underline, strike, invisible
 } GmuxCell;
 typedef struct {
+    uint64_t total, offset, len;
+} GmuxScrollback;
+typedef struct {
     uint16_t cols, rows, cursor_x, cursor_y;
     uint8_t cursor_visible, cursor_style, background[3], foreground[3], cursor[3];
+    GmuxScrollback scrollback;
 } GmuxFrame;
 typedef void (*GmuxEventFn)(void *, int, const uint8_t *, size_t);
 typedef struct {
     GhosttyTerminal terminal;
     GhosttyRenderState render;
+    GhosttyTerminalScrollbar scrollbar;
     GhosttyRenderStateRowIterator iterator;
     GhosttyRenderStateRowCells cells;
     GhosttyKeyEncoder encoder;
@@ -43,6 +48,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         // Capture at the exact start of the hold, even if the same PTY chunk
         // contains the next frame. Keep it visible until that frame is complete.
         if (ghostty_render_state_update(e->render, terminal)) return;
+        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
         e->hold_started_ms = now_ms();
     }
     e->held = held;
@@ -167,6 +173,13 @@ void gmux_engine_scroll(GmuxEngine *e, intptr_t delta, bool bottom) {
     };
     ghostty_terminal_scroll_viewport(e->terminal, scroll);
 }
+void gmux_engine_scroll_to(GmuxEngine *e, uint64_t row) {
+    GhosttyTerminalScrollViewport scroll = {
+        .tag = GHOSTTY_SCROLL_VIEWPORT_ROW,
+        .value = {.row = row > SIZE_MAX ? SIZE_MAX : (size_t)row}
+    };
+    ghostty_terminal_scroll_viewport(e->terminal, scroll);
+}
 size_t gmux_engine_string(GmuxEngine *e, int pwd, uint8_t *out, size_t cap) {
     GhosttyString s = {0};
     ghostty_terminal_get(e->terminal, pwd ? GHOSTTY_TERMINAL_DATA_PWD : GHOSTTY_TERMINAL_DATA_TITLE, &s);
@@ -206,6 +219,8 @@ int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len, bool clipb
 int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap) {
     gmux_engine_expire_render_hold(e);
     if (!e->held && ghostty_render_state_update(e->render, e->terminal)) return -1;
+    if (!e->held && ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar)) return -1;
+    frame->scrollback = (GmuxScrollback){e->scrollbar.total, e->scrollbar.offset, e->scrollbar.len};
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_COLS, &frame->cols);
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_ROWS, &frame->rows);
     if ((size_t)frame->cols * frame->rows > cap) return -1;

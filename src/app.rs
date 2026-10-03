@@ -2652,7 +2652,9 @@ fn layout_widget(
             paned.set_overflow(gtk::Overflow::Visible);
             paned.set_hexpand(true);
             paned.set_vexpand(true);
-            paned.set_wide_handle(false);
+            // Narrow handles extend their hit area into adjacent scrollbars.
+            // Keep input within the existing 6px separator styled in CSS.
+            paned.set_wide_handle(true);
             paned.set_shrink_start_child(false);
             paned.set_shrink_end_child(false);
             let mut first_path = path.clone();
