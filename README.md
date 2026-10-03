@@ -69,6 +69,8 @@ gmux notify 'Tests finished'
 
 Pane commands default to the calling shell's pane, or the active pane when called outside Gmux. Run `gmux --help` for all commands and `gmux <command> --help` for options.
 
+Alerts from the focused terminal pane stay read and do not send desktop notifications while the Gmux window is active. Other panes and tabs still notify, including split panes in the active tab. When another window has focus, every pane can notify.
+
 ## Development
 
 ```sh
@@ -79,6 +81,8 @@ cargo clippy --locked --all-targets -- -D warnings
 ```
 
 Native regression tests are in [scripts/](scripts/). The [keyboard and clipboard test](docs/renderer.md#validation) runs in an isolated Wayland compositor with XWayland disabled. See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
+
+Run `python3 scripts/notification-focus-smoke-test.py` to check focused-pane suppression, alerts from other panes and inactive windows, and unread state after reconnect in an isolated Wayland compositor.
 
 Run `python3 scripts/icon-smoke-test.py` to check the app icons with GdkPixbuf's format detection and SVG loader. This check requires PyGObject and the GdkPixbuf SVG loader, and runs without a display.
 

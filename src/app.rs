@@ -1358,6 +1358,14 @@ impl Ui {
         self.toast.add_toast(adw::Toast::new(message));
     }
     fn notify(&self, tab: u64, pane: u64, message: String) {
+        if self.window.is_active()
+            && self
+                .active_pane()
+                .is_some_and(|terminal| terminal.id == pane && terminal.area.has_focus())
+        {
+            self.mark_read(pane);
+            return;
+        }
         let name = {
             let tabs = self.tabs.borrow();
             if let Some(w) = tabs.iter().find(|w| w.id == tab) {
@@ -1987,7 +1995,7 @@ impl Ui {
         behavior.add(&restore);
         let desktop = adw::SwitchRow::builder()
             .title("Desktop notifications")
-            .subtitle("Send terminal alerts to the desktop")
+            .subtitle("Send alerts from unattended terminals to the desktop")
             .active(self.settings.borrow().desktop_notifications)
             .build();
         let weak = Rc::downgrade(self);

@@ -136,6 +136,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         notifications.click(alert)
         wait_for(lambda: state()["active_tab"] == first["id"] and tab(first["id"])["active_pane"] == pane)
         assert not tab(first["id"])["unread"], "Clicking an alert should clear its unread indicator"
+        # Desktop delivery tests must use an unattended terminal.
+        assert rpc("focus", pane=project_pane).get("ok")
         send(pane, "printf '\\033]9;GMUX_OSC9'; sleep 0.1; printf '\\007'")
         wait_for(lambda: any(n["body"] == "GMUX_OSC9" for n in notifications.received))
         assert rpc("notify", pane=pane, message="GMUX_DIRECT_ALERT").get("ok")
@@ -214,6 +216,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         assert state()["tabs"] == [], "An empty saved session should stay empty"
         assert state()["active_tab"] is None
         disabled = rpc("new", name="Disabled notifications", directory=str(root))
+        assert rpc("new", name="Foreground", directory=str(root)).get("tab")
         count = len(notifications.received)
         assert rpc("notify", pane=disabled["pane"], message="GMUX_DISABLED_ALERT").get("ok")
         time.sleep(0.3)
