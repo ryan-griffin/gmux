@@ -1030,7 +1030,7 @@ impl Ui {
             .valign(gtk::Align::Center)
             .ellipsize(pango::EllipsizeMode::End)
             .build();
-        workspace_label.add_css_class("caption");
+        workspace_label.add_css_class("caption-heading");
         workspace_label.add_css_class("dim-label");
         workspace_box.append(&workspace_label);
         name_line.append(&workspace_box);
