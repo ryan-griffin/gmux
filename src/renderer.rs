@@ -91,6 +91,7 @@ impl Scene<'_> {
 struct GlyphRun {
     font: pango::Font,
     glyphs: Vec<pango::GlyphInfo>,
+    ink: (i32, i32),
 }
 
 fn shape(cell: &Cell, font: &pango::FontDescription, context: &pango::Context) -> Vec<GlyphRun> {
@@ -108,7 +109,7 @@ fn shape(cell: &Cell, font: &pango::FontDescription, context: &pango::Context) -
     let mut iter = layout.iter();
     loop {
         if let Some(run) = iter.run_readonly() {
-            let (_, logical) = iter.run_extents();
+            let (ink, logical) = iter.run_extents();
             let mut x = logical.x();
             let baseline = iter.run_baseline() + pango::SCALE;
             let glyphs = run
@@ -131,6 +132,7 @@ fn shape(cell: &Cell, font: &pango::FontDescription, context: &pango::Context) -
             result.push(GlyphRun {
                 font: run.item().analysis().font(),
                 glyphs,
+                ink: (ink.x(), ink.x().saturating_add(ink.width())),
             });
         }
         if !iter.next_run() {
@@ -310,6 +312,7 @@ impl Renderer {
         let cols = scene.frame.cols as usize;
         self.reuse_scrolled_rows(scene.cells, cols);
         let mut stats = RenderStats::default();
+        let mut batch = TextBatches::default();
         for (y, cells) in scene.cells.chunks(cols).enumerate() {
             let base = y * cols;
             let highlights = scene.matches.get(base..base + cells.len()).unwrap_or(&[]);
@@ -375,7 +378,6 @@ impl Renderer {
                 }
                 row.background = background.to_node();
                 let row_snapshot = gtk::Snapshot::new();
-                let mut batch = TextBatch::default();
                 for (x, cell) in cells.iter().enumerate() {
                     let text = cell.text();
                     let has_glyph = !text.is_empty() && text != " ";
@@ -511,9 +513,18 @@ struct TextBatch {
     font: Option<pango::Font>,
     color: Option<gdk::RGBA>,
     glyphs: Vec<pango::GlyphInfo>,
+    right: i32,
 }
 
-impl TextBatch {
+// Fallback fonts often alternate within a terminal row. Reuse a compatible
+// batch only when its new ink cannot overlap any glyph whose order would change.
+// Graphics flush all batches, preserving their order relative to text.
+#[derive(Default)]
+struct TextBatches {
+    batches: Vec<TextBatch>,
+    used: usize,
+}
+impl TextBatches {
     fn append(
         &mut self,
         snapshot: &gtk::Snapshot,
@@ -521,13 +532,37 @@ impl TextBatch {
         color: gdk::RGBA,
         x: i32,
     ) -> usize {
+        let compatible = self.batches[..self.used].iter().rposition(|batch| {
+            batch.font.as_ref() == Some(&run.font) && batch.color == Some(color)
+        });
+        let left = x.saturating_add(run.ink.0);
+        let right = x.saturating_add(run.ink.1);
         let mut flushed = 0;
-        if self.font.as_ref() != Some(&run.font) || self.color != Some(color) {
-            flushed = self.flush(snapshot);
-            self.font = Some(run.font.clone());
-            self.color = Some(color);
-        }
-        self.glyphs.extend(run.glyphs.iter().map(|info| {
+        let index = if let Some(index) = compatible
+            && (index + 1 == self.used
+                || self.batches[index..self.used]
+                    .iter()
+                    .all(|batch| batch.right <= left))
+        {
+            index
+        } else {
+            // Bound the search even when every cell has a different color.
+            if self.used == 8 {
+                flushed = self.flush(snapshot);
+            }
+            if self.used == self.batches.len() {
+                self.batches.push(TextBatch::default());
+            }
+            let batch = &mut self.batches[self.used];
+            batch.font = Some(run.font.clone());
+            batch.color = Some(color);
+            batch.right = i32::MIN;
+            self.used += 1;
+            self.used - 1
+        };
+        let batch = &mut self.batches[index];
+        batch.right = batch.right.max(right);
+        batch.glyphs.extend(run.glyphs.iter().map(|info| {
             let mut info = *info;
             let geometry = info.geometry_mut();
             geometry.set_x_offset(geometry.x_offset() + x);
@@ -536,6 +571,17 @@ impl TextBatch {
         flushed
     }
 
+    fn flush(&mut self, snapshot: &gtk::Snapshot) -> usize {
+        let mut nodes = 0;
+        for batch in &mut self.batches[..self.used] {
+            nodes += batch.flush(snapshot);
+        }
+        self.used = 0;
+        nodes
+    }
+}
+
+impl TextBatch {
     fn flush(&mut self, snapshot: &gtk::Snapshot) -> usize {
         if self.glyphs.is_empty() {
             return 0;

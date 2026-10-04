@@ -588,7 +588,7 @@ impl Ui {
             return;
         }
         self.request(
-            json!({"method":"_busy","panes":panes}),
+            InternalRequest::Busy { panes },
             move |ui, result| match result {
                 Ok(value) => ui.confirm_close_tab(id, value["busy"].as_bool().unwrap_or(true)),
                 Err(e) => ui.message(&e.to_string()),

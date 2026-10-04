@@ -3,7 +3,8 @@
 The application benchmark runs Gmux on native Wayland in an isolated headless
 Mutter compositor with XWayland disabled. It measures frontend and daemon CPU,
 resident memory, and input-to-composited-frame latency with visible, hidden, and
-detached workloads.
+detached workloads. Results describe the dated binaries identified below.
+Rerun the benchmark after later code changes.
 
 ## Method
 
@@ -12,10 +13,10 @@ Build matching frontend and daemon binaries, then run:
 ```sh
 cargo build --release --locked --bins
 python3 scripts/performance-benchmark.py \
-  --binary target/release/gmux --output artifacts/performance-wayland.json
+  --binary target/release/gmux --output artifacts/performance-run.json
 ```
 
-The test dependencies are listed in [the renderer validation notes](renderer.md#validation).
+The [testing guide](testing.md#prerequisites) lists the native prerequisites.
 The selected binary must have its matching `gmux-daemon` alongside it. The script
 starts its own D-Bus session, Wayland compositor, PipeWire server, and WirePlumber
 session manager. Settings, runtime sockets, caches, shells, and accessibility
@@ -58,7 +59,64 @@ They may change between Mutter releases; tested versions are recorded in the
 reports. Other compositors, graphics drivers, monitor scales, and physical
 displays need their own measurements.
 
-## Native Wayland results
+Each application report records the frontend and daemon SHA-256 hashes. For
+comparisons, keep each matching binary pair together and use separate output
+paths. Record the source revision and any local source changes with the reports;
+a binary hash identifies a build but does not recover its source.
+
+`artifacts/` is ignored by Git. The report and profile paths below refer to
+local files from recorded runs and are absent from a fresh checkout. Preserve
+those files separately when sharing measurements.
+
+## Fallback-font batching comparison
+
+This is the latest recorded application comparison, measured on 2026-10-04
+before and after fallback-font batching and the accompanying I/O and storage
+cleanup. It used the same Intel Core i7-13700H and Iris Xe/Mesa machine,
+Linux 7.2.4, GTK 4.22.5, Mutter 50.5, Vulkan, and Monospace 12.
+
+A 1 ms gprofng CPU profile of the application workload recorded
+1.86 seconds in `gsk_text_node_new` out of 4.90 sampled CPU seconds. The renderer's
+glyph-cache lookup used 0.034 seconds. The profile includes startup, idle, and
+busy periods; it identifies expensive calls but is not a latency benchmark.
+The [renderer design](renderer.md#implementation) describes the batching rules.
+
+The renderer benchmark includes repeated ASCII/CJK/emoji output and updates
+that change every row. For this 120 × 40 fallback-font fixture, full repainting
+created 1,841 text nodes per frame before batching and 160 afterward. Median
+scene preparation fell from 6.34 to 1.20 ms. These are local Vulkan measurements
+with 120 frames after five warmup frames. GPU rendering and readback timings vary
+between runs; node counts provide the direct check of reduced work.
+
+Application comparisons use matching release frontend and daemon binaries,
+five-second resource samples, and 40 latency samples. The first comparison
+measured busy frontend CPU at 21.7% before and 9.4% afterward, with throughput
+of 561 and 563 KiB/s. Busy input latency was 35.1 and 35.7 ms at the median,
+and 65.6 ms at p95 in both runs. This establishes lower CPU use in this workload,
+without an input-latency improvement. Idle and hidden frontends remained near
+zero CPU. A second comparison measured 17.7% before and 9.6% afterward at
+563 KiB/s, so busy frontend CPU fell by 46% to 57% across the two comparisons.
+Busy median latency was 34.0 and 33.1 ms in the second comparison, with p95
+at 48.1 and 51.2 ms. Machine load and graphics-driver state differed between
+dates, so earlier measurements do not provide a direct comparison.
+
+The application reports identify these builds by SHA-256 prefix:
+
+| Report | Frontend | Daemon |
+| --- | --- | --- |
+| `improvements-before.json` and `improvements-before-2.json` | `eaa51b46de87` | `712ab1d5c853` |
+| `improvements-after.json` | `b07602dad7c0` | `20d977ad147f` |
+| `improvements-after-2.json` | `e099fafaddbb` | `51bf4ffb23d3` |
+
+These report files are under `artifacts/`. The second post-change run used
+rebuilt binaries; the hashes above distinguish them.
+Renderer reports are under `artifacts/renderer-improvements-before/` and
+`artifacts/renderer-improvements-after/`. The CPU profile and call breakdown are
+`artifacts/frontend-profile-before.er` and `artifacts/frontend-profile-before.txt`.
+The renderer validation covers Vulkan, OpenGL, and Cairo, including overlapping
+fallback glyphs, italic and faint text, retained scrolling, and fractional scales.
+
+## Historical native Wayland baseline
 
 Measured on 2026-10-03 with an Intel Core i7-13700H, Intel Iris Xe/Mesa,
 Linux 7.2.4, GTK 4.22.5, Mutter 50.5, Vulkan, and Monospace 12. The input pane
@@ -89,8 +147,8 @@ Latency includes the capture and readback costs described above.
 The raw report is `artifacts/performance-wayland.json`, including individual
 samples, geometry, monitor parameters, and binary hashes. The frontend SHA-256
 prefix is `1cababa9de37`; the daemon prefix is `93b011ac1faf`. Timing varies
-between runs. This run establishes a native Wayland measurement with the current
-build; it does not establish a scheduling improvement over an earlier build.
+between runs. This run establishes a native Wayland measurement for that
+dated build; it does not establish a scheduling improvement over an earlier build.
 
 ## Historical XWayland comparison
 

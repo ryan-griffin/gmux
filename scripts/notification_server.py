@@ -67,3 +67,8 @@ class NotificationServer:
         self.loop.quit()
         self.thread.join(timeout=3)
         self.connection.unregister_object(self.registration)
+        self.connection.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "ReleaseName", GLib.Variant("(s)", ("org.freedesktop.Notifications",)),
+            GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 3000, None,
+        )

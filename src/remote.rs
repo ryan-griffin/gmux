@@ -1,11 +1,14 @@
 //! Frontend handles contain cached viewports; terminal engines live in the daemon.
 use crate::{
-    Cell, Frame, ipc,
+    Cell, Frame,
+    control::InternalRequest,
+    incoming, ipc,
     model::{CursorStyle, Session},
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
-    transport::{self, Metadata, Packet},
+    transport::{self, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest},
 };
+#[cfg(test)]
 use serde_json::{Value, json};
 use std::{
     cell::{Cell as ValueCell, RefCell},
@@ -30,16 +33,15 @@ struct Connection {
     socket: UnixStream,
 }
 struct Outgoing {
-    request: Value,
+    request: StreamRequest,
     bytes: usize,
 }
 
 impl Connection {
-    fn send(&self, request: Value) -> anyhow::Result<()> {
-        let bytes = if request["method"] == "paste" {
-            request["text"].as_str().map_or(0, str::len)
-        } else {
-            0
+    fn send(&self, request: StreamRequest) -> anyhow::Result<()> {
+        let bytes = match &request.command {
+            StreamCommand::Paste { text, .. } => text.len(),
+            _ => 0,
         };
         anyhow::ensure!(
             bytes <= transport::MAX_PASTE,
@@ -58,27 +60,42 @@ impl Connection {
     }
 }
 
-fn write_request(writer: &mut impl std::io::Write, mut request: Value) -> anyhow::Result<()> {
-    if request["method"] != "paste" {
+fn write_request(writer: &mut impl std::io::Write, request: StreamRequest) -> anyhow::Result<()> {
+    let StreamCommand::Paste { text, options } = request.command else {
         return transport::command(writer, &request);
-    }
-    let Value::String(text) = request["text"].take() else {
-        anyhow::bail!("Paste requires text");
     };
-    request["method"] = json!("paste-begin");
-    request["size"] = json!(text.len());
-    transport::command(writer, &request)?;
-    let pane = request["pane"].clone();
+    let pane = request.pane;
+    transport::command(
+        writer,
+        &StreamRequest {
+            pane,
+            command: StreamCommand::PasteBegin {
+                size: text.len(),
+                options,
+            },
+        },
+    )?;
     let mut start = 0;
     while start < text.len() {
         let end = text.floor_char_boundary((start + transport::PASTE_CHUNK).min(text.len()));
         transport::command(
             writer,
-            &json!({"method":"paste-data", "pane":pane, "text":&text[start..end]}),
+            &StreamRequest {
+                pane,
+                command: StreamCommand::PasteData {
+                    text: text[start..end].to_owned(),
+                },
+            },
         )?;
         start = end;
     }
-    transport::command(writer, &json!({"method":"paste-end", "pane":pane}))
+    transport::command(
+        writer,
+        &StreamRequest {
+            pane,
+            command: StreamCommand::PasteEnd,
+        },
+    )
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -88,7 +105,7 @@ impl Drop for Connection {
 
 pub struct SessionManager {
     connection: Rc<Connection>,
-    receiver: mpsc::Receiver<Result<Packet, String>>,
+    receiver: incoming::Receiver,
     sessions: HashMap<u64, SessionHandle>,
     metadata: HashMap<u64, Metadata>,
     visible: HashSet<u64>,
@@ -102,7 +119,7 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut child: Option<std::process::Child> = None;
     loop {
-        if let Ok(value) = ipc::call(json!({"method":"_hello"})) {
+        if let Ok(value) = ipc::call(InternalRequest::Hello) {
             anyhow::ensure!(
                 value["version"] == transport::VERSION,
                 "Incompatible gmux daemon. Stop it with gmux quit before upgrading."
@@ -118,10 +135,10 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
         } else if child.is_none() {
             // Surface recovery errors to the launcher before a failing daemon
             // can hide their details in its log.
-            let settings = crate::model::load::<crate::model::Settings>("settings.json")?;
-            let _: crate::model::WorkspaceCatalog = crate::model::load("workspaces.json")?;
+            let settings = crate::storage::load::<crate::model::Settings>("settings.json")?;
+            let _: crate::model::WorkspaceCatalog = crate::storage::load("workspaces.json")?;
             if settings.restore {
-                let _: Session = crate::model::load("session.json")?;
+                let _: Session = crate::storage::load("session.json")?;
             }
             let exe = std::env::current_exe()?.with_file_name("gmux-daemon");
             anyhow::ensure!(
@@ -129,11 +146,11 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
                 "Missing {}. Build both binaries with cargo build --bins.",
                 exe.display()
             );
-            std::fs::create_dir_all(crate::model::config_dir())?;
+            std::fs::create_dir_all(crate::storage::config_dir())?;
             let log = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(crate::model::config_dir().join("daemon.log"))?;
+                .open(crate::storage::config_dir().join("daemon.log"))?;
             let mut command = std::process::Command::new(exe);
             command
                 .stdin(std::process::Stdio::null())
@@ -156,7 +173,7 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
             anyhow::ensure!(
                 status.success(),
                 "Daemon exited with {status}. See daemon.log in {}",
-                crate::model::config_dir().display()
+                crate::storage::config_dir().display()
             );
             // Another launcher may have won the lock while its daemon was still starting.
             child = None;
@@ -173,13 +190,15 @@ impl SessionManager {
         let mut writer = socket.try_clone()?;
         transport::command(
             &mut writer,
-            &json!({"method":"attach","version":transport::VERSION}),
+            &StreamRequest::connection(StreamCommand::Attach {
+                version: transport::VERSION,
+            }),
         )?;
         let reader = socket.try_clone()?;
         let (commands, queue) = mpsc::sync_channel::<Outgoing>(128);
         let pending_bytes = Arc::new(AtomicUsize::new(0));
         let writer_bytes = pending_bytes.clone();
-        let (sender, receiver) = mpsc::sync_channel(64);
+        let (sender, receiver) = incoming::channel(incoming::MAX_BYTES, 64);
         let errors = sender.clone();
         let writer_wake = wake.clone();
         std::thread::spawn(move || {
@@ -201,6 +220,13 @@ impl SessionManager {
             let mut reader = BufReader::new(reader);
             loop {
                 let packet = Packet::read(&mut reader)
+                    .and_then(|packet| {
+                        anyhow::ensure!(
+                            incoming::packet_size(&packet) <= incoming::MAX_BYTES,
+                            "Viewport packet exceeds the frontend memory budget"
+                        );
+                        Ok(packet)
+                    })
                     .map_err(|e| format!("Lost connection to the terminal daemon: {e}"));
                 let failed = packet.is_err();
                 if sender.send(packet).is_err() {
@@ -229,7 +255,7 @@ impl SessionManager {
         })
     }
     pub fn saved_session(&mut self) -> anyhow::Result<Session> {
-        let mut value = ipc::call(json!({"method":"_state"}))?;
+        let mut value = ipc::call(InternalRequest::State)?;
         self.install_metadata(serde_json::from_value(value["metadata"].take())?);
         Ok(serde_json::from_value(value["session"].take())?)
     }
@@ -253,7 +279,9 @@ impl SessionManager {
     fn subscribe(&mut self) -> anyhow::Result<()> {
         if self.subscription_pending {
             self.connection
-                .send(json!({"method":"subscribe","panes":self.visible}))?;
+                .send(StreamRequest::connection(StreamCommand::Subscribe {
+                    panes: self.visible.clone(),
+                }))?;
             self.subscription_pending = false;
         }
         Ok(())
@@ -272,7 +300,10 @@ impl SessionManager {
     fn flush_reads(&mut self) {
         self.pending_reads.retain(|id, sequence| {
             self.connection
-                .send(json!({"method":"mark-read","pane":id,"through":sequence}))
+                .send(StreamRequest::pane(
+                    *id,
+                    StreamCommand::MarkRead { through: *sequence },
+                ))
                 .is_err()
         });
     }
@@ -414,9 +445,9 @@ pub struct RemoteSession {
     selection: Option<(u64, u64)>,
 }
 impl RemoteSession {
-    fn command(&self, mut request: Value) -> anyhow::Result<()> {
-        request["pane"] = json!(self.id());
-        self.connection.send(request)
+    fn command(&self, command: StreamCommand) -> anyhow::Result<()> {
+        self.connection
+            .send(StreamRequest::pane(self.id(), command))
     }
     pub fn id(&self) -> u64 {
         self.meta.id
@@ -447,15 +478,28 @@ impl RemoteSession {
         }
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.command(json!({"method":"input","bytes":bytes}))
+        self.command(StreamCommand::Input {
+            bytes: bytes.to_vec(),
+        })
     }
     pub fn send_text(&self, text: &str, enter: bool) -> anyhow::Result<()> {
-        self.command(json!({"method":"paste","text":text,"enter":enter,"clipboard":false}))
+        self.command(StreamCommand::Paste {
+            text: text.to_owned(),
+            options: PasteOptions {
+                enter,
+                ..PasteOptions::default()
+            },
+        })
     }
     pub fn paste(&self, text: &str) -> anyhow::Result<()> {
-        self.command(
-            json!({"method":"paste","text":text,"enter":false,"clipboard":true,"bottom":true}),
-        )
+        self.command(StreamCommand::Paste {
+            text: text.to_owned(),
+            options: PasteOptions {
+                clipboard: true,
+                bottom: true,
+                ..PasteOptions::default()
+            },
+        })
     }
     pub fn key(
         &self,
@@ -465,9 +509,13 @@ impl RemoteSession {
         release: bool,
         text: &str,
     ) -> anyhow::Result<()> {
-        self.command(
-            json!({"method":"key","name":name,"cp":cp,"mods":mods,"release":release,"text":text}),
-        )
+        self.command(StreamCommand::Key {
+            name: name.to_owned(),
+            cp,
+            mods,
+            release,
+            text: text.to_owned(),
+        })
     }
     pub fn mouse(
         &self,
@@ -478,31 +526,40 @@ impl RemoteSession {
         mods: u16,
         pressed: bool,
     ) -> anyhow::Result<()> {
-        self.command(json!({"method":"mouse","position":position,"metrics":metrics,"action":action,"button":button,"mods":mods,"pressed":pressed}))
+        self.command(StreamCommand::Mouse {
+            position,
+            metrics,
+            action,
+            button,
+            mods,
+            pressed,
+        })
     }
     pub fn find(&self, query: &str) -> anyhow::Result<()> {
-        self.command(json!({"method":"find","query":query}))
+        self.command(StreamCommand::Find {
+            query: query.to_owned(),
+        })
     }
     pub fn find_advance(&self, previous: bool) -> anyhow::Result<()> {
-        self.command(json!({"method":"find-advance","previous":previous}))
+        self.command(StreamCommand::FindAdvance { previous })
     }
     pub fn find_state(&self) -> &crate::search::FindState {
         &self.find
     }
     pub fn select(&self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
-        self.command(json!({"method":"select","start":start,"end":end}))
+        self.command(StreamCommand::Select { start, end })
     }
     pub fn copy(&self) -> anyhow::Result<()> {
-        self.command(json!({"method":"copy"}))
+        self.command(StreamCommand::Copy)
     }
     pub fn clear_selection(&self) -> anyhow::Result<()> {
-        self.command(json!({"method":"clear-selection"}))
+        self.command(StreamCommand::ClearSelection)
     }
     pub fn selection(&self) -> Option<(u64, u64)> {
         self.selection
     }
     pub fn scroll(&self, delta: isize, bottom: bool) {
-        if let Err(e) = self.command(json!({"method":"scroll","delta":delta,"bottom":bottom})) {
+        if let Err(e) = self.command(StreamCommand::Scroll { delta, bottom }) {
             eprintln!("{e}");
         }
     }
@@ -514,7 +571,10 @@ impl RemoteSession {
     fn flush_scroll(&self) {
         if let Some(row) = self.pending_scroll.get()
             && self
-                .command(json!({"method":"scroll-to","row":row,"serial":self.scroll_serial.get()}))
+                .command(StreamCommand::ScrollTo {
+                    row,
+                    serial: self.scroll_serial.get(),
+                })
                 .is_ok()
         {
             self.pending_scroll.set(None);
@@ -524,10 +584,10 @@ impl RemoteSession {
         self.scroll_acknowledged < self.scroll_serial.get()
     }
     pub fn set_cursor_style(&self, style: CursorStyle) -> anyhow::Result<()> {
-        self.command(json!({"method":"style","style":style}))
+        self.command(StreamCommand::Style { style })
     }
     pub fn set_theme(&self, theme: &Theme) -> anyhow::Result<()> {
-        self.command(json!({"method":"theme","theme":theme}))
+        self.command(StreamCommand::Theme { theme: *theme })
     }
     pub fn resize(
         &mut self,
@@ -538,7 +598,14 @@ impl RemoteSession {
         width: u16,
         height: u16,
     ) -> anyhow::Result<()> {
-        self.command(json!({"method":"resize","cols":cols,"rows":rows,"cw":cw,"ch":ch,"width":width,"height":height}))?;
+        self.command(StreamCommand::Resize {
+            cols,
+            rows,
+            cw,
+            ch,
+            width,
+            height,
+        })?;
         Ok(())
     }
     pub fn snapshot(&self) -> ScreenSnapshot<'_> {
@@ -553,11 +620,17 @@ impl RemoteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn request(value: Value) -> StreamRequest {
+        serde_json::from_value(value).unwrap()
+    }
+    fn wire(request: StreamRequest) -> Value {
+        serde_json::to_value(request).unwrap()
+    }
     #[test]
     fn large_pastes_use_bounded_utf8_chunks_and_preserve_operation_options() {
         let text = "a界\n\0".repeat(transport::MAX_PASTE / 6);
         let mut bytes = Vec::new();
-        write_request(&mut bytes, json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true})).unwrap();
+        write_request(&mut bytes, request(json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true}))).unwrap();
         let commands: Vec<Value> = bytes
             .split(|b| *b == b'\n')
             .filter(|line| !line.is_empty())
@@ -590,7 +663,7 @@ mod tests {
             socket,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         };
-        let paste = || json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE)});
+        let paste = || request(json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE)}));
         connection.send(paste()).unwrap();
         connection.send(paste()).unwrap();
         assert!(connection.send(paste()).is_err());
@@ -600,12 +673,14 @@ mod tests {
         );
         assert!(
             connection
-                .send(json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE + 1)}))
+                .send(request(
+                    json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE + 1)})
+                ))
                 .is_err()
         );
         assert!(
             connection
-                .send(json!({"method":"paste","text":""}))
+                .send(request(json!({"method":"paste","text":""})))
                 .is_err()
         );
         assert_eq!(
@@ -617,11 +692,7 @@ mod tests {
     use crate::transport::Header;
     use std::path::PathBuf;
 
-    fn manager() -> (
-        SessionManager,
-        mpsc::Sender<Result<Packet, String>>,
-        SessionHandle,
-    ) {
+    fn manager() -> (SessionManager, incoming::Sender, SessionHandle) {
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, _) = mpsc::sync_channel(1);
         let connection = Rc::new(Connection {
@@ -629,7 +700,7 @@ mod tests {
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket,
         });
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = incoming::channel(incoming::MAX_BYTES, 64);
         let session = Rc::new(RefCell::new(RemoteSession {
             connection: connection.clone(),
             meta: Metadata {
@@ -755,7 +826,7 @@ mod tests {
         let (commands, receiver) = mpsc::sync_channel(1);
         commands
             .send(Outgoing {
-                request: json!({"method":"input"}),
+                request: request(json!({"method":"input","bytes":[]})),
                 bytes: 0,
             })
             .unwrap();
@@ -769,10 +840,13 @@ mod tests {
         session.borrow().scroll_to(10);
         session.borrow().scroll_to(20);
         assert!(session.borrow().scroll_pending());
-        assert_eq!(receiver.try_recv().unwrap().request["method"], "input");
+        assert_eq!(
+            wire(receiver.try_recv().unwrap().request)["method"],
+            "input"
+        );
         manager.poll();
         assert_eq!(
-            receiver.try_recv().unwrap().request,
+            wire(receiver.try_recv().unwrap().request),
             json!({"method":"scroll-to","pane":1,"row":20,"serial":2})
         );
         for serial in [1, 2] {
@@ -817,7 +891,7 @@ mod tests {
         let (commands, receiver) = mpsc::sync_channel(1);
         commands
             .send(Outgoing {
-                request: json!({"method":"input"}),
+                request: request(json!({"method":"input","bytes":[]})),
                 bytes: 0,
             })
             .unwrap();
@@ -827,10 +901,13 @@ mod tests {
             socket,
         });
         assert!(manager.set_visible(HashSet::from([1])).is_err());
-        assert_eq!(receiver.try_recv().unwrap().request["method"], "input");
+        assert_eq!(
+            wire(receiver.try_recv().unwrap().request)["method"],
+            "input"
+        );
         assert!(manager.poll().is_empty());
         assert_eq!(
-            receiver.try_recv().unwrap().request,
+            wire(receiver.try_recv().unwrap().request),
             json!({"method":"subscribe","panes":[1]})
         );
         assert!(manager.poll().is_empty());
@@ -875,7 +952,7 @@ mod tests {
         let (commands, receiver) = mpsc::sync_channel(1);
         commands
             .send(Outgoing {
-                request: json!({"method":"input"}),
+                request: request(json!({"method":"input","bytes":[]})),
                 bytes: 0,
             })
             .unwrap();
@@ -887,10 +964,13 @@ mod tests {
         session.borrow_mut().meta.unread = 7;
         manager.mark_read(1);
         assert!(!session.borrow().unread());
-        assert_eq!(receiver.try_recv().unwrap().request["method"], "input");
+        assert_eq!(
+            wire(receiver.try_recv().unwrap().request)["method"],
+            "input"
+        );
         manager.poll();
         assert_eq!(
-            receiver.try_recv().unwrap().request,
+            wire(receiver.try_recv().unwrap().request),
             json!({"method":"mark-read","pane":1,"through":7})
         );
         manager.poll();

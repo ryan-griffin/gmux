@@ -61,6 +61,92 @@ fn workspace_selection<'de, D: serde::Deserializer<'de>>(
     Option::<u64>::deserialize(deserializer).map(Some)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "method")]
+pub enum InternalRequest {
+    #[serde(rename = "_hello")]
+    Hello,
+    #[serde(rename = "_busy")]
+    Busy { panes: Vec<u64> },
+    #[serde(rename = "_command")]
+    Command { command: Command },
+    #[serde(rename = "_focus")]
+    Focus { tab: u64, pane: Option<u64> },
+    #[serde(rename = "_presentation")]
+    Presentation { session: Session },
+    #[serde(rename = "_state")]
+    State,
+    #[serde(rename = "_metadata")]
+    Metadata { pane: Option<u64> },
+    #[serde(rename = "_copy")]
+    Copy { pane: Option<u64> },
+    #[serde(rename = "_read")]
+    Read { pane: Option<u64> },
+    #[serde(rename = "_close")]
+    Close { pane: Option<u64> },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "kebab-case")]
+pub(crate) enum PublicRequest {
+    DaemonInfo,
+    Quit,
+    List,
+    Read {
+        pane: Option<u64>,
+    },
+    Send {
+        pane: Option<u64>,
+        text: String,
+        #[serde(default)]
+        paste: bool,
+        #[serde(default)]
+        enter: bool,
+    },
+    Notify {
+        pane: Option<u64>,
+        message: String,
+    },
+    Focus {
+        pane: Option<u64>,
+        tab: Option<u64>,
+        workspace: Option<u64>,
+    },
+}
+
+pub(crate) enum Request {
+    Layout(Command),
+    Internal(InternalRequest),
+    Public(PublicRequest),
+}
+impl Request {
+    pub fn decode(value: serde_json::Value) -> anyhow::Result<Self> {
+        let method = value["method"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
+        Ok(if Command::supports(method) {
+            Self::Layout(serde_json::from_value(value)?)
+        } else if method.starts_with('_') {
+            Self::Internal(serde_json::from_value(value)?)
+        } else {
+            Self::Public(serde_json::from_value(value)?)
+        })
+    }
+    pub fn mutates_state(&self) -> bool {
+        matches!(
+            self,
+            Self::Layout(_)
+                | Self::Internal(
+                    InternalRequest::Command { .. }
+                        | InternalRequest::Focus { .. }
+                        | InternalRequest::Presentation { .. }
+                        | InternalRequest::Close { .. }
+                )
+                | Self::Public(PublicRequest::Focus { .. } | PublicRequest::Quit)
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CommandOutput {
@@ -160,6 +246,97 @@ mod tests {
         ] {
             let result: CommandResult = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(serde_json::to_value(result).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn internal_requests_preserve_wire_fields_and_nested_workspace_selection() {
+        for wire in [
+            json!({"method":"_hello"}),
+            json!({"method":"_focus","tab":0,"pane":null}),
+            json!({"method":"_busy","panes":[1,2]}),
+            json!({"method":"_read","pane":7}),
+            json!({"method":"_command","command":{"method":"close","pane":7}}),
+        ] {
+            let request: InternalRequest = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        }
+        for (fields, expected) in [(json!({}), None), (json!({"workspace":null}), Some(None))] {
+            let mut command = fields;
+            command["method"] = json!("new");
+            let request = Request::decode(json!({"method":"_command","command":command})).unwrap();
+            let Request::Internal(InternalRequest::Command {
+                command: Command::New { workspace, .. },
+            }) = request
+            else {
+                panic!("Expected internal new command");
+            };
+            assert_eq!(workspace, expected);
+        }
+    }
+
+    #[test]
+    fn presentation_requests_round_trip_sessions_with_pane_directory_keys() {
+        use crate::model::{Layout, SavedTab};
+        use std::collections::HashMap;
+        let session = Session {
+            tabs: vec![SavedTab {
+                id: 1,
+                name: "Terminal".into(),
+                custom_name: false,
+                workspace: None,
+                layout: Layout::Pane(2),
+                directories: HashMap::from([(2, PathBuf::from("/tmp"))]),
+                active: 2,
+            }],
+            active: 1,
+            ..Session::default()
+        };
+        let wire = json!({"method":"_presentation","session":session});
+        let request: InternalRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        let Request::Internal(InternalRequest::Presentation { session }) =
+            Request::decode(wire.clone()).unwrap()
+        else {
+            panic!("Expected presentation");
+        };
+        assert_eq!(session.tabs[0].directories[&2], PathBuf::from("/tmp"));
+        let mut invalid = wire;
+        invalid["session"]["tabs"][0]["directories"] = json!({"invalid":"/tmp"});
+        assert!(Request::decode(invalid).is_err());
+    }
+
+    #[test]
+    fn control_requests_classify_mutations_and_reject_invalid_fields() {
+        for (wire, mutates) in [
+            (json!({"method":"_hello"}), false),
+            (json!({"method":"_read","pane":7}), false),
+            (json!({"method":"send","pane":7,"text":"hello"}), false),
+            (json!({"method":"notify","pane":7,"message":"hello"}), false),
+            (json!({"method":"close","pane":7}), true),
+            (
+                json!({"method":"_command","command":{"method":"close","pane":7}}),
+                true,
+            ),
+            (json!({"method":"_focus","tab":0}), true),
+            (
+                json!({"method":"_presentation","session":Session::default()}),
+                true,
+            ),
+            (json!({"method":"focus","workspace":7}), true),
+            (json!({"method":"quit"}), true),
+        ] {
+            assert_eq!(Request::decode(wire).unwrap().mutates_state(), mutates);
+        }
+        for wire in [
+            json!({"method":"_focus","tab":"invalid"}),
+            json!({"method":"_read","pane":-1}),
+            json!({"method":"_busy","panes":["invalid"]}),
+            json!({"method":"_command","command":{"method":"move"}}),
+            json!({"method":"send","text":false}),
+            json!({"method":"notify"}),
+        ] {
+            assert!(Request::decode(wire).is_err());
         }
     }
 }

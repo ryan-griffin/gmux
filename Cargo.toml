@@ -23,6 +23,16 @@ glib-unix = "0.22"
 [build-dependencies]
 cc = "1"
 
+# The renderer smoke suite runs these tools. Their included render module's
+# unit tests already run in the application target.
+[[example]]
+name = "renderer-benchmark"
+test = false
+
+[[example]]
+name = "renderer-check"
+test = false
+
 [profile.dev]
 debug = 0
 

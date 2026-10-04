@@ -6,11 +6,13 @@ use std::{
     path::PathBuf,
 };
 
+mod requests;
+pub(crate) use requests::{PasteOptions, StreamCommand, StreamRequest};
+
 pub(crate) const VERSION: u32 = 6;
 pub(crate) const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub(crate) const PASTE_CHUNK: usize = 16 * 1024;
 pub(crate) const MAX_PACKET: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_CELLS: usize = 131_072;
 const CELL_BYTES: usize = 71;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +50,26 @@ pub(crate) struct Packet {
 }
 
 impl Packet {
+    pub(crate) fn memory_size(&self) -> usize {
+        let header = &self.header;
+        std::mem::size_of::<Self>()
+            + self.cells.capacity() * std::mem::size_of::<Cell>()
+            + header.meta.directory.capacity()
+            + header.meta.title.capacity()
+            + header.rows.capacity() * std::mem::size_of::<u16>()
+            + header.notifications.capacity() * std::mem::size_of::<String>()
+            + header
+                .notifications
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+            + header.error.as_ref().map_or(0, String::capacity)
+            + header.copy.as_ref().map_or(0, String::capacity)
+            + header.find.as_ref().map_or(0, |find| {
+                find.highlights.capacity() * std::mem::size_of::<(usize, usize, u8)>()
+            })
+    }
+
     pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
         let header = serde_json::to_vec(&self.header)?;
         let size = 4 + header.len() + self.cells.len() * CELL_BYTES;
@@ -83,7 +105,7 @@ impl Packet {
             let cols = frame.cols as usize;
             let rows = frame.rows as usize;
             anyhow::ensure!(
-                cols > 0 && rows > 0 && cols * rows <= MAX_CELLS,
+                crate::viewport::valid(cols as u64, rows as u64),
                 "Invalid viewport dimensions"
             );
             anyhow::ensure!(
@@ -116,7 +138,7 @@ impl Packet {
     }
 }
 
-pub(crate) fn command(writer: &mut impl Write, request: &serde_json::Value) -> anyhow::Result<()> {
+pub(crate) fn command(writer: &mut impl Write, request: &impl Serialize) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(request)?;
     anyhow::ensure!(bytes.len() <= 1_048_576, "Frontend command is too large");
     writer.write_all(&bytes)?;
@@ -186,6 +208,29 @@ mod tests {
             assert!(Packet::read(&mut reader).unwrap().cells == packet.cells);
         }
         assert!(reader.is_empty());
+    }
+    #[test]
+    fn incoming_budget_counts_retained_capacity_and_rejects_oversized_packets() {
+        let mut oversized = packet();
+        oversized.cells.reserve_exact(4096);
+        let mut encoded = Vec::new();
+        oversized.encode_into(&mut encoded).unwrap();
+        let size = crate::incoming::packet_size(&oversized);
+        assert!(size > encoded.len());
+        let (sender, receiver) = crate::incoming::channel(size - 1, 8);
+        assert!(
+            sender
+                .send(Ok(oversized))
+                .unwrap_err()
+                .to_string()
+                .contains("memory budget")
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        sender.send(Ok(packet())).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Ok(packet)) if packet.header.scroll_serial == 42));
     }
     #[test]
     fn malformed_packets_are_rejected_before_applying_rows() {

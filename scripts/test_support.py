@@ -1,5 +1,6 @@
 """Shared socket calls, waits, accessibility traversal, and private app fixtures."""
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import socket
@@ -37,6 +38,16 @@ def wait_for(predicate, timeout=12, *, context=None, exceptions=(OSError,), mess
     raise AssertionError(message)
 
 
+def assert_stays(predicate, duration, *, message):
+    """Observe a condition for a bounded interval, including delayed updates."""
+    deadline = time.monotonic() + duration
+    while True:
+        assert predicate(), message
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.025)
+
+
 def descendants(element):
     element.clear_cache()
     yield element
@@ -44,6 +55,73 @@ def descendants(element):
         child = element.get_child_at_index(index)
         if child:
             yield from descendants(child)
+
+
+def stop_process(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=8)
+
+
+@contextmanager
+def scenario(name):
+    print(f"Running: {name}", flush=True)
+    try:
+        yield
+    except Exception:
+        print(f"FAIL: {name}", flush=True)
+        raise
+    print(f"PASS: {name}", flush=True)
+
+
+def wait_accessible(predicate, timeout=12, **kwargs):
+    from gi.repository import GLib
+    return wait_for(predicate, timeout, context=GLib.MainContext.default(),
+                    exceptions=(OSError, GLib.Error), **kwargs)
+
+
+class AccessibilityFixture:
+    """Wait for the private accessibility registry and stop it if we started it."""
+    def __init__(self, **process_options):
+        self.process_options = process_options
+        self.process = None
+        self.connection = None
+
+    def __enter__(self):
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        address = bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+            None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+        self.connection = Gio.DBusConnection.new_for_address_sync(address,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+
+        def ready():
+            return self.connection.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "NameHasOwner", GLib.Variant("(s)", ("org.a11y.atspi.Registry",)),
+                GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+
+        try:
+            if not ready():
+                self.process = subprocess.Popen(["/usr/lib/at-spi2-registryd"],
+                    env=dict(os.environ, AT_SPI_BUS_ADDRESS=address, DBUS_SESSION_BUS_ADDRESS=address),
+                    **self.process_options)
+            wait_accessible(ready, message="Accessibility registry did not acquire its bus name")
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *_):
+        try:
+            stop_process(self.process)
+        finally:
+            if self.connection is not None:
+                self.connection.close_sync(None)
 
 
 class DelayedViewport:
@@ -106,23 +184,43 @@ class DelayedViewport:
 
 
 class AppFixture:
-    def __init__(self, settings=None):
-        self.directory = tempfile.TemporaryDirectory(prefix="gmux-test-")
+    def __init__(self, settings=None, *, prefix="gmux-test-", shell_script=None, env=None):
+        self.directory = tempfile.TemporaryDirectory(prefix=prefix)
         self.path = Path(self.directory.name)
-        config = self.path / "config/gmux"
-        config.mkdir(parents=True)
-        (config / "settings.json").write_text(json.dumps(settings or {}))
+        self.config = self.path / "config/gmux"
+        self.config.mkdir(parents=True)
+        self.settings_path = self.config / "settings.json"
+        self.set_settings(settings or {})
         shell = self.path / "shell"
-        shell.write_text("#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
+        shell.write_text(shell_script or "#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
         shell.chmod(0o700)
         self.env = dict(os.environ, GMUX_SOCKET=str(self.path / "socket"),
                         XDG_CONFIG_HOME=str(self.path / "config"), SHELL=str(shell))
+        self.env.update(env or {})
         self.processes = []
 
-    def start(self, binary, **kwargs):
-        process = subprocess.Popen([str(binary)], env=self.env, **kwargs)
+    def set_settings(self, settings):
+        self.settings_path.write_text(json.dumps(settings))
+
+    def start(self, binary, *args, **kwargs):
+        process = subprocess.Popen([str(binary), *map(str, args)], env=self.env, **kwargs)
         self.processes.append(process)
         return process
+
+    def start_app(self, binary, *args, **kwargs):
+        process = self.start(binary, *args, **kwargs)
+        wait_for(lambda: process.poll() is not None or self.rpc("daemon-info")["attached"],
+                 message="Application did not attach to its daemon")
+        assert process.poll() is None, "Application exited before attaching to its daemon"
+        wait_for(lambda: self.rpc("renderer-info")["gtk"], message="Application did not construct its window")
+        return process
+
+    def stop(self):
+        try:
+            stop_daemon(self.env["GMUX_SOCKET"])
+        finally:
+            for process in reversed(self.processes):
+                stop_process(process)
 
     def rpc(self, method, **params):
         return rpc(self.env["GMUX_SOCKET"], method, **params)
@@ -132,14 +230,6 @@ class AppFixture:
 
     def __exit__(self, *_):
         try:
-            stop_daemon(self.env["GMUX_SOCKET"])
+            self.stop()
         finally:
-            for process in reversed(self.processes):
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=8)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=8)
             self.directory.cleanup()

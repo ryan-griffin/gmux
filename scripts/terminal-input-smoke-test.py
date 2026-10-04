@@ -174,7 +174,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             def assert_stopped():
                 offset = wait_for(viewport)["scrollback"]["offset"]
                 time.sleep(.25)
-                assert viewport()["scrollback"]["offset"] == offset, "Selection scrolling must stop"
+                assert wait_for(viewport)["scrollback"]["offset"] == offset, "Selection scrolling must stop"
 
             native.move(left + cw / 2, (top + bottom) / 2)
             native.button(True)
@@ -259,7 +259,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
                     y = viewport_top - distance if direction < 0 else viewport_bottom + distance
                     native.move(left + cw * 6.5, y)
                     time.sleep(.003)
-                previous = viewport()["scrollback"]["offset"]
+                previous = wait_for(viewport)["scrollback"]["offset"]
                 for _ in range(150):
                     state = rpc("renderer-info", pane=pane)["viewport"]
                     offset = state["scrollback"]["offset"]

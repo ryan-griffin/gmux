@@ -80,17 +80,15 @@ python3 scripts/check.py
 python3 scripts/check.py --native
 ```
 
-The check runner performs formatting, all Rust tests, Clippy, builds, and headless smoke tests. `--native` also runs the desktop suite. Use `--only find terminal-input` to select smoke tests and `--skip-build` after a completed build. Shared socket calls, waits, accessibility traversal, and private process fixtures live in `scripts/test_support.py`. Native regression tests are in [scripts/](scripts/). The [keyboard and clipboard test](docs/renderer.md#validation) runs in an isolated Wayland compositor with XWayland disabled. See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
+The runner checks formatting, Rust tests, Clippy, builds, and smoke tests.
+Use the [testing guide](docs/testing.md) for prerequisites, selected checks,
+rendering backends, appearance variants, and failure logs.
 
-Run `python3 scripts/notification-focus-smoke-test.py` to check focused-pane suppression, alerts from other panes and inactive windows, and unread state after reconnect in an isolated Wayland compositor.
-
-Run `python3 scripts/icon-smoke-test.py` to check the app icons with GdkPixbuf's format detection and SVG loader. This check requires PyGObject and the GdkPixbuf SVG loader, and runs without a display.
-
-Terminal processes and state live in a GTK-independent [session manager](docs/terminal-sessions.md). A headless daemon owns that manager and sends changed rows to the GTK frontend.
-
-Gmux uses Ghostty's terminal engine with Pango font shaping and GSK rendering. GTK selects a GPU backend or its software backend; see the [renderer design and benchmarks](docs/renderer.md). Find searches retained scrollback and scrolls to offscreen matches. Selection can span scrollback and follows terminal updates. The terminal exposes viewport text, caret, and selection through GTK accessibility. Terminal image protocols are not supported.
-
-The [application benchmark](docs/performance.md) measures frontend and daemon CPU, resident memory, and native Wayland input-to-composited-frame latency with several busy panes.
+- [Code organization](docs/code-organization.md) maps module responsibilities.
+- [GNOME UI design](docs/code-review.md) explains widgets, menus, focus, and accessibility.
+- [Background sessions](docs/terminal-sessions.md) covers lifecycle, scheduling, transport, and persistence.
+- [Terminal rendering](docs/renderer.md) covers Pango shaping, GSK nodes, caches, and renderer benchmarks.
+- [Application performance](docs/performance.md) records benchmark methods and dated build comparisons.
 
 ## License
 

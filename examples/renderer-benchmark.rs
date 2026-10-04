@@ -120,10 +120,22 @@ fn main() -> anyhow::Result<()> {
         ..Frame::default()
     };
     let mut results = Vec::new();
-    for fixture_name in ["ascii", "mixed", "tui"] {
-        for workload in ["static", "single-row", "full-screen"] {
+    for fixture_name in ["ascii", "mixed", "tui", "fallback"] {
+        for workload in ["static", "single-row", "full-screen", "all-rows"] {
             let mut renderer = Renderer::new();
             let mut cells = fixture(options.cols, options.rows, theme, fixture_name != "ascii");
+            if fixture_name == "fallback" {
+                for (index, cell) in cells.iter_mut().enumerate() {
+                    let x = index % options.cols as usize;
+                    let y = index / options.cols as usize;
+                    *cell = self::cell(
+                        ["a", "b", "c", "界", "", "🙂", "", " "][x % 8],
+                        theme.palette[1 + y % 7],
+                        theme.background,
+                        if matches!(x % 8, 4 | 6) { 64 } else { 0 },
+                    );
+                }
+            }
             if fixture_name == "tui" {
                 for (index, cell) in cells.iter_mut().enumerate() {
                     let x = index % options.cols as usize;
@@ -166,6 +178,17 @@ fn main() -> anyhow::Result<()> {
                             0,
                         );
                     }
+                    if workload == "all-rows" {
+                        for y in 0..options.rows as usize {
+                            let index = y * options.cols as usize;
+                            cells[index] = cell(
+                                &((b'a' + (iteration % 26) as u8) as char).to_string(),
+                                theme.foreground,
+                                theme.background,
+                                0,
+                            );
+                        }
+                    }
                 }
                 let scene = Scene {
                     frame,
@@ -196,6 +219,7 @@ fn main() -> anyhow::Result<()> {
                     let expected = match workload {
                         "static" => 0,
                         "single-row" => 1,
+                        "all-rows" => options.rows as usize,
                         _ => 1,
                     };
                     assert_eq!(

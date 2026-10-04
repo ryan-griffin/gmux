@@ -199,6 +199,42 @@ fn assert_direct_text(node: &gsk::RenderNode) {
     }
 }
 
+fn validate_overlapping_fallbacks(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    let theme = Theme::adwaita(true);
+    let mut cells = vec![cell(" ", theme, 0); 40 * 8];
+    for (index, target) in cells.iter_mut().enumerate() {
+        *target = cell(
+            ["f", "界", "j", "🙂"][index % 4],
+            theme,
+            [0, 2, 4, 6][index / 40 % 4],
+        );
+        target.fg = theme.palette[1 + index % 3];
+    }
+    let mut scene = scene(&cells, theme);
+    // Force ink across neighboring cells to exercise paint-order checks, with
+    // alternating fallback fonts, colors, italics, and node opacity.
+    scene.metrics.0 = 3.0;
+    scene.width = 120;
+    let actual = node(&mut Renderer::new(), &scene, font, context).0;
+    let expected = reference(&scene, font, context);
+    let actual = pixels(&render(gpu, &actual, &scene));
+    let expected = pixels(&render(gpu, &expected, &scene));
+    let delta = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&a, &b)| (a as f64 - b as f64).abs())
+        .sum::<f64>()
+        / actual.len() as f64;
+    assert!(
+        delta < 1.0,
+        "Overlapping fallback glyphs changed paint order: {delta}"
+    );
+}
+
 fn validate_cache(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
     let theme = Theme::adwaita(true);
     let cells = fixture(theme);
@@ -350,11 +386,25 @@ fn validate_scroll_cache(
                     assert_eq!(stats.rebuilt_rows, 1, "Scrolling should reuse seven rows");
                 }
                 let fresh = node(&mut Renderer::new(), &scene, font, context).0;
-                assert_eq!(
-                    pixels(&render(gpu, &cached, &scene)),
-                    pixels(&render(gpu, &fresh, &scene)),
-                    "Scrolled cache differs at step {step}, scale {scale}, origin {origin:?}"
-                );
+                let actual = render(gpu, &cached, &scene);
+                let expected = render(gpu, &fresh, &scene);
+                if pixels(&actual) != pixels(&expected) {
+                    actual
+                        .save_to_png("artifacts/scroll-cache-actual.png")
+                        .unwrap();
+                    expected
+                        .save_to_png("artifacts/scroll-cache-expected.png")
+                        .unwrap();
+                    cached
+                        .write_to_file("artifacts/scroll-cache-actual.node")
+                        .unwrap();
+                    fresh
+                        .write_to_file("artifacts/scroll-cache-expected.node")
+                        .unwrap();
+                    panic!(
+                        "Scrolled cache differs at step {step}, scale {scale}, origin {origin:?}"
+                    );
+                }
             }
         }
     }
@@ -584,6 +634,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let font = pango::FontDescription::from_string("Monospace 12");
+    validate_overlapping_fallbacks(&gpu, &font, &context);
     validate_cache(&gpu, &font, &context);
     validate_scroll_cache(&gpu, &font, &context);
     validate_geometry(&gpu, &font, &context);
@@ -593,7 +644,7 @@ fn main() -> anyhow::Result<()> {
             "gtk_renderer": gpu.type_().name(), "glyph_cases": cases,
             "checks": ["independent layout agreement", "row invalidation", "scroll cache reuse", "bounded glyph cache",
                        "font and context changes", "fractional blocks", "selection and search",
-                       "concealed text", "blank and wide decorations", "wide cursor", "background batching"]
+                       "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order"]
         }))?,
     )?;
     println!(

@@ -4,12 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub fn config_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "gmux")
-        .unwrap()
-        .config_dir()
-        .to_owned()
-}
 pub fn home() -> PathBuf {
     directories::BaseDirs::new().unwrap().home_dir().to_owned()
 }
@@ -174,9 +168,26 @@ pub struct SavedTab {
     pub custom_name: bool,
     pub workspace: Option<u64>,
     pub layout: Layout,
+    #[serde(deserialize_with = "pane_directories")]
     pub directories: HashMap<u64, PathBuf>,
     pub active: u64,
 }
+
+fn pane_directories<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<u64, PathBuf>, D::Error> {
+    // JSON object keys are strings. Parse IDs explicitly so this also works
+    // when a tagged request buffers the session before deserializing it.
+    HashMap::<String, PathBuf>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(id, path)| {
+            id.parse()
+                .map(|id| (id, path))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
 impl SavedTab {
     pub fn validate(&self) -> anyhow::Result<()> {
         let ids = self.layout.ids();
@@ -228,6 +239,16 @@ pub struct WorkspaceCatalog {
     pub workspaces: Vec<WorkspaceDefinition>,
 }
 impl WorkspaceCatalog {
+    /// Keep the first valid definition for each ID without rewriting the file.
+    pub fn retain_valid(&mut self) {
+        let mut ids = HashSet::new();
+        self.workspaces.retain(|workspace| {
+            workspace.id > 0
+                && workspace.id < u64::MAX
+                && !workspace.name.trim().is_empty()
+                && ids.insert(workspace.id)
+        });
+    }
     pub fn validate_name(&self, name: &str, editing: Option<u64>) -> anyhow::Result<String> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "Enter a workspace name");
@@ -241,65 +262,36 @@ impl WorkspaceCatalog {
         Ok(name.to_owned())
     }
 }
-pub fn load<T: serde::de::DeserializeOwned + Default>(name: &str) -> anyhow::Result<T> {
-    load_at(&config_dir().join(name))
-}
-fn load_at<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
-    use anyhow::Context;
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
-            format!("Could not load {}. The file is unchanged. Repair it or move it aside to start with defaults", path.display())
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
-    }
-}
-pub fn save<T: Serialize + serde::de::DeserializeOwned + Default>(
-    name: &str,
-    value: &T,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(config_dir())?;
-    let path = config_dir().join(name);
-    save_at(&path, value)
-}
-fn save_at<T: Serialize + serde::de::DeserializeOwned + Default>(
-    path: &Path,
-    value: &T,
-) -> anyhow::Result<()> {
-    // An autosave must not replace a file that became unreadable or invalid
-    // after startup. Missing files are the only case that starts from defaults.
-    let _: T = load_at(path)?;
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
-    std::fs::rename(temp, path)?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn missing_state_uses_defaults_but_invalid_and_unreadable_state_is_preserved() {
-        let path = std::env::temp_dir().join(format!(
-            "gmux-state-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        let file = path.join("session.json");
-        assert!(load_at::<Session>(&file).unwrap().tabs.is_empty());
-        assert!(load_at::<Session>(&path).is_err());
-        for bytes in [b"{broken".as_slice(), b"{\"tabs\":\"invalid\"}".as_slice()] {
-            std::fs::write(&file, bytes).unwrap();
-            assert!(load_at::<Session>(&file).is_err());
-            assert!(save_at(&file, &Session::default()).is_err());
-            assert_eq!(std::fs::read(&file).unwrap(), bytes);
-            assert!(!file.with_extension("tmp").exists());
-        }
-        std::fs::remove_dir_all(path).unwrap();
+    fn catalog_validation_keeps_first_valid_ids_and_preserves_definition_order() {
+        let definition = |id, name: &str| WorkspaceDefinition {
+            id,
+            name: name.into(),
+            directory: PathBuf::from("/tmp"),
+        };
+        let mut catalog = WorkspaceCatalog {
+            workspaces: vec![
+                definition(0, "Zero"),
+                definition(1, " "),
+                definition(1, "First"),
+                definition(2, "Second"),
+                definition(1, "Duplicate"),
+                definition(u64::MAX, "Overflow"),
+            ],
+        };
+        catalog.retain_valid();
+        assert_eq!(
+            catalog
+                .workspaces
+                .iter()
+                .map(|w| (w.id, w.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "First"), (2, "Second")]
+        );
     }
     #[test]
     fn unassigned_filter_matches_only_unassigned_tabs() {

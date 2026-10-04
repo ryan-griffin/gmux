@@ -154,10 +154,10 @@ impl Drop for Server {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-pub fn call(request: Value) -> anyhow::Result<Value> {
+pub fn call(request: impl serde::Serialize) -> anyhow::Result<Value> {
     call_at(&socket_path(), request)
 }
-pub fn call_at(path: &Path, request: Value) -> anyhow::Result<Value> {
+pub fn call_at(path: &Path, request: impl serde::Serialize) -> anyhow::Result<Value> {
     let mut stream = UnixStream::connect(path).map_err(|e| {
         anyhow::anyhow!(
             "Cannot connect to gmux at {}: {e}. Start the app first.",
@@ -166,7 +166,8 @@ pub fn call_at(path: &Path, request: Value) -> anyhow::Result<Value> {
     })?;
     stream.set_read_timeout(Some(Duration::from_secs(6)))?;
     stream.set_write_timeout(Some(Duration::from_secs(6)))?;
-    writeln!(stream, "{request}")?;
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
     let mut response = String::new();
     BufReader::new(stream).read_line(&mut response)?;
     let value: Value = serde_json::from_str(&response)?;
@@ -179,7 +180,7 @@ pub fn call_at(path: &Path, request: Value) -> anyhow::Result<Value> {
 enum Job {
     Request(u64, Value),
     Focus(u64, Option<u64>),
-    Save(Value),
+    Save(crate::model::Session),
     Persist(crate::model::Settings),
 }
 #[derive(Default)]
@@ -217,21 +218,18 @@ impl Client {
                     Job::Request(id, request) => (id, call_at(&path, request)),
                     Job::Focus(tab, pane) => (
                         0,
-                        call_at(
-                            &path,
-                            serde_json::json!({"method":"_focus","tab":tab,"pane":pane}),
-                        ),
+                        call_at(&path, crate::control::InternalRequest::Focus { tab, pane }),
                     ),
                     Job::Save(session) => (
                         0,
                         call_at(
                             &path,
-                            serde_json::json!({"method":"_presentation","session":session}),
+                            crate::control::InternalRequest::Presentation { session },
                         ),
                     ),
                     Job::Persist(settings) => (
                         0,
-                        crate::model::save("settings.json", &settings).map(|()| Value::Null),
+                        crate::storage::save("settings.json", &settings).map(|()| Value::Null),
                     ),
                 };
                 if sender.send((id, result)).is_err() {
@@ -246,16 +244,16 @@ impl Client {
             next: std::cell::Cell::new(1),
         }
     }
-    pub fn request(&self, request: Value) -> anyhow::Result<u64> {
+    pub fn request(&self, request: impl serde::Serialize) -> anyhow::Result<u64> {
         let id = self.next.get();
         self.next.set(
             id.checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("No request IDs remain"))?,
         );
-        self.enqueue(Job::Request(id, request))?;
+        self.enqueue(Job::Request(id, serde_json::to_value(request)?))?;
         Ok(id)
     }
-    pub fn save(&self, session: Value) -> anyhow::Result<()> {
+    pub fn save(&self, session: crate::model::Session) -> anyhow::Result<()> {
         self.enqueue(Job::Save(session))
     }
     pub fn focus(&self, tab: u64, pane: Option<u64>) -> anyhow::Result<()> {
@@ -336,23 +334,38 @@ mod tests {
         ready.recv_timeout(Duration::from_secs(3)).unwrap();
         client.focus(1, Some(10)).unwrap();
         client.focus(2, Some(20)).unwrap();
-        client.save(serde_json::json!({"revision":1})).unwrap();
-        client.save(serde_json::json!({"revision":2})).unwrap();
+        client
+            .save(crate::model::Session {
+                width: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        client
+            .save(crate::model::Session {
+                width: 2,
+                ..Default::default()
+            })
+            .unwrap();
         client
             .request(serde_json::json!({"method":"command"}))
             .unwrap();
         client.focus(3, Some(30)).unwrap();
-        client.save(serde_json::json!({"revision":3})).unwrap();
+        client
+            .save(crate::model::Session {
+                width: 3,
+                ..Default::default()
+            })
+            .unwrap();
         release.send(()).unwrap();
         let seen = worker.join().unwrap();
         assert_eq!(seen.len(), 6);
         assert_eq!(seen[1]["method"], "_focus");
         assert_eq!(seen[1]["tab"], 2);
         assert_eq!(seen[1]["pane"], 20);
-        assert_eq!(seen[2]["session"]["revision"], 2);
+        assert_eq!(seen[2]["session"]["width"], 2);
         assert_eq!(seen[3]["method"], "command");
         assert_eq!(seen[4]["tab"], 3);
-        assert_eq!(seen[5]["session"]["revision"], 3);
+        assert_eq!(seen[5]["session"]["width"], 3);
         std::fs::remove_file(path).unwrap();
     }
     #[test]

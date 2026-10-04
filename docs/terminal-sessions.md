@@ -7,10 +7,12 @@ Closing a pane still terminates that pane, and an exited shell removes its pane.
 
 Use **Quit Gmux** in the main menu, Ctrl+Shift+Q, or `gmux quit` to stop the daemon
 and its terminals. The GUI confirms Quit when a foreground job is running. The
-CLI command is an explicit shutdown and does not show a dialog. A layout save failure produces a warning but still closes the terminals and daemon. SIGTERM/SIGINT
-sent to the frontend detach it; sent to the daemon they stop its sessions.
+CLI command is an explicit shutdown and does not show a dialog. A layout save
+failure produces a warning but still closes the terminals and daemon. SIGTERM
+and SIGINT sent to the frontend detach it; sent to the daemon they stop its
+sessions.
 
-A stopped daemon cannot resume arbitrary commands. At this stage, daemon restart
+A stopped daemon cannot resume arbitrary commands. Daemon restart
 restores the saved layout and working directories with fresh shells when Restore
 tabs is enabled. Output and scrollback survive window closure and frontend
 crashes, but not daemon shutdown or a reboot. Disk terminal checkpoints are not
@@ -22,19 +24,20 @@ automation, run `target/debug/gmux-daemon`. `gmux list`, `new`, `split`, `send`,
 `read`, `close`, workspace changes, and focus selection work with the window
 closed. Screenshot, menus, search controls, and other GUI actions require an
 open window. Desktop alerts arrive through the frontend. With it closed, the
-daemon queues the latest 64 alerts per pane for delivery on reconnect. CLI and
-terminal OSC alerts use the same bounded queue. Delivering an alert does not
-clear its unread indicator. The daemon owns unread state across frontend
-reconnects; selecting a pane acknowledges the alerts the frontend has seen.
+daemon queues up to 64 recent alerts per pane within a 512 KiB text budget for
+delivery on reconnect. An individual alert larger than that budget is truncated
+at a UTF-8 boundary. CLI and terminal OSC alerts use the same bounded queue.
+Delivering an alert does not clear its unread indicator. The daemon owns unread
+state across frontend reconnects; selecting a pane acknowledges the alerts the
+frontend has seen.
 Sequence numbers prevent a delayed acknowledgement from clearing a newer alert.
 Unread state and queued alerts are kept in memory, not across daemon restarts.
 
 ## Ownership and scheduling
 
-`src/daemon.rs` owns the live layout and `TerminalSession` objects.
-`src/session.rs` owns PTYs, Ghostty engines, protocol replies, process titles,
-working directories, and scrollback. Neither module depends on GTK, Pango, or
-Cairo. The daemon binary links libghostty-vt and GLib without a graphics stack.
+The headless daemon owns live terminal state and PTYs. GTK owns the visible
+window, clipboard, fonts, rendering, and accessible text. See
+[code organization](code-organization.md) for their module boundaries.
 
 The daemon uses nonblocking PTY descriptors in one `poll` loop. It reads at most
 512 KiB per ready pane before servicing other panes, handles partial writes, and
@@ -60,6 +63,15 @@ worker outside GTK's main thread. Adjacent presentation saves coalesce; commands
 preserve queue order. Close and Quit check all affected panes in one asynchronous
 busy-process request. Startup connects before presenting the window.
 
+Daemon saves run on one disk worker. Commands wait for their save result while
+the owner thread continues processing PTYs, viewport updates, and read-only
+requests. Later layout and workspace mutations wait in order. Adjacent automatic
+layout snapshots coalesce; command saves do not. Workspace membership changes
+take effect after the catalog save succeeds, then advance to a session save.
+Each pending command tracks its current save stage and replies after the save
+sequence finishes or fails. Preparing a session snapshot is separate from
+submitting it to the worker.
+
 Git HEAD watches supply branch updates, and ancestor directory watches discover
 repository creation, removal, and nested repositories. Two workers publish each
 directory's result independently, share lookups between tabs, and coalesce queued
@@ -81,8 +93,9 @@ startup, and sockets have owner-only permissions. The frontend and daemon use
 one protocol version and reject mismatched binaries. Build and install both
 binaries from the same revision. Gmux does not maintain older protocol versions
 or migrate older saved formats during pre-release development.
-These changes use protocol version 6, which includes immediate focus updates.
-Restart an existing daemon before using the rebuilt binaries.
+The protocol version is defined in [`src/transport.rs`](../src/transport.rs).
+When an upgrade changes it, quit the existing daemon before launching the
+matching rebuilt binaries.
 
 Clipboard and text pastes use messages of at most 16 KiB of UTF-8 text. The
 daemon assembles a complete paste of up to 4 MiB before asking Ghostty to encode
@@ -90,6 +103,10 @@ it, preserving one bracketed-paste boundary and preventing incomplete transfers
 from reaching a shell. The frontend bounds queued paste text to 8 MiB, and the
 daemon bounds pending PTY input to 8 MiB. PTY writes yield after 512 KiB per poll.
 Oversized or malformed frontend commands report errors without disconnecting.
+Stream commands and internal control requests use shared Rust types for their
+JSON fields. The daemon decodes each request before dispatch and
+rejects invalid types and out-of-range integers. A malformed command cancels an
+incomplete paste; a malformed attach disconnects the frontend.
 
 `src/remote.rs` contains frontend session handles with cached cells and frame
 metadata. Input, key and mouse encoding requests, paste, resize, theme changes,
@@ -112,16 +129,22 @@ viewport. Subsequent packets compare rows against the last transmitted cells.
 Packets with no changed cells, frame metadata, notifications, search or selection
 state, or scroll acknowledgement are suppressed. Key handlers draw when changed
 terminal state arrives. The frontend applies packets in order before rendering.
-The daemon still scans
-and retains a viewport copy for each visible pane, but updates that copy only
-for changed rows. It encodes packets directly into the socket output buffer and
+Frontend sizing, daemon resizing, and packet decoding share limits of 1,000
+columns, 1,000 rows, and 131,072 total cells. A large frontend allocation reduces
+the row count to fit the total cell budget.
+The daemon scans and retains a viewport copy for each visible pane, but updates
+it only for changed rows. It encodes packets directly into the socket output buffer and
 reuses its polling buffers. It does not copy scrollback or send pixels through
 the socket.
 
 Bounded queues provide backpressure. A frontend that exceeds the daemon's 32 MiB
 pending-output limit detaches while its terminal sessions continue. Reopening
-resynchronizes complete viewports. If the backend disappears, the frontend
-exits and the next launch starts a new daemon. Typed layout and workspace commands
+resynchronizes complete viewports. The frontend incoming queue retains at most
+64 packets within a 32 MiB budget for decoded allocations. The reader waits for
+space without discarding packets, preserving notifications and acknowledgements.
+This budget excludes the packet being decoded and the installed pane viewports.
+If the backend disappears, the frontend exits and the next launch starts a new
+daemon. Typed layout and workspace commands
 share one daemon implementation for the GUI and detached CLI. Each command
 returns authoritative layout, catalog, and process metadata for reconciliation.
 The frontend persists presentation state and divider proportions without replacing
@@ -133,13 +156,19 @@ files produce a recovery error and remain unchanged. Startup failures show the
 file path and recovery instructions in a window. Saves validate the existing
 file before replacing it, so a file damaged after startup remains available for
 repair. Move it aside to use defaults, or repair it before restarting or saving.
+`src/storage.rs` owns these disk operations. The UI and daemon load workspace
+catalogs through the same validation, retaining the first valid definition for
+each ID without changing the file during a read.
+Each state file has a separate writer lock and an exclusively created temporary
+file in the same directory. Saves flush and sync the temporary file, rename it
+over the destination, then sync the directory. Failed writes remove their
+temporary files. Published files have owner-only read and write permissions.
 
 Find scans all retained rows in batches of 64 and yields between batches. It
 joins soft-wrapped rows and preserves hard line breaks. A bounded unmatched
 suffix carries queries across rows and scan batches, including wide characters.
-Output
-and resize invalidate results for a fresh scan. Navigation sends the viewport to
-an offscreen match. Selection endpoints use Ghostty tracked references and survive
+Output and resize invalidate results for a fresh scan. Navigation sends the
+viewport to an offscreen match. Selection endpoints use Ghostty tracked references and survive
 scrolling and terminal updates. Dragging a selection near or beyond the top or
 bottom edge scrolls history while the pointer stays there. Moving farther outside
 increases the speed. Releasing the button or returning inside stops scrolling.
@@ -150,20 +179,14 @@ During a drag, the frontend draws the range from the current pointer and viewpor
 delayed daemon replies cannot restore an older highlight. Selection commands
 coalesce once per GTK frame. Release sends the final endpoint before subsequent
 input or Copy.
-Ghostty formats copied text across history,
-including wrapped lines. Copy responses travel separately from viewport packets
+Ghostty formats copied text across history, including wrapped lines. Copy
+responses travel separately from viewport packets
 and are limited to 4 MiB.
 
 ## Validation
 
-```sh
-python3 scripts/check.py
-python3 scripts/check.py --native
-python3 scripts/control-smoke-test.py
-GTK_A11Y=none dbus-run-session -- python3 scripts/daemon-smoke-test.py --native
-GTK_A11Y=none dbus-run-session -- python3 scripts/smoke-test.py --native
-GTK_A11Y=none dbus-run-session -- python3 scripts/notifications-smoke-test.py
-```
+Use the [testing guide](testing.md) to run all checks or select the daemon,
+control, recovery, scheduling, and notification tests in the isolated fixture.
 
 The daemon test covers actual PTYs without a display, background output, idle CPU
 usage, one-row packets, hidden-pane output without automatic snapshots,
@@ -180,13 +203,11 @@ acknowledgements, stale acknowledgements racing with new alerts, and the latest
 64 messages from both CLI and OSC producers. It also verifies replies to 48
 concurrent GUI requests when the event source processes 16 requests per turn.
 Unit tests cover coalesced wakes and acknowledgement retries under backpressure.
+They also cover incoming byte limits, concurrent state writers, failed-write
+cleanup, and ordered background saves. The control smoke test blocks state-file
+locks to verify continued terminal I/O and delayed command replies.
 
 The scheduling test checks native tab and split-pane focus before persistence,
 prompt directory messages, zero Git launches while idle, branch updates during
 a stuck lookup, and timeout recovery. Branch checks also cover repository
 discovery through `.git` creation without a polling delay.
-
-The follow-up review also passed the command palette accessibility test, including
-retained search focus, disabled command handling, selection and no-result
-announcements, and the search-to-list relation. Terminal Find, fonts, resizing,
-workspace behavior, and the pane lifecycle audit passed separately.

@@ -13,7 +13,7 @@ mod terminal;
 mod terminal_canvas;
 
 use clap::{Parser, Subcommand};
-use gmux::{ipc, model, theme};
+use gmux::{ipc, model, storage, theme};
 use serde_json::json;
 use std::path::PathBuf;
 

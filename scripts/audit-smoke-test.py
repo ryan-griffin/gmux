@@ -1,215 +1,168 @@
 #!/usr/bin/env python3
-"""Regression checks for tab focus, directory tracking, and app activation.
-
-Run with GTK_A11Y=none dbus-run-session -- python3 scripts/audit-smoke-test.py.
-Uses an isolated configuration and a shell without prompt hooks.
-"""
+"""Check focus, directory, screenshot, activation, and restoration regressions."""
 import json
-from functools import partial
-from test_support import rpc as shared_rpc, wait_for as shared_wait_for
-import os
 from pathlib import Path
-import shlex
 import resource
+import shlex
 import subprocess
-import tempfile
-import time
 
-from daemon_test_support import stop_daemon
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf
+
+from test_support import AppFixture, scenario, wait_for
 
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 
-wait_for = partial(shared_wait_for, timeout=8)
+def tab(fixture, identifier):
+    return next(t for t in fixture.rpc("list")["tabs"] if t["id"] == identifier)
 
 
-with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
-    temp = Path(temp)
-    shell = temp / "shell"
-    rcfile = temp / "bashrc"
-    rcfile.write_text("PS1='GMUX_AUDIT> '\nPROMPT_COMMAND=''\n")
-    shell.write_text(f"#!/bin/sh\nexec /bin/bash --noprofile --rcfile {shlex.quote(str(rcfile))} -i\n")
-    shell.chmod(0o700)
-    env = os.environ.copy()
-    env.update(XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell),
-               GMUX_SOCKET=str(temp / "gmux.sock"), GTK_A11Y="none")
+def run(fixture, pane, command):
+    wait_for(lambda: "GMUX_AUDIT>" in fixture.rpc("read", pane=pane)["text"])
+    fixture.rpc("send", pane=pane, text=command, paste=True, enter=True)
 
-    def rpc(method, **params):
-        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
-    def state():
-        return rpc("list")
+def inactive_pane_focus(fixture, app, log):
+    first = fixture.rpc("list")["tabs"][0]
+    a = first["active_pane"]
+    b = fixture.rpc("split", pane=a)["pane"]
+    c = fixture.rpc("split", pane=b)["pane"]
+    fixture.rpc("focus", pane=c)
+    fixture.rpc("close", pane=b)
+    assert tab(fixture, first["id"])["active_pane"] == c
 
-    def tab(identifier):
-        return next(w for w in state()["tabs"] if w["id"] == identifier)
 
-    def run(pane, command):
-        rpc("send", pane=pane, text=command, paste=True, enter=True)
+def background_tab_focus(fixture, app, log):
+    first = fixture.rpc("list")["tabs"][0]
+    a = first["active_pane"]
+    b = fixture.rpc("split", pane=a)["pane"]
+    selected = fixture.rpc("new", name="Keep selected", directory=str(root))
+    fixture.rpc("close", pane=a)
+    assert fixture.rpc("list")["active_tab"] == selected["tab"]
+    fixture.rpc("close", pane=b)
+    assert fixture.rpc("list")["active_tab"] == selected["tab"]
 
-    failures = []
 
-    def check(name, test):
-        try:
-            test()
-            print(f"PASS: {name}", flush=True)
-        except AssertionError as error:
-            failures.append(name)
-            print(f"FAIL: {name}: {error}", flush=True)
+def stale_directory(fixture, app, log):
+    first = fixture.rpc("list")["tabs"][0]
+    pane = first["active_pane"]
+    changed = fixture.path / "new-directory"
+    changed.mkdir()
+    run(fixture, pane, f"printf '\\033]7;{root.as_uri()}\\007'; cd {shlex.quote(str(changed))}")
+    wait_for(lambda: tab(fixture, first["id"])["panes"][0]["directory"] == str(changed), timeout=4)
+    new = fixture.rpc("split", pane=pane)["pane"]
+    assert next(p for p in tab(fixture, first["id"])["panes"] if p["id"] == new)["directory"] == str(changed)
 
-    with (artifacts / "audit-smoke.log").open("w") as log:
-        app = subprocess.Popen([str(root / "target/debug/gmux"), "--directory", str(root)],
-                               env=env, cwd=root, stdout=log, stderr=log)
-        try:
-            wait_for(lambda: rpc("daemon-info")["attached"])
-            first = wait_for(lambda: state()["tabs"])[0]
-            a = first["active_pane"]
-            b = rpc("split", pane=a)["pane"]
-            c = rpc("split", pane=b)["pane"]
-            rpc("focus", pane=c)
-            rpc("close", pane=b)
 
-            def selected_pane():
-                assert tab(first["id"])["active_pane"] == c, state()
+def fresh_screenshot(fixture, app, log):
+    pane = fixture.rpc("list")["tabs"][0]["active_pane"]
+    before, after = artifacts / "audit-before.png", artifacts / "audit-after.png"
 
-            check("closing an inactive pane preserves the selected pane", selected_pane)
-            rpc("focus", pane=c)
-            second = rpc("new", name="Keep selected", directory=str(root))
-            rpc("close", pane=a)
+    def background_pixels(path):
+        image = GdkPixbuf.Pixbuf.new_from_file(str(path))
+        pixels = image.get_pixels()
+        channels, stride = image.get_n_channels(), image.get_rowstride()
+        color = bytes((52, 86, 120))
+        return sum(pixels[y * stride + x * channels:y * stride + x * channels + 3] == color
+                   for y in range(image.get_height()) for x in range(image.get_width()))
 
-            def selected_tab():
-                assert state()["active_tab"] == second["tab"], state()
+    fixture.rpc("screenshot", path=str(before))
+    assert background_pixels(before) < 100, "The screenshot fixture already contains the target background"
+    run(fixture, pane, "printf '\\033]11;#345678\\007\\033[2J\\033[HCAPTURE_UPDATED\\n'")
+    wait_for(lambda: fixture.rpc("read", pane=pane)["text"].startswith("CAPTURE_UPDATED"))
 
-            check("closing a background pane preserves the selected tab", selected_tab)
-            # Closing the last pane of a background tab has the same rule.
-            third = rpc("new", name="Third", directory=str(root))
-            rpc("close", pane=c)
+    def updated_pixels():
+        fixture.rpc("screenshot", path=str(after))
+        return background_pixels(after) > 10_000
 
-            def last_background_pane():
-                assert state()["active_tab"] == third["tab"], state()
+    wait_for(updated_pixels, message="Screenshot did not render the terminal's new background color")
 
-            check("closing a background tab preserves focus", last_background_pane)
 
-            pane = third["pane"]
-            changed = temp / "new-directory"
-            changed.mkdir()
-            run(pane, f"printf '\\033]7;{root.as_uri()}\\007'; cd {shlex.quote(str(changed))}")
+def activation(fixture, app, log):
+    count = len(fixture.rpc("list")["tabs"])
+    opened = fixture.path / "open-directory"
+    opened.mkdir()
+    result = subprocess.run([str(root / "target/debug/gmux"), "--directory", str(opened)],
+                            env=fixture.env, cwd=root, stdout=log, stderr=log, timeout=10)
+    assert result.returncode == 0
+    wait_for(lambda: len(fixture.rpc("list")["tabs"]) == count + 1, timeout=3)
+    assert fixture.rpc("list")["tabs"][0]["panes"][0]["directory"] == str(opened)
 
-            def directory():
-                wait_for(lambda: tab(third["tab"])["panes"][0]["directory"] == str(changed), timeout=4)
-                new = rpc("split", pane=pane)["pane"]
-                assert next(p for p in tab(third["tab"])["panes"] if p["id"] == new)["directory"] == str(changed)
 
-            check("stale OSC directory does not override the shell's current directory", directory)
+def shell_exit(fixture, app, log):
+    selected = fixture.rpc("list")["active_tab"]
+    workspace = fixture.rpc("workspace-new", name="Keep workspace", directory=str(root))["workspace"]
+    exiting = fixture.rpc("new", name="Exit checks", workspace=workspace)
+    left = exiting["pane"]
+    middle = fixture.rpc("split", pane=left)["pane"]
+    right = fixture.rpc("split", pane=middle, down=True)["pane"]
+    run(fixture, left, "printf '\\nSTILL_HERE\\n'; (exit 7)")
+    wait_for(lambda: "STILL_HERE" in fixture.rpc("read", pane=left)["text"].splitlines())
+    assert len(tab(fixture, exiting["tab"])["panes"]) == 3, "A subshell exit closed its parent pane"
+    run(fixture, left, "exit")
+    wait_for(lambda: len(tab(fixture, exiting["tab"])["panes"]) == 2)
+    assert tab(fixture, exiting["tab"])["active_pane"] == right
+    assert tab(fixture, exiting["tab"])["layout"]["Split"]["first"] == {"Pane": middle}
+    run(fixture, right, "exit 7")
+    wait_for(lambda: tab(fixture, exiting["tab"])["layout"] == {"Pane": middle})
+    assert tab(fixture, exiting["tab"])["active_pane"] == middle
+    fixture.rpc("send", pane=middle, text="\x04")
+    wait_for(lambda: all(t["id"] != exiting["tab"] for t in fixture.rpc("list")["tabs"]))
+    assert fixture.rpc("list")["active_tab"] == selected
+    assert any(w["id"] == workspace for w in fixture.rpc("list")["workspaces"])
 
-            def captures_current_output():
-                before = artifacts / "audit-before.png"
-                after = artifacts / "audit-after.png"
-                rpc("screenshot", path=str(before))
-                run(pane, "printf '\\033]11;#345678\\007\\033[2J\\033[HCAPTURE_UPDATED\\n'")
-                wait_for(lambda: rpc("read", pane=pane)["text"].startswith("CAPTURE_UPDATED"))
-                rpc("screenshot", path=str(after))
-                assert before.read_bytes() != after.read_bytes(), "Screenshot returned a stale frame"
 
-            check("screenshots capture current terminal output", captures_current_output)
-            count = len(state()["tabs"])
-            opened = temp / "open-directory"
-            opened.mkdir()
-            result = subprocess.run([str(root / "target/debug/gmux"), "--directory", str(opened)],
-                                    env=env, cwd=root, stdout=log, stderr=log, timeout=10)
+def invalid_saved_ids(fixture, app, log):
+    workspace = fixture.rpc("workspace-new", name="Saved workspace", directory=str(root))["workspace"]
+    first = fixture.rpc("new", name="Saved split", workspace=workspace)
+    second = fixture.rpc("split", pane=first["pane"])["pane"]
+    fixture.rpc("split", pane=second, down=True)
+    fixture.stop()
+    session_path = fixture.config / "session.json"
+    saved = json.loads(session_path.read_text())
+    valid = saved["tabs"]
+    invalid = dict(id=2**64 - 1, name="Invalid tab", custom_name=True, workspace=None,
+                   layout={"Pane": 42}, directories={"42": str(root)}, active=42)
+    duplicate = dict(valid[0], name="Duplicate tab")
+    duplicate_pane = dict(duplicate, id=10_000, name="Duplicate pane")
+    saved["tabs"] = [invalid, valid[0], duplicate, duplicate_pane] + valid[1:]
+    session_path.write_text(json.dumps(saved))
+    app = fixture.start_app(root / "target/debug/gmux", cwd=root, stdout=log, stderr=log)
+    restored = wait_for(lambda: fixture.rpc("list")["tabs"])
+    for key in ("name", "id", "layout", "workspace"):
+        assert [t[key] for t in restored] == [t.get(key) for t in valid], key
+    for old, current in zip(valid, restored):
+        assert {str(p["id"]): p["directory"] for p in current["panes"]} == old["directories"]
+    for current in restored:
+        for pane in current["panes"]:
+            run(fixture, pane["id"], "exit")
+    wait_for(lambda: fixture.rpc("list")["tabs"] == [])
+    assert fixture.rpc("list")["active_tab"] is None
+    assert app.poll() is None, "Exiting the last pane closed the empty window"
+    assert fixture.rpc("list")["workspaces"], "Exiting shells deleted workspace definitions"
 
-            def activation():
-                assert result.returncode == 0
-                wait_for(lambda: len(state()["tabs"]) == count + 1, timeout=3)
-                assert state()["tabs"][0]["panes"][0]["directory"] == str(opened)
 
-            check("opening a directory in an existing instance creates a tab", activation)
-
-            def shell_exit():
-                selected = state()["active_tab"]
-                workspace = rpc("workspace-new", name="Keep workspace", directory=str(root))["workspace"]
-                exiting = rpc("new", name="Exit checks", workspace=workspace)
-                left = exiting["pane"]
-                middle = rpc("split", pane=left)["pane"]
-                right = rpc("split", pane=middle, down=True)["pane"]
-                run(left, "printf 'STILL_HERE\\n'; (exit 7)")
-                wait_for(lambda: "STILL_HERE" in rpc("read", pane=left)["text"].splitlines())
-                assert len(tab(exiting["tab"])["panes"]) == 3, "A command or subshell exiting must not close its parent shell's pane"
-                run(left, "exit")
-                wait_for(lambda: len(tab(exiting["tab"])["panes"]) == 2)
-                assert tab(exiting["tab"])["active_pane"] == right
-                assert tab(exiting["tab"])["layout"]["Split"]["first"] == {"Pane": middle}
-                run(right, "exit 7")
-                wait_for(lambda: tab(exiting["tab"])["layout"] == {"Pane": middle})
-                assert tab(exiting["tab"])["active_pane"] == middle
-                rpc("send", pane=middle, text="\x04")
-                wait_for(lambda: all(t["id"] != exiting["tab"] for t in state()["tabs"]))
-                assert state()["active_tab"] == selected
-                assert any(w["id"] == workspace for w in state()["workspaces"])
-
-            check("shell exit closes active and inactive splits, Ctrl+D closes the final pane, and workspaces stay saved", shell_exit)
-        finally:
-            app.terminate()
-            app.wait(timeout=10)
-            stop_daemon(env["GMUX_SOCKET"])
-
-        session_path = temp / "config/gmux/session.json"
-        saved = json.loads(session_path.read_text())
-        valid = saved["tabs"]
-        invalid = dict(id=2**64 - 1, name="Invalid tab", custom_name=True, workspace=None, layout={"Pane": 42},
-                       directories={"42": str(root)}, active=42)
-        duplicate = dict(valid[0], name="Duplicate tab")
-        duplicate_pane = dict(duplicate, id=10_000, name="Duplicate pane")
-        saved["tabs"] = [invalid, valid[0], duplicate, duplicate_pane] + valid[1:]
-        session_path.write_text(json.dumps(saved))
-        app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, cwd=root,
-                               stdout=log, stderr=log)
-        try:
-            def restore():
-                wait_for(lambda: rpc("daemon-info")["attached"])
-                def restored():
-                    assert app.poll() is None, "Invalid saved IDs crashed the application"
-                    return state()["tabs"]
-                tabs = wait_for(restored)
-                assert [w["name"] for w in tabs] == [w["name"] for w in valid]
-                assert [w["id"] for w in tabs] == [w["id"] for w in valid]
-                assert [w["layout"] for w in tabs] == [w["layout"] for w in valid]
-                assert [w["workspace"] for w in tabs] == [w.get("workspace") for w in valid]
-                for old, current in zip(valid, tabs):
-                    assert {str(p["id"]): p["directory"] for p in current["panes"]} == old["directories"]
-
-            check("invalid saved IDs are skipped while valid tabs restore", restore)
-
-            def exit_last_tab():
-                for current in state()["tabs"]:
-                    for pane in current["panes"]:
-                        # Bash can flush queued input during startup. A restored
-                        # pane exists before its new shell is ready for commands.
-                        try:
-                            wait_for(lambda: "GMUX_AUDIT>" in rpc("read", pane=pane["id"])["text"])
-                        except AssertionError:
-                            print("Shell not ready:", pane, rpc("read", pane=pane["id"]), flush=True)
-                            raise
-                        run(pane["id"], "exit")
-                try:
-                    wait_for(lambda: state()["tabs"] == [])
-                except AssertionError:
-                    print("Panes remaining after exit:", state(), flush=True)
-                    for current in state()["tabs"]:
-                        for pane in current["panes"]:
-                            print("Remaining pane output:", pane["id"], rpc("read", pane=pane["id"]), flush=True)
-                    raise
-                assert state()["active_tab"] is None
-                assert app.poll() is None, "Exiting the last pane should leave the app's empty state open"
-                assert state()["workspaces"], "Exiting shells must not delete workspace definitions"
-
-            check("exiting every shell leaves the empty state open with saved workspaces", exit_last_tab)
-        finally:
-            if app.poll() is None:
-                app.terminate()
-                app.wait(timeout=10)
-                stop_daemon(env["GMUX_SOCKET"])
-    assert not failures, failures
+cases = [
+    ("closing an inactive pane preserves focus", inactive_pane_focus),
+    ("closing background panes and the last background pane preserves focus", background_tab_focus),
+    ("stale OSC directories do not override the shell's directory", stale_directory),
+    ("screenshots render the current terminal background", fresh_screenshot),
+    ("opening a directory activates the existing application", activation),
+    ("shell exit preserves remaining splits, focus, and workspaces", shell_exit),
+    ("invalid saved IDs are skipped and valid tabs restore", invalid_saved_ids),
+]
+with (artifacts / "audit-smoke.log").open("w") as log:
+    for name, test in cases:
+        with scenario(name), AppFixture(
+            dict(appearance="dark", desktop_notifications=False), prefix="gmux-audit-",
+            env={"GTK_A11Y": "none"},
+            shell_script="#!/bin/sh\nexport PS1='GMUX_AUDIT> '\nexport PROMPT_COMMAND=''\nexec /bin/bash --noprofile --norc -i\n",
+        ) as fixture:
+            app = fixture.start_app(root / "target/debug/gmux", "--directory", root,
+                                    cwd=root, stdout=log, stderr=log)
+            test(fixture, app, log)

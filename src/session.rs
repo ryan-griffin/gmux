@@ -203,7 +203,7 @@ impl TerminalSession {
             let mut pending = pty.pending.borrow_mut();
             let mut budget = 512 * 1024;
             while !pending.is_empty() && budget > 0 {
-                let bytes = pending.make_contiguous();
+                let (bytes, _) = pending.as_slices();
                 let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len().min(budget)) };
                 if n > 0 {
                     pending.drain(..n as usize);
@@ -336,7 +336,10 @@ impl TerminalSession {
         width: u16,
         height: u16,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(cols > 0 && rows > 0, "Terminal dimensions must be positive");
+        anyhow::ensure!(
+            crate::viewport::valid(cols as u64, rows as u64),
+            "Invalid terminal size"
+        );
         self.engine.resize(cols, rows, cw, ch)?;
         self.size = (cols, rows);
         if let Some(pty) = &self.pty {
@@ -602,6 +605,39 @@ mod tests {
             std::fs::read(directory.0.join("reply")).unwrap(),
             b"\x1b[1;1R"
         );
+    }
+
+    #[test]
+    fn wrapped_input_queues_preserve_bytes_through_partial_pty_writes() {
+        let directory = TestDirectory::new();
+        let mut session = start(
+            1,
+            &directory.0,
+            r"
+            stty raw -echo
+            printf '\033]9;ready\007'
+            dd bs=65536 count=1 iflag=fullblock status=none > input
+            printf '\033]9;input-received\007'
+            dd bs=1 count=1 status=none > /dev/null
+        ",
+        );
+        wait_for(|| notification(&mut session, "ready"));
+        let bytes: Vec<_> = (0..65536).map(|i| (i % 251) as u8).collect();
+        {
+            let mut pending = session.pty.as_ref().unwrap().pending.borrow_mut();
+            *pending = VecDeque::with_capacity(bytes.len());
+            pending.extend(std::iter::repeat_n(0, 32768));
+            pending.extend(&bytes[..16384]);
+            pending.drain(..32768);
+        }
+        session.send(&bytes[16384..]).unwrap();
+        {
+            let pending = session.pty.as_ref().unwrap().pending.borrow();
+            let (first, second) = pending.as_slices();
+            assert!(!first.is_empty() && !second.is_empty());
+        }
+        wait_for(|| notification(&mut session, "input-received"));
+        assert_eq!(std::fs::read(directory.0.join("input")).unwrap(), bytes);
     }
 
     #[test]

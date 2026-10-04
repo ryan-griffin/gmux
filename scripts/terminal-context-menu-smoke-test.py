@@ -105,6 +105,10 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
 
     with (artifacts / f"terminal-context-menu-{variant}.log").open("w") as log, WaylandInput() as native:
         try:
+            # The check runner shares a compositor across suites. Replace any
+            # earlier clipboard offer with a non-text format before checking Paste.
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "SetSelection",
+                        "(a{sv})", ({"mime-types": GLib.Variant("as", ["application/octet-stream"])},))
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             address = bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
                 "GetAddress", None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE,
