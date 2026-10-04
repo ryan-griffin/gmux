@@ -35,7 +35,7 @@ Ghostty's render-hold callback now handles synchronized output. The renderer cap
 
 Paste encoding now goes through Ghostty's paste API, which handles terminal modes, newline encoding, and control-byte filtering. Paste bytes remain separate from already queued device replies. Middle-click reads the desktop's primary selection.
 
-Git branch refreshes use one persistent worker with at most one batch in flight. Tabs in the same directory share a lookup within each batch. Slow Git commands therefore cannot create overlapping batches or block GTK.
+Git branch refreshes use one persistent worker with at most one batch in flight. Tabs in the same directory share a lookup within each batch. Requests during a lookup coalesce into one follow-up batch, and completed lookups wake the frontend immediately. A single Git command resolves both the branch and its HEAD path for existing commits; unborn branches use a second query. GIO directory monitors detect changes to each repository's HEAD, including Git's atomic file replacements and linked worktrees, and refresh only tabs using that HEAD. Unchanged branch results skip sidebar filtering. Slow Git commands cannot create overlapping batches or block GTK.
 
 Terminal keyboard handlers now match the application's registered accelerators with `GdkKeyEvent.matches` for both presses and releases. The previous hardcoded checks swallowed unbound Ctrl+Shift key presses and leaked some shortcut releases into programs using extended keyboard reporting. Local scrollback shortcuts also reserve their releases. GDK handles keyboard groups and consumed modifiers when matching shortcuts.
 
@@ -51,7 +51,7 @@ The screenshot diagnostic still uses deprecated GTK calls for the window's CSS b
 
 Terminal rendering now uses [GSK nodes with Pango shaping](renderer.md). Terminal image protocols remain outside the current implementation. Find now searches retained history, selection spans scrollback, and the canvas exposes read-only GTK accessible text, caret, and selection.
 
-The [headless daemon](terminal-sessions.md) owns event-driven PTY I/O and process state. Stream packets and GUI requests now wake a GLib file-descriptor source; the frontend has no periodic update poll. A two-second settings and Git refresh remains.
+The [headless daemon](terminal-sessions.md) owns event-driven PTY I/O and process state. Stream packets, GUI requests, and completed Git lookups wake a GLib file-descriptor source; the frontend has no periodic update poll. A two-second settings and repository discovery fallback remains.
 
 ## Validation
 

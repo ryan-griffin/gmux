@@ -18,7 +18,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     os::fd::AsRawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
 };
@@ -46,6 +46,7 @@ struct Tab {
     unread_indicator: gtk::Box,
     menu: gtk::PopoverMenu,
     branch_directory: PathBuf,
+    branch_head: Option<PathBuf>,
 }
 impl Drop for Tab {
     fn drop(&mut self) {
@@ -88,6 +89,7 @@ pub struct Ui {
     pending: RefCell<HashMap<u64, BackendCallback>>,
     update_source: RefCell<Option<glib::SourceId>>,
     branches: BranchWorker,
+    branch_monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
 }
 type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<Value>)>;
 
@@ -95,6 +97,9 @@ impl Drop for Ui {
     fn drop(&mut self) {
         if let Some(source) = self.update_source.get_mut().take() {
             source.remove();
+        }
+        for monitor in self.branch_monitors.get_mut().values() {
+            monitor.cancel();
         }
     }
 }
@@ -444,7 +449,8 @@ impl Ui {
             pending: RefCell::new(HashMap::new()),
             wake: wake.clone(),
             update_source: RefCell::new(None),
-            branches: BranchWorker::new(),
+            branches: BranchWorker::new(wake.clone()),
+            branch_monitors: RefCell::new(HashMap::new()),
         });
         ui.install_actions();
         ui.refresh_workspace_ui();
@@ -656,6 +662,7 @@ impl Ui {
                     }
                 }
                 let updates = ui.sessions.borrow_mut().poll();
+                let directory_changed = updates.values().any(|update| update.directory_changed);
                 if ui.sessions.borrow().disconnected() {
                     ui.app.quit();
                     return glib::ControlFlow::Continue;
@@ -673,6 +680,7 @@ impl Ui {
                         ui.dirty.set(true);
                     }
                     pane.tick(&update);
+                    ui.refresh_tab_title(tab);
                     if let Some(unread) = update.unread {
                         ui.set_unread(pane.id, unread);
                     }
@@ -685,6 +693,10 @@ impl Ui {
                         ui.message(&error.to_string());
                     }
                 }
+                if directory_changed {
+                    ui.refresh_metadata();
+                }
+                ui.update_branches();
                 for _ in 0..16 {
                     let Ok(request) = ui.server.receiver.try_recv() else {
                         if ui.search.is_search_mode() {
@@ -1138,11 +1150,13 @@ impl Ui {
                 unread_indicator,
                 menu,
                 branch_directory: PathBuf::new(),
+                branch_head: None,
             },
         );
         self.changing.set(false);
         self.rebuild(saved.id);
         self.refresh_workspace_ui();
+        self.refresh_tab_title(saved.id);
         self.refresh_metadata();
         self.dirty.set(true);
         Ok(())
@@ -1172,6 +1186,7 @@ impl Ui {
         }
     }
     fn switch(self: &Rc<Self>, id: u64) {
+        self.refresh_tab_title(id);
         let workspace = self
             .tabs
             .borrow()
@@ -1287,6 +1302,8 @@ impl Ui {
             }
             w.id
         };
+        self.refresh_tab_title(tab);
+        self.refresh_branches();
         if self.active.get() != tab {
             self.switch(tab);
         }
@@ -1443,6 +1460,7 @@ impl Ui {
                 }
             }
         }
+        self.refresh_branches();
         self.refresh_sidebar();
         self.dirty.set(true);
         Ok(())
@@ -1601,18 +1619,152 @@ impl Ui {
             p.area.grab_focus();
         }
     }
-    fn refresh_metadata(self: &Rc<Self>) {
-        for (id, directory, branch) in self.branches.results() {
+    fn refresh_tab_title(&self, id: u64) {
+        let mut tabs = self.tabs.borrow_mut();
+        let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        if tab.custom_name {
+            return;
+        }
+        let Some(pane) = tab.panes.get(&tab.active) else {
+            return;
+        };
+        let title = pane.title.text();
+        if title.is_empty() || tab.name == title.as_str() {
+            return;
+        }
+        tab.name = title.to_string();
+        tab.name_label.set_text(&tab.name);
+        if tab.id == self.active.get() {
+            self.heading.set_title(&tab.name);
+            self.window.set_title(Some(&format!("{} — Gmux", tab.name)));
+        }
+        self.dirty.set(true);
+        drop(tabs);
+        self.refresh_sidebar();
+    }
+    fn update_branches(self: &Rc<Self>) {
+        let results = self.branches.results();
+        if results.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (id, directory, branch) in results {
             let mut tabs = self.tabs.borrow_mut();
             if let Some(w) = tabs.iter_mut().find(|w| w.id == id)
                 && w.branch_directory == directory
+                && w.panes
+                    .get(&w.active)
+                    .is_some_and(|pane| pane.directory() == directory)
             {
-                w.branch_label.set_label(&branch);
-                w.branch_box.set_tooltip_text(Some(&branch));
-                w.branch_box.set_visible(!branch.is_empty());
+                if w.branch_label.text() != branch.name {
+                    w.branch_label.set_label(&branch.name);
+                    w.branch_box.set_tooltip_text(Some(&branch.name));
+                    changed = true;
+                }
+                let visible = !branch.name.is_empty();
+                if w.branch_box.get_visible() != visible {
+                    w.branch_box.set_visible(visible);
+                    changed = true;
+                }
+                w.branch_head = branch.head;
             }
         }
+        if changed {
+            self.refresh_sidebar();
+        }
+        let heads = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|tab| tab.branch_head.clone())
+            .collect::<HashSet<_>>();
+        let mut monitors = self.branch_monitors.borrow_mut();
+        monitors.retain(|head, monitor| {
+            if heads.contains(head) {
+                true
+            } else {
+                monitor.cancel();
+                false
+            }
+        });
+        let mut installed = HashSet::new();
+        for head in heads {
+            if monitors.contains_key(&head) {
+                continue;
+            }
+            // Watch the parent so Git's atomic HEAD.lock -> HEAD rename is reported.
+            let Some(parent) = head.parent() else {
+                continue;
+            };
+            let Ok(monitor) = gio::File::for_path(parent)
+                .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+            monitor.set_rate_limit(50);
+            let weak = Rc::downgrade(self);
+            let watched = head.clone();
+            monitor.connect_changed(move |_, file, other, _| {
+                if (file.path().as_ref() == Some(&watched)
+                    || other.and_then(gio::File::path).as_ref() == Some(&watched))
+                    && let Some(ui) = weak.upgrade()
+                {
+                    ui.refresh_branch_head(&watched);
+                }
+            });
+            installed.insert(head.clone());
+            monitors.insert(head, monitor);
+        }
+        drop(monitors);
+        // Close the gap between the first lookup and installing its monitor.
+        if !installed.is_empty() {
+            let jobs = self
+                .tabs
+                .borrow()
+                .iter()
+                .filter(|tab| {
+                    tab.branch_head
+                        .as_ref()
+                        .is_some_and(|head| installed.contains(head))
+                })
+                .map(|tab| (tab.id, tab.branch_directory.clone()))
+                .collect();
+            self.branches.refresh_subset(jobs);
+        }
+    }
+    fn refresh_branch_head(&self, head: &Path) {
+        let jobs = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| tab.branch_head.as_deref() == Some(head))
+            .map(|tab| (tab.id, tab.branch_directory.clone()))
+            .collect();
+        self.branches.refresh_subset(jobs);
+    }
+    fn refresh_branches(&self) {
         let mut jobs = Vec::new();
+        for tab in self.tabs.borrow_mut().iter_mut() {
+            if let Some(pane) = tab.panes.get(&tab.active) {
+                let directory = pane.directory();
+                if tab.branch_directory != directory {
+                    tab.branch_box.set_visible(false);
+                    tab.branch_head = None;
+                }
+                tab.branch_directory = directory.clone();
+                jobs.push((tab.id, directory));
+            }
+        }
+        if jobs.is_empty() {
+            for monitor in self.branch_monitors.borrow_mut().drain().map(|(_, m)| m) {
+                monitor.cancel();
+            }
+        }
+        self.branches.refresh(jobs);
+    }
+    fn refresh_metadata(self: &Rc<Self>) {
         let catalog = self.catalog.borrow();
         for w in self.tabs.borrow_mut().iter_mut() {
             if let Some(p) = w.panes.get(&w.active) {
@@ -1625,14 +1777,6 @@ impl Ui {
                         .find(|workspace| workspace.id == id)
                 });
                 w.path_label.set_text(&display);
-                if !w.custom_name {
-                    let title = p.title.text().to_string();
-                    if !title.is_empty() && w.name != title {
-                        w.name = title;
-                        w.name_label.set_text(&w.name);
-                        self.dirty.set(true);
-                    }
-                }
                 w.path_label
                     .set_tooltip_text(Some(&path.display().to_string()));
                 let tooltip = workspace
@@ -1644,15 +1788,10 @@ impl Ui {
                     self.window.set_title(Some(&format!("{} — Gmux", w.name)));
                     self.heading.set_subtitle(&display);
                 }
-                if w.branch_directory != path {
-                    w.branch_box.set_visible(false);
-                }
-                w.branch_directory = path.clone();
-                jobs.push((w.id, path));
             }
         }
         self.refresh_sidebar();
-        self.branches.refresh(jobs);
+        self.refresh_branches();
     }
     fn save_session(&self) {
         let session = Session {

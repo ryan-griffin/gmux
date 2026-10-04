@@ -51,15 +51,23 @@ time.sleep(30)
         return next(p for w in rpc("list")["tabs"] for p in w["panes"]
                     if p["id"] == pane)["title"]
 
-    def expect(pane, expected):
-        wait_for(lambda: title(pane) == expected)
+    def expect(pane, expected, tab_name=None):
+        def updated():
+            for tab in rpc("list")["tabs"]:
+                for terminal in tab["panes"]:
+                    if terminal["id"] == pane and terminal["title"] == expected:
+                        return tab
+        tab = wait_for(updated)
+        if tab["active_pane"] == pane:
+            assert tab["name"] == (tab_name or expected), (
+                "The tab title must update in the same event as its selected pane", tab)
 
     def run(pane, command):
         rpc("send", pane=pane, text=command, paste=True, enter=True)
 
-    def interrupt(pane):
+    def interrupt(pane, tab_name=None):
         rpc("send", pane=pane, text="\x03")
-        expect(pane, "gmux")
+        expect(pane, "gmux", tab_name)
 
     def ready(pane):
         run(pane, "printf 'GMUX_READY\\n'")
@@ -96,9 +104,9 @@ time.sleep(30)
             run(second, "sleep 30")
             expect(second, "sleep")
             assert title(pane) == "OpenCode", "Other panes must keep their own title"
-            wait_for(lambda: rpc("list")["tabs"][0]["name"] == "sleep")
+            assert rpc("list")["tabs"][0]["name"] == "sleep"
             rpc("focus", pane=pane)
-            wait_for(lambda: rpc("list")["tabs"][0]["name"] == "OpenCode")
+            assert rpc("list")["tabs"][0]["name"] == "OpenCode"
             rpc("focus", pane=second)
             interrupt(pane)
             interrupt(second)
@@ -106,16 +114,16 @@ time.sleep(30)
             subdir.mkdir()
             run(second, f"cd {shlex.quote(str(subdir))}")
             expect(second, "changed-directory")
-            wait_for(lambda: rpc("list")["tabs"][0]["name"] == "changed-directory")
+            assert rpc("list")["tabs"][0]["name"] == "changed-directory"
             named = rpc("new", name="Pinned title", directory=str(root))
             ready(named["pane"])
             run(named["pane"], f"python3 {shlex.quote(str(job))} title")
-            expect(named["pane"], "OpenCode")
+            expect(named["pane"], "OpenCode", "Pinned title")
             assert next(t for t in rpc("list")["tabs"] if t["id"] == named["tab"])["name"] == "Pinned title"
-            interrupt(named["pane"])
+            interrupt(named["pane"], "Pinned title")
             print("PASS: foreground titles, repeated OSC titles, empty title reset, exec, "
                   "silent commands, shell directory fallback, independent split titles, "
-                  "tab titles following the selected pane, and explicit tab names")
+                  "tab titles immediately following the selected pane, and explicit tab names")
         finally:
             app.terminate()
             app.wait(timeout=10)

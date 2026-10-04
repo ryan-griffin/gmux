@@ -28,7 +28,7 @@ if not args.skip_build:
     run(["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"])
     run(["cargo", "build", "--locked", "--bins", "--examples"])
 if args.native:
-    names = ["daemon", "control", "icon", "state-recovery", "smoke", "audit", "workspace", "sidebar-search", "title", "resize", "font",
+    names = ["daemon", "control", "icon", "state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch", "title", "resize", "font",
              "find", "commands", "main-menu", "terminal-context-menu", "terminal-scrollbar",
              "terminal-renderer", "terminal-input", "notifications", "notification-focus", "renderer"]
 else:
