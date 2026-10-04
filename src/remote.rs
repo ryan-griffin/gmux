@@ -46,7 +46,7 @@ impl Connection {
             "Paste is too large. The limit is 4 MiB."
         );
         self.pending_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                 (pending + bytes <= 2 * transport::MAX_PASTE).then_some(pending + bytes)
             })
             .map_err(|_| anyhow::anyhow!("Terminal input queue is full"))?;
