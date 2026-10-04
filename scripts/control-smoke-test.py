@@ -70,7 +70,7 @@ with AppFixture() as fixture:
             data = exact(size)
             header_size, = struct.unpack("<I", data[:4])
             return json.loads(data[4:4+header_size])
-        send("attach", version=5)
+        send("attach", version=6)
         send("subscribe", panes=[pane])
         wait_for(lambda: packet()["frame"])
         time.sleep(.1)

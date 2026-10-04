@@ -90,6 +90,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
             database = rpc("new", name="Database", workspace=b)
             scratch = rpc("new", name="Scratch", workspace=None)
             rpc("notify", pane=sibling, message="Keep unread while searching")
+            wait_for(lambda: tab(server["tab"])["unread"], timeout=0.75)
             search("sErVeR", [server["tab"]])
             assert state()["active_tab"] == scratch["tab"], "Typing must not replace the active terminal"
             assert tab(server["tab"])["unread"], "Filtering must not mark hidden alerts as read"
@@ -117,6 +118,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
             assert state()["active_tab"] == client["tab"], "No matches must not make tab navigation crash"
             capture("sidebar-search-no-matches")
             rpc("notify", pane=sibling, message="Keep sibling unread after revealing a hidden pane")
+            wait_for(lambda: tab(server["tab"])["unread"], timeout=0.75)
             rpc("focus", pane=server["pane"])
             assert state()["tab_search"] == ""
             assert state()["filter"] == {"workspace": a}

@@ -78,7 +78,7 @@ impl Ui {
             })
             .unwrap_or_else(model::home)
     }
-    pub(super) fn apply_filter(&self, filter: TabFilter) {
+    pub(super) fn apply_filter(self: &Rc<Self>, filter: TabFilter) {
         let filter = match filter {
             TabFilter::Workspace(id)
                 if !self.catalog.borrow().workspaces.iter().any(|w| w.id == id) =>
@@ -123,7 +123,7 @@ impl Ui {
             _ => "Open a tab to start a terminal.".into(),
         }));
         self.refresh_sidebar();
-        self.dirty.set(true);
+        self.mark_dirty();
     }
     pub(super) fn set_filter(self: &Rc<Self>, filter: TabFilter) {
         self.apply_filter(filter);
@@ -142,7 +142,7 @@ impl Ui {
         }
         self.refresh_metadata();
     }
-    pub(super) fn refresh_workspace_ui(&self) {
+    pub(super) fn refresh_workspace_ui(self: &Rc<Self>) {
         let catalog = self.catalog.borrow();
         let menu = gio::Menu::new();
         let filters = gio::Menu::new();

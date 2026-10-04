@@ -42,20 +42,32 @@ bounds each pane's pending input to 8 MiB. SIGCHLD wakes it through `signalfd` t
 reap exited shells. An idle detached daemon blocks in `poll`; it has no periodic
 16 ms wakeup and no reader or writer thread per pane. A render hold schedules
 expiry checks until synchronized output completes. Attached frontends receive
-process metadata once a second and viewport batches at most once every 16 ms.
+fallback process metadata once a second and viewport batches at most once every
+16 ms. Shell directory messages refresh the live process directory during the
+same PTY update. Positive poll waits round up to avoid spinning before deadlines.
 An `eventfd` wakes a GLib file-descriptor source when stream packets or GUI socket
 requests arrive. There is no periodic frontend update poll. The source drains
 bounded batches and rearms itself if work remains, visiting only panes with
 received updates. Writer progress also wakes it to retry commands held by queue
-backpressure. Idle frontends still have a two-second settings and Git refresh.
-Tab switches and layout changes update viewport subscriptions. Resize indicators
-use their own dismissal timers. Directory metadata arrives through the stream;
+backpressure. Focus changes update the daemon immediately; presentation saves
+coalesce behind a two-second timer scheduled only after a change. Tab switches and
+layout changes update viewport subscriptions. Resize indicators use their own
+dismissal timers. Directory metadata arrives through the stream;
 splitting a pane and checking for busy jobs still request fresh process state.
 Activity in one pane does not rebuild idle panes' process metadata between the
 once-a-second refreshes. Runtime control requests and settings writes use one
 worker outside GTK's main thread. Adjacent presentation saves coalesce; commands
 preserve queue order. Close and Quit check all affected panes in one asynchronous
 busy-process request. Startup connects before presenting the window.
+
+Git HEAD watches supply branch updates, and ancestor directory watches discover
+repository creation, removal, and nested repositories. Two workers publish each
+directory's result independently, share lookups between tabs, and coalesce queued
+refreshes. A HEAD event needs one lookup for all tabs using that HEAD. Older
+completions cannot replace a newer result for the same HEAD. Git commands have a
+two-second timeout and bounded output; timed-out process groups are killed
+and reaped. Working watches cause no idle Git launches. A 30-second fallback
+retries failed watches and lookups.
 
 Sessions use this same nonblocking I/O path in production and headless unit
 tests. Explicitly closing a session or dropping its owner terminates the process.
@@ -69,8 +81,8 @@ startup, and sockets have owner-only permissions. The frontend and daemon use
 one protocol version and reject mismatched binaries. Build and install both
 binaries from the same revision. Gmux does not maintain older protocol versions
 or migrate older saved formats during pre-release development.
-These changes use protocol version 5. Restart an existing daemon before using
-the rebuilt binaries.
+These changes use protocol version 6, which includes immediate focus updates.
+Restart an existing daemon before using the rebuilt binaries.
 
 Clipboard and text pastes use messages of at most 16 KiB of UTF-8 text. The
 daemon assembles a complete paste of up to 4 MiB before asking Ghostty to encode
@@ -168,6 +180,11 @@ acknowledgements, stale acknowledgements racing with new alerts, and the latest
 64 messages from both CLI and OSC producers. It also verifies replies to 48
 concurrent GUI requests when the event source processes 16 requests per turn.
 Unit tests cover coalesced wakes and acknowledgement retries under backpressure.
+
+The scheduling test checks native tab and split-pane focus before persistence,
+prompt directory messages, zero Git launches while idle, branch updates during
+a stuck lookup, and timeout recovery. Branch checks also cover repository
+discovery through `.git` creation without a polling delay.
 
 The follow-up review also passed the command palette accessibility test, including
 retained search focus, disabled command handling, selection and no-result

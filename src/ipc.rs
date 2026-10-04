@@ -178,6 +178,7 @@ pub fn call_at(path: &Path, request: Value) -> anyhow::Result<Value> {
 
 enum Job {
     Request(u64, Value),
+    Focus(u64, Option<u64>),
     Save(Value),
     Persist(crate::model::Settings),
 }
@@ -214,6 +215,13 @@ impl Client {
                 };
                 let (id, result) = match job {
                     Job::Request(id, request) => (id, call_at(&path, request)),
+                    Job::Focus(tab, pane) => (
+                        0,
+                        call_at(
+                            &path,
+                            serde_json::json!({"method":"_focus","tab":tab,"pane":pane}),
+                        ),
+                    ),
                     Job::Save(session) => (
                         0,
                         call_at(
@@ -250,6 +258,9 @@ impl Client {
     pub fn save(&self, session: Value) -> anyhow::Result<()> {
         self.enqueue(Job::Save(session))
     }
+    pub fn focus(&self, tab: u64, pane: Option<u64>) -> anyhow::Result<()> {
+        self.enqueue(Job::Focus(tab, pane))
+    }
     pub fn persist(&self, settings: crate::model::Settings) -> anyhow::Result<()> {
         self.enqueue(Job::Persist(settings))
     }
@@ -258,6 +269,10 @@ impl Client {
         let mut jobs = lock.lock().unwrap();
         // Only adjacent saves coalesce. A layout command is an ordering barrier.
         match (job, jobs.queue.back_mut()) {
+            (Job::Focus(tab, pane), Some(Job::Focus(last_tab, last_pane))) => {
+                *last_tab = tab;
+                *last_pane = pane;
+            }
             (Job::Save(value), Some(Job::Save(last))) => *last = value,
             (Job::Persist(settings), Some(Job::Persist(last))) => *last = settings,
             (job, _) => {
@@ -292,7 +307,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slow_requests_leave_the_caller_free_and_saves_coalesce_without_crossing_commands() {
+    fn slow_requests_leave_the_caller_free_and_focus_and_saves_preserve_command_order() {
         let path =
             std::env::temp_dir().join(format!("gmux-worker-test-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&path).unwrap();
@@ -300,7 +315,7 @@ mod tests {
         let (release, gate) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for i in 0..4 {
+            for i in 0..6 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(&socket).read_line(&mut line).unwrap();
@@ -319,18 +334,25 @@ mod tests {
             .request(serde_json::json!({"method":"slow"}))
             .unwrap();
         ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        client.focus(1, Some(10)).unwrap();
+        client.focus(2, Some(20)).unwrap();
         client.save(serde_json::json!({"revision":1})).unwrap();
         client.save(serde_json::json!({"revision":2})).unwrap();
         client
             .request(serde_json::json!({"method":"command"}))
             .unwrap();
+        client.focus(3, Some(30)).unwrap();
         client.save(serde_json::json!({"revision":3})).unwrap();
         release.send(()).unwrap();
         let seen = worker.join().unwrap();
-        assert_eq!(seen.len(), 4);
-        assert_eq!(seen[1]["session"]["revision"], 2);
-        assert_eq!(seen[2]["method"], "command");
-        assert_eq!(seen[3]["session"]["revision"], 3);
+        assert_eq!(seen.len(), 6);
+        assert_eq!(seen[1]["method"], "_focus");
+        assert_eq!(seen[1]["tab"], 2);
+        assert_eq!(seen[1]["pane"], 20);
+        assert_eq!(seen[2]["session"]["revision"], 2);
+        assert_eq!(seen[3]["method"], "command");
+        assert_eq!(seen[4]["tab"], 3);
+        assert_eq!(seen[5]["session"]["revision"], 3);
         std::fs::remove_file(path).unwrap();
     }
     #[test]

@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) const VERSION: u32 = 5;
+pub(crate) const VERSION: u32 = 6;
 pub(crate) const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub(crate) const PASTE_CHUNK: usize = 16 * 1024;
 pub(crate) const MAX_PACKET: usize = 16 * 1024 * 1024;

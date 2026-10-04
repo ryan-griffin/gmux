@@ -80,6 +80,11 @@ static void title_changed(GhosttyTerminal t, void *ud) {
     // The new title is available after this callback returns.
     e->callback(e->userdata, 2, NULL, 0);
 }
+static void pwd_changed(GhosttyTerminal t, void *ud) {
+    (void)t;
+    GmuxEngine *e = ud;
+    e->callback(e->userdata, 3, NULL, 0);
+}
 static void notify(GhosttyTerminal t, void *ud, const GhosttyTerminalDesktopNotification *n) {
     (void)t;
     GmuxEngine *e = ud;
@@ -125,6 +130,7 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY, write_pty);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_BELL, bell);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, title_changed);
+    ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PWD_CHANGED, pwd_changed);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, notify);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);

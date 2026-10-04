@@ -26,6 +26,17 @@ use std::{
 
 const MAX_PENDING: usize = 32 * 1024 * 1024;
 const MAX_NOTIFICATIONS: usize = 64;
+
+fn poll_timeout(deadline: Option<Instant>, now: Instant) -> i32 {
+    deadline.map_or(-1, |deadline| {
+        // A positive fraction of a millisecond must still sleep, not spin.
+        deadline
+            .saturating_duration_since(now)
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32
+    })
+}
 #[derive(Default)]
 struct SentScreen {
     frame: Frame,
@@ -654,6 +665,31 @@ impl Daemon {
                     metadata,
                 })?)
             }
+            "_focus" => {
+                let tab_id = request["tab"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("focus requires a tab"))?;
+                if tab_id == 0 {
+                    self.state.active = 0;
+                } else {
+                    let pane = request["pane"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("focus requires a pane"))?;
+                    let tab = self
+                        .state
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == tab_id)
+                        .ok_or_else(|| anyhow::anyhow!("Tab {tab_id} does not exist"))?;
+                    anyhow::ensure!(
+                        tab.layout.ids().contains(&pane),
+                        "Pane {pane} does not belong to tab {tab_id}"
+                    );
+                    tab.active = pane;
+                    self.state.active = tab_id;
+                }
+                Ok(json!({"ok":true}))
+            }
             "_presentation" => {
                 let state: Session = serde_json::from_value(request["session"].take())?;
                 self.state.width = state.width;
@@ -1250,14 +1286,7 @@ pub fn run() -> anyhow::Result<()> {
         {
             deadline = Some(deadline.map_or(next, |current| current.min(next)));
         }
-        let timeout = deadline
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(now)
-                    .as_millis()
-                    .min(i32::MAX as u128) as i32
-            })
-            .unwrap_or(-1);
+        let timeout = poll_timeout(deadline, now);
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if result < 0 {
             let error = std::io::Error::last_os_error();
@@ -1456,6 +1485,22 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_deadlines_round_up_positive_waits_and_bound_long_waits() {
+        let now = Instant::now();
+        assert_eq!(poll_timeout(None, now), -1);
+        assert_eq!(poll_timeout(Some(now), now), 0);
+        assert_eq!(poll_timeout(Some(now - Duration::from_millis(1)), now), 0);
+        for (duration, expected) in [
+            (Duration::from_nanos(1), 1),
+            (Duration::from_millis(1), 1),
+            (Duration::from_micros(1001), 2),
+            (Duration::from_millis(i32::MAX as u64 + 1), i32::MAX),
+        ] {
+            assert_eq!(poll_timeout(Some(now + duration), now), expected);
+        }
+    }
 
     #[test]
     fn queued_packets_survive_partial_writes_and_buffer_compaction() {

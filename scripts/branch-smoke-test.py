@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -85,10 +86,10 @@ with tempfile.TemporaryDirectory(prefix="gmux-branch-") as directory:
             git(worktree, "switch", "--quiet", "--create", "worktree-two")
             expect_branch("worktree-two", {linked["tab"]})
 
-            # Repository discovery still has a periodic fallback. Once found,
-            # even a repository with no commits must react promptly to HEAD.
+            # A .git creation must trigger repository discovery immediately.
+            # Even a repository with no commits must react promptly to HEAD.
             git(outside, "init", "--quiet", "--initial-branch=unborn-one")
-            expect_branch("unborn-one", {untracked["tab"]}, timeout=8)
+            expect_branch("unborn-one", {untracked["tab"]})
             git(outside, "symbolic-ref", "HEAD", "refs/heads/unborn-two")
             expect_branch("unborn-two", {untracked["tab"]})
 
@@ -107,9 +108,27 @@ with tempfile.TemporaryDirectory(prefix="gmux-branch-") as directory:
                                   if tab["id"] == first["tab"])["active_pane"] == first["pane"])
             expect_branch("main-branch", shared)
 
+            # Discover a nested repository even though the pane cwd is unchanged,
+            # then return to the parent repository when the nested .git is removed.
+            git(subdir, "init", "--quiet", "--initial-branch=nested-one")
+            expect_branch("nested-one", shared)
+            git(subdir, "symbolic-ref", "HEAD", "refs/heads/nested-two")
+            expect_branch("nested-two", shared)
+            shutil.rmtree(subdir / ".git")
+            expect_branch("main-branch", shared)
+
+            # A temporarily missing HEAD must preserve its parent-directory watch.
+            head = project / ".git/HEAD"
+            backup = project / ".git/HEAD.backup"
+            head.rename(backup)
+            expect_branch("main-branch", set())
+            backup.rename(head)
+            expect_branch("main-branch", shared)
+
             print(f"PASS: external branch switches update in at most {max(latencies)*1000:.0f}ms; "
                   "shared tabs, worktree HEADs, branch rename, detached HEAD, unborn branches, "
-                  "directory changes, selected split panes, and shell exit")
+                  "directory changes, selected split panes, shell exit, nested repository discovery/removal, "
+                  "and temporarily missing HEAD recovery")
         finally:
             app.terminate()
             app.wait(timeout=10)

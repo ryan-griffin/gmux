@@ -54,6 +54,7 @@ struct Events {
     replies: Vec<u8>,
     notifications: Vec<String>,
     title_changed: bool,
+    directory_changed: bool,
 }
 unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usize) {
     // The C engine calls synchronously on the thread owning the session.
@@ -70,6 +71,7 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
             .notifications
             .push(String::from_utf8_lossy(bytes).into_owned()),
         2 => events.title_changed = true,
+        3 => events.directory_changed = true,
         _ => {}
     }
 }
@@ -356,6 +358,9 @@ impl Engine {
     }
     pub fn take_title_update(&mut self) -> Option<String> {
         std::mem::take(&mut self.events.title_changed).then(|| self.metadata(false))
+    }
+    pub fn take_directory_update(&mut self) -> bool {
+        std::mem::take(&mut self.events.directory_changed)
     }
     pub fn key(&mut self, name: &str, cp: u32, mods: u16, release: bool, text: &str) -> Vec<u8> {
         let Ok(name) = CString::new(name) else {
@@ -701,6 +706,22 @@ mod tests {
         assert_eq!(e.take_title_update().as_deref(), Some("OpenCode"));
         e.write(b"\x1b]2;\x07");
         assert_eq!(e.take_title_update().as_deref(), Some(""));
+    }
+    #[test]
+    fn directory_events_wait_for_complete_sequences_and_include_clears() {
+        let mut e = Engine::new().unwrap();
+        assert!(!e.take_directory_update());
+        e.write(b"\x1b]7;file://localhost/tmp/project");
+        assert!(!e.take_directory_update());
+        e.write(b"\x07");
+        assert!(e.take_directory_update());
+        assert_eq!(e.metadata(true), "file://localhost/tmp/project");
+        assert!(!e.take_directory_update());
+        e.write(b"ordinary output");
+        assert!(!e.take_directory_update());
+        e.write(b"\x1b]7;\x1b\\");
+        assert!(e.take_directory_update());
+        assert_eq!(e.metadata(true), "");
     }
     #[test]
     fn keys_respect_terminal_modes() {

@@ -120,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=5)
+        command("attach", version=6)
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header

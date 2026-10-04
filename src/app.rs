@@ -1,5 +1,5 @@
 use crate::{
-    branch::BranchWorker,
+    branch::{BranchCache, BranchWorker},
     commands::{COMMANDS, Query},
     find_field::FindField,
     font, ipc,
@@ -47,6 +47,7 @@ struct Tab {
     menu: gtk::PopoverMenu,
     branch_directory: PathBuf,
     branch_head: Option<PathBuf>,
+    branch_requested: bool,
 }
 impl Drop for Tab {
     fn drop(&mut self) {
@@ -81,15 +82,19 @@ pub struct Ui {
     search_next: gtk::Button,
     search_status: Cell<Option<(bool, usize, usize, bool)>>,
     active: Cell<u64>,
+    synced_focus: Cell<(u64, Option<u64>)>,
     changing: Cell<bool>,
     dirty: Cell<bool>,
+    save_source: RefCell<Option<glib::SourceId>>,
     server: ipc::Server,
     wake: ipc::Wake,
     backend: ipc::Client,
     pending: RefCell<HashMap<u64, BackendCallback>>,
     update_source: RefCell<Option<glib::SourceId>>,
     branches: BranchWorker,
+    branch_cache: RefCell<BranchCache>,
     branch_monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
+    repository_monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
 }
 type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<Value>)>;
 
@@ -98,7 +103,13 @@ impl Drop for Ui {
         if let Some(source) = self.update_source.get_mut().take() {
             source.remove();
         }
+        if let Some(source) = self.save_source.get_mut().take() {
+            source.remove();
+        }
         for monitor in self.branch_monitors.get_mut().values() {
+            monitor.cancel();
+        }
+        for monitor in self.repository_monitors.get_mut().values() {
             monitor.cancel();
         }
     }
@@ -442,15 +453,19 @@ impl Ui {
             search_next,
             search_status: Cell::new(None),
             active: Cell::new(0),
+            synced_focus: Cell::new((u64::MAX, None)),
             changing: Cell::new(false),
             dirty: Cell::new(false),
+            save_source: RefCell::new(None),
             server,
             backend: ipc::Client::new(wake.clone()),
             pending: RefCell::new(HashMap::new()),
             wake: wake.clone(),
             update_source: RefCell::new(None),
             branches: BranchWorker::new(wake.clone()),
+            branch_cache: RefCell::new(BranchCache::default()),
             branch_monitors: RefCell::new(HashMap::new()),
+            repository_monitors: RefCell::new(HashMap::new()),
         });
         ui.install_actions();
         ui.refresh_workspace_ui();
@@ -677,7 +692,7 @@ impl Ui {
                         continue;
                     };
                     if update.directory_changed {
-                        ui.dirty.set(true);
+                        ui.mark_dirty();
                     }
                     pane.tick(&update);
                     ui.refresh_tab_title(tab);
@@ -760,7 +775,14 @@ impl Ui {
                         continue;
                     }
                     if method == "read" {
-                        let body = json!({"method":"_read","pane":request.body["pane"]});
+                        let pane = match ui.pane(request.body["pane"].as_u64()) {
+                            Ok(pane) => pane.id,
+                            Err(error) => {
+                                let _ = request.reply.try_send(json!({"error":error.to_string()}));
+                                continue;
+                            }
+                        };
+                        let body = json!({"method":"_read","pane":pane});
                         let reply = request.reply;
                         ui.request(body, move |_, result| {
                             let _ = reply.try_send(
@@ -783,14 +805,12 @@ impl Ui {
             });
         *ui.update_source.borrow_mut() = Some(source);
         let weak = Rc::downgrade(&ui);
-        glib::timeout_add_local(Duration::from_secs(2), move || {
+        glib::timeout_add_local(Duration::from_secs(30), move || {
             let Some(ui) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            ui.refresh_metadata();
-            if ui.dirty.replace(false) {
-                ui.save_session();
-            }
+            // Retry failed watches and lookups. Working watches need no polling.
+            ui.refresh_unwatched_branches();
             glib::ControlFlow::Continue
         });
         Ok(ui)
@@ -1151,6 +1171,7 @@ impl Ui {
                 menu,
                 branch_directory: PathBuf::new(),
                 branch_head: None,
+                branch_requested: false,
             },
         );
         self.changing.set(false);
@@ -1158,7 +1179,7 @@ impl Ui {
         self.refresh_workspace_ui();
         self.refresh_tab_title(saved.id);
         self.refresh_metadata();
-        self.dirty.set(true);
+        self.mark_dirty();
         Ok(())
     }
     fn rebuild(self: &Rc<Self>, tab: u64) {
@@ -1245,7 +1266,17 @@ impl Ui {
             self.mark_read(p.id);
         }
         self.changing.set(false);
-        self.dirty.set(true);
+        self.sync_focus();
+        self.mark_dirty();
+    }
+    fn sync_focus(&self) {
+        let focus = (self.active.get(), self.active_pane().map(|pane| pane.id));
+        if focus != self.synced_focus.get() {
+            match self.backend.focus(focus.0, focus.1) {
+                Ok(()) => self.synced_focus.set(focus),
+                Err(error) => eprintln!("Could not sync terminal focus: {error}"),
+            }
+        }
     }
     fn update_tab_actions(&self, enabled: bool) {
         for name in TAB_ACTIONS {
@@ -1258,7 +1289,7 @@ impl Ui {
             }
         }
     }
-    fn show_empty(&self) {
+    fn show_empty(self: &Rc<Self>) {
         self.active.set(0);
         self.subscribe_visible();
         self.changing.set(true);
@@ -1270,7 +1301,8 @@ impl Ui {
         self.window.set_title(Some("Gmux"));
         self.search.set_search_mode(false);
         self.update_tab_actions(false);
-        self.dirty.set(true);
+        self.sync_focus();
+        self.mark_dirty();
     }
     fn subscribe_visible(&self) {
         let visible = self
@@ -1308,7 +1340,8 @@ impl Ui {
             self.switch(tab);
         }
         self.mark_read(id);
-        self.dirty.set(true);
+        self.sync_focus();
+        self.mark_dirty();
         if let Some(p) = self.active_pane() {
             self.heading
                 .set_subtitle(&model::display_path(&p.directory()));
@@ -1462,7 +1495,7 @@ impl Ui {
         }
         self.refresh_branches();
         self.refresh_sidebar();
-        self.dirty.set(true);
+        self.mark_dirty();
         Ok(())
     }
     fn request_close(self: &Rc<Self>, id: u64) {
@@ -1619,7 +1652,7 @@ impl Ui {
             p.area.grab_focus();
         }
     }
-    fn refresh_tab_title(&self, id: u64) {
+    fn refresh_tab_title(self: &Rc<Self>, id: u64) {
         let mut tabs = self.tabs.borrow_mut();
         let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
@@ -1640,7 +1673,7 @@ impl Ui {
             self.heading.set_title(&tab.name);
             self.window.set_title(Some(&format!("{} — Gmux", tab.name)));
         }
-        self.dirty.set(true);
+        self.mark_dirty();
         drop(tabs);
         self.refresh_sidebar();
     }
@@ -1650,14 +1683,40 @@ impl Ui {
             return;
         }
         let mut changed = false;
-        for (id, directory, branch) in results {
+        for (id, directory, generation, result) in results {
             let mut tabs = self.tabs.borrow_mut();
-            if let Some(w) = tabs.iter_mut().find(|w| w.id == id)
-                && w.branch_directory == directory
-                && w.panes
-                    .get(&w.active)
-                    .is_some_and(|pane| pane.directory() == directory)
-            {
+            let Some(branch) = result else {
+                if let Some(tab) = tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == id && tab.branch_directory == directory)
+                {
+                    tab.branch_requested = false;
+                }
+                continue;
+            };
+            let head = branch.head.clone().or_else(|| {
+                tabs.iter()
+                    .find(|tab| tab.id == id && tab.branch_directory == directory)
+                    .and_then(|tab| tab.branch_head.clone())
+            });
+            let branch = if let Some(head) = head {
+                self.branch_cache
+                    .borrow_mut()
+                    .resolve(&head, generation, branch)
+            } else {
+                branch
+            };
+            for w in tabs.iter_mut() {
+                let direct = w.id == id && w.branch_directory == directory;
+                let shared = branch.head.is_some() && w.branch_head == branch.head;
+                if !(direct || shared)
+                    || !w
+                        .panes
+                        .get(&w.active)
+                        .is_some_and(|pane| pane.directory() == w.branch_directory)
+                {
+                    continue;
+                }
                 if w.branch_label.text() != branch.name {
                     w.branch_label.set_label(&branch.name);
                     w.branch_box.set_tooltip_text(Some(&branch.name));
@@ -1668,7 +1727,12 @@ impl Ui {
                     w.branch_box.set_visible(visible);
                     changed = true;
                 }
-                w.branch_head = branch.head;
+                // Keep the watch through a temporarily missing HEAD. A later
+                // creation must still wake us without waiting for a fallback.
+                if branch.head.is_some() {
+                    w.branch_head = branch.head.clone();
+                }
+                w.branch_requested = true;
             }
         }
         if changed {
@@ -1680,6 +1744,7 @@ impl Ui {
             .iter()
             .filter_map(|tab| tab.branch_head.clone())
             .collect::<HashSet<_>>();
+        self.branch_cache.borrow_mut().retain_heads(&heads);
         let mut monitors = self.branch_monitors.borrow_mut();
         monitors.retain(|head, monitor| {
             if heads.contains(head) {
@@ -1706,7 +1771,19 @@ impl Ui {
             monitor.set_rate_limit(50);
             let weak = Rc::downgrade(self);
             let watched = head.clone();
-            monitor.connect_changed(move |_, file, other, _| {
+            let watched_parent = parent.to_path_buf();
+            monitor.connect_changed(move |_, file, other, event| {
+                if event == gio::FileMonitorEvent::Unmounted
+                    || (event == gio::FileMonitorEvent::Deleted
+                        && file.path().as_ref() == Some(&watched_parent))
+                {
+                    if let Some(ui) = weak.upgrade()
+                        && let Some(monitor) = ui.branch_monitors.borrow_mut().remove(&watched)
+                    {
+                        monitor.cancel();
+                    }
+                    return;
+                }
                 if (file.path().as_ref() == Some(&watched)
                     || other.and_then(gio::File::path).as_ref() == Some(&watched))
                     && let Some(ui) = weak.upgrade()
@@ -1719,50 +1796,132 @@ impl Ui {
         }
         drop(monitors);
         // Close the gap between the first lookup and installing its monitor.
-        if !installed.is_empty() {
-            let jobs = self
-                .tabs
-                .borrow()
-                .iter()
-                .filter(|tab| {
-                    tab.branch_head
-                        .as_ref()
-                        .is_some_and(|head| installed.contains(head))
-                })
-                .map(|tab| (tab.id, tab.branch_directory.clone()))
-                .collect();
-            self.branches.refresh_subset(jobs);
+        for head in installed {
+            self.refresh_branch_head(&head);
         }
     }
     fn refresh_branch_head(&self, head: &Path) {
+        // One query supplies every tab using this HEAD, including subdirectories.
         let jobs = self
             .tabs
             .borrow()
             .iter()
-            .filter(|tab| tab.branch_head.as_deref() == Some(head))
-            .map(|tab| (tab.id, tab.branch_directory.clone()))
-            .collect();
+            .find(|tab| tab.branch_head.as_deref() == Some(head))
+            .map(|tab| vec![(tab.id, tab.branch_directory.clone())])
+            .unwrap_or_default();
         self.branches.refresh_subset(jobs);
     }
-    fn refresh_branches(&self) {
+    fn refresh_repository_monitors(self: &Rc<Self>) {
+        let directories: HashSet<_> = self
+            .tabs
+            .borrow()
+            .iter()
+            .flat_map(|tab| tab.branch_directory.ancestors().map(Path::to_path_buf))
+            .collect();
+        let mut monitors = self.repository_monitors.borrow_mut();
+        monitors.retain(|directory, monitor| {
+            if directories.contains(directory) {
+                true
+            } else {
+                monitor.cancel();
+                false
+            }
+        });
+        for directory in directories {
+            if monitors.contains_key(&directory) {
+                continue;
+            }
+            let Ok(monitor) = gio::File::for_path(&directory)
+                .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+            monitor.set_rate_limit(50);
+            let watched = directory.clone();
+            let weak = Rc::downgrade(self);
+            monitor.connect_changed(move |_, file, other, event| {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                let git_changed = file
+                    .basename()
+                    .is_some_and(|name| name == Path::new(".git"))
+                    || other
+                        .and_then(gio::File::basename)
+                        .is_some_and(|name| name == Path::new(".git"));
+                let lost = event == gio::FileMonitorEvent::Unmounted
+                    || (event == gio::FileMonitorEvent::Deleted
+                        && file.path().as_ref() == Some(&watched));
+                if lost && let Some(monitor) = ui.repository_monitors.borrow_mut().remove(&watched)
+                {
+                    monitor.cancel();
+                }
+                if git_changed || lost {
+                    for tab in ui
+                        .tabs
+                        .borrow_mut()
+                        .iter_mut()
+                        .filter(|tab| tab.branch_directory.starts_with(&watched))
+                    {
+                        tab.branch_requested = false;
+                        tab.branch_head = None;
+                        tab.branch_box.set_visible(false);
+                    }
+                    ui.refresh_branches();
+                }
+            });
+            monitors.insert(directory, monitor);
+        }
+    }
+    fn refresh_unwatched_branches(self: &Rc<Self>) {
+        self.refresh_repository_monitors();
+        let heads = self.branch_monitors.borrow();
+        let directories = self.repository_monitors.borrow();
         let mut jobs = Vec::new();
         for tab in self.tabs.borrow_mut().iter_mut() {
+            let unwatched = tab
+                .branch_head
+                .as_ref()
+                .is_some_and(|head| !heads.contains_key(head))
+                || tab
+                    .branch_directory
+                    .ancestors()
+                    .any(|directory| !directories.contains_key(directory));
+            if unwatched || !tab.branch_requested {
+                tab.branch_requested = true;
+                jobs.push((tab.id, tab.branch_directory.clone()));
+            }
+        }
+        self.branches.refresh_subset(jobs);
+    }
+    fn refresh_branches(self: &Rc<Self>) {
+        let mut jobs = Vec::new();
+        let mut ids = HashSet::new();
+        for tab in self.tabs.borrow_mut().iter_mut() {
+            ids.insert(tab.id);
             if let Some(pane) = tab.panes.get(&tab.active) {
                 let directory = pane.directory();
                 if tab.branch_directory != directory {
                     tab.branch_box.set_visible(false);
                     tab.branch_head = None;
+                    tab.branch_requested = false;
                 }
                 tab.branch_directory = directory.clone();
-                jobs.push((tab.id, directory));
+                if !tab.branch_requested {
+                    tab.branch_requested = true;
+                    jobs.push((tab.id, directory));
+                }
             }
         }
-        if jobs.is_empty() {
+        self.refresh_repository_monitors();
+        self.branches.retain_tabs(&ids);
+        self.branches.refresh_subset(jobs);
+        if ids.is_empty() {
+            self.branch_cache.borrow_mut().retain_heads(&HashSet::new());
             for monitor in self.branch_monitors.borrow_mut().drain().map(|(_, m)| m) {
                 monitor.cancel();
             }
         }
-        self.branches.refresh(jobs);
     }
     fn refresh_metadata(self: &Rc<Self>) {
         let catalog = self.catalog.borrow();
@@ -1793,7 +1952,29 @@ impl Ui {
         self.refresh_sidebar();
         self.refresh_branches();
     }
+    fn mark_dirty(self: &Rc<Self>) {
+        self.dirty.set(true);
+        if self.save_source.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        *self.save_source.borrow_mut() = Some(glib::timeout_add_local_once(
+            Duration::from_secs(2),
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.save_source.borrow_mut().take();
+                    if ui.dirty.replace(false) {
+                        ui.save_session();
+                    }
+                }
+            },
+        ));
+    }
     fn save_session(&self) {
+        if let Some(source) = self.save_source.borrow_mut().take() {
+            source.remove();
+        }
+        self.dirty.set(false);
         let session = Session {
             filter: self.filter.get(),
             active: self.active.get(),
@@ -3050,7 +3231,7 @@ fn layout_widget(
                     *ratio = (paned.position() as f64 / dimension as f64).clamp(0.1, 0.9);
                 }
                 if let Some(ui) = ui.upgrade() {
-                    ui.dirty.set(true);
+                    ui.mark_dirty();
                 }
             });
             paned.upcast()

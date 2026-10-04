@@ -251,6 +251,12 @@ impl TerminalSession {
             let _ = self.send(&replies);
         }
         update.changed |= self.engine.poll_find();
+        if self.engine.take_directory_update() {
+            let previous = self.directory.clone();
+            self.refresh_directory();
+            update.directory_changed = self.directory != previous;
+            update.changed |= update.directory_changed;
+        }
         let title_update = self.engine.take_title_update();
         self.refresh_title(title_update);
         if let Some(pty) = &mut self.pty
@@ -529,6 +535,54 @@ mod tests {
         assert!(session.text().unwrap().contains("reattached:hello"));
     }
 
+    #[test]
+    fn directory_messages_refresh_live_cwd_in_the_same_pty_update() {
+        let directory = TestDirectory::new();
+        let subdir = directory.0.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let mut session = start(
+            1,
+            &directory.0,
+            r#"
+            stty -echo
+            printf '\033]9;ready\007'
+            IFS= read -r request
+            cd subdir
+            printf '\033]7;file://localhost%s\007\033]9;changed\007' "$PWD"
+            IFS= read -r request
+            printf '\033]7;file://localhost/tmp/stale\007\033]9;stale\007'
+            IFS= read -r request
+        "#,
+        );
+        wait_for(|| notification(&mut session, "ready"));
+        session.send_text("go", true).unwrap();
+        let mut changed = false;
+        wait_for(|| {
+            let update = session.poll();
+            if update.directory_changed {
+                assert_eq!(session.directory(), subdir);
+                changed = true;
+            }
+            if update
+                .notifications
+                .iter()
+                .any(|message| message == "changed")
+            {
+                assert!(changed);
+                assert_eq!(session.directory(), subdir);
+                true
+            } else {
+                false
+            }
+        });
+        session.send_text("go", true).unwrap();
+        wait_for(|| notification(&mut session, "stale"));
+        assert_eq!(
+            session.directory(),
+            subdir,
+            "Live process cwd must override stale OSC metadata"
+        );
+    }
     #[test]
     fn headless_poll_delivers_terminal_replies_to_the_process() {
         let directory = TestDirectory::new();
