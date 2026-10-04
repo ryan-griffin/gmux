@@ -1,15 +1,11 @@
 use crate::{
     model::{self, Settings},
     renderer::{Renderer, Scene},
-    search::Search,
     terminal_canvas::TerminalCanvas,
     theme::Theme,
 };
 use gmux::Frame;
-use gmux::{
-    remote::SessionHandle,
-    session::{ScreenSnapshot, SessionUpdate},
-};
+use gmux::{remote::SessionHandle, session::SessionUpdate};
 use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
 use std::{
     cell::{Cell as ValueCell, RefCell},
@@ -47,8 +43,14 @@ pub struct Terminal {
     session: SessionHandle,
     selection: RefCell<Option<(usize, usize)>>,
     drag_origin: ValueCell<(f64, f64)>,
-    search: RefCell<Search>,
-    search_revision: ValueCell<u64>,
+    drag_position: ValueCell<Option<(f64, f64)>>,
+    drag_endpoint: ValueCell<Option<(u16, u32)>>,
+    drag_selection_tick: RefCell<Option<gtk::TickCallbackId>>,
+    drag_scroll_timer: RefCell<Option<glib::SourceId>>,
+    drag_kinetic_scrolling: ValueCell<Option<bool>>,
+    search: RefCell<Vec<u8>>,
+    search_query: RefCell<String>,
+    selection_anchor: ValueCell<Option<usize>>,
     metrics: ValueCell<(f64, f64)>,
     grid: ValueCell<(u16, u16)>,
     grid_initialized: ValueCell<bool>,
@@ -194,8 +196,14 @@ impl Terminal {
             session,
             selection: RefCell::new(None),
             drag_origin: ValueCell::new((0.0, 0.0)),
-            search: RefCell::new(Search::default()),
-            search_revision: ValueCell::new(0),
+            drag_position: ValueCell::new(None),
+            drag_endpoint: ValueCell::new(None),
+            drag_selection_tick: RefCell::new(None),
+            drag_scroll_timer: RefCell::new(None),
+            drag_kinetic_scrolling: ValueCell::new(None),
+            search: RefCell::new(Vec::new()),
+            search_query: RefCell::new(String::new()),
+            selection_anchor: ValueCell::new(None),
             metrics: ValueCell::new((9.6, 22.0)),
             grid: ValueCell::new(grid),
             grid_initialized: ValueCell::new(false),
@@ -245,9 +253,6 @@ impl Terminal {
         let weak = Rc::downgrade(&terminal);
         terminal.area.set_scroll_func(move |row| {
             if let Some(t) = weak.upgrade() {
-                if t.selection.borrow_mut().take().is_some() {
-                    t.area.queue_draw();
-                }
                 t.session.borrow().scroll_to(row);
             }
         });
@@ -299,7 +304,9 @@ impl Terminal {
         let weak = Rc::downgrade(&terminal);
         terminal.im.connect_commit(move |_, text| {
             if let Some(t) = weak.upgrade() {
-                t.selection.borrow_mut().take();
+                if t.selection.borrow_mut().take().is_some() {
+                    let _ = t.session.borrow().clear_selection();
+                }
                 let pending = pending.borrow();
                 t.key_input(&pending.0, pending.1, pending.2, false, text);
             }
@@ -360,7 +367,10 @@ impl Terminal {
                     .is_some_and(|key| key.is_modifier())
             });
             if !modifier {
-                t.selection.borrow_mut().take();
+                t.stop_selection_drag();
+                if t.selection.borrow_mut().take().is_some() {
+                    let _ = t.session.borrow().clear_selection();
+                }
             }
             t.key_input(
                 key.name().as_deref().unwrap_or(""),
@@ -437,9 +447,12 @@ impl Terminal {
         });
         terminal.area.add_controller(click);
         let motion = gtk::EventControllerMotion::new();
+        motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(&terminal);
         motion.connect_motion(move |controller, x, y| {
-            if let Some(t) = weak.upgrade() {
+            if let Some(t) = weak.upgrade()
+                && !t.context_menu.is_visible()
+            {
                 t.mouse_position.set((x, y));
                 let state = controller.current_event_state();
                 if !state.contains(gdk::ModifierType::SHIFT_MASK) && t.session.borrow().mode(0) {
@@ -451,21 +464,46 @@ impl Terminal {
         let drag = gtk::GestureDrag::new();
         drag.set_button(1);
         let weak = Rc::downgrade(&terminal);
-        drag.connect_drag_begin(move |_, x, y| {
+        drag.connect_drag_begin(move |gesture, x, y| {
             if let Some(t) = weak.upgrade() {
+                t.stop_selection_drag();
+                if t.context_menu.is_visible()
+                    || (!gesture
+                        .current_event_state()
+                        .contains(gdk::ModifierType::SHIFT_MASK)
+                        && t.session.borrow().mode(0))
+                {
+                    return;
+                }
+                t.drag_kinetic_scrolling
+                    .set(Some(t.scroller.is_kinetic_scrolling()));
+                t.scroller.set_kinetic_scrolling(false);
+                // Stop GTK's animation and reset its retained overshoot before
+                // selection autoscroll takes over. Otherwise pointer motion can
+                // restart the spring and pull the viewport back to the edge.
+                let adjustment = t.scroller.vadjustment();
+                adjustment.set_value(adjustment.value());
+                adjustment.emit_by_name::<()>("value-changed", &[]);
                 t.area.grab_focus();
                 t.drag_origin.set((x, y));
+                let offset = t.session.borrow().snapshot().frame.scrollback.offset as usize;
+                let cols = t.session.borrow().snapshot().frame.cols as usize;
+                t.selection_anchor
+                    .set(Some(offset * cols + t.cell_at(x, y)));
                 t.selection.borrow_mut().take();
+                let _ = t.session.borrow().clear_selection();
                 t.area.queue_draw();
             }
         });
         let weak = Rc::downgrade(&terminal);
         drag.connect_drag_update(move |_, x, y| {
-            if let Some(t) = weak.upgrade() {
+            if let Some(t) = weak.upgrade()
+                && t.selection_anchor.get().is_some()
+            {
                 let (ox, oy) = t.drag_origin.get();
                 // GestureDrag begins on press. Wait for intentional movement,
                 // using GTK's configured threshold rather than selecting a click.
-                if t.selection.borrow().is_none()
+                if t.drag_position.get().is_none()
                     && !t.area.drag_check_threshold(
                         ox.round() as i32,
                         oy.round() as i32,
@@ -475,13 +513,38 @@ impl Terminal {
                 {
                     return;
                 }
-                let start = t.cell_at(ox, oy);
-                let end = t.cell_at(ox + x, oy + y);
-                *t.selection.borrow_mut() = Some((start.min(end), start.max(end)));
-                t.area.queue_draw();
+                t.drag_position.set(Some((ox + x, oy + y)));
+                t.update_drag_selection();
+                t.sync_selection_scroll();
+            }
+        });
+        let weak = Rc::downgrade(&terminal);
+        drag.connect_drag_end(move |_, x, y| {
+            if let Some(t) = weak.upgrade() {
+                if t.drag_position.get().is_some() {
+                    let (ox, oy) = t.drag_origin.get();
+                    t.drag_position.set(Some((ox + x, oy + y)));
+                    t.update_drag_selection();
+                    // Flush the final endpoint before Copy or other input can
+                    // follow release, even if the next frame has not started.
+                    t.send_drag_selection();
+                }
+                t.stop_selection_drag();
+            }
+        });
+        let weak = Rc::downgrade(&terminal);
+        drag.connect_cancel(move |_, _| {
+            if let Some(t) = weak.upgrade() {
+                t.stop_selection_drag();
             }
         });
         terminal.area.add_controller(drag);
+        let weak = Rc::downgrade(&terminal);
+        terminal.area.connect_unmap(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.stop_selection_drag();
+            }
+        });
         let middle = gtk::GestureClick::new();
         middle.set_button(2);
         let weak = Rc::downgrade(&terminal);
@@ -534,6 +597,120 @@ impl Terminal {
         canvas.add_controller(scroll);
         terminal
     }
+    fn drag_selection_end(&self) -> Option<usize> {
+        let (x, y) = self.drag_position.get()?;
+        let frame = self.session.borrow().snapshot().frame;
+        Some(frame.scrollback.offset as usize * frame.cols as usize + self.cell_at(x, y))
+    }
+    fn update_drag_selection(self: &Rc<Self>) {
+        let Some(start) = self.selection_anchor.get() else {
+            return;
+        };
+        let Some(end) = self.drag_selection_end() else {
+            return;
+        };
+        let next = Some((start.min(end), start.max(end)));
+        if self.selection.replace(next) != next {
+            self.area.queue_draw();
+        }
+        // Multiple pointer events between frames share one daemon command. The
+        // visible range follows the current pointer immediately, without waiting
+        // for older daemon selection replies to arrive.
+        if self.drag_selection_tick.borrow().is_none() {
+            let weak = Rc::downgrade(self);
+            *self.drag_selection_tick.borrow_mut() =
+                Some(self.area.add_tick_callback(move |_, _| {
+                    if let Some(terminal) = weak.upgrade() {
+                        terminal.drag_selection_tick.borrow_mut().take();
+                        terminal.send_drag_selection();
+                    }
+                    glib::ControlFlow::Break
+                }));
+        }
+    }
+    fn send_drag_selection(&self) {
+        let Some(start) = self.selection_anchor.get() else {
+            return;
+        };
+        let Some(end) = self.drag_selection_end() else {
+            return;
+        };
+        let session = self.session.borrow();
+        let cols = session.snapshot().frame.cols.max(1) as usize;
+        let endpoint = ((end % cols) as u16, (end / cols) as u32);
+        if self.drag_endpoint.get() == Some(endpoint) {
+            return;
+        }
+        if let Err(error) = session.select(((start % cols) as u16, (start / cols) as u32), endpoint)
+        {
+            self.show_status(&error.to_string());
+            return;
+        }
+        self.drag_endpoint.set(Some(endpoint));
+    }
+    fn selection_scroll_delta(&self) -> f64 {
+        let Some((_, y)) = self.drag_position.get() else {
+            return 0.0;
+        };
+        let height = self.area.height() as f64;
+        let row_height = self.metrics.get().1;
+        let edge = row_height.min(height / 2.0);
+        let distance = if y < edge {
+            y - edge
+        } else if y > height - edge {
+            y - (height - edge)
+        } else {
+            return 0.0;
+        };
+        // One row per tick near the edge; faster, capped scrolling outside it.
+        distance.signum() * (distance.abs() / row_height).ceil().clamp(1.0, 8.0) * row_height
+    }
+    fn sync_selection_scroll(self: &Rc<Self>) {
+        if self.selection_scroll_delta() == 0.0 {
+            if let Some(timer) = self.drag_scroll_timer.borrow_mut().take() {
+                timer.remove();
+            }
+            return;
+        }
+        if self.drag_scroll_timer.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        *self.drag_scroll_timer.borrow_mut() = Some(glib::timeout_add_local(
+            Duration::from_millis(50),
+            move || {
+                let Some(terminal) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let delta = terminal.selection_scroll_delta();
+                if delta == 0.0 || !terminal.area.is_mapped() {
+                    terminal.drag_scroll_timer.borrow_mut().take();
+                    return glib::ControlFlow::Break;
+                }
+                // Wait for the viewport before requesting another scroll. GTK's
+                // adjustment callback queues the row through the session writer.
+                if !terminal.session.borrow().scroll_pending() {
+                    let adjustment = terminal.scroller.vadjustment();
+                    adjustment.set_value(adjustment.value() + delta);
+                }
+                glib::ControlFlow::Continue
+            },
+        ));
+    }
+    fn stop_selection_drag(&self) {
+        self.drag_position.set(None);
+        self.drag_endpoint.set(None);
+        self.selection_anchor.set(None);
+        if let Some(tick) = self.drag_selection_tick.borrow_mut().take() {
+            tick.remove();
+        }
+        if let Some(timer) = self.drag_scroll_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        if let Some(kinetic_scrolling) = self.drag_kinetic_scrolling.take() {
+            self.scroller.set_kinetic_scrolling(kinetic_scrolling);
+        }
+    }
     fn show_context_menu(&self, x: f64, y: f64) {
         self.area.grab_focus();
         self.copy_action
@@ -559,7 +736,6 @@ impl Terminal {
         if let Err(error) = self.session.borrow().key(name, cp, mods, release, text) {
             self.show_status(&error.to_string());
         }
-        self.area.queue_draw();
     }
     fn mouse(&self, action: i32, button: i32, modifiers: gdk::ModifierType) {
         let (x, y) = self.mouse_position.get();
@@ -579,16 +755,36 @@ impl Terminal {
     pub fn send_text(&self, text: &str, enter: bool) -> anyhow::Result<()> {
         self.session.borrow_mut().send_text(text, enter)
     }
-    pub fn tick(&self, update: &SessionUpdate) {
+    pub fn tick(self: &Rc<Self>, update: &SessionUpdate) {
         if let Some(error) = &update.error {
             self.show_status(error);
         }
+        if let Some(text) = &update.copy {
+            self.area.clipboard().set_text(text);
+        }
         if update.changed {
+            if self.selection_anchor.get().is_some() {
+                // The drag owns the displayed selection. Replies may describe
+                // a previous pointer position, including the preceding clear.
+                self.update_drag_selection();
+            } else {
+                *self.selection.borrow_mut() = self
+                    .session
+                    .borrow()
+                    .selection()
+                    .map(|(a, b)| (a as usize, b as usize));
+            }
             self.area.queue_draw();
             let frame = {
                 let session = self.session.borrow();
                 let screen = session.snapshot();
-                self.refresh_search_frame(&screen);
+                let base = screen.frame.scrollback.offset as usize * screen.frame.cols as usize;
+                let selection = self.selection.borrow().and_then(|(a, b)| {
+                    let start = a.max(base);
+                    let end = b.min(base + screen.cells.len().saturating_sub(1));
+                    (start <= end).then_some((start.saturating_sub(base), end.saturating_sub(base)))
+                });
+                self.area.update_text(&screen, selection);
                 self.area
                     .set_scrollback(screen.frame.scrollback, session.scroll_pending());
                 screen.frame
@@ -682,20 +878,11 @@ impl Terminal {
             self.id
         ));
     }
-    pub fn refresh_directory(&self) {
-        self.session.borrow_mut().refresh_directory();
-        self.title
-            .set_tooltip_text(Some(&self.directory().display().to_string()));
-        self.refresh_title();
-    }
     pub fn directory(&self) -> PathBuf {
         self.session.borrow().directory().to_path_buf()
     }
     pub fn exited(&self) -> bool {
         self.session.borrow().exited()
-    }
-    pub fn busy(&self) -> bool {
-        self.session.borrow().busy()
     }
     pub fn set_active(&self, active: bool) {
         if active {
@@ -704,9 +891,6 @@ impl Terminal {
             self.root.remove_css_class("active-pane");
         }
         self.area.queue_draw();
-    }
-    pub fn text(&self) -> anyhow::Result<String> {
-        self.session.borrow_mut().text()
     }
     pub fn renderer_name(&self) -> &'static str {
         "gsk"
@@ -717,7 +901,8 @@ impl Terminal {
     pub fn renderer_geometry(&self) -> serde_json::Value {
         let (scale, origin) = self.surface_position();
         let (cw, ch) = self.metrics.get();
-        let (cols, rows) = self.grid.get();
+        let frame = self.session.borrow().snapshot().frame;
+        let (cols, rows) = (frame.cols.max(1), frame.rows.max(1));
         let scrollbar = self.scroller.vscrollbar();
         let scrollbar_origin = scrollbar
             .compute_point(&self.area, &graphene::Point::new(0.0, 0.0))
@@ -730,6 +915,10 @@ impl Terminal {
             "scale": scale, "origin": [origin.0, origin.1], "focused": self.area.has_focus(),
             "scrollback": session.snapshot().frame.scrollback,
             "scroll_pending": session.scroll_pending(),
+            "selection": *self.selection.borrow(),
+            "selection_drag": self.drag_position.get().map(|position| serde_json::json!({
+                "anchor": self.selection_anchor.get(), "position": position,
+            })),
             "scrollbar": {
                 "visible": scrollbar.is_mapped(),
                 "origin": scrollbar_origin,
@@ -740,27 +929,13 @@ impl Terminal {
         })
     }
     pub fn copy(&self) -> bool {
-        let Some((start, end)) = *self.selection.borrow() else {
+        if self.selection.borrow().is_none() {
             return false;
-        };
-        let session = self.session.borrow();
-        let e = session.snapshot();
-        let cols = e.frame.cols as usize;
-        let mut text = String::new();
-        for index in start..=end.min(e.cells.len().saturating_sub(1)) {
-            if index > start && index % cols == 0 {
-                while text.ends_with(' ') {
-                    text.pop();
-                }
-                text.push('\n');
-            }
-            if e.cells[index].flags & 64 != 0 {
-                continue;
-            }
-            let glyph = e.cells[index].text();
-            text.push_str(if glyph.is_empty() { " " } else { glyph });
         }
-        self.area.clipboard().set_text(text.trim_end());
+        if let Err(error) = self.session.borrow().copy() {
+            self.show_status(&error.to_string());
+            return false;
+        }
         true
     }
     pub fn paste(self: &Rc<Self>) {
@@ -770,7 +945,9 @@ impl Terminal {
         let weak = Rc::downgrade(self);
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             if let (Some(t), Ok(Some(text))) = (weak.upgrade(), result) {
+                t.stop_selection_drag();
                 t.selection.borrow_mut().take();
+                let _ = t.session.borrow().clear_selection();
                 if let Err(error) = t.session.borrow().paste(&text) {
                     t.show_status(&error.to_string());
                 }
@@ -779,35 +956,27 @@ impl Terminal {
         });
     }
     pub fn scroll(&self, delta: isize) {
-        if self.selection.borrow_mut().take().is_some() {
-            self.area.queue_draw();
-        }
-        self.session.borrow_mut().scroll(delta, false);
+        self.session.borrow().scroll(delta, false);
     }
     pub fn search(&self, query: &str) {
-        let mut search = self.search.borrow_mut();
-        search.set_query(query);
-        let session = self.session.borrow();
-        let screen = session.snapshot();
-        search.refresh(screen.cells, screen.frame.cols as usize);
-        self.search_revision.set(screen.revision);
-        self.area.queue_draw();
+        if *self.search_query.borrow() == query {
+            return;
+        }
+        if let Err(error) = self.session.borrow().find(query) {
+            self.show_status(&error.to_string());
+            return;
+        }
+        *self.search_query.borrow_mut() = query.to_owned();
     }
     pub fn search_advance(&self, previous: bool) {
-        self.search.borrow_mut().advance(previous);
-        self.area.queue_draw();
-    }
-    pub fn search_status(&self) -> (usize, usize) {
-        self.search.borrow().status()
-    }
-    fn refresh_search_frame(&self, screen: &ScreenSnapshot<'_>) {
-        // Another consumer, such as Read or Copy, may already have refreshed
-        // the cell buffer. Track its revision rather than the last call's dirty flag.
-        if self.search_revision.replace(screen.revision) != screen.revision {
-            self.search
-                .borrow_mut()
-                .refresh(screen.cells, screen.frame.cols as usize);
+        if let Err(error) = self.session.borrow().find_advance(previous) {
+            self.show_status(&error.to_string());
         }
+    }
+    pub fn search_status(&self) -> (usize, usize, bool) {
+        let session = self.session.borrow();
+        let state = session.find_state();
+        (state.current, state.total, state.pending)
     }
     pub fn zoom(&self, delta: f64) {
         self.render_font.borrow_mut().take();
@@ -820,7 +989,8 @@ impl Terminal {
     }
     fn cell_at(&self, x: f64, y: f64) -> usize {
         let (cw, ch) = self.metrics.get();
-        let (cols, rows) = self.grid.get();
+        let frame = self.session.borrow().snapshot().frame;
+        let (cols, rows) = (frame.cols.max(1), frame.rows.max(1));
         let x = (x / cw).floor().max(0.0) as usize;
         let y = (y / ch).floor().max(0.0) as usize;
         y.min(rows as usize - 1) * cols as usize + x.min(cols as usize - 1)
@@ -857,6 +1027,7 @@ impl Terminal {
                 Some((font.clone(), context.clone(), context.serial()));
         }
         let (cw, ch) = self.metrics.get();
+        self.area.set_text_metrics(cw as f32, ch as f32);
         // GTK supplies the small canvas margins. Use its full allocation so
         // the grid, selections, and pointer coordinates share the same origin.
         let cols = ((width as f64 / cw).floor() as i32).clamp(1, 1000) as u16;
@@ -884,8 +1055,25 @@ impl Terminal {
         }
         self.grid_initialized.set(true);
         let e = session.snapshot();
-        self.refresh_search_frame(&e);
         let mut search = self.search.borrow_mut();
+        let find = session.find_state();
+        if find.highlights.is_empty() {
+            search.clear();
+        } else {
+            search.resize(e.cells.len(), 0);
+            search.fill(0);
+            for &(start, end, value) in &find.highlights {
+                if let Some(range) = search.get_mut(start..end) {
+                    range.fill(value);
+                }
+            }
+        }
+        let base = e.frame.scrollback.offset as usize * e.frame.cols as usize;
+        let selection = self.selection.borrow().and_then(|(start, end)| {
+            let start = start.max(base);
+            let end = end.min(base + e.cells.len().saturating_sub(1));
+            (start <= end).then_some((start.saturating_sub(base), end.saturating_sub(base)))
+        });
         let (scale, origin) = self.surface_position();
         let scene = Scene {
             frame: e.frame,
@@ -896,8 +1084,8 @@ impl Terminal {
             width,
             height,
             theme: self.theme.get(),
-            selection: *self.selection.borrow(),
-            matches: search.highlights(e.cells.len()),
+            selection,
+            matches: &search,
             focused: self.area.has_focus(),
             exited,
         };
@@ -967,6 +1155,12 @@ impl Drop for Terminal {
         self.context_menu.unparent();
         if let Some(timer) = self.size_timer.get_mut().take() {
             timer.remove();
+        }
+        if let Some(timer) = self.drag_scroll_timer.get_mut().take() {
+            timer.remove();
+        }
+        if let Some(tick) = self.drag_selection_tick.get_mut().take() {
+            tick.remove();
         }
         gtk::style_context_remove_provider_for_display(&self.root.display(), &self.chrome_css);
     }

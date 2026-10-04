@@ -5,6 +5,8 @@ Run GTK_A11Y=none dbus-run-session -- python3 scripts/notifications-smoke-test.p
 Uses private settings, sockets, and shells.
 """
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 import socket
@@ -21,16 +23,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 
-def wait_for(predicate):
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        try:
-            if value := predicate():
-                return value
-        except (OSError, ValueError, KeyError):
-            pass
-        time.sleep(0.025)
-    raise AssertionError("Notification state did not settle")
+wait_for = partial(shared_wait_for, exceptions=(OSError, ValueError, KeyError))
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
@@ -47,13 +40,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
     stream = None
     with (artifacts / "notifications-smoke.log").open("w") as log:
         def rpc(method, **params):
-            with socket.socket(socket.AF_UNIX) as connection:
-                connection.settimeout(6)
-                connection.connect(env["GMUX_SOCKET"])
-                connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-                result = json.loads(connection.makefile("rb").readline())
-                assert "error" not in result, result
-                return result
+            return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
         def tab(identifier):
             return next(tab for tab in rpc("list")["tabs"] if tab["id"] == identifier)
@@ -79,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             stream = socket.socket(socket.AF_UNIX)
             stream.settimeout(6)
             stream.connect(env["GMUX_SOCKET"] + ".stream")
-            command("attach", version=3)
+            command("attach", version=5)
 
         def command(method, **params):
             stream.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())

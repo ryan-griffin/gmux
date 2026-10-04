@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Exercise terminal context menus with native Wayland input and AT-SPI."""
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, descendants, wait_for as shared_wait_for
 import os
 from pathlib import Path
 import re
 import shlex
-import socket
 import subprocess
 import tempfile
 import time
@@ -29,27 +30,7 @@ assert appearance in ("light", "dark"), appearance
 variant = appearance + ("-hc" if os.environ.get("ADW_DEBUG_HIGH_CONTRAST") == "1" else "")
 
 
-def wait_for(predicate, timeout=12):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (OSError, GLib.Error):
-            pass
-        while GLib.MainContext.default().pending():
-            GLib.MainContext.default().iteration(False)
-        time.sleep(0.025)
-    raise AssertionError("Terminal context menu did not reach the expected state")
-
-
-def descendants(element):
-    element.clear_cache()
-    yield element
-    for index in range(element.get_child_count()):
-        child = element.get_child_at_index(index)
-        if child:
-            yield from descendants(child)
+wait_for = partial(shared_wait_for, context=GLib.MainContext.default(), exceptions=(OSError, GLib.Error))
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
@@ -67,13 +48,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
     app = registry = pane = None
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def find(name=None, role=None):
         return next((obj for obj in descendants(Atspi.get_desktop(0))
@@ -271,6 +246,31 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
             # Wait for its alternate screen to reach the composited frame.
             bounds = wait_for(lambda: native.frame(timeout=0.1, fresh=False).color_bounds((30, 160, 230)))
             left, top, right, bottom = bounds
+            native.move(left + cw / 2, (top + bottom) / 2)
+            native.button(True)
+            time.sleep(.05)
+            native.move(left + cw * 3.5, (top + bottom) / 2)
+            time.sleep(.05)
+            native.button(False)
+            wait_for(lambda: mouse.exists() and b"\x1b[<0;" in mouse.read_bytes()
+                     and b"\x1b[<32;" in mouse.read_bytes())
+            # Shift-drag selects text instead of sending terminal mouse reports.
+            time.sleep(.1)
+            data = mouse.read_bytes()
+            native.key(Gdk.KEY_Shift_L, True)
+            native.move(left + cw / 2, (top + bottom) / 2)
+            native.button(True)
+            time.sleep(.05)
+            native.move(left + cw * 3.5, (top + bottom) / 2)
+            time.sleep(.05)
+            native.button(False)
+            native.key(Gdk.KEY_Shift_L, False)
+            rpc("action", name="copy")
+            wait_for(lambda: native.clipboard_text() == "MOUS")
+            # Releasing Shift can resynchronize the pointer with an unpressed
+            # motion report. The drag itself must send no button reports.
+            extra = mouse.read_bytes()[len(data):]
+            assert re.sub(rb"\x1b\[<35;\d+;\d+M", b"", extra) == b"", extra
             native.move(left + cw * 2, (top + bottom) / 2)
             right_click()
             wait_for(lambda: mouse.exists() and b"\x1b[<2;" in mouse.read_bytes()
@@ -324,6 +324,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
                   "selection and clipboard, Find focus, keyboard navigation and activation, mnemonics, "
                   "pane-specific splitting and closing, busy-process confirmation, mouse reporting, and Shift override")
         except Exception:
+            if "mouse" in locals() and mouse.exists():
+                print("Recorded mouse input:", mouse.read_bytes(), flush=True)
             capture("failed")
             print("Visible accessible items:", [(obj.get_role_name(), obj.get_name())
                   for obj in descendants(Atspi.get_desktop(0))

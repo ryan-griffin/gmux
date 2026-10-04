@@ -52,8 +52,9 @@ motion across daemon acknowledgements. Font zoom changes the pixel range without
 changing touchpad sensitivity. Mouse-tracking applications receive wheel buttons;
 touchpad deltas accumulate a cell height before sending each button.
 Each pane has its own adjustment, and panes without scrollback hide their bars.
-Scroll input redraws immediately when clearing a selection; updated terminal
-content draws when its daemon frame arrives. The native input test covers flick
+Scrolling preserves selection. Updated terminal content and overlays draw when
+their daemon state arrives. Keys that leave the viewport unchanged schedule no
+terminal redraw. The native input test covers flick
 momentum and rapid reversals as well as wheel input and small touchpad movements.
 GTK manages GPU glyph and texture caches. Cached rows retain an additional
 viewport cell copy, about 333 KiB for 120 × 40 cells, plus render nodes and glyphs.
@@ -65,16 +66,27 @@ Whole-process resident memory is measured in the [application benchmark](perform
 GPU memory has not been measured.
 
 The [daemon](terminal-sessions.md) sends changed rows and frame metadata, with a
-complete viewport on attach or a new subscription. Fonts, selection, search,
-and render nodes remain in the frontend. Hidden and detached panes keep parsing
+complete viewport on attach or a new subscription. The daemon also sends history
+Find highlights and tracked selection ranges. Fonts and render nodes remain in
+the frontend. Hidden and detached panes keep parsing
 output without automatic viewport extraction or terminal painting.
+
+The canvas implements `GtkAccessibleText` alongside `GtkScrollable`. It exposes
+Unicode viewport text, character offsets, caret, selection, text boundaries, and
+cell extents. Text updates use the viewport revision to avoid rebuilding it for
+unchanged cells. Cached and rebuilt selections share the same cell-end mapping,
+including wide glyphs and row boundaries. Boundary queries reuse a lazily created
+GTK text buffer until the text changes. Changes to colors alone do not emit text
+replacement notifications. The interface is read-only; keyboard input still
+uses terminal encoding and the input method.
+Wide glyphs expose their full two-cell bounds, combining characters share their
+glyph's bounds, and points outside the terminal grid have no character offset.
 
 ## Validation
 
 ```sh
-cargo build --locked --bins --examples
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
+python3 scripts/check.py
+python3 scripts/check.py --native
 GTK_A11Y=none GSK_RENDERER=vulkan dbus-run-session -- python3 scripts/renderer-smoke-test.py
 GTK_A11Y=none GSK_RENDERER=gl dbus-run-session -- python3 scripts/renderer-smoke-test.py
 GTK_A11Y=none GSK_RENDERER=cairo dbus-run-session -- python3 scripts/renderer-smoke-test.py
@@ -103,8 +115,12 @@ its software backend.
 The native input test starts an isolated headless Mutter Wayland compositor
 with `--no-x11`, a 1280 × 960 virtual monitor, and private D-Bus and PipeWire
 sessions. It verifies the application uses `GdkWaylandDisplay`, sends native
-keyboard and pointer input, and checks terminal accessibility, selection,
-Ctrl+Shift+C, and the Wayland clipboard. Pointer coordinates come from colored
+keyboard and pointer input, and checks accessible text, caret and selection,
+row-end selection bounds and repeated text boundary queries across output changes,
+selection across scrollback, stationary drag autoscroll in both directions,
+scroll cancellation, fast edge drags during GTK overscroll without viewport
+bouncing, rapid reversals with delayed viewport replies, Ctrl+Shift+C,
+and the Wayland clipboard. Pointer coordinates come from colored
 markers in composited frames, including the compositor's window placement.
 No test input reaches the user's desktop.
 

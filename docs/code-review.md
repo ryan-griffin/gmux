@@ -29,7 +29,7 @@ The Find field remains a small compound widget because it places the match count
 
 The GTK, libadwaita, Pango, GLib Unix, and PTY Rust bindings were checked against their current stable releases. GTK 4.22 and libadwaita 1.9 feature levels now expose current API deprecations during compilation. Deprecated Rust API use is denied, with one documented exception below. The build was checked with GTK 4.22.5 and libadwaita 1.9.4.
 
-The Ghostty revision remains pinned because its terminal C API is still changing. The bridge now uses that revision's dirty-row iterator to update the persistent cell buffer. Search tracks the buffer revision so another reader cannot consume an update before Find sees it. Glyph-cache lookups no longer allocate a string for every displayed cell.
+The Ghostty revision remains pinned because its terminal C API is still changing. The bridge now uses that revision's dirty-row iterator to update the persistent cell buffer. The daemon scans retained history for Find in bounded row batches after terminal updates. Glyph-cache lookups no longer allocate a string for every displayed cell.
 
 Ghostty's render-hold callback now handles synchronized output. The renderer captures the last complete frame at the start of a hold and waits for release before showing subsequent output. A one-second timeout prevents a program from leaving the display frozen.
 
@@ -49,7 +49,7 @@ Underline and strikethrough rendering now includes blank cells and wide-characte
 
 The screenshot diagnostic still uses deprecated GTK calls for the window's CSS background and frame. `GtkWidgetPaintable` returns cached content when the compositor pauses an occluded window, which fails the existing fresh-screenshot regression test. The exception is confined to `capture_window`; normal application controls use current APIs.
 
-Terminal rendering now uses [GSK nodes with Pango shaping](renderer.md). Terminal image protocols and the full GTK accessible text interface remain outside the current implementation. Search and selection operate on the visible viewport.
+Terminal rendering now uses [GSK nodes with Pango shaping](renderer.md). Terminal image protocols remain outside the current implementation. Find now searches retained history, selection spans scrollback, and the canvas exposes read-only GTK accessible text, caret, and selection.
 
 The [headless daemon](terminal-sessions.md) owns event-driven PTY I/O and process state. Stream packets and GUI requests now wake a GLib file-descriptor source; the frontend has no periodic update poll. A two-second settings and Git refresh remains.
 
@@ -119,6 +119,63 @@ frame pacing. Its latency includes compositor presentation and capture overhead,
 so it cannot be compared directly with the historical XWayland measurements.
 All 40 library tests, 11 application tests, eight example tests, formatting,
 Clippy with warnings denied, and debug and release binary builds passed.
+
+## Command and history cleanup
+
+The daemon now applies the same typed layout and workspace commands for the GUI
+and detached CLI. The frontend adopts the returned state; its presentation saves
+cannot replace daemon topology. Workspace names are trimmed before uniqueness
+checks. Quit finishes after a layout save failure, and completed live commands
+return their changed state with a persistence warning.
+
+One frontend worker handles runtime requests and settings writes outside GTK's
+main thread. It coalesces adjacent presentation saves while preserving command
+order. Busy-process checks batch all affected panes. Unchanged viewport packets
+are suppressed without dropping initial viewports or scroll acknowledgements.
+Key presses and releases rely on changed terminal state to trigger drawing.
+
+Find scans retained history in batches of 64 rows. Selection uses Ghostty tracked
+references and its plain-text formatter, including wrapped lines and scrollback.
+The terminal canvas exposes Unicode viewport text, caret, and selection through
+`GtkAccessibleText`. Native regressions exercise offscreen Unicode matches and
+selection across history. Shared test helpers and `scripts/check.py` provide one
+entry point for headless and isolated Wayland checks.
+
+The follow-up pass added bounded paste messages with complete-operation encoding,
+Find across soft wraps, strict state-file reads and protected saves, a visible
+startup recovery window, and corrected accessible glyph bounds and hit testing.
+Daemon execution matches typed commands directly and returns typed results to
+the frontend. Missing and explicit-null workspace assignments retain their
+different meanings.
+
+Rust checks passed all 73 tests, formatting, Clippy with warnings denied, and
+debug builds. `python3 scripts/check.py --native --skip-build` passed all 21
+smoke suites. Release builds of both binaries also passed. The control regression covers normalized
+workspace duplicates, preservation of daemon topology, unchanged key releases,
+scroll acknowledgements, live changes after save errors, and Quit after a save
+error. Native checks verify accessible text, caret and selection, and copying a
+selection spanning 120 scrollback lines. Engine tests also verify selection
+through reflow and reversed endpoints. Additional regressions cover a complete
+4 MiB bracketed paste through a real PTY, oversized-command recovery, damaged
+state files before and after startup, Unicode queries across wraps and scan
+batches, wide and combining glyph geometry, off-grid hit testing, and a large
+Unicode clipboard paste through GTK.
+
+The final cleanup pass moves coalesced save payloads and daemon command payloads
+instead of copying them. Layout traversal collects pane IDs in one vector.
+Closing a pane discards its pending input error, paste operation, and viewport
+subscription. Find labels now describe terminal search rather than restricting
+it to the visible viewport.
+
+Accessible text uses one mapping for fresh and cached caret and selection
+updates. A native regression caught a cached row-end selection that included an
+extra newline. Boundary queries reuse GTK's text buffer, and color changes avoid
+text replacement notifications. Tests cover repeated boundary queries after
+new output, wide glyphs, combining characters, and row-end selections.
+
+Validation passed all 74 Rust tests, all 21 smoke suites, formatting, Clippy with
+warnings denied, and debug and release binary builds. Selection autoscroll and
+the regressions for delayed highlights and GTK overscroll also passed.
 
 ## References
 

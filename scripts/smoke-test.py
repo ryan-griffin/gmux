@@ -6,9 +6,9 @@ Pass --native to test on your Wayland or X11 display and capture screenshots.
 """
 import argparse
 import json
+from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
 import time
@@ -26,19 +26,6 @@ binary = args.binary.resolve() if args.binary else root / "target/debug/gmux"
 assert binary.exists(), "Run cargo build first"
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-
-
-def wait_for(predicate, timeout=12):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            result = predicate()
-            if result:
-                return result
-        except (FileNotFoundError, ConnectionRefusedError, OSError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Timed out waiting for application state")
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
@@ -65,11 +52,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-smoke-") as temp:
         return process
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            return json.loads(connection.makefile("rb").readline())
+        return shared_rpc(env["GMUX_SOCKET"], method, check=False, **params)
 
     def state():
         result = rpc("list")

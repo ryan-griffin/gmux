@@ -7,7 +7,7 @@ Closing a pane still terminates that pane, and an exited shell removes its pane.
 
 Use **Quit Gmux** in the main menu, Ctrl+Shift+Q, or `gmux quit` to stop the daemon
 and its terminals. The GUI confirms Quit when a foreground job is running. The
-CLI command is an explicit shutdown and does not show a dialog. SIGTERM/SIGINT
+CLI command is an explicit shutdown and does not show a dialog. A layout save failure produces a warning but still closes the terminals and daemon. SIGTERM/SIGINT
 sent to the frontend detach it; sent to the daemon they stop its sessions.
 
 A stopped daemon cannot resume arbitrary commands. At this stage, daemon restart
@@ -38,7 +38,7 @@ Cairo. The daemon binary links libghostty-vt and GLib without a graphics stack.
 
 The daemon uses nonblocking PTY descriptors in one `poll` loop. It reads at most
 512 KiB per ready pane before servicing other panes, handles partial writes, and
-bounds each pane's pending input to 1 MiB. SIGCHLD wakes it through `signalfd` to
+bounds each pane's pending input to 8 MiB. SIGCHLD wakes it through `signalfd` to
 reap exited shells. An idle detached daemon blocks in `poll`; it has no periodic
 16 ms wakeup and no reader or writer thread per pane. A render hold schedules
 expiry checks until synchronized output completes. Attached frontends receive
@@ -52,7 +52,10 @@ Tab switches and layout changes update viewport subscriptions. Resize indicators
 use their own dismissal timers. Directory metadata arrives through the stream;
 splitting a pane and checking for busy jobs still request fresh process state.
 Activity in one pane does not rebuild idle panes' process metadata between the
-once-a-second refreshes.
+once-a-second refreshes. Runtime control requests and settings writes use one
+worker outside GTK's main thread. Adjacent presentation saves coalesce; commands
+preserve queue order. Close and Quit check all affected panes in one asynchronous
+busy-process request. Startup connects before presenting the window.
 
 Sessions use this same nonblocking I/O path in production and headless unit
 tests. Explicitly closing a session or dropping its owner terminates the process.
@@ -66,12 +69,22 @@ startup, and sockets have owner-only permissions. The frontend and daemon use
 one protocol version and reject mismatched binaries. Build and install both
 binaries from the same revision. Gmux does not maintain older protocol versions
 or migrate older saved formats during pre-release development.
+These changes use protocol version 5. Restart an existing daemon before using
+the rebuilt binaries.
+
+Clipboard and text pastes use messages of at most 16 KiB of UTF-8 text. The
+daemon assembles a complete paste of up to 4 MiB before asking Ghostty to encode
+it, preserving one bracketed-paste boundary and preventing incomplete transfers
+from reaching a shell. The frontend bounds queued paste text to 8 MiB, and the
+daemon bounds pending PTY input to 8 MiB. PTY writes yield after 512 KiB per poll.
+Oversized or malformed frontend commands report errors without disconnecting.
 
 `src/remote.rs` contains frontend session handles with cached cells and frame
 metadata. Input, key and mouse encoding requests, paste, resize, theme changes,
 and scrolling go to the daemon. Ghostty encodes them against the actual live
-terminal modes. The frontend owns fonts, glyph shaping, rendering, selection,
-search, clipboard, and input methods. It uses the [GSK renderer](renderer.md).
+terminal modes. The daemon also owns history search and tracked selection
+endpoints. The frontend owns fonts, glyph shaping, rendering, clipboard, Find
+controls, accessible viewport text, and input methods. It uses the [GSK renderer](renderer.md).
 
 Only panes in the displayed tab subscribe to viewport updates. Hidden and
 unattached panes continue parsing output and answering terminal requests without
@@ -84,7 +97,10 @@ requested position until the daemon acknowledges it, and retries the latest
 position if its command queue is full.
 Initial attachment, a new subscription, and changed dimensions send a full
 viewport. Subsequent packets compare rows against the last transmitted cells.
-The frontend applies packets in order before rendering. The daemon still scans
+Packets with no changed cells, frame metadata, notifications, search or selection
+state, or scroll acknowledgement are suppressed. Key handlers draw when changed
+terminal state arrives. The frontend applies packets in order before rendering.
+The daemon still scans
 and retains a viewport copy for each visible pane, but updates that copy only
 for changed rows. It encodes packets directly into the socket output buffer and
 reuses its polling buffers. It does not copy scrollback or send pixels through
@@ -93,16 +109,45 @@ the socket.
 Bounded queues provide backpressure. A frontend that exceeds the daemon's 32 MiB
 pending-output limit detaches while its terminal sessions continue. Reopening
 resynchronizes complete viewports. If the backend disappears, the frontend
-exits and the next launch starts a new daemon. Pane creation records a provisional
-layout before responding, so a frontend crash during creation cannot orphan a
-running pane. Normal UI changes then save the requested layout and names.
+exits and the next launch starts a new daemon. Typed layout and workspace commands
+share one daemon implementation for the GUI and detached CLI. Each command
+returns authoritative layout, catalog, and process metadata for reconciliation.
+The frontend persists presentation state and divider proportions without replacing
+daemon topology. Completed live changes return their resulting state even if
+saving the layout fails, with a separate persistence warning.
+
+Missing settings, workspace, and session files use defaults. Invalid or unreadable
+files produce a recovery error and remain unchanged. Startup failures show the
+file path and recovery instructions in a window. Saves validate the existing
+file before replacing it, so a file damaged after startup remains available for
+repair. Move it aside to use defaults, or repair it before restarting or saving.
+
+Find scans all retained rows in batches of 64 and yields between batches. It
+joins soft-wrapped rows and preserves hard line breaks. A bounded unmatched
+suffix carries queries across rows and scan batches, including wide characters.
+Output
+and resize invalidate results for a fresh scan. Navigation sends the viewport to
+an offscreen match. Selection endpoints use Ghostty tracked references and survive
+scrolling and terminal updates. Dragging a selection near or beyond the top or
+bottom edge scrolls history while the pointer stays there. Moving farther outside
+increases the speed. Releasing the button or returning inside stops scrolling.
+Starting a selection cancels GTK's existing momentum and overscroll animation
+so it cannot pull the viewport back toward an edge. Normal kinetic scrolling
+resumes when the selection gesture ends or is cancelled.
+During a drag, the frontend draws the range from the current pointer and viewport;
+delayed daemon replies cannot restore an older highlight. Selection commands
+coalesce once per GTK frame. Release sends the final endpoint before subsequent
+input or Copy.
+Ghostty formats copied text across history,
+including wrapped lines. Copy responses travel separately from viewport packets
+and are limited to 4 MiB.
 
 ## Validation
 
 ```sh
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-python3 scripts/daemon-smoke-test.py
+python3 scripts/check.py
+python3 scripts/check.py --native
+python3 scripts/control-smoke-test.py
 GTK_A11Y=none dbus-run-session -- python3 scripts/daemon-smoke-test.py --native
 GTK_A11Y=none dbus-run-session -- python3 scripts/smoke-test.py --native
 GTK_A11Y=none dbus-run-session -- python3 scripts/notifications-smoke-test.py

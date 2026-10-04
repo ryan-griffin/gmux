@@ -33,6 +33,7 @@ typedef struct {
     void *userdata;
     bool dark;
     bool held;
+    GhosttyTrackedGridRef selection_start, selection_end;
     uint64_t hold_started_ms;
 } GmuxEngine;
 
@@ -93,6 +94,8 @@ static bool color_scheme(GhosttyTerminal t, void *ud, GhosttyColorScheme *out) {
 }
 void gmux_engine_free(GmuxEngine *e) {
     if (!e) return;
+    ghostty_tracked_grid_ref_free(e->selection_start);
+    ghostty_tracked_grid_ref_free(e->selection_end);
     ghostty_key_event_free(e->key);
     ghostty_mouse_event_free(e->mouse);
     ghostty_mouse_encoder_free(e->mouse_encoder);
@@ -346,4 +349,72 @@ size_t gmux_engine_mouse(GmuxEngine *e, float x, float y, uint32_t cw, uint32_t 
     size_t written = 0;
     if (ghostty_mouse_encoder_encode(e->mouse_encoder, e->mouse, (char *)out, cap, &written)) return 0;
     return written;
+}
+
+int gmux_engine_history_size(GmuxEngine *e, uint16_t *cols, size_t *rows) {
+    return ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, cols) ||
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_TOTAL_ROWS, rows);
+}
+static size_t utf8(uint32_t cp, uint8_t *out) {
+    if (cp <= 0x7f) { out[0] = cp; return 1; }
+    if (cp <= 0x7ff) { out[0] = 0xc0 | (cp >> 6); out[1] = 0x80 | (cp & 63); return 2; }
+    if (cp <= 0xffff) { out[0] = 0xe0 | (cp >> 12); out[1] = 0x80 | ((cp >> 6)&63); out[2] = 0x80 | (cp&63); return 3; }
+    out[0] = 0xf0 | (cp >> 18); out[1] = 0x80 | ((cp >> 12)&63); out[2] = 0x80 | ((cp >> 6)&63); out[3] = 0x80 | (cp&63); return 4;
+}
+int gmux_engine_history_row(GmuxEngine *e, uint32_t y, GmuxCell *out, size_t cols, bool *wrapped) {
+    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {.x=0, .y=y}};
+    if (ghostty_terminal_grid_ref(e->terminal, point, &ref)) return -1;
+    GhosttyRow row;
+    if (ghostty_grid_ref_row(&ref, &row) || ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, wrapped)) return -1;
+    memset(out, 0, sizeof(GmuxCell)*cols);
+    for (size_t x=0; x<cols; x++) {
+        ref.x = x;
+        GhosttyCell raw;
+        GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+        if (ghostty_grid_ref_cell(&ref, &raw)) return -1;
+        ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+        if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) out[x].flags = 64;
+        if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) out[x].flags = 128;
+        uint32_t cps[64]; size_t count = 0, len = 0;
+        if (ghostty_grid_ref_graphemes(&ref, cps, 64, &count)) {
+            memcpy(out[x].text, "\xef\xbf\xbd", 3); continue;
+        }
+        for (size_t i=0; i<count; i++) {
+            uint8_t bytes[4]; size_t n = utf8(cps[i], bytes);
+            if (len+n >= sizeof(out[x].text)) { memcpy(out[x].text, "\xef\xbf\xbd", 3); out[x].text[3]=0; break; }
+            memcpy(out[x].text+len, bytes, n); len += n;
+        }
+    }
+    return 0;
+}
+int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey) {
+    GhosttyPoint start = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={sx,sy}};
+    GhosttyPoint end = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={ex,ey}};
+    if (!e->selection_start && ghostty_terminal_grid_ref_track(e->terminal, start, &e->selection_start)) return -1;
+    if (!e->selection_end && ghostty_terminal_grid_ref_track(e->terminal, end, &e->selection_end)) return -1;
+    return ghostty_tracked_grid_ref_set(e->selection_end, e->terminal, end);
+}
+void gmux_engine_clear_selection(GmuxEngine *e) {
+    ghostty_tracked_grid_ref_free(e->selection_start); e->selection_start=NULL;
+    ghostty_tracked_grid_ref_free(e->selection_end); e->selection_end=NULL;
+}
+int gmux_engine_selection(GmuxEngine *e, uint64_t *start, uint64_t *end) {
+    if (!e->selection_start || !e->selection_end) return -1;
+    GhosttyPointCoordinate a,b; uint16_t cols=0;
+    if (ghostty_tracked_grid_ref_point(e->selection_start, GHOSTTY_POINT_TAG_SCREEN, &a) ||
+        ghostty_tracked_grid_ref_point(e->selection_end, GHOSTTY_POINT_TAG_SCREEN, &b) ||
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols)) return -1;
+    *start = (uint64_t)a.y*cols+a.x; *end=(uint64_t)b.y*cols+b.x;
+    if (*start > *end) { uint64_t swap=*start; *start=*end; *end=swap; }
+    return 0;
+}
+int gmux_engine_copy(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    if (!e->selection_start || !e->selection_end || ghostty_tracked_grid_ref_snapshot(e->selection_start, &selection.start) ||
+        ghostty_tracked_grid_ref_snapshot(e->selection_end, &selection.end)) { *written=0; return 0; }
+    GhosttyTerminalSelectionFormatOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
+    options.emit=GHOSTTY_FORMATTER_FORMAT_PLAIN; options.unwrap=true; options.trim=true; options.selection=&selection;
+    GhosttyResult result=ghostty_terminal_selection_format_buf(e->terminal, options, out, cap, written);
+    return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
 }

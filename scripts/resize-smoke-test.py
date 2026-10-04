@@ -5,10 +5,10 @@ Run with GTK_A11Y=none GDK_BACKEND=wayland dbus-run-session -- python3
 scripts/resize-smoke-test.py. Requires PyGObject and a native display.
 """
 import json
+from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
 import re
-import socket
 import subprocess
 import tempfile
 import time
@@ -23,18 +23,6 @@ from gi.repository import GdkPixbuf
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-
-
-def wait_for(predicate):
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (FileNotFoundError, ConnectionRefusedError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Timed out waiting for application state")
 
 
 def central_text(image):
@@ -65,13 +53,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-resize-") as directory:
     env["GDK_DEBUG"] = env.get("GDK_DEBUG", "") + ":no-vsync"
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(5)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def capture(name):
         path = artifacts / f"{name}.png"

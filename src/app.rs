@@ -8,7 +8,10 @@ use crate::{
     theme::Theme,
 };
 use adw::prelude::*;
-use gmux::remote::SessionManager;
+use gmux::{
+    control::{Command, CommandReply, CommandResult},
+    remote::SessionManager,
+};
 use gtk::{gdk, gio, glib, pango};
 use serde_json::{Value, json};
 use std::{
@@ -75,16 +78,18 @@ pub struct Ui {
     search_count: gtk::Label,
     search_previous: gtk::Button,
     search_next: gtk::Button,
-    search_status: Cell<Option<(bool, usize, usize)>>,
+    search_status: Cell<Option<(bool, usize, usize, bool)>>,
     active: Cell<u64>,
-    next_id: Cell<u64>,
     changing: Cell<bool>,
     dirty: Cell<bool>,
     server: ipc::Server,
     wake: ipc::Wake,
+    backend: ipc::Client,
+    pending: RefCell<HashMap<u64, BackendCallback>>,
     update_source: RefCell<Option<glib::SourceId>>,
     branches: BranchWorker,
 }
+type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<Value>)>;
 
 impl Drop for Ui {
     fn drop(&mut self) {
@@ -125,7 +130,7 @@ pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
             }
             Err(error) => {
                 *activate_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
-                app.quit();
+                show_startup_error(app, &error);
             }
         }
     });
@@ -147,15 +152,13 @@ pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
                 }
                 Err(error) => {
                     *open_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
-                    app.quit();
+                    show_startup_error(app, &error);
                     return;
                 }
             }
         };
         for directory in directories.into_iter().skip(skip) {
-            if let Err(error) = ui.new_tab(directory, None) {
-                ui.message(&error.to_string());
-            }
+            ui.new_tab(directory, None);
         }
         ui.window.present();
     });
@@ -170,9 +173,6 @@ pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
         anyhow::bail!("{error}");
     }
     if let Some(ui) = holder.borrow_mut().take() {
-        if !ui.sessions.borrow().disconnected() {
-            ui.save_session();
-        }
         ui.tabs.borrow_mut().clear();
         ui.sessions.borrow_mut().clear();
     }
@@ -180,12 +180,37 @@ pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn show_startup_error(app: &adw::Application, error: &anyhow::Error) {
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Gmux")
+        .default_width(560)
+        .default_height(340)
+        .build();
+    let page = adw::StatusPage::builder()
+        .title("Could Not Start Gmux")
+        .description(format!("{error:#}"))
+        .icon_name("dialog-warning-symbolic")
+        .build();
+    let close = gtk::Button::with_label("Close");
+    close.set_halign(gtk::Align::Center);
+    let weak = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = weak.upgrade() {
+            window.close();
+        }
+    });
+    page.set_child(Some(&close));
+    window.set_content(Some(&page));
+    window.present();
+}
+
 impl Ui {
     fn new(app: &adw::Application, directory: Option<PathBuf>) -> anyhow::Result<Rc<Self>> {
         gio::resources_register_include!("gmux.gresource")?;
         gtk::IconTheme::for_display(&gdk::Display::default().unwrap())
             .add_resource_path("/dev/gmux/Gmux/icons");
-        let settings = Rc::new(RefCell::new(model::load::<Settings>("settings.json")));
+        let settings = Rc::new(RefCell::new(model::load::<Settings>("settings.json")?));
         let desktop_settings = font::desktop_settings();
         if let Some(desktop) = &desktop_settings {
             settings.borrow_mut().system_font = desktop.string(font::KEY).to_string();
@@ -193,9 +218,18 @@ impl Ui {
         apply_appearance(&settings.borrow());
         let wake = ipc::Wake::new()?;
         let server = ipc::Server::start_at(ipc::companion_path(".ui"), wake.clone())?;
-        let sessions = SessionManager::connect(wake.clone())?;
-        let saved_session = sessions.saved_session()?;
-        let mut catalog = model::load::<WorkspaceCatalog>("workspaces.json");
+        let mut sessions = SessionManager::connect(wake.clone())?;
+        let saved_session = if let Some(directory) = directory {
+            // Initial setup completes before presenting a window. Runtime commands use the worker.
+            let reply: CommandReply = serde_json::from_value(ipc::call(
+                json!({"method":"_command","command":Command::New { directory: Some(directory), name: None, workspace: None }}),
+            )?)?;
+            sessions.install_metadata(reply.metadata);
+            reply.session
+        } else {
+            sessions.saved_session()?
+        };
+        let mut catalog = model::load::<WorkspaceCatalog>("workspaces.json")?;
         let mut ids = HashSet::new();
         catalog.workspaces.retain(|workspace| {
             workspace.id > 0
@@ -389,15 +423,6 @@ impl Ui {
             desktop_settings,
             tabs: RefCell::new(Vec::new()),
             sessions: RefCell::new(sessions),
-            next_id: Cell::new(
-                catalog
-                    .workspaces
-                    .iter()
-                    .map(|workspace| workspace.id)
-                    .max()
-                    .unwrap_or(0)
-                    + 1,
-            ),
             catalog: RefCell::new(catalog),
             filter: Cell::new(TabFilter::All),
             filter_title,
@@ -415,6 +440,8 @@ impl Ui {
             changing: Cell::new(false),
             dirty: Cell::new(false),
             server,
+            backend: ipc::Client::new(wake.clone()),
+            pending: RefCell::new(HashMap::new()),
             wake: wake.clone(),
             update_source: RefCell::new(None),
             branches: BranchWorker::new(),
@@ -573,8 +600,7 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         ui.window.connect_close_request(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.save_session();
-                ui.app.quit();
+                ui.detach_frontend();
             }
             glib::Propagation::Stop
         });
@@ -582,8 +608,7 @@ impl Ui {
             let weak = Rc::downgrade(&ui);
             glib_unix::unix_signal_add_local(signal, move || {
                 if let Some(ui) = weak.upgrade() {
-                    ui.save_session();
-                    ui.app.quit();
+                    ui.detach_frontend();
                 }
                 glib::ControlFlow::Break
             });
@@ -592,9 +617,6 @@ impl Ui {
             if let Err(error) = ui.restore_tab(saved, false) {
                 ui.message(&format!("Could not restore a tab: {error}"));
             }
-        }
-        if let Some(directory) = directory {
-            ui.new_tab(directory, None)?;
         }
         let active = {
             let tabs = ui.tabs.borrow();
@@ -624,6 +646,15 @@ impl Ui {
                 let Some(ui) = weak.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
+                let replies: Vec<_> = ui.backend.replies().collect();
+                for (id, result) in replies {
+                    let callback = ui.pending.borrow_mut().remove(&id);
+                    if let Some(callback) = callback {
+                        callback(&ui, result);
+                    } else if let Err(error) = result {
+                        ui.message(&error.to_string());
+                    }
+                }
                 let updates = ui.sessions.borrow_mut().poll();
                 if ui.sessions.borrow().disconnected() {
                     ui.app.quit();
@@ -661,6 +692,71 @@ impl Ui {
                         }
                         return glib::ControlFlow::Continue;
                     };
+                    let method = request.body["method"].as_str().unwrap_or("");
+                    let action_command = if method == "action" {
+                        let name = request.body["name"].as_str().unwrap_or("");
+                        if ui
+                            .window
+                            .lookup_action(name)
+                            .is_some_and(|a| a.is_enabled())
+                        {
+                            match name {
+                                "new" => Some(Command::New {
+                                    directory: Some(ui.default_directory()),
+                                    name: None,
+                                    workspace: Some(ui.selected_workspace()),
+                                }),
+                                "split-right" | "split-down" => {
+                                    ui.active_pane().map(|pane| Command::Split {
+                                        pane: Some(pane.id),
+                                        down: name == "split-down",
+                                    })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(command) = action_command {
+                        let reply = request.reply;
+                        ui.command(command, move |_, result| {
+                            let response = result
+                                .map(|_| json!({"ok":true}))
+                                .unwrap_or_else(|e| json!({"error":e.to_string()}));
+                            let _ = reply.try_send(response);
+                        });
+                        continue;
+                    }
+                    if gmux::control::Command::supports(method) {
+                        let reply = request.reply;
+                        let command = match serde_json::from_value(request.body) {
+                            Ok(command) => command,
+                            Err(error) => {
+                                let _ = reply.try_send(json!({"error":error.to_string()}));
+                                continue;
+                            }
+                        };
+                        ui.command(command, move |_, result| {
+                            let response = result
+                                .and_then(|result| Ok(serde_json::to_value(result)?))
+                                .unwrap_or_else(|e| json!({"error":e.to_string()}));
+                            let _ = reply.try_send(response);
+                        });
+                        continue;
+                    }
+                    if method == "read" {
+                        let body = json!({"method":"_read","pane":request.body["pane"]});
+                        let reply = request.reply;
+                        ui.request(body, move |_, result| {
+                            let _ = reply.try_send(
+                                result.unwrap_or_else(|e| json!({"error":e.to_string()})),
+                            );
+                        });
+                        continue;
+                    }
                     let response = ui
                         .handle_request(request.body)
                         .unwrap_or_else(|error| json!({"error":error.to_string()}));
@@ -687,20 +783,7 @@ impl Ui {
         });
         Ok(ui)
     }
-    fn next(&self) -> anyhow::Result<u64> {
-        let id = self.next_id.get();
-        self.next_id.set(
-            id.checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("No tab or pane IDs remain"))?,
-        );
-        Ok(id)
-    }
-    fn terminal(
-        self: &Rc<Self>,
-        id: u64,
-        tab: u64,
-        directory: PathBuf,
-    ) -> anyhow::Result<Rc<Terminal>> {
+    fn terminal(self: &Rc<Self>, id: u64) -> anyhow::Result<Rc<Terminal>> {
         let weak = Rc::downgrade(self);
         let focus = Rc::new(move |id| {
             if let Some(ui) = weak.upgrade() {
@@ -713,13 +796,10 @@ impl Ui {
                 ui.request_close(id);
             }
         });
-        let session = self.sessions.borrow_mut().spawn(
-            id,
-            tab,
-            directory,
-            self.settings.borrow().cursor_style,
-            &Theme::adwaita(adw::StyleManager::default().is_dark()),
-        )?;
+        let session = self
+            .sessions
+            .borrow_mut()
+            .attach(id, &Theme::adwaita(adw::StyleManager::default().is_dark()))?;
         Ok(Terminal::new(
             session,
             self.settings.clone(),
@@ -728,7 +808,7 @@ impl Ui {
             self.app.upcast_ref(),
         ))
     }
-    fn new_tab(self: &Rc<Self>, directory: PathBuf, name: Option<String>) -> anyhow::Result<u64> {
+    fn new_tab(self: &Rc<Self>, directory: PathBuf, name: Option<String>) {
         self.create_tab(directory, name, self.selected_workspace())
     }
     fn create_tab(
@@ -736,37 +816,135 @@ impl Ui {
         directory: PathBuf,
         name: Option<String>,
         workspace: Option<u64>,
-    ) -> anyhow::Result<u64> {
-        if let Some(id) = workspace {
-            anyhow::ensure!(
-                self.catalog.borrow().workspaces.iter().any(|w| w.id == id),
-                "Workspace {id} does not exist"
-            );
-        }
-        anyhow::ensure!(
-            directory.is_dir(),
-            "{} is not a directory",
-            directory.display()
-        );
-        let tab = self.next()?;
-        let pane = self.next()?;
-        self.restore_tab(
-            SavedTab {
-                id: tab,
-                workspace,
-                custom_name: name.as_ref().is_some_and(|name| !name.trim().is_empty()),
-                name: name
-                    .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| model::directory_name(&directory)),
-                layout: Layout::Pane(pane),
-                directories: HashMap::from([(pane, directory)]),
-                active: pane,
+    ) {
+        self.command(
+            Command::New {
+                directory: Some(directory),
+                name,
+                workspace: Some(workspace),
             },
-            true,
-        )?;
-        self.switch(tab);
+            |ui, result| {
+                if let Err(e) = result {
+                    ui.message(&e.to_string());
+                }
+            },
+        );
+    }
+    fn request(
+        self: &Rc<Self>,
+        body: Value,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<Value>) + 'static,
+    ) {
+        match self.backend.request(body) {
+            Ok(id) => {
+                self.pending.borrow_mut().insert(id, Box::new(callback));
+            }
+            Err(error) => callback(self, Err(error)),
+        }
+    }
+    fn command(
+        self: &Rc<Self>,
+        command: Command,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>) + 'static,
+    ) {
+        let reveal = matches!(command, Command::New { .. } | Command::Split { .. });
         self.save_session();
-        Ok(tab)
+        self.request(
+            json!({"method":"_command","command":command}),
+            move |ui, result| {
+                let result = result.and_then(|value| {
+                    let reply: CommandReply = serde_json::from_value(value)?;
+                    let result = ui.apply_backend(reply, reveal)?;
+                    if let Some(warning) = result.warning.as_deref() {
+                        ui.message(warning);
+                    }
+                    Ok(result)
+                });
+                callback(ui, result);
+            },
+        );
+    }
+    fn apply_backend(
+        self: &Rc<Self>,
+        reply: CommandReply,
+        reveal: bool,
+    ) -> anyhow::Result<CommandResult> {
+        let previous_active = self.active.get();
+        let CommandReply {
+            result,
+            session: state,
+            catalog,
+            metadata,
+        } = reply;
+        *self.catalog.borrow_mut() = catalog;
+        self.sessions.borrow_mut().install_metadata(metadata);
+        let ids: HashSet<_> = state.tabs.iter().flat_map(|t| t.layout.ids()).collect();
+        let removed: Vec<_> = self
+            .tabs
+            .borrow()
+            .iter()
+            .flat_map(|t| t.panes.keys().copied())
+            .filter(|id| !ids.contains(id))
+            .collect();
+        for id in removed {
+            self.close_pane(id)?;
+        }
+        for saved in state.tabs {
+            let existing = self.tabs.borrow().iter().any(|t| t.id == saved.id);
+            if !existing {
+                self.restore_tab(saved, true)?;
+                continue;
+            }
+            let new_ids: Vec<_> = {
+                let tabs = self.tabs.borrow();
+                let tab = tabs.iter().find(|t| t.id == saved.id).unwrap();
+                saved
+                    .layout
+                    .ids()
+                    .into_iter()
+                    .filter(|id| !tab.panes.contains_key(id))
+                    .collect()
+            };
+            let mut new_panes = Vec::new();
+            for id in new_ids {
+                new_panes.push((id, self.terminal(id)?));
+            }
+            let changed = {
+                let mut tabs = self.tabs.borrow_mut();
+                let tab = tabs.iter_mut().find(|t| t.id == saved.id).unwrap();
+                let changed = *tab.layout.borrow() != saved.layout;
+                *tab.layout.borrow_mut() = saved.layout;
+                tab.panes.extend(new_panes);
+                tab.name = saved.name;
+                tab.custom_name = saved.custom_name;
+                tab.workspace = saved.workspace;
+                tab.active = saved.active;
+                tab.name_label.set_text(&tab.name);
+                changed
+            };
+            if changed {
+                self.rebuild(saved.id);
+            }
+        }
+        self.apply_filter(state.filter);
+        self.refresh_workspace_ui();
+        let visible = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.id == state.active)
+            .is_some_and(|tab| self.tab_is_visible(tab));
+        if state.active == previous_active && !visible && !reveal {
+            // Typing in the sidebar can hide the active row without changing its terminal.
+        } else if state.active != 0 && (reveal || visible) {
+            self.switch(state.active);
+        } else if state.active != 0 {
+            self.set_filter(state.filter);
+        } else {
+            self.show_empty();
+        }
+        self.refresh_metadata();
+        Ok(result)
     }
     fn restore_tab(self: &Rc<Self>, saved: SavedTab, prepend: bool) -> anyhow::Result<()> {
         saved.validate()?;
@@ -792,16 +970,8 @@ impl Ui {
             "Saved tab IDs conflict with another tab"
         );
         let mut panes = HashMap::new();
-        self.next_id.set(self.next_id.get().max(saved.id + 1));
         for id in ids {
-            self.next_id.set(self.next_id.get().max(id + 1));
-            let directory = saved
-                .directories
-                .get(&id)
-                .cloned()
-                .filter(|p| p.is_dir())
-                .unwrap_or_else(model::home);
-            match self.terminal(id, saved.id, directory) {
+            match self.terminal(id) {
                 Ok(terminal) => {
                     panes.insert(id, terminal);
                 }
@@ -1148,24 +1318,29 @@ impl Ui {
         self.update_search_count();
     }
     fn update_search_count(&self) {
-        let (current, total) = self
+        let (current, total, pending) = self
             .active_pane()
-            .map_or((0, 0), |pane| pane.search_status());
+            .map_or((0, 0, false), |pane| pane.search_status());
         let has_query = !self.search_entry.text().is_empty();
-        let status = Some((has_query, current, total));
+        let status = Some((has_query, current, total, pending));
         if self.search_status.replace(status) == status {
             return;
         }
-        self.search_count.set_text(&format!("{current} of {total}"));
-        self.search_count.set_visible(has_query && total > 0);
-        if has_query && total == 0 {
+        self.search_count.set_text(&if pending && total == 0 {
+            "Searching…".to_owned()
+        } else {
+            format!("{current} of {total}")
+        });
+        self.search_count
+            .set_visible(has_query && (total > 0 || pending));
+        if has_query && total == 0 && !pending {
             self.search_field.add_css_class("error");
         } else {
             self.search_field.remove_css_class("error");
         }
         self.search_entry
             .update_state(&[gtk::accessible::State::Invalid(
-                if has_query && total == 0 {
+                if has_query && total == 0 && !pending {
                     gtk::AccessibleInvalidState::True
                 } else {
                     gtk::AccessibleInvalidState::False
@@ -1186,42 +1361,18 @@ impl Ui {
                 .ok_or_else(|| anyhow::anyhow!("No active terminal"))
         }
     }
-    fn split_pane(self: &Rc<Self>, id: u64, down: bool) -> anyhow::Result<u64> {
-        let pane = self.pane(Some(id))?;
-        pane.refresh_directory();
-        let tab = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|w| w.panes.contains_key(&id))
-            .unwrap()
-            .id;
-        anyhow::ensure!(
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|w| w.id == tab)
-                .unwrap()
-                .panes
-                .len()
-                < 24,
-            "A tab can have at most 24 panes"
+    fn split_pane(self: &Rc<Self>, id: u64, down: bool) {
+        self.command(
+            Command::Split {
+                pane: Some(id),
+                down,
+            },
+            |ui, result| {
+                if let Err(e) = result {
+                    ui.message(&e.to_string());
+                }
+            },
         );
-        let new_id = self.next()?;
-        let terminal = self.terminal(new_id, tab, pane.directory())?;
-        {
-            let mut tabs = self.tabs.borrow_mut();
-            let w = tabs.iter_mut().find(|w| w.id == tab).unwrap();
-            w.layout.borrow_mut().split(id, new_id, down);
-            w.panes.insert(new_id, terminal.clone());
-            w.active = new_id;
-        }
-        self.rebuild(tab);
-        self.switch(tab);
-        terminal.area.grab_focus();
-        self.dirty.set(true);
-        self.save_session();
-        Ok(new_id)
     }
     fn close_pane(self: &Rc<Self>, id: u64) -> anyhow::Result<()> {
         let tab = self
@@ -1294,15 +1445,24 @@ impl Ui {
         }
         self.refresh_sidebar();
         self.dirty.set(true);
-        self.save_session();
         Ok(())
     }
     fn request_close(self: &Rc<Self>, id: u64) {
-        let busy = self.pane(Some(id)).is_ok_and(|p| p.busy());
+        self.request(
+            json!({"method":"_busy","panes":[id]}),
+            move |ui, result| match result {
+                Ok(value) => ui.confirm_close(id, value["busy"].as_bool().unwrap_or(true)),
+                Err(e) => ui.message(&e.to_string()),
+            },
+        );
+    }
+    fn confirm_close(self: &Rc<Self>, id: u64, busy: bool) {
         if !busy {
-            if let Err(e) = self.close_pane(id) {
-                self.message(&e.to_string());
-            }
+            self.command(Command::Close { pane: Some(id) }, |ui, result| {
+                if let Err(e) = result {
+                    ui.message(&e.to_string());
+                }
+            });
             return;
         }
         let dialog = adw::AlertDialog::builder()
@@ -1317,17 +1477,31 @@ impl Ui {
         let weak = Rc::downgrade(self);
         dialog.connect_response(Some("close"), move |_, _| {
             if let Some(ui) = weak.upgrade() {
-                let _ = ui.close_pane(id);
+                ui.command(Command::Close { pane: Some(id) }, |ui, result| {
+                    if let Err(e) = result {
+                        ui.message(&e.to_string());
+                    }
+                });
             }
         });
         dialog.present(Some(&self.window));
     }
     fn request_quit(self: &Rc<Self>) {
-        let busy = self
+        let panes: Vec<_> = self
             .tabs
             .borrow()
             .iter()
-            .any(|w| w.panes.values().any(|p| p.busy()));
+            .flat_map(|t| t.panes.keys().copied())
+            .collect();
+        self.request(
+            json!({"method":"_busy","panes":panes}),
+            |ui, result| match result {
+                Ok(value) => ui.confirm_quit(value["busy"].as_bool().unwrap_or(true)),
+                Err(e) => ui.message(&e.to_string()),
+            },
+        );
+    }
+    fn confirm_quit(self: &Rc<Self>, busy: bool) {
         if !busy {
             self.stop_daemon();
             return;
@@ -1346,13 +1520,26 @@ impl Ui {
         });
         dialog.present(Some(&self.window));
     }
-    fn stop_daemon(&self) {
+    fn stop_daemon(self: &Rc<Self>) {
         self.save_session();
-        if let Err(error) = self.sessions.borrow().shutdown() {
-            self.message(&error.to_string());
-            return;
-        }
-        self.app.quit();
+        self.request(json!({"method":"quit"}), |ui, result| match result {
+            Ok(value) => {
+                if let Some(warning) = value["warning"].as_str() {
+                    eprintln!("{warning}");
+                }
+                ui.app.quit();
+            }
+            Err(error) => ui.message(&error.to_string()),
+        });
+    }
+    fn detach_frontend(self: &Rc<Self>) {
+        self.save_session();
+        self.request(json!({"method":"_hello"}), |ui, result| {
+            if let Err(error) = result {
+                eprintln!("Could not finish saving layout: {error}");
+            }
+            ui.app.quit();
+        });
     }
     fn message(&self, message: &str) {
         self.toast.add_toast(adw::Toast::new(message));
@@ -1489,7 +1676,10 @@ impl Ui {
                 })
                 .collect(),
         };
-        if let Err(e) = self.sessions.borrow().save(&session) {
+        if let Err(e) = self
+            .backend
+            .save(serde_json::to_value(&session).expect("Session is serializable"))
+        {
             eprintln!("Could not save session: {e}");
         }
     }
@@ -1607,9 +1797,8 @@ impl Ui {
         action.connect_activate(move |_, value| {
             if let (Some(ui), Some((tab, workspace))) =
                 (weak.upgrade(), value.and_then(|v| v.get::<(u64, u64)>()))
-                && let Err(error) = ui.assign_tab(tab, (workspace != 0).then_some(workspace))
             {
-                ui.message(&error.to_string());
+                ui.assign_tab(tab, (workspace != 0).then_some(workspace));
             }
         });
         self.window.add_action(&action);
@@ -1633,10 +1822,8 @@ impl Ui {
                     .iter()
                     .find(|workspace| workspace.id == id)
                     .map(|workspace| workspace.directory.clone());
-                if let Some(directory) = directory
-                    && let Err(error) = ui.create_tab(directory, None, Some(id))
-                {
-                    ui.message(&error.to_string());
+                if let Some(directory) = directory {
+                    ui.create_tab(directory, None, Some(id));
                 }
             }
         });
@@ -1662,110 +1849,104 @@ impl Ui {
         if TAB_ACTIONS.contains(&name) && self.active.get() == 0 {
             return;
         }
-        let result: anyhow::Result<()> = (|| {
-            match name {
-                "new" => {
-                    self.new_tab(self.default_directory(), None)?;
-                }
-                "open-folder" => self.open_folder(),
-                "new-workspace" => self.workspace_editor(None),
-                "manage-workspaces" => self.manage_workspaces(),
-                "split-right" | "split-down" => {
-                    if let Some(p) = self.active_pane() {
-                        self.split_pane(p.id, name == "split-down")?;
-                    }
-                }
-                "close" => {
-                    if let Some(p) = self.active_pane() {
-                        self.request_close(p.id);
-                    }
-                }
-                "close-active-tab" => self.request_close_tab(self.active.get()),
-                "copy" => {
-                    if let Some(p) = self.active_pane()
-                        && !p.copy()
-                    {
-                        self.message("Select terminal text to copy it");
-                    }
-                }
-                "paste" => {
-                    if let Some(p) = self.active_pane() {
-                        p.paste();
-                    }
-                }
-                "find" => {
-                    let show = !self.search.is_search_mode();
-                    self.search.set_search_mode(show);
-                    if show {
-                        self.search_entry.grab_focus();
-                    }
-                }
-                "sidebar" => self.split.set_show_sidebar(!self.split.shows_sidebar()),
-                "palette" => self.palette(),
-                "next-tab" | "previous-tab" => {
-                    let ids = self
-                        .tabs
-                        .borrow()
-                        .iter()
-                        .filter(|tab| self.tab_is_visible(tab))
-                        .map(|w| w.id)
-                        .collect::<Vec<_>>();
-                    if let Some(index) = ids.iter().position(|id| *id == self.active.get()) {
-                        let next = (index + if name == "next-tab" { 1 } else { ids.len() - 1 })
-                            % ids.len();
-                        self.switch(ids[next]);
-                    } else if let Some(id) = if name == "next-tab" {
-                        ids.first()
-                    } else {
-                        ids.last()
-                    } {
-                        self.switch(*id);
-                    }
-                }
-                "next-pane" | "previous-pane" => {
-                    let (ids, active) = {
-                        let list = self.tabs.borrow();
-                        let w = list.iter().find(|w| w.id == self.active.get()).unwrap();
-                        let ids = w.layout.borrow().ids();
-                        (ids, w.active)
-                    };
-                    let index = ids.iter().position(|id| *id == active).unwrap();
-                    let next = (index
-                        + if name == "next-pane" {
-                            1
-                        } else {
-                            ids.len() - 1
-                        })
-                        % ids.len();
-                    self.jump_to_pane(ids[next]);
-                }
-                "zoom-in" | "zoom-out" | "zoom-reset" => {
-                    if let Some(p) = self.active_pane() {
-                        p.zoom(match name {
-                            "zoom-in" => 1.0,
-                            "zoom-out" => -1.0,
-                            _ => 0.0,
-                        });
-                    }
-                }
-                "preferences" => self.preferences(),
-                "shortcuts" => self.shortcuts(),
-                "rename" => self.rename_tab(self.active.get()),
-                "fullscreen" => {
-                    if self.window.is_fullscreen() {
-                        self.window.unfullscreen();
-                    } else {
-                        self.window.fullscreen();
-                    }
-                }
-                "quit" => self.request_quit(),
-                "about" => self.about(),
-                _ => (),
+        match name {
+            "new" => {
+                self.new_tab(self.default_directory(), None);
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.message(&error.to_string());
+            "open-folder" => self.open_folder(),
+            "new-workspace" => self.workspace_editor(None),
+            "manage-workspaces" => self.manage_workspaces(),
+            "split-right" | "split-down" => {
+                if let Some(p) = self.active_pane() {
+                    self.split_pane(p.id, name == "split-down");
+                }
+            }
+            "close" => {
+                if let Some(p) = self.active_pane() {
+                    self.request_close(p.id);
+                }
+            }
+            "close-active-tab" => self.request_close_tab(self.active.get()),
+            "copy" => {
+                if let Some(p) = self.active_pane()
+                    && !p.copy()
+                {
+                    self.message("Select terminal text to copy it");
+                }
+            }
+            "paste" => {
+                if let Some(p) = self.active_pane() {
+                    p.paste();
+                }
+            }
+            "find" => {
+                let show = !self.search.is_search_mode();
+                self.search.set_search_mode(show);
+                if show {
+                    self.search_entry.grab_focus();
+                }
+            }
+            "sidebar" => self.split.set_show_sidebar(!self.split.shows_sidebar()),
+            "palette" => self.palette(),
+            "next-tab" | "previous-tab" => {
+                let ids = self
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .filter(|tab| self.tab_is_visible(tab))
+                    .map(|w| w.id)
+                    .collect::<Vec<_>>();
+                if let Some(index) = ids.iter().position(|id| *id == self.active.get()) {
+                    let next =
+                        (index + if name == "next-tab" { 1 } else { ids.len() - 1 }) % ids.len();
+                    self.switch(ids[next]);
+                } else if let Some(id) = if name == "next-tab" {
+                    ids.first()
+                } else {
+                    ids.last()
+                } {
+                    self.switch(*id);
+                }
+            }
+            "next-pane" | "previous-pane" => {
+                let (ids, active) = {
+                    let list = self.tabs.borrow();
+                    let w = list.iter().find(|w| w.id == self.active.get()).unwrap();
+                    let ids = w.layout.borrow().ids();
+                    (ids, w.active)
+                };
+                let index = ids.iter().position(|id| *id == active).unwrap();
+                let next = (index
+                    + if name == "next-pane" {
+                        1
+                    } else {
+                        ids.len() - 1
+                    })
+                    % ids.len();
+                self.jump_to_pane(ids[next]);
+            }
+            "zoom-in" | "zoom-out" | "zoom-reset" => {
+                if let Some(p) = self.active_pane() {
+                    p.zoom(match name {
+                        "zoom-in" => 1.0,
+                        "zoom-out" => -1.0,
+                        _ => 0.0,
+                    });
+                }
+            }
+            "preferences" => self.preferences(),
+            "shortcuts" => self.shortcuts(),
+            "rename" => self.rename_tab(self.active.get()),
+            "fullscreen" => {
+                if self.window.is_fullscreen() {
+                    self.window.unfullscreen();
+                } else {
+                    self.window.fullscreen();
+                }
+            }
+            "quit" => self.request_quit(),
+            "about" => self.about(),
+            _ => (),
         }
     }
     fn open_folder(self: &Rc<Self>) {
@@ -1780,9 +1961,8 @@ impl Ui {
             move |result| {
                 if let (Some(ui), Ok(folder)) = (weak.upgrade(), result)
                     && let Some(path) = folder.path()
-                    && let Err(e) = ui.new_tab(path, None)
                 {
-                    ui.message(&e.to_string());
+                    ui.new_tab(path, None);
                 }
             },
         );
@@ -1852,16 +2032,18 @@ impl Ui {
                 if name.is_empty() {
                     return;
                 }
-                if let Some(w) = ui.tabs.borrow_mut().iter_mut().find(|w| w.id == id) {
-                    w.name = name.clone();
-                    w.custom_name = true;
-                    w.name_label.set_text(&name);
-                }
-                ui.refresh_metadata();
-                ui.dirty.set(true);
-                if let Some(dialog) = close.upgrade() {
-                    dialog.close();
-                }
+                let close = close.clone();
+                ui.command(
+                    Command::Rename { tab: id, name },
+                    move |ui, result| match result {
+                        Ok(_) => {
+                            if let Some(dialog) = close.upgrade() {
+                                dialog.close();
+                            }
+                        }
+                        Err(error) => ui.message(&error.to_string()),
+                    },
+                );
             }
         });
         dialog.present(Some(&self.window));
@@ -2016,7 +2198,7 @@ impl Ui {
         self.redraw_terminals();
     }
     fn persist_settings(&self) {
-        if let Err(e) = model::save("settings.json", &*self.settings.borrow()) {
+        if let Err(e) = self.backend.persist(self.settings.borrow().clone()) {
             self.message(&e.to_string());
         }
     }
@@ -2262,7 +2444,7 @@ impl Ui {
                 &[
                     ("Copy selection", "copy"),
                     ("Paste", "paste"),
-                    ("Find in visible terminal", "find"),
+                    ("Find in terminal", "find"),
                     ("Zoom in", "zoom-in"),
                     ("Zoom out", "zoom-out"),
                     ("Reset zoom", "zoom-reset"),
@@ -2355,79 +2537,6 @@ impl Ui {
                     })).collect::<Vec<_>>()
                 }))
             }
-            "new" => {
-                let workspace = if let Some(value) = request.get("workspace") {
-                    anyhow::ensure!(
-                        value.is_null() || value.is_u64(),
-                        "workspace must be an ID or null"
-                    );
-                    value.as_u64()
-                } else {
-                    self.selected_workspace()
-                };
-                let directory = request
-                    .get("directory")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        workspace.and_then(|id| {
-                            self.catalog
-                                .borrow()
-                                .workspaces
-                                .iter()
-                                .find(|workspace| workspace.id == id)
-                                .map(|workspace| workspace.directory.clone())
-                        })
-                    })
-                    .unwrap_or_else(model::home);
-                let id = self.create_tab(
-                    directory,
-                    request
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    workspace,
-                )?;
-                Ok(
-                    json!({"tab": id, "pane": self.active_pane().unwrap().id, "workspace": workspace}),
-                )
-            }
-            "workspace-new" => {
-                let directory = request
-                    .get("directory")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(model::home);
-                let name = request
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| model::directory_name(&directory));
-                Ok(json!({"workspace": self.add_workspace(name, directory)?}))
-            }
-            "workspace-delete" => {
-                let id = request
-                    .get("workspace")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("workspace-delete requires a workspace"))?;
-                self.remove_workspace(id)?;
-                Ok(json!({"ok": true}))
-            }
-            "move" => {
-                let tab = request
-                    .get("tab")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(self.active.get());
-                let value = request.get("workspace").ok_or_else(|| {
-                    anyhow::anyhow!("move requires workspace, or null for no workspace")
-                })?;
-                anyhow::ensure!(
-                    value.is_null() || value.is_u64(),
-                    "workspace must be an ID or null"
-                );
-                self.assign_tab(tab, value.as_u64())?;
-                Ok(json!({"ok": true}))
-            }
             "search-tabs" => {
                 let query = request
                     .get("query")
@@ -2462,17 +2571,6 @@ impl Ui {
                 self.set_filter(filter);
                 Ok(json!({"ok": true}))
             }
-            "split" => {
-                let pane = self.pane(pane_id)?;
-                let id = self.split_pane(
-                    pane.id,
-                    request
-                        .get("down")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                )?;
-                Ok(json!({"pane":id}))
-            }
             "send" => {
                 let pane = self.pane(pane_id)?;
                 let text = request
@@ -2496,7 +2594,6 @@ impl Ui {
                 }
                 Ok(json!({"ok":true}))
             }
-            "read" => Ok(json!({"text":self.pane(pane_id)?.text()?})),
             "focus" => {
                 if let Some(pane) = pane_id {
                     self.pane(Some(pane))?;
@@ -2522,11 +2619,6 @@ impl Ui {
                 } else {
                     anyhow::bail!("focus requires a tab, workspace, or pane");
                 }
-                Ok(json!({"ok":true}))
-            }
-            "close" => {
-                let pane = self.pane(pane_id)?;
-                self.close_pane(pane.id)?;
                 Ok(json!({"ok":true}))
             }
             "screenshot" => {

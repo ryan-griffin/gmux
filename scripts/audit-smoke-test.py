@@ -5,11 +5,12 @@ Run with GTK_A11Y=none dbus-run-session -- python3 scripts/audit-smoke-test.py.
 Uses an isolated configuration and a shell without prompt hooks.
 """
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 import shlex
 import resource
-import socket
 import subprocess
 import tempfile
 import time
@@ -23,16 +24,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 
-def wait_for(predicate, timeout=8):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (FileNotFoundError, ConnectionRefusedError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Application state did not reach the expected value")
+wait_for = partial(shared_wait_for, timeout=8)
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
@@ -47,13 +39,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-audit-") as temp:
                GMUX_SOCKET=str(temp / "gmux.sock"), GTK_A11Y="none")
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def state():
         return rpc("list")

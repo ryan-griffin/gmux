@@ -5,9 +5,9 @@ Run with GDK_BACKEND=wayland dbus-run-session -- python3
 scripts/find-smoke-test.py. Uses its own app, settings, and accessibility bus.
 """
 import json
+from test_support import rpc as shared_rpc, wait_for, descendants
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
 import time
@@ -22,27 +22,6 @@ from gi.repository import Atspi, Gio, GLib
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-
-
-def wait_for(predicate):
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (FileNotFoundError, ConnectionRefusedError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Terminal find did not reach the expected state")
-
-
-def descendants(element):
-    element.clear_cache()
-    yield element
-    for index in range(element.get_child_count()):
-        child = element.get_child_at_index(index)
-        if child:
-            yield from descendants(child)
 
 
 def find(name, role):
@@ -88,13 +67,7 @@ with (artifacts / "find-smoke.log").open("w") as log:
                 app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
                 try:
                     def rpc(method, **params):
-                        with socket.socket(socket.AF_UNIX) as connection:
-                            connection.settimeout(6)
-                            connection.connect(env["GMUX_SOCKET"])
-                            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-                            result = json.loads(connection.makefile("rb").readline())
-                            assert "error" not in result, result
-                            return result
+                        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
                     wait_for(lambda: rpc("daemon-info")["attached"])
                     first = rpc("new", name="Find Test")
@@ -169,6 +142,21 @@ with (artifacts / "find-smoke.log").open("w") as log:
                     entry = wait_for(lambda: (find("Find...", "entry") or find("Find...", "text")))
                     assert Atspi.Text.get_text(entry, 0, -1) == ""
                     assert rpc("list")["active_tab"] == first["tab"]
+                    # Find must scan retained history and reveal an offscreen match.
+                    rpc("send", pane=first["pane"], text="printf '\\033[3J\\033[2J\\033[HSCROLLBACK_FIND_界\\n'; seq 1 200", paste=True, enter=True)
+                    wait_for(lambda: "200" in rpc("read", pane=first["pane"])["text"])
+                    assert "SCROLLBACK_FIND_界" not in rpc("read", pane=first["pane"])["text"]
+                    assert entry.get_editable_text_iface().set_text_contents("scrollback_find_界")
+                    wait_for(lambda: find("1 of 1", "label"))
+                    assert following.get_action_iface().do_action(0)
+                    wait_for(lambda: "SCROLLBACK_FIND_界" in rpc("read", pane=first["pane"])["text"])
+                    # Place the query across the terminal's current wrap boundary.
+                    cols = rpc("_metadata", pane=first["pane"])["meta"]["size"][0]
+                    wrapped = "x" * (cols - 2) + "needle"
+                    rpc("send", pane=first["pane"], text="printf '\\033[3J\\033[2J\\033[H" + wrapped + "\\n'", paste=True, enter=True)
+                    wait_for(lambda: wrapped in rpc("read", pane=first["pane"])["text"].replace("\n", ""))
+                    assert entry.get_editable_text_iface().set_text_contents("needle")
+                    wait_for(lambda: find("1 of 1", "label"))
                 finally:
                     app.terminate()
                     app.wait(timeout=8)
@@ -177,4 +165,4 @@ with (artifacts / "find-smoke.log").open("w") as log:
         registry.terminate()
         registry.wait(timeout=8)
 
-print("PASS: dark/light find bars, match counts, up/down navigation and wrapping, no matches, live output, tab/pane switching, clearing and reopening")
+print("PASS: dark/light find bars, Unicode history search, offscreen navigation, match counts, wrapping, live output, tab/pane switching, clearing and reopening")

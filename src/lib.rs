@@ -1,5 +1,6 @@
 #![deny(deprecated)]
 
+pub mod control;
 pub mod daemon;
 mod engine;
 pub mod ipc;

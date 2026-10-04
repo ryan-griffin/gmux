@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import gi
@@ -87,6 +88,17 @@ def _run(script, arguments):
                     "org.freedesktop.DBus", "NameHasOwner", GLib.Variant("(s)", (REMOTE,)),
                     GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
             wait_for(ready)
+            # GTK needs a keyboard seat for native window and dialog focus.
+            # Keep it available for suites that inspect focus through AT-SPI.
+            seat = bus.call_sync(REMOTE, "/org/gnome/Mutter/RemoteDesktop", REMOTE,
+                "CreateSession", None, GLib.VariantType.new("(o)"),
+                Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+            bus.call_sync(REMOTE, seat, REMOTE + ".Session", "Start", None,
+                None, Gio.DBusCallFlags.NONE, 5000, None)
+            for pressed in (True, False):
+                bus.call_sync(REMOTE, seat, REMOTE + ".Session", "NotifyKeyboardKeysym",
+                    GLib.Variant("(ub)", (65505, pressed)), None,
+                    Gio.DBusCallFlags.NONE, 5000, None)
             env = dict(os.environ, GMUX_WAYLAND_TEST="1")
             process = subprocess.Popen([sys.executable, script, *arguments], env=env)
             processes.append(process)
@@ -146,6 +158,7 @@ class WaylandInput:
         self.call(REMOTE, self.remote, REMOTE + ".Session", "Start")
         wait_for(lambda: self.node)
         self.call(REMOTE, self.remote, REMOTE + ".Session", "EnableClipboard", "(a{sv})", ({},))
+        self.clipboard_subscription = None
         # Headless Mutter has no physical seat devices. Advertise a keyboard
         # and pointer before GTK connects, rather than on the first test key.
         self.key(0xffe1, True)  # Shift_L
@@ -227,9 +240,43 @@ class WaylandInput:
         finally:
             os.close(fd)
 
+    def set_clipboard_text(self, text):
+        data = text.encode()
+        if self.clipboard_subscription is not None:
+            self.bus.signal_unsubscribe(self.clipboard_subscription)
+        def transfer(connection, sender, path, interface, signal, parameters):
+            mime, serial = parameters.unpack()
+            assert mime in ("text/plain;charset=utf-8", "text/plain"), mime
+            result, descriptors = self.bus.call_with_unix_fd_list_sync(REMOTE, self.remote,
+                REMOTE + ".Session", "SelectionWrite", GLib.Variant("(u)", (serial,)),
+                GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, 5000, None, None)
+            fd = descriptors.get(result.unpack()[0])
+            def write():
+                success = False
+                try:
+                    os.set_blocking(fd, False)
+                    remaining = memoryview(data)
+                    deadline = time.monotonic() + 5
+                    while remaining:
+                        assert select.select([], [fd], [], max(0, deadline - time.monotonic()))[1], "Clipboard write timed out"
+                        written = os.write(fd, remaining[:65536])
+                        assert written > 0
+                        remaining = remaining[written:]
+                    success = True
+                finally:
+                    os.close(fd)
+                    self.call(REMOTE, self.remote, REMOTE + ".Session", "SelectionWriteDone", "(ub)", (serial, success))
+            threading.Thread(target=write, daemon=True).start()
+        self.clipboard_subscription = self.bus.signal_subscribe(REMOTE, REMOTE + ".Session",
+            "SelectionTransfer", self.remote, None, Gio.DBusSignalFlags.NONE, transfer)
+        self.call(REMOTE, self.remote, REMOTE + ".Session", "SetSelection", "(a{sv})",
+            ({"mime-types": GLib.Variant("as", ["text/plain;charset=utf-8", "text/plain"])},))
+
     def close(self):
         self.pipeline.set_state(Gst.State.NULL)
         self.bus.signal_unsubscribe(self.subscription)
+        if self.clipboard_subscription is not None:
+            self.bus.signal_unsubscribe(self.clipboard_subscription)
         self.call(REMOTE, self.remote, REMOTE + ".Session", "Stop")
 
     def __enter__(self):

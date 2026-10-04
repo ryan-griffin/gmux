@@ -47,7 +47,7 @@ Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close
 | Close pane | Ctrl+Shift+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
-| Find in visible terminal | Ctrl+Shift+F |
+| Find in terminal history | Ctrl+Shift+F |
 | Commands | Ctrl+Shift+P |
 | Main menu | F10 |
 | Preferences | Ctrl+, |
@@ -75,12 +75,12 @@ Alerts from the focused terminal pane stay read and do not send desktop notifica
 
 ```sh
 ./scripts/bootstrap-ghostty.sh
-cargo build --locked
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+python3 scripts/check.py
+# Include the desktop regression suite in an isolated Wayland compositor:
+python3 scripts/check.py --native
 ```
 
-Native regression tests are in [scripts/](scripts/). The [keyboard and clipboard test](docs/renderer.md#validation) runs in an isolated Wayland compositor with XWayland disabled. See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
+The check runner performs formatting, all Rust tests, Clippy, builds, and headless smoke tests. `--native` also runs the desktop suite. Use `--only find terminal-input` to select smoke tests and `--skip-build` after a completed build. Shared socket calls, waits, accessibility traversal, and private process fixtures live in `scripts/test_support.py`. Native regression tests are in [scripts/](scripts/). The [keyboard and clipboard test](docs/renderer.md#validation) runs in an isolated Wayland compositor with XWayland disabled. See the [code and GNOME UI review](docs/code-review.md) for widget choices, library integration, validation, and known limitations.
 
 Run `python3 scripts/notification-focus-smoke-test.py` to check focused-pane suppression, alerts from other panes and inactive windows, and unread state after reconnect in an isolated Wayland compositor.
 
@@ -88,7 +88,7 @@ Run `python3 scripts/icon-smoke-test.py` to check the app icons with GdkPixbuf's
 
 Terminal processes and state live in a GTK-independent [session manager](docs/terminal-sessions.md). A headless daemon owns that manager and sends changed rows to the GTK frontend.
 
-Gmux uses Ghostty's terminal engine with Pango font shaping and GSK rendering. GTK selects a GPU backend or its software backend; see the [renderer design and benchmarks](docs/renderer.md). Terminal image protocols are not supported; Find and selection currently operate on the visible viewport.
+Gmux uses Ghostty's terminal engine with Pango font shaping and GSK rendering. GTK selects a GPU backend or its software backend; see the [renderer design and benchmarks](docs/renderer.md). Find searches retained scrollback and scrolls to offscreen matches. Selection can span scrollback and follows terminal updates. The terminal exposes viewport text, caret, and selection through GTK accessibility. Terminal image protocols are not supported.
 
 The [application benchmark](docs/performance.md) measures frontend and daemon CPU, resident memory, and native Wayland input-to-composited-frame latency with several busy panes.
 

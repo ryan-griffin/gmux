@@ -7,7 +7,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     time::Duration,
 };
 
@@ -165,6 +165,7 @@ pub fn call_at(path: &Path, request: Value) -> anyhow::Result<Value> {
         )
     })?;
     stream.set_read_timeout(Some(Duration::from_secs(6)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(6)))?;
     writeln!(stream, "{request}")?;
     let mut response = String::new();
     BufReader::new(stream).read_line(&mut response)?;
@@ -173,6 +174,110 @@ pub fn call_at(path: &Path, request: Value) -> anyhow::Result<Value> {
         anyhow::bail!("{}", error.as_str().unwrap_or("Request failed"));
     }
     Ok(value)
+}
+
+enum Job {
+    Request(u64, Value),
+    Save(Value),
+    Persist(crate::model::Settings),
+}
+#[derive(Default)]
+struct Jobs {
+    queue: std::collections::VecDeque<Job>,
+    closed: bool,
+}
+pub struct Client {
+    jobs: Arc<(Mutex<Jobs>, Condvar)>,
+    replies: mpsc::Receiver<(u64, anyhow::Result<Value>)>,
+    next: std::cell::Cell<u64>,
+}
+impl Client {
+    pub fn new(wake: Wake) -> Self {
+        Self::at(socket_path(), wake)
+    }
+    fn at(path: PathBuf, wake: Wake) -> Self {
+        let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
+        let worker = jobs.clone();
+        let (sender, replies) = mpsc::channel();
+        std::thread::spawn(move || {
+            loop {
+                let job = {
+                    let (lock, ready) = &*worker;
+                    let mut jobs = lock.lock().unwrap();
+                    while jobs.queue.is_empty() && !jobs.closed {
+                        jobs = ready.wait(jobs).unwrap();
+                    }
+                    let Some(job) = jobs.queue.pop_front() else {
+                        break;
+                    };
+                    job
+                };
+                let (id, result) = match job {
+                    Job::Request(id, request) => (id, call_at(&path, request)),
+                    Job::Save(session) => (
+                        0,
+                        call_at(
+                            &path,
+                            serde_json::json!({"method":"_presentation","session":session}),
+                        ),
+                    ),
+                    Job::Persist(settings) => (
+                        0,
+                        crate::model::save("settings.json", &settings).map(|()| Value::Null),
+                    ),
+                };
+                if sender.send((id, result)).is_err() {
+                    break;
+                }
+                wake.notify();
+            }
+        });
+        Self {
+            jobs,
+            replies,
+            next: std::cell::Cell::new(1),
+        }
+    }
+    pub fn request(&self, request: Value) -> anyhow::Result<u64> {
+        let id = self.next.get();
+        self.next.set(
+            id.checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("No request IDs remain"))?,
+        );
+        self.enqueue(Job::Request(id, request))?;
+        Ok(id)
+    }
+    pub fn save(&self, session: Value) -> anyhow::Result<()> {
+        self.enqueue(Job::Save(session))
+    }
+    pub fn persist(&self, settings: crate::model::Settings) -> anyhow::Result<()> {
+        self.enqueue(Job::Persist(settings))
+    }
+    fn enqueue(&self, job: Job) -> anyhow::Result<()> {
+        let (lock, ready) = &*self.jobs;
+        let mut jobs = lock.lock().unwrap();
+        // Only adjacent saves coalesce. A layout command is an ordering barrier.
+        match (job, jobs.queue.back_mut()) {
+            (Job::Save(value), Some(Job::Save(last))) => *last = value,
+            (Job::Persist(settings), Some(Job::Persist(last))) => *last = settings,
+            (job, _) => {
+                anyhow::ensure!(jobs.queue.len() < 128, "Daemon request queue is full");
+                jobs.queue.push_back(job);
+            }
+        }
+        ready.notify_one();
+        Ok(())
+    }
+    pub fn replies(&self) -> impl Iterator<Item = (u64, anyhow::Result<Value>)> + '_ {
+        self.replies.try_iter()
+    }
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.jobs;
+        lock.lock().unwrap().closed = true;
+        ready.notify_one();
+    }
 }
 
 /// Separate sockets share the explicitly selected runtime directory.
@@ -186,6 +291,48 @@ pub fn companion_path(suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn slow_requests_leave_the_caller_free_and_saves_coalesce_without_crossing_commands() {
+        let path =
+            std::env::temp_dir().join(format!("gmux-worker-test-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let (started, ready) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for i in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&socket).read_line(&mut line).unwrap();
+                let body: Value = serde_json::from_str(&line).unwrap();
+                if i == 0 {
+                    started.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                seen.push(body);
+                writeln!(socket, "{{\"ok\":true}}").unwrap();
+            }
+            seen
+        });
+        let client = Client::at(path.clone(), Wake::new().unwrap());
+        client
+            .request(serde_json::json!({"method":"slow"}))
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        client.save(serde_json::json!({"revision":1})).unwrap();
+        client.save(serde_json::json!({"revision":2})).unwrap();
+        client
+            .request(serde_json::json!({"method":"command"}))
+            .unwrap();
+        client.save(serde_json::json!({"revision":3})).unwrap();
+        release.send(()).unwrap();
+        let seen = worker.join().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[1]["session"]["revision"], 2);
+        assert_eq!(seen[2]["method"], "command");
+        assert_eq!(seen[3]["session"]["revision"], 3);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn wake_coalesces_notifications_and_rearms_after_drain() {
         let wake = Wake::new().unwrap();

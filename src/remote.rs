@@ -12,25 +12,73 @@ use std::{
     collections::{HashMap, HashSet},
     io::BufReader,
     os::unix::net::UnixStream,
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
 pub type SessionHandle = Rc<RefCell<RemoteSession>>;
 
 struct Connection {
-    commands: mpsc::SyncSender<Value>,
+    commands: mpsc::SyncSender<Outgoing>,
+    pending_bytes: Arc<AtomicUsize>,
     socket: UnixStream,
+}
+struct Outgoing {
+    request: Value,
+    bytes: usize,
 }
 
 impl Connection {
     fn send(&self, request: Value) -> anyhow::Result<()> {
-        self.commands
-            .try_send(request)
-            .map_err(|e| anyhow::anyhow!("Could not queue daemon command: {e}"))
+        let bytes = if request["method"] == "paste" {
+            request["text"].as_str().map_or(0, str::len)
+        } else {
+            0
+        };
+        anyhow::ensure!(
+            bytes <= transport::MAX_PASTE,
+            "Paste is too large. The limit is 4 MiB."
+        );
+        self.pending_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                (pending + bytes <= 2 * transport::MAX_PASTE).then_some(pending + bytes)
+            })
+            .map_err(|_| anyhow::anyhow!("Terminal input queue is full"))?;
+        if let Err(error) = self.commands.try_send(Outgoing { request, bytes }) {
+            self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            anyhow::bail!("Could not queue daemon command: {error}");
+        }
+        Ok(())
     }
+}
+
+fn write_request(writer: &mut impl std::io::Write, mut request: Value) -> anyhow::Result<()> {
+    if request["method"] != "paste" {
+        return transport::command(writer, &request);
+    }
+    let Value::String(text) = request["text"].take() else {
+        anyhow::bail!("Paste requires text");
+    };
+    request["method"] = json!("paste-begin");
+    request["size"] = json!(text.len());
+    transport::command(writer, &request)?;
+    let pane = request["pane"].clone();
+    let mut start = 0;
+    while start < text.len() {
+        let end = text.floor_char_boundary((start + transport::PASTE_CHUNK).min(text.len()));
+        transport::command(
+            writer,
+            &json!({"method":"paste-data", "pane":pane, "text":&text[start..end]}),
+        )?;
+        start = end;
+    }
+    transport::command(writer, &json!({"method":"paste-end", "pane":pane}))
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -42,6 +90,7 @@ pub struct SessionManager {
     connection: Rc<Connection>,
     receiver: mpsc::Receiver<Result<Packet, String>>,
     sessions: HashMap<u64, SessionHandle>,
+    metadata: HashMap<u64, Metadata>,
     visible: HashSet<u64>,
     subscription_pending: bool,
     pending_reads: HashMap<u64, u64>,
@@ -67,6 +116,13 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
                 return Ok(());
             }
         } else if child.is_none() {
+            // Surface recovery errors to the launcher before a failing daemon
+            // can hide their details in its log.
+            let settings = crate::model::load::<crate::model::Settings>("settings.json")?;
+            let _: crate::model::WorkspaceCatalog = crate::model::load("workspaces.json")?;
+            if settings.restore {
+                let _: Session = crate::model::load("session.json")?;
+            }
             let exe = std::env::current_exe()?.with_file_name("gmux-daemon");
             anyhow::ensure!(
                 exe.is_file(),
@@ -120,13 +176,17 @@ impl SessionManager {
             &json!({"method":"attach","version":transport::VERSION}),
         )?;
         let reader = socket.try_clone()?;
-        let (commands, queue) = mpsc::sync_channel(128);
+        let (commands, queue) = mpsc::sync_channel::<Outgoing>(128);
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
+        let writer_bytes = pending_bytes.clone();
         let (sender, receiver) = mpsc::sync_channel(64);
         let errors = sender.clone();
         let writer_wake = wake.clone();
         std::thread::spawn(move || {
-            while let Ok(request) = queue.recv() {
-                if let Err(error) = transport::command(&mut writer, &request) {
+            while let Ok(outgoing) = queue.recv() {
+                let result = write_request(&mut writer, outgoing.request);
+                writer_bytes.fetch_sub(outgoing.bytes, Ordering::Relaxed);
+                if let Err(error) = result {
                     let _ = errors.send(Err(error.to_string()));
                     writer_wake.notify();
                     let _ = writer.shutdown(std::net::Shutdown::Both);
@@ -153,9 +213,14 @@ impl SessionManager {
             }
         });
         Ok(Self {
-            connection: Rc::new(Connection { commands, socket }),
+            connection: Rc::new(Connection {
+                commands,
+                pending_bytes,
+                socket,
+            }),
             receiver,
             sessions: HashMap::new(),
+            metadata: HashMap::new(),
             visible: HashSet::new(),
             subscription_pending: false,
             pending_reads: HashMap::new(),
@@ -163,18 +228,20 @@ impl SessionManager {
             disconnected: false,
         })
     }
-    pub fn saved_session(&self) -> anyhow::Result<Session> {
-        Ok(serde_json::from_value(
-            ipc::call(json!({"method":"_state"}))?["session"].take(),
-        )?)
+    pub fn saved_session(&mut self) -> anyhow::Result<Session> {
+        let mut value = ipc::call(json!({"method":"_state"}))?;
+        self.install_metadata(serde_json::from_value(value["metadata"].take())?);
+        Ok(serde_json::from_value(value["session"].take())?)
     }
-    pub fn save(&self, session: &Session) -> anyhow::Result<()> {
-        ipc::call(json!({"method":"_save","session":session}))?;
-        Ok(())
-    }
-    pub fn shutdown(&self) -> anyhow::Result<()> {
-        ipc::call(json!({"method":"quit"}))?;
-        Ok(())
+    pub fn install_metadata(&mut self, metadata: Vec<Metadata>) {
+        self.metadata.clear();
+        for meta in metadata {
+            if let Some(session) = self.sessions.get(&meta.id) {
+                session.borrow_mut().meta = meta.clone();
+            } else {
+                self.metadata.insert(meta.id, meta);
+            }
+        }
     }
     pub fn set_visible(&mut self, ids: HashSet<u64>) -> anyhow::Result<()> {
         if self.visible != ids {
@@ -209,15 +276,14 @@ impl SessionManager {
                 .is_err()
         });
     }
-    pub fn spawn(
-        &mut self,
-        id: u64,
-        tab: u64,
-        directory: PathBuf,
-        cursor_style: CursorStyle,
-        theme: &Theme,
-    ) -> anyhow::Result<SessionHandle> {
-        let meta = serde_json::from_value(ipc::call(json!({"method":"_spawn","pane":id,"tab":tab,"directory":directory,"style":cursor_style,"theme":theme}))?["meta"].take())?;
+    pub fn attach(&mut self, id: u64, theme: &Theme) -> anyhow::Result<SessionHandle> {
+        if let Some(handle) = self.sessions.get(&id) {
+            return Ok(handle.clone());
+        }
+        let meta = self
+            .metadata
+            .remove(&id)
+            .ok_or_else(|| anyhow::anyhow!("Missing daemon metadata for pane {id}"))?;
         let handle = Rc::new(RefCell::new(RemoteSession {
             connection: self.connection.clone(),
             meta,
@@ -242,6 +308,8 @@ impl SessionManager {
             scroll_serial: ValueCell::new(0),
             scroll_acknowledged: 0,
             pending_scroll: ValueCell::new(None),
+            find: crate::search::FindState::default(),
+            selection: None,
         }));
         self.sessions.insert(id, handle.clone());
         Ok(handle)
@@ -265,6 +333,12 @@ impl SessionManager {
                             session.meta.directory != packet.header.meta.directory;
                         session.meta = packet.header.meta;
                         update.unread = Some(session.unread());
+                        if let Some(find) = packet.header.find {
+                            update.changed |= session.find != find;
+                            session.find = find;
+                        }
+                        update.changed |= session.selection != packet.header.selection;
+                        session.selection = packet.header.selection;
                         if let Some(frame) = packet.header.frame {
                             session
                                 .cells
@@ -284,6 +358,9 @@ impl SessionManager {
                             update.changed = true;
                         }
                         update.notifications.extend(packet.header.notifications);
+                        if packet.header.copy.is_some() {
+                            update.copy = packet.header.copy;
+                        }
                         if packet.header.error.is_some() {
                             update.error = packet.header.error;
                         }
@@ -308,10 +385,8 @@ impl SessionManager {
         self.disconnected
     }
     pub fn close(&mut self, id: u64) {
-        if let Err(error) = ipc::call(json!({"method":"_close","pane":id})) {
-            eprintln!("Could not close pane: {error}");
-        }
         self.sessions.remove(&id);
+        self.metadata.remove(&id);
         self.pending_reads.remove(&id);
     }
     pub fn clear(&mut self) {
@@ -335,6 +410,8 @@ pub struct RemoteSession {
     scroll_serial: ValueCell<u64>,
     scroll_acknowledged: u64,
     pending_scroll: ValueCell<Option<u64>>,
+    find: crate::search::FindState,
+    selection: Option<(u64, u64)>,
 }
 impl RemoteSession {
     fn command(&self, mut request: Value) -> anyhow::Result<()> {
@@ -357,10 +434,7 @@ impl RemoteSession {
         self.meta.unread > self.read_through
     }
     pub fn busy(&self) -> bool {
-        ipc::call(json!({"method":"_metadata","pane":self.id()}))
-            .ok()
-            .and_then(|value| value["meta"]["busy"].as_bool())
-            .unwrap_or(self.meta.busy)
+        self.meta.busy
     }
     pub fn title(&self) -> &str {
         &self.meta.title
@@ -370,13 +444,6 @@ impl RemoteSession {
             0 => self.meta.modes[0],
             1004 => self.meta.modes[1],
             _ => false,
-        }
-    }
-    pub fn refresh_directory(&mut self) {
-        if let Ok(mut value) = ipc::call(json!({"method":"_metadata","pane":self.id()}))
-            && let Ok(meta) = serde_json::from_value(value["meta"].take())
-        {
-            self.meta = meta;
         }
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -412,6 +479,27 @@ impl RemoteSession {
         pressed: bool,
     ) -> anyhow::Result<()> {
         self.command(json!({"method":"mouse","position":position,"metrics":metrics,"action":action,"button":button,"mods":mods,"pressed":pressed}))
+    }
+    pub fn find(&self, query: &str) -> anyhow::Result<()> {
+        self.command(json!({"method":"find","query":query}))
+    }
+    pub fn find_advance(&self, previous: bool) -> anyhow::Result<()> {
+        self.command(json!({"method":"find-advance","previous":previous}))
+    }
+    pub fn find_state(&self) -> &crate::search::FindState {
+        &self.find
+    }
+    pub fn select(&self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
+        self.command(json!({"method":"select","start":start,"end":end}))
+    }
+    pub fn copy(&self) -> anyhow::Result<()> {
+        self.command(json!({"method":"copy"}))
+    }
+    pub fn clear_selection(&self) -> anyhow::Result<()> {
+        self.command(json!({"method":"clear-selection"}))
+    }
+    pub fn selection(&self) -> Option<(u64, u64)> {
+        self.selection
     }
     pub fn scroll(&self, delta: isize, bottom: bool) {
         if let Err(e) = self.command(json!({"method":"scroll","delta":delta,"bottom":bottom})) {
@@ -460,20 +548,74 @@ impl RemoteSession {
             revision: self.revision,
         }
     }
-    pub fn text(&self) -> anyhow::Result<String> {
-        Ok(
-            ipc::call(json!({"method":"_read","pane":self.id()}))?["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-        )
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn large_pastes_use_bounded_utf8_chunks_and_preserve_operation_options() {
+        let text = "a界\n\0".repeat(transport::MAX_PASTE / 6);
+        let mut bytes = Vec::new();
+        write_request(&mut bytes, json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true})).unwrap();
+        let commands: Vec<Value> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                assert!(line.len() < 100_000);
+                serde_json::from_slice(line).unwrap()
+            })
+            .collect();
+        assert_eq!(commands[0]["method"], "paste-begin");
+        assert_eq!(commands[0]["size"], text.len());
+        assert_eq!(commands[0]["clipboard"], true);
+        assert_eq!(commands[0]["enter"], true);
+        assert_eq!(commands.last().unwrap()["method"], "paste-end");
+        let mut received = String::new();
+        for command in &commands[1..commands.len() - 1] {
+            assert_eq!(command["method"], "paste-data");
+            assert_eq!(command["pane"], 7);
+            let chunk = command["text"].as_str().unwrap();
+            assert!(chunk.len() <= transport::PASTE_CHUNK);
+            received.push_str(chunk);
+        }
+        assert_eq!(received, text);
+    }
+    #[test]
+    fn paste_queue_limits_count_bytes_and_failed_enqueues_release_the_reservation() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(2);
+        let connection = Connection {
+            commands,
+            socket,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let paste = || json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE)});
+        connection.send(paste()).unwrap();
+        connection.send(paste()).unwrap();
+        assert!(connection.send(paste()).is_err());
+        assert_eq!(
+            connection.pending_bytes.load(Ordering::Relaxed),
+            2 * transport::MAX_PASTE
+        );
+        assert!(
+            connection
+                .send(json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE + 1)}))
+                .is_err()
+        );
+        assert!(
+            connection
+                .send(json!({"method":"paste","text":""}))
+                .is_err()
+        );
+        assert_eq!(
+            connection.pending_bytes.load(Ordering::Relaxed),
+            2 * transport::MAX_PASTE
+        );
+        assert!(receiver.try_recv().is_ok());
+    }
     use crate::transport::Header;
+    use std::path::PathBuf;
 
     fn manager() -> (
         SessionManager,
@@ -482,7 +624,11 @@ mod tests {
     ) {
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, _) = mpsc::sync_channel(1);
-        let connection = Rc::new(Connection { commands, socket });
+        let connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket,
+        });
         let (sender, receiver) = mpsc::channel();
         let session = Rc::new(RefCell::new(RemoteSession {
             connection: connection.clone(),
@@ -507,12 +653,15 @@ mod tests {
             scroll_serial: ValueCell::new(0),
             scroll_acknowledged: 0,
             pending_scroll: ValueCell::new(None),
+            find: crate::search::FindState::default(),
+            selection: None,
         }));
         (
             SessionManager {
                 connection,
                 receiver,
                 sessions: HashMap::from([(1, session.clone())]),
+                metadata: HashMap::new(),
                 visible: HashSet::new(),
                 subscription_pending: false,
                 pending_reads: HashMap::new(),
@@ -540,6 +689,9 @@ mod tests {
                     rows: vec![],
                     notifications: vec!["ready".into()],
                     error: None,
+                    find: None,
+                    selection: None,
+                    copy: None,
                 },
                 cells: vec![],
             }))
@@ -575,6 +727,9 @@ mod tests {
                         rows: vec![row],
                         notifications: vec![],
                         error: None,
+                        find: None,
+                        selection: None,
+                        copy: None,
                     },
                     cells: vec![cell; 2],
                 }))
@@ -598,17 +753,26 @@ mod tests {
         let (mut manager, sender, session) = manager();
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
-        commands.send(json!({"method":"input"})).unwrap();
-        let connection = Rc::new(Connection { commands, socket });
+        commands
+            .send(Outgoing {
+                request: json!({"method":"input"}),
+                bytes: 0,
+            })
+            .unwrap();
+        let connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket,
+        });
         manager.connection = connection.clone();
         session.borrow_mut().connection = connection;
         session.borrow().scroll_to(10);
         session.borrow().scroll_to(20);
         assert!(session.borrow().scroll_pending());
-        assert_eq!(receiver.try_recv().unwrap()["method"], "input");
+        assert_eq!(receiver.try_recv().unwrap().request["method"], "input");
         manager.poll();
         assert_eq!(
-            receiver.try_recv().unwrap(),
+            receiver.try_recv().unwrap().request,
             json!({"method":"scroll-to","pane":1,"row":20,"serial":2})
         );
         for serial in [1, 2] {
@@ -627,6 +791,9 @@ mod tests {
                         rows: vec![],
                         notifications: vec![],
                         error: None,
+                        find: None,
+                        selection: None,
+                        copy: None,
                     },
                     cells: vec![],
                 }))
@@ -648,13 +815,22 @@ mod tests {
         let (mut manager, _sender, _session) = manager();
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
-        commands.send(json!({"method":"input"})).unwrap();
-        manager.connection = Rc::new(Connection { commands, socket });
+        commands
+            .send(Outgoing {
+                request: json!({"method":"input"}),
+                bytes: 0,
+            })
+            .unwrap();
+        manager.connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket,
+        });
         assert!(manager.set_visible(HashSet::from([1])).is_err());
-        assert_eq!(receiver.try_recv().unwrap()["method"], "input");
+        assert_eq!(receiver.try_recv().unwrap().request["method"], "input");
         assert!(manager.poll().is_empty());
         assert_eq!(
-            receiver.try_recv().unwrap(),
+            receiver.try_recv().unwrap().request,
             json!({"method":"subscribe","panes":[1]})
         );
         assert!(manager.poll().is_empty());
@@ -680,6 +856,9 @@ mod tests {
                         rows: vec![],
                         notifications: vec![],
                         error: None,
+                        find: None,
+                        selection: None,
+                        copy: None,
                     },
                     cells: vec![],
                 }))
@@ -694,15 +873,24 @@ mod tests {
         let (mut manager, _sender, session) = manager();
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
-        commands.send(json!({"method":"input"})).unwrap();
-        manager.connection = Rc::new(Connection { commands, socket });
+        commands
+            .send(Outgoing {
+                request: json!({"method":"input"}),
+                bytes: 0,
+            })
+            .unwrap();
+        manager.connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket,
+        });
         session.borrow_mut().meta.unread = 7;
         manager.mark_read(1);
         assert!(!session.borrow().unread());
-        assert_eq!(receiver.try_recv().unwrap()["method"], "input");
+        assert_eq!(receiver.try_recv().unwrap().request["method"], "input");
         manager.poll();
         assert_eq!(
-            receiver.try_recv().unwrap(),
+            receiver.try_recv().unwrap().request,
             json!({"method":"mark-read","pane":1,"through":7})
         );
         manager.poll();

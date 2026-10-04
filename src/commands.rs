@@ -41,7 +41,7 @@ pub const COMMANDS: &[Command] = &[
         keywords: "remove terminal",
     },
     Command {
-        title: "Find in Visible Terminal…",
+        title: "Find in Terminal…",
         action: "find",
         keywords: "search text match locate",
     },

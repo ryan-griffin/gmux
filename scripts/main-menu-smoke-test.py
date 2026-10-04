@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Exercise header, workspace, and tab menus in an isolated Wayland session."""
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, descendants, wait_for as shared_wait_for
 import os
 from pathlib import Path
 import shlex
-import socket
 import subprocess
 import tempfile
 import time
@@ -32,27 +33,7 @@ terminal_items = ("Split Right", "Split Down", "Find in Terminal…", "Zoom In",
                   "Reset Zoom", "Close Pane", "Close Tab")
 
 
-def wait_for(predicate, timeout=12):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (OSError, GLib.Error):
-            pass
-        while GLib.MainContext.default().pending():
-            GLib.MainContext.default().iteration(False)
-        time.sleep(0.025)
-    raise AssertionError("Main menu did not reach the expected state")
-
-
-def descendants(element):
-    element.clear_cache()
-    yield element
-    for index in range(element.get_child_count()):
-        child = element.get_child_at_index(index)
-        if child:
-            yield from descendants(child)
+wait_for = partial(shared_wait_for, context=GLib.MainContext.default(), exceptions=(OSError, GLib.Error))
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
@@ -71,13 +52,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
     app = registry = pane = None
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def find(name=None, role=None):
         return next((obj for obj in descendants(Atspi.get_desktop(0))

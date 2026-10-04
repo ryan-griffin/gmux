@@ -12,6 +12,10 @@ mod imp {
     use super::*;
 
     pub struct TerminalCanvas {
+        pub text: RefCell<crate::accessible_terminal::Text>,
+        pub text_buffer: RefCell<Option<gtk::TextBuffer>>,
+        pub text_revision: Cell<Option<(u64, u16, u16, u64)>>,
+        pub metrics: Cell<(f32, f32)>,
         pub callback: RefCell<Option<SnapshotCallback>>,
         pub scroll_callback: RefCell<Option<ScrollCallback>>,
         pub hadjustment: RefCell<Option<gtk::Adjustment>>,
@@ -29,6 +33,10 @@ mod imp {
     impl Default for TerminalCanvas {
         fn default() -> Self {
             Self {
+                text: RefCell::default(),
+                text_buffer: RefCell::default(),
+                text_revision: Cell::new(None),
+                metrics: Cell::new((9.6, 22.0)),
                 callback: RefCell::default(),
                 scroll_callback: RefCell::default(),
                 hadjustment: RefCell::default(),
@@ -50,7 +58,7 @@ mod imp {
         const NAME: &'static str = "GmuxTerminalCanvas";
         type Type = super::TerminalCanvas;
         type ParentType = gtk::Widget;
-        type Interfaces = (gtk::Scrollable,);
+        type Interfaces = (gtk::Scrollable, gtk::AccessibleText);
 
         fn class_init(klass: &mut Self::Class) {
             klass.set_accessible_role(gtk::AccessibleRole::Terminal);
@@ -141,6 +149,110 @@ mod imp {
 
     impl ScrollableImpl for TerminalCanvas {}
 
+    impl AccessibleTextImpl for TerminalCanvas {
+        fn caret_position(&self) -> u32 {
+            self.text.borrow().caret
+        }
+        fn contents(&self, start: u32, end: u32) -> Option<glib::Bytes> {
+            Some(glib::Bytes::from_owned(
+                self.text.borrow().bytes(start, end),
+            ))
+        }
+        fn contents_at(
+            &self,
+            offset: u32,
+            granularity: gtk::AccessibleTextGranularity,
+        ) -> Option<(u32, u32, glib::Bytes)> {
+            let text = self.text.borrow();
+            if offset >= text.char_count() {
+                return None;
+            }
+            let buffer = self
+                .text_buffer
+                .borrow_mut()
+                .get_or_insert_with(|| {
+                    let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+                    buffer.set_text(&text.value);
+                    buffer
+                })
+                .clone();
+            let mut start = buffer.iter_at_offset(offset as i32);
+            let mut end = start;
+            match granularity {
+                gtk::AccessibleTextGranularity::Character => {
+                    if !start.is_cursor_position() {
+                        start.backward_cursor_position();
+                    }
+                    end.forward_cursor_position();
+                }
+                gtk::AccessibleTextGranularity::Word
+                    if start.inside_word() || start.starts_word() =>
+                {
+                    if !start.starts_word() {
+                        start.backward_word_start();
+                    }
+                    end.forward_word_end();
+                }
+                gtk::AccessibleTextGranularity::Sentence => {
+                    if !start.starts_sentence() {
+                        start.backward_sentence_start();
+                    }
+                    end.forward_sentence_end();
+                }
+                gtk::AccessibleTextGranularity::Word => {
+                    end.forward_cursor_position();
+                }
+                _ => {
+                    start.set_line_offset(0);
+                    if !end.ends_line() {
+                        end.forward_to_line_end();
+                    }
+                    end.forward_char();
+                }
+            }
+            let (start, end) = (start.offset() as u32, end.offset() as u32);
+            Some((start, end, glib::Bytes::from_owned(text.bytes(start, end))))
+        }
+        fn attributes(
+            &self,
+            _: u32,
+        ) -> Vec<(gtk::AccessibleTextRange, glib::GString, glib::GString)> {
+            Vec::new()
+        }
+        fn default_attributes(&self) -> Vec<(glib::GString, glib::GString)> {
+            vec![("editable".into(), "false".into())]
+        }
+        fn selection(&self) -> Vec<gtk::AccessibleTextRange> {
+            self.text
+                .borrow()
+                .selection
+                .map(|(start, end)| {
+                    vec![gtk::AccessibleTextRange::new(
+                        start as usize,
+                        (end - start) as usize,
+                    )]
+                })
+                .unwrap_or_default()
+        }
+        fn extents(&self, start: u32, end: u32) -> Option<gtk::graphene::Rect> {
+            let text = self.text.borrow();
+            let (cw, ch) = self.metrics.get();
+            text.extents(start, end, cw, ch)
+                .map(|(x, y, width, height)| gtk::graphene::Rect::new(x, y, width, height))
+        }
+        fn offset(&self, point: &gtk::graphene::Point) -> Option<u32> {
+            let text = self.text.borrow();
+            let (cw, ch) = self.metrics.get();
+            text.offset_at(point.x(), point.y(), cw, ch)
+        }
+        fn set_caret_position(&self, _: u32) -> bool {
+            false
+        }
+        fn set_selection(&self, _: usize, _: gtk::AccessibleTextRange) -> bool {
+            false
+        }
+    }
+
     impl WidgetImpl for TerminalCanvas {
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
             self.parent_size_allocate(width, height, baseline);
@@ -165,10 +277,68 @@ mod imp {
 glib::wrapper! {
     pub struct TerminalCanvas(ObjectSubclass<imp::TerminalCanvas>)
         @extends gtk::Widget,
-        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Scrollable;
+        @implements gtk::Accessible, gtk::AccessibleText, gtk::Buildable, gtk::ConstraintTarget, gtk::Scrollable;
 }
 
 impl TerminalCanvas {
+    pub fn update_text(
+        &self,
+        screen: &gmux::session::ScreenSnapshot<'_>,
+        selection: Option<(usize, usize)>,
+    ) {
+        let imp = self.imp();
+        let key = (
+            screen.revision,
+            screen.frame.cols,
+            screen.frame.rows,
+            screen.frame.scrollback.offset,
+        );
+        let next = if imp.text_revision.get() != Some(key) {
+            crate::accessible_terminal::Text::from_frame(screen.frame, screen.cells, selection)
+        } else {
+            let mut old = imp.text.borrow_mut();
+            let (caret, selected) = (old.caret, old.selection);
+            old.update_positions(screen.frame, selection);
+            let caret_changed = old.caret != caret;
+            let selection_changed = old.selection != selected;
+            drop(old);
+            if caret_changed {
+                self.update_caret_position();
+            }
+            if selection_changed {
+                self.update_selection_bound();
+            }
+            return;
+        };
+        let (content_changed, caret_changed, selection_changed, old_len) = {
+            let old = imp.text.borrow();
+            (
+                old.value != next.value,
+                old.caret != next.caret,
+                old.selection != next.selection,
+                old.char_count(),
+            )
+        };
+        let new_len = next.char_count();
+        if content_changed {
+            self.update_contents(gtk::AccessibleTextContentChange::Remove, 0, old_len);
+            imp.text_buffer.borrow_mut().take();
+        }
+        *imp.text.borrow_mut() = next;
+        imp.text_revision.set(Some(key));
+        if content_changed {
+            self.update_contents(gtk::AccessibleTextContentChange::Insert, 0, new_len);
+        }
+        if content_changed || caret_changed {
+            self.update_caret_position();
+        }
+        if content_changed || selection_changed {
+            self.update_selection_bound();
+        }
+    }
+    pub fn set_text_metrics(&self, cw: f32, ch: f32) {
+        self.imp().metrics.set((cw, ch));
+    }
     pub fn new() -> Self {
         let canvas: Self = glib::Object::new();
         canvas.set_focusable(true);

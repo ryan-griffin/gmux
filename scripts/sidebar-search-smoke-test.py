@@ -5,9 +5,9 @@ Run with GTK_A11Y=none GDK_BACKEND=wayland dbus-run-session -- python3
 scripts/sidebar-search-smoke-test.py. Uses temporary settings and directories.
 """
 import json
+from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
 import time
@@ -17,18 +17,6 @@ from daemon_test_support import stop_daemon
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-
-
-def wait_for(predicate):
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (FileNotFoundError, ConnectionRefusedError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Sidebar search did not reach the expected state")
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
@@ -54,13 +42,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
     subprocess.run(["git", "init", "--quiet", "--initial-branch=feature/search-panel", str(project)], check=True)
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def state():
         return rpc("list")

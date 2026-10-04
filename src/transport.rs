@@ -6,13 +6,15 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 5;
+pub(crate) const MAX_PASTE: usize = 4 * 1024 * 1024;
+pub(crate) const PASTE_CHUNK: usize = 16 * 1024;
 pub(crate) const MAX_PACKET: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_CELLS: usize = 131_072;
 const CELL_BYTES: usize = 71;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Metadata {
+pub struct Metadata {
     pub id: u64,
     pub directory: PathBuf,
     pub title: String,
@@ -32,6 +34,12 @@ pub(crate) struct Header {
     pub rows: Vec<u16>,
     pub notifications: Vec<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub find: Option<crate::search::FindState>,
+    #[serde(default)]
+    pub selection: Option<(u64, u64)>,
+    #[serde(default)]
+    pub copy: Option<String>,
 }
 
 pub(crate) struct Packet {
@@ -150,6 +158,9 @@ mod tests {
                 rows: vec![1],
                 notifications: vec!["alert".into()],
                 error: None,
+                find: None,
+                selection: None,
+                copy: None,
             },
             cells: vec![cell, Cell::default()],
         }

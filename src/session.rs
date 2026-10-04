@@ -30,6 +30,7 @@ pub struct SessionUpdate {
     pub unread: Option<bool>,
     pub error: Option<String>,
     pub notifications: Vec<String>,
+    pub copy: Option<String>,
 }
 
 struct Pty {
@@ -177,7 +178,7 @@ impl TerminalSession {
             .ok_or_else(|| anyhow::anyhow!("Session is closed"))?;
         let mut pending = pty.pending.borrow_mut();
         anyhow::ensure!(
-            pending.len() + bytes.len() <= 1_048_576,
+            pending.len() + bytes.len() <= 2 * crate::transport::MAX_PASTE,
             "Terminal input queue is full"
         );
         pending.extend(bytes);
@@ -200,11 +201,13 @@ impl TerminalSession {
         if let Some(pty) = &mut self.pty {
             let fd = pty.master.as_raw_fd().unwrap();
             let mut pending = pty.pending.borrow_mut();
-            while !pending.is_empty() {
+            let mut budget = 512 * 1024;
+            while !pending.is_empty() && budget > 0 {
                 let bytes = pending.make_contiguous();
-                let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+                let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len().min(budget)) };
                 if n > 0 {
                     pending.drain(..n as usize);
+                    budget -= n as usize;
                 } else {
                     let error = std::io::Error::last_os_error();
                     if error.kind() == std::io::ErrorKind::Interrupted {
@@ -247,6 +250,7 @@ impl TerminalSession {
         if !replies.is_empty() {
             let _ = self.send(&replies);
         }
+        update.changed |= self.engine.poll_find();
         let title_update = self.engine.take_title_update();
         self.refresh_title(title_update);
         if let Some(pty) = &mut self.pty
@@ -353,6 +357,30 @@ impl TerminalSession {
         self.engine.text()
     }
 
+    pub fn find(&mut self, query: &str) {
+        self.engine.find(query);
+    }
+    pub fn find_advance(&mut self, previous: bool) {
+        self.engine.find_advance(previous);
+    }
+    pub(crate) fn find_pending(&self) -> bool {
+        self.engine.find_pending()
+    }
+    pub fn find_state(&self) -> crate::search::FindState {
+        self.engine.find_state()
+    }
+    pub fn select(&mut self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
+        self.engine.select(start, end)
+    }
+    pub fn clear_selection(&mut self) {
+        self.engine.clear_selection();
+    }
+    pub fn selection(&self) -> Option<(u64, u64)> {
+        self.engine.selection()
+    }
+    pub fn copy(&self) -> anyhow::Result<String> {
+        self.engine.copy()
+    }
     pub fn mode(&self, mode: i32) -> bool {
         self.engine.mode(mode)
     }

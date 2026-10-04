@@ -1,5 +1,4 @@
 use super::*;
-use model::WorkspaceDefinition;
 
 impl Ui {
     pub(super) fn tab_is_visible(&self, tab: &Tab) -> bool {
@@ -279,81 +278,18 @@ impl Ui {
         self.changing.set(changing);
         self.apply_filter(self.filter.get());
     }
-    pub(super) fn add_workspace(&self, name: String, directory: PathBuf) -> anyhow::Result<u64> {
-        let directory = std::path::absolute(directory)?;
-        let name = name.trim().to_string();
-        anyhow::ensure!(!name.is_empty(), "Enter a workspace name");
-        anyhow::ensure!(
-            directory.is_dir(),
-            "{} is not a directory",
-            directory.display()
+    pub(super) fn assign_tab(self: &Rc<Self>, id: u64, workspace: Option<u64>) {
+        self.command(
+            Command::Move {
+                tab: Some(id),
+                workspace,
+            },
+            |ui, result| {
+                if let Err(e) = result {
+                    ui.message(&e.to_string());
+                }
+            },
         );
-        let mut catalog = self.catalog.borrow().clone();
-        anyhow::ensure!(
-            !catalog
-                .workspaces
-                .iter()
-                .any(|w| w.name.eq_ignore_ascii_case(&name)),
-            "A workspace with that name already exists"
-        );
-        let id = self.next()?;
-        catalog.workspaces.push(WorkspaceDefinition {
-            id,
-            name,
-            directory,
-        });
-        model::save("workspaces.json", &catalog)?;
-        *self.catalog.borrow_mut() = catalog;
-        self.refresh_workspace_ui();
-        Ok(id)
-    }
-    pub(super) fn remove_workspace(self: &Rc<Self>, id: u64) -> anyhow::Result<()> {
-        let filter = if self.filter.get() == TabFilter::Workspace(id) {
-            TabFilter::Unassigned
-        } else {
-            self.filter.get()
-        };
-        let mut catalog = self.catalog.borrow().clone();
-        anyhow::ensure!(
-            catalog.workspaces.iter().any(|w| w.id == id),
-            "Workspace {id} does not exist"
-        );
-        catalog.workspaces.retain(|workspace| workspace.id != id);
-        model::save("workspaces.json", &catalog)?;
-        *self.catalog.borrow_mut() = catalog;
-        for tab in self.tabs.borrow_mut().iter_mut() {
-            if tab.workspace == Some(id) {
-                tab.workspace = None;
-            }
-        }
-        self.refresh_workspace_ui();
-        self.set_filter(filter);
-        self.save_session();
-        Ok(())
-    }
-    pub(super) fn assign_tab(
-        self: &Rc<Self>,
-        id: u64,
-        workspace: Option<u64>,
-    ) -> anyhow::Result<()> {
-        if let Some(id) = workspace {
-            anyhow::ensure!(
-                self.catalog.borrow().workspaces.iter().any(|w| w.id == id),
-                "Workspace {id} does not exist"
-            );
-        }
-        {
-            let mut tabs = self.tabs.borrow_mut();
-            let tab = tabs
-                .iter_mut()
-                .find(|tab| tab.id == id)
-                .ok_or_else(|| anyhow::anyhow!("Tab {id} does not exist"))?;
-            tab.workspace = workspace;
-        }
-        self.refresh_workspace_ui();
-        self.set_filter(self.filter.get());
-        self.save_session();
-        Ok(())
     }
     pub(super) fn workspace_editor(self: &Rc<Self>, id: Option<u64>) {
         self.workspace_editor_with_tab(id, None);
@@ -494,62 +430,41 @@ impl Ui {
         });
         let weak = Rc::downgrade(self);
         let close = dialog.downgrade();
-        save.connect_clicked(move |_| {
+        save.connect_clicked(move |button| {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let result = if let Some(id) = id {
-                (|| -> anyhow::Result<u64> {
-                    let name = name.text().trim().to_string();
-                    anyhow::ensure!(!name.is_empty(), "Enter a workspace name");
-                    anyhow::ensure!(directory.borrow().is_dir(), "Choose an existing directory");
-                    let mut catalog = ui.catalog.borrow().clone();
-                    anyhow::ensure!(
-                        !catalog
-                            .workspaces
-                            .iter()
-                            .any(|w| w.id != id && w.name.eq_ignore_ascii_case(&name)),
-                        "A workspace with that name already exists"
-                    );
-                    let workspace = catalog
-                        .workspaces
-                        .iter_mut()
-                        .find(|w| w.id == id)
-                        .ok_or_else(|| anyhow::anyhow!("Workspace no longer exists"))?;
-                    workspace.name = name;
-                    workspace.directory = directory.borrow().clone();
-                    model::save("workspaces.json", &catalog)?;
-                    *ui.catalog.borrow_mut() = catalog;
-                    ui.refresh_workspace_ui();
-                    Ok(id)
-                })()
+            let command = if let Some(id) = id {
+                Command::WorkspaceEdit {
+                    workspace: id,
+                    name: name.text().to_string(),
+                    directory: directory.borrow().clone(),
+                }
             } else {
-                (|| -> anyhow::Result<u64> {
-                    if let Some(tab) = tab {
-                        anyhow::ensure!(
-                            ui.tabs.borrow().iter().any(|current| current.id == tab),
-                            "The tab has been closed"
-                        );
-                    }
-                    let id =
-                        ui.add_workspace(name.text().to_string(), directory.borrow().clone())?;
-                    if let Some(tab) = tab {
-                        ui.assign_tab(tab, Some(id))?;
-                    }
-                    Ok(id)
-                })()
+                Command::WorkspaceNew {
+                    name: name.text().to_string(),
+                    directory: Some(directory.borrow().clone()),
+                    tab,
+                }
             };
-            match result {
-                Ok(_) => {
-                    if let Some(dialog) = close.upgrade() {
-                        dialog.close();
+            let error = error.clone();
+            let close = close.clone();
+            let button = button.clone();
+            button.set_sensitive(false);
+            ui.command(command, move |_, result| {
+                button.set_sensitive(true);
+                match result {
+                    Ok(_) => {
+                        if let Some(dialog) = close.upgrade() {
+                            dialog.close();
+                        }
+                    }
+                    Err(message) => {
+                        error.set_text(&message.to_string());
+                        error.set_visible(true);
                     }
                 }
-                Err(message) => {
-                    error.set_text(&message.to_string());
-                    error.set_visible(true);
-                }
-            }
+            });
         });
         dialog.present(Some(&self.window));
     }
@@ -634,13 +549,21 @@ impl Ui {
                     let row = row.clone();
                     dialog.connect_response(Some("remove"), move |_, _| {
                         if let Some(ui) = weak.upgrade() {
-                            if let Err(error) = ui.remove_workspace(id) {
-                                ui.message(&error.to_string());
-                            } else if let (Some(group), Some(row)) =
-                                (group.upgrade(), row.upgrade())
-                            {
-                                group.remove(&row);
-                            }
+                            let group = group.clone();
+                            let row = row.clone();
+                            ui.command(
+                                Command::WorkspaceDelete { workspace: id },
+                                move |ui, result| match result {
+                                    Err(error) => ui.message(&error.to_string()),
+                                    Ok(_) => {
+                                        if let (Some(group), Some(row)) =
+                                            (group.upgrade(), row.upgrade())
+                                        {
+                                            group.remove(&row);
+                                        }
+                                    }
+                                },
+                            );
                         }
                     });
                     dialog.present(Some(&ui.window));
@@ -654,28 +577,33 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
     pub(super) fn request_close_tab(self: &Rc<Self>, id: u64) {
-        let panes = self
+        let panes: Vec<_> = self
             .tabs
             .borrow()
             .iter()
-            .find(|tab| tab.id == id)
-            .map(|tab| tab.panes.values().cloned().collect::<Vec<_>>())
+            .find(|t| t.id == id)
+            .map(|t| t.panes.keys().copied().collect())
             .unwrap_or_default();
         if panes.is_empty() {
             return;
         }
+        self.request(
+            json!({"method":"_busy","panes":panes}),
+            move |ui, result| match result {
+                Ok(value) => ui.confirm_close_tab(id, value["busy"].as_bool().unwrap_or(true)),
+                Err(e) => ui.message(&e.to_string()),
+            },
+        );
+    }
+    fn confirm_close_tab(self: &Rc<Self>, id: u64, busy: bool) {
         let close = move |ui: &Rc<Self>| {
-            for pane in &panes {
-                let _ = ui.close_pane(pane.id);
-            }
+            ui.command(Command::CloseTab { tab: id }, |ui, result| {
+                if let Err(e) = result {
+                    ui.message(&e.to_string());
+                }
+            });
         };
-        if !self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|tab| tab.id == id)
-            .is_some_and(|tab| tab.panes.values().any(|pane| pane.busy()))
-        {
+        if !busy {
             close(self);
             return;
         }

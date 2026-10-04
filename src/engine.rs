@@ -28,7 +28,7 @@ impl Cell {
         std::str::from_utf8(&self.text[..end]).unwrap_or("\u{fffd}")
     }
 }
-#[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(C)]
 pub struct Frame {
     pub cols: u16,
@@ -79,6 +79,23 @@ unsafe extern "C" {
         cb: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize),
     ) -> *mut c_void;
     fn gmux_engine_free(engine: *mut c_void);
+    fn gmux_engine_history_size(engine: *mut c_void, cols: *mut u16, rows: *mut usize) -> i32;
+    fn gmux_engine_history_row(
+        engine: *mut c_void,
+        row: u32,
+        cells: *mut Cell,
+        cols: usize,
+        wrapped: *mut bool,
+    ) -> i32;
+    fn gmux_engine_select(engine: *mut c_void, sx: u16, sy: u32, ex: u16, ey: u32) -> i32;
+    fn gmux_engine_clear_selection(engine: *mut c_void);
+    fn gmux_engine_selection(engine: *mut c_void, start: *mut u64, end: *mut u64) -> i32;
+    fn gmux_engine_copy(
+        engine: *mut c_void,
+        bytes: *mut u8,
+        cap: usize,
+        written: *mut usize,
+    ) -> i32;
     fn gmux_engine_theme(
         engine: *mut c_void,
         background: *const u8,
@@ -134,6 +151,8 @@ pub struct Engine {
     pub frame: Frame,
     pub cells: Vec<Cell>,
     revision: u64,
+    find: crate::search::HistorySearch,
+    find_row: Vec<Cell>,
 }
 impl Engine {
     pub fn new() -> anyhow::Result<Self> {
@@ -147,6 +166,8 @@ impl Engine {
             frame: Frame::default(),
             cells: vec![Cell::default(); 80 * 24],
             revision: 0,
+            find: crate::search::HistorySearch::default(),
+            find_row: Vec::new(),
         };
         engine.set_theme(&Theme::adwaita(true))?;
         engine.set_cursor_style(CursorStyle::default())?;
@@ -173,10 +194,13 @@ impl Engine {
     }
     pub fn write(&mut self, bytes: &[u8]) {
         unsafe { gmux_engine_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
+        self.find.invalidate();
     }
     pub fn resize(&mut self, cols: u16, rows: u16, cw: u32, ch: u32) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_resize(self.raw.as_ptr(), cols, rows, cw, ch) };
         anyhow::ensure!(result == 0, "Ghostty resize failed ({result})");
+        self.find.invalidate();
+        self.find.pending = false;
         self.cells
             .resize(cols as usize * rows as usize, Cell::default());
         Ok(())
@@ -196,6 +220,102 @@ impl Engine {
             self.revision = self.revision.wrapping_add(1);
         }
         Ok(result != 0)
+    }
+    pub fn find(&mut self, query: &str) {
+        self.find.set_query(query);
+    }
+    pub fn find_pending(&self) -> bool {
+        self.find.pending || self.find.dirty
+    }
+    pub fn poll_find(&mut self) -> bool {
+        if !self.find_pending() {
+            return false;
+        }
+        if !self.find.pending {
+            let (mut cols, mut rows) = (0, 0);
+            if unsafe { gmux_engine_history_size(self.raw.as_ptr(), &mut cols, &mut rows) } != 0
+                || cols == 0
+            {
+                return false;
+            }
+            self.find.begin(rows as u64, cols as usize);
+            self.find_row.resize(cols as usize, Cell::default());
+            if rows == 0 {
+                self.find.finish();
+            }
+        }
+        for _ in 0..64 {
+            if !self.find.pending {
+                break;
+            }
+            let mut wrapped = false;
+            if unsafe {
+                gmux_engine_history_row(
+                    self.raw.as_ptr(),
+                    self.find.next as u32,
+                    self.find_row.as_mut_ptr(),
+                    self.find.cols,
+                    &mut wrapped,
+                )
+            } != 0
+            {
+                self.find.finish();
+                self.find.invalidate();
+                break;
+            }
+            self.find.feed(&self.find_row, wrapped);
+        }
+        true
+    }
+    pub fn find_state(&self) -> crate::search::FindState {
+        self.find
+            .state(self.frame.scrollback.offset, self.cells.len())
+    }
+    pub fn find_advance(&mut self, previous: bool) {
+        if let Some(row) = self.find.advance(previous) {
+            let offset = self.frame.scrollback.offset;
+            if row < offset || row >= offset + self.frame.rows as u64 {
+                self.scroll_to(row);
+            }
+        }
+    }
+    pub fn select(&mut self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
+        let result =
+            unsafe { gmux_engine_select(self.raw.as_ptr(), start.0, start.1, end.0, end.1) };
+        anyhow::ensure!(result == 0, "Selection is outside terminal history");
+        Ok(())
+    }
+    pub fn clear_selection(&mut self) {
+        unsafe { gmux_engine_clear_selection(self.raw.as_ptr()) }
+    }
+    pub fn selection(&self) -> Option<(u64, u64)> {
+        let (mut start, mut end) = (0, 0);
+        (unsafe { gmux_engine_selection(self.raw.as_ptr(), &mut start, &mut end) } == 0)
+            .then_some((start, end))
+    }
+    pub fn copy(&self) -> anyhow::Result<String> {
+        let mut written = 0;
+        let result =
+            unsafe { gmux_engine_copy(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut written) };
+        anyhow::ensure!(
+            result >= 0 && written <= crate::transport::MAX_PASTE,
+            "Selection is too large to copy"
+        );
+        let mut bytes = vec![0; written];
+        let result = unsafe {
+            gmux_engine_copy(
+                self.raw.as_ptr(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut written,
+            )
+        };
+        anyhow::ensure!(
+            result == 0 && written <= bytes.len(),
+            "Could not copy terminal selection"
+        );
+        bytes.truncate(written);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
     pub fn revision(&self) -> u64 {
         self.revision
@@ -314,6 +434,59 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_find_preserves_unicode_matching_and_selection_across_scrolling() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(30, 3, 8, 16).unwrap();
+        engine.write("needle É e\u{301} İ\r\n".as_bytes());
+        for i in 0..200 {
+            engine.write(format!("line-{i:03}\r\n").as_bytes());
+        }
+        for query in ["needle", "é", "e\u{301}", "i\u{307}"] {
+            engine.find(query);
+            for _ in 0..100 {
+                if !engine.find_pending() {
+                    break;
+                }
+                engine.poll_find();
+            }
+            assert!(!engine.find_pending());
+            assert_eq!(engine.find_state().total, 1, "{query}");
+        }
+        engine.find("needle");
+        engine.poll_find();
+        assert!(
+            engine.find_pending(),
+            "History scans must yield between batches"
+        );
+        while engine.find_pending() {
+            engine.poll_find();
+        }
+        engine.snapshot().unwrap();
+        assert!(engine.frame.scrollback.offset > 0);
+        engine.find_advance(false);
+        assert!(engine.text().unwrap().starts_with("needle"));
+        engine.select((0, 0), (7, 1)).unwrap();
+        let copied = engine.copy().unwrap();
+        assert!(copied.starts_with("needle É"));
+        assert!(copied.contains("line-000"));
+        engine.scroll(0, true);
+        engine.write(b"another line\r\n");
+        assert_eq!(engine.copy().unwrap(), copied);
+        engine.clear_selection();
+        assert_eq!(engine.copy().unwrap(), "");
+        engine.select((11, 201), (0, 0)).unwrap();
+        let copied = engine.copy().unwrap();
+        assert!(copied.starts_with("needle É"));
+        assert!(copied.ends_with("another line"));
+        assert!(copied.contains("line-199"));
+        engine.resize(10, 3, 8, 16).unwrap();
+        assert_eq!(
+            engine.copy().unwrap(),
+            copied,
+            "Reflow must retain selection endpoints"
+        );
+    }
     #[test]
     fn reading_text_preserves_blank_rows_indentation_and_unicode() {
         let mut engine = Engine::new().unwrap();

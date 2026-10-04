@@ -1,6 +1,8 @@
 //! Headless owner of PTYs, terminal engines, and the reconnectable live layout.
 use crate::{
-    Cell, Frame, ipc,
+    Cell, Frame,
+    control::{Command, CommandOutput, CommandReply, CommandResult},
+    ipc,
     model::{self, CursorStyle, Layout, SavedTab, Session, Settings, TabFilter, WorkspaceCatalog},
     session::TerminalSession,
     theme::Theme,
@@ -39,6 +41,17 @@ struct Frontend {
     screens: HashMap<u64, SentScreen>,
     metadata: HashMap<u64, Metadata>,
     scroll_serials: HashMap<u64, u64>,
+    sent_scroll_serials: HashMap<u64, u64>,
+    find: HashMap<u64, crate::search::FindState>,
+    selections: HashMap<u64, Option<(u64, u64)>>,
+    discarding: bool,
+    paste: Option<Paste>,
+}
+struct Paste {
+    pane: u64,
+    size: usize,
+    text: String,
+    request: Value,
 }
 impl Frontend {
     fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
@@ -76,27 +89,38 @@ impl Frontend {
     }
     fn requests(&mut self) -> anyhow::Result<Vec<Value>> {
         let mut buffer = [0; 16384];
+        let mut requests = Vec::new();
         for _ in 0..32 {
-            match self.socket.read(&mut buffer) {
+            let n = match self.socket.read(&mut buffer) {
                 Ok(0) => anyhow::bail!("Frontend disconnected"),
-                Ok(n) => self.input.extend_from_slice(&buffer[..n]),
+                Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
+            };
+            for part in buffer[..n].split_inclusive(|c| *c == b'\n') {
+                let complete = part.ends_with(b"\n");
+                if self.discarding {
+                    self.discarding = !complete;
+                    continue;
+                }
+                if self.input.len() + part.len() > 1_048_577 {
+                    self.input.clear();
+                    self.discarding = !complete;
+                    requests.push(
+                        json!({"method":"_invalid", "error":"Frontend command is too large"}),
+                    );
+                    continue;
+                }
+                self.input.extend_from_slice(part);
+                if complete {
+                    requests.push(serde_json::from_slice(&self.input).unwrap_or_else(
+                        |_| json!({"method":"_invalid", "error":"Invalid frontend command"}),
+                    ));
+                    self.input.clear();
+                }
             }
-            anyhow::ensure!(self.input.len() <= 2_097_152, "Frontend input is too large");
         }
-        let mut requests = Vec::new();
-        let mut end = 0;
-        for line in self.input.split_inclusive(|c| *c == b'\n') {
-            if !line.ends_with(b"\n") {
-                break;
-            }
-            anyhow::ensure!(line.len() <= 1_048_577, "Frontend command is too large");
-            requests.push(serde_json::from_slice(line)?);
-            end += line.len();
-        }
-        self.input.drain(..end);
         Ok(requests)
     }
 }
@@ -107,6 +131,7 @@ struct Daemon {
     frontend: Option<Frontend>,
     changed: HashSet<u64>,
     notifications: HashMap<u64, VecDeque<String>>,
+    clipboard: HashMap<u64, String>,
     errors: HashMap<u64, String>,
     unread: HashMap<u64, u64>,
     alert_sequence: u64,
@@ -116,8 +141,8 @@ struct Daemon {
     started: Instant,
 }
 impl Daemon {
-    fn catalog() -> WorkspaceCatalog {
-        let mut catalog = model::load::<WorkspaceCatalog>("workspaces.json");
+    fn catalog() -> anyhow::Result<WorkspaceCatalog> {
+        let mut catalog = model::load::<WorkspaceCatalog>("workspaces.json")?;
         let mut used = HashSet::new();
         catalog.workspaces.retain(|workspace| {
             workspace.id > 0
@@ -125,12 +150,12 @@ impl Daemon {
                 && !workspace.name.trim().is_empty()
                 && used.insert(workspace.id)
         });
-        catalog
+        Ok(catalog)
     }
     fn new() -> anyhow::Result<Self> {
-        let settings = model::load::<Settings>("settings.json");
+        let settings = model::load::<Settings>("settings.json")?;
         let saved = if settings.restore {
-            model::load::<Session>("session.json")
+            model::load::<Session>("session.json")?
         } else {
             Session::default()
         };
@@ -147,6 +172,7 @@ impl Daemon {
             frontend: None,
             changed: HashSet::new(),
             notifications: HashMap::new(),
+            clipboard: HashMap::new(),
             errors: HashMap::new(),
             unread: HashMap::new(),
             alert_sequence: 0,
@@ -155,7 +181,7 @@ impl Daemon {
             sent_rows: 0,
             started: Instant::now(),
         };
-        let catalog = Self::catalog();
+        let catalog = Self::catalog()?;
         let mut used: HashSet<_> = catalog.workspaces.iter().map(|w| w.id).collect();
         for tab in saved.tabs {
             if let Err(e) = tab.validate() {
@@ -225,8 +251,10 @@ impl Daemon {
         }
     }
     fn pane_id(&self, request: &Value) -> anyhow::Result<u64> {
-        let id = request["pane"]
-            .as_u64()
+        self.resolve_pane(request["pane"].as_u64())
+    }
+    fn resolve_pane(&self, pane: Option<u64>) -> anyhow::Result<u64> {
+        let id = pane
             .or_else(|| {
                 self.state
                     .tabs
@@ -244,7 +272,7 @@ impl Daemon {
             .iter()
             .flat_map(|t| std::iter::once(t.id).chain(t.layout.ids()))
             .chain(self.sessions.keys().copied())
-            .chain(Self::catalog().workspaces.iter().map(|w| w.id))
+            .chain(Self::catalog()?.workspaces.iter().map(|w| w.id))
             .max()
             .unwrap_or(0)
             .checked_add(1)
@@ -267,14 +295,33 @@ impl Daemon {
         }
     }
     fn close(&mut self, id: u64) {
+        let active_index = self
+            .state
+            .tabs
+            .iter()
+            .filter(|tab| self.state.filter.matches(tab.workspace))
+            .position(|tab| tab.id == self.state.active);
         self.sessions.remove(&id);
         self.unread.remove(&id);
         self.notifications.remove(&id);
+        self.clipboard.remove(&id);
+        self.errors.remove(&id);
         self.changed.remove(&id);
         if let Some(frontend) = &mut self.frontend {
+            frontend.visible.remove(&id);
+            if frontend
+                .paste
+                .as_ref()
+                .is_some_and(|paste| paste.pane == id)
+            {
+                frontend.paste = None;
+            }
             frontend.screens.remove(&id);
             frontend.metadata.remove(&id);
             frontend.scroll_serials.remove(&id);
+            frontend.sent_scroll_serials.remove(&id);
+            frontend.find.remove(&id);
+            frontend.selections.remove(&id);
         }
         self.state.tabs.retain_mut(|tab| {
             if !tab.layout.ids().contains(&id) {
@@ -284,12 +331,37 @@ impl Daemon {
                 return false;
             };
             if tab.active == id {
-                tab.active = layout.ids()[0];
+                let old = tab.layout.ids();
+                let index = old.iter().position(|pane| *pane == id).unwrap_or(0);
+                let remaining = layout.ids();
+                tab.active = remaining[index.min(remaining.len() - 1)];
             }
             tab.layout = layout;
             tab.directories.remove(&id);
             true
         });
+        if !self
+            .state
+            .tabs
+            .iter()
+            .any(|tab| tab.id == self.state.active)
+        {
+            let visible: Vec<_> = self
+                .state
+                .tabs
+                .iter()
+                .filter(|tab| self.state.filter.matches(tab.workspace))
+                .map(|tab| tab.id)
+                .collect();
+            self.state.active = visible
+                .get(
+                    active_index
+                        .unwrap_or(0)
+                        .min(visible.len().saturating_sub(1)),
+                )
+                .copied()
+                .unwrap_or(0);
+        }
         self.select_visible();
     }
     fn refresh_state(&mut self) {
@@ -307,146 +379,310 @@ impl Daemon {
         self.refresh_state();
         model::save("session.json", &self.state)
     }
-    fn list(&mut self) -> Value {
-        self.refresh_state();
-        let catalog = Self::catalog();
-        json!({"active_tab":(self.state.active!=0).then_some(self.state.active),"filter":self.state.filter,"tab_search":"","workspaces":catalog.workspaces.iter().map(|w|json!({"id":w.id,"name":w.name,"directory":w.directory,"tabs":self.state.tabs.iter().filter(|t|t.workspace==Some(w.id)).count(),"unread":self.state.tabs.iter().any(|t|t.workspace==Some(w.id)&&t.layout.ids().iter().any(|id|self.unread.contains_key(id)))})).collect::<Vec<_>>(),"tabs":self.state.tabs.iter().map(|t| json!({"id":t.id,"name":t.name,"workspace":t.workspace,"visible":self.state.filter.matches(t.workspace),"active_pane":t.active,"unread":t.layout.ids().iter().any(|id|self.unread.contains_key(id)),"layout":t.layout,"panes":t.layout.ids().iter().filter_map(|id|self.sessions.get(id)).map(|s|json!({"id":s.id(),"title":s.title(),"directory":s.directory(),"exited":s.exited(),"unread":self.unread.contains_key(&s.id())})).collect::<Vec<_>>()})).collect::<Vec<_>>()})
+    fn save_result(&mut self, mut result: Value) -> Value {
+        if let Err(error) = self.save() {
+            result["warning"] = json!(format!("Could not save layout: {error}"));
+        }
+        result
     }
-    fn control(&mut self, request: Value) -> anyhow::Result<Value> {
+    fn list(&mut self) -> anyhow::Result<Value> {
+        self.refresh_state();
+        let catalog = Self::catalog()?;
+        Ok(
+            json!({"active_tab":(self.state.active!=0).then_some(self.state.active),"filter":self.state.filter,"tab_search":"","workspaces":catalog.workspaces.iter().map(|w|json!({"id":w.id,"name":w.name,"directory":w.directory,"tabs":self.state.tabs.iter().filter(|t|t.workspace==Some(w.id)).count(),"unread":self.state.tabs.iter().any(|t|t.workspace==Some(w.id)&&t.layout.ids().iter().any(|id|self.unread.contains_key(id)))})).collect::<Vec<_>>(),"tabs":self.state.tabs.iter().map(|t| json!({"id":t.id,"name":t.name,"workspace":t.workspace,"visible":self.state.filter.matches(t.workspace),"active_pane":t.active,"unread":t.layout.ids().iter().any(|id|self.unread.contains_key(id)),"layout":t.layout,"panes":t.layout.ids().iter().filter_map(|id|self.sessions.get(id)).map(|s|json!({"id":s.id(),"title":s.title(),"directory":s.directory(),"exited":s.exited(),"unread":self.unread.contains_key(&s.id())})).collect::<Vec<_>>()})).collect::<Vec<_>>()}),
+        )
+    }
+    fn saved_result(&mut self, output: CommandOutput) -> CommandResult {
+        CommandResult {
+            output,
+            warning: self
+                .save()
+                .err()
+                .map(|error| format!("Could not save layout: {error}")),
+        }
+    }
+    fn execute(&mut self, command: Command) -> anyhow::Result<CommandResult> {
+        let mut catalog = Self::catalog()?;
+        match command {
+            Command::New {
+                directory,
+                name,
+                workspace,
+            } => {
+                let workspace = workspace.unwrap_or(match self.state.filter {
+                    TabFilter::Workspace(id) => Some(id),
+                    _ => None,
+                });
+                let definition = workspace
+                    .map(|id| {
+                        catalog
+                            .workspaces
+                            .iter()
+                            .find(|w| w.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("Workspace {id} does not exist"))
+                    })
+                    .transpose()?;
+                let directory = directory
+                    .or_else(|| definition.map(|w| w.directory.clone()))
+                    .unwrap_or_else(model::home);
+                anyhow::ensure!(
+                    directory.is_dir(),
+                    "{} is not a directory",
+                    directory.display()
+                );
+                let tab = self.next()?;
+                let pane = tab
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("No IDs remain"))?;
+                let settings = model::load::<Settings>("settings.json")?;
+                let session = TerminalSession::spawn(
+                    pane,
+                    tab,
+                    directory.clone(),
+                    settings.cursor_style,
+                    &Theme::adwaita(settings.appearance != "light"),
+                )?;
+                self.sessions.insert(pane, session);
+                let name = name.filter(|n| !n.trim().is_empty());
+                self.state.tabs.insert(
+                    0,
+                    SavedTab {
+                        id: tab,
+                        name: name
+                            .clone()
+                            .unwrap_or_else(|| model::directory_name(&directory)),
+                        custom_name: name.is_some(),
+                        workspace,
+                        layout: Layout::Pane(pane),
+                        directories: HashMap::from([(pane, directory)]),
+                        active: pane,
+                    },
+                );
+                self.state.active = tab;
+                Ok(self.saved_result(CommandOutput::New {
+                    tab,
+                    pane,
+                    workspace,
+                }))
+            }
+            Command::Split { pane, down } => {
+                let target = self.resolve_pane(pane)?;
+                let tab = self
+                    .state
+                    .tabs
+                    .iter()
+                    .find(|t| t.layout.ids().contains(&target))
+                    .ok_or_else(|| anyhow::anyhow!("Pane has no tab"))?;
+                anyhow::ensure!(
+                    tab.layout.ids().len() < 24,
+                    "A tab can have at most 24 panes"
+                );
+                let tab_id = tab.id;
+                self.sessions.get_mut(&target).unwrap().refresh_directory();
+                let directory = self.sessions[&target].directory().to_path_buf();
+                let pane = self.next()?;
+                let settings = model::load::<Settings>("settings.json")?;
+                let session = TerminalSession::spawn(
+                    pane,
+                    tab_id,
+                    directory.clone(),
+                    settings.cursor_style,
+                    &Theme::adwaita(settings.appearance != "light"),
+                )?;
+                self.sessions.insert(pane, session);
+                let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
+                tab.layout.split(target, pane, down);
+                tab.active = pane;
+                tab.directories.insert(pane, directory);
+                self.state.active = tab_id;
+                Ok(self.saved_result(CommandOutput::Split { pane }))
+            }
+            Command::Close { pane } => {
+                let pane = self.resolve_pane(pane)?;
+                self.close(pane);
+                Ok(self.saved_result(CommandOutput::Done { ok: true }))
+            }
+            Command::CloseTab { tab } => {
+                let panes = self
+                    .state
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab)
+                    .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?
+                    .layout
+                    .ids();
+                for pane in panes {
+                    self.close(pane);
+                }
+                Ok(self.saved_result(CommandOutput::Done { ok: true }))
+            }
+            Command::Rename { tab, name } => {
+                let name = name.trim();
+                anyhow::ensure!(!name.is_empty(), "Enter a tab name");
+                let tab = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.id == tab)
+                    .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?;
+                tab.name = name.to_owned();
+                tab.custom_name = true;
+                Ok(self.saved_result(CommandOutput::Done { ok: true }))
+            }
+            Command::WorkspaceNew {
+                name,
+                directory,
+                tab,
+            } => {
+                let directory = directory.unwrap_or_else(model::home);
+                anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
+                let name = catalog.validate_name(&name, None)?;
+                if let Some(id) = tab {
+                    anyhow::ensure!(
+                        self.state.tabs.iter().any(|t| t.id == id),
+                        "The tab has been closed"
+                    );
+                }
+                let workspace = self.next()?;
+                catalog.workspaces.push(model::WorkspaceDefinition {
+                    id: workspace,
+                    name,
+                    directory,
+                });
+                model::save("workspaces.json", &catalog)?;
+                let output = CommandOutput::Workspace { workspace };
+                if let Some(id) = tab {
+                    self.state
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .workspace = Some(workspace);
+                    self.select_visible();
+                    return Ok(self.saved_result(output));
+                }
+                Ok(output.into())
+            }
+            Command::WorkspaceEdit {
+                workspace,
+                name,
+                directory,
+            } => {
+                let name = catalog.validate_name(&name, Some(workspace))?;
+                anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
+                let definition = catalog
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.id == workspace)
+                    .ok_or_else(|| anyhow::anyhow!("Workspace no longer exists"))?;
+                definition.name = name;
+                definition.directory = directory;
+                model::save("workspaces.json", &catalog)?;
+                Ok(CommandOutput::Workspace { workspace }.into())
+            }
+            Command::WorkspaceDelete { workspace } => {
+                anyhow::ensure!(
+                    catalog.workspaces.iter().any(|w| w.id == workspace),
+                    "Workspace {workspace} does not exist"
+                );
+                catalog.workspaces.retain(|w| w.id != workspace);
+                model::save("workspaces.json", &catalog)?;
+                for tab in &mut self.state.tabs {
+                    if tab.workspace == Some(workspace) {
+                        tab.workspace = None;
+                    }
+                }
+                if self.state.filter == TabFilter::Workspace(workspace) {
+                    self.state.filter = TabFilter::Unassigned;
+                }
+                self.select_visible();
+                Ok(self.saved_result(CommandOutput::Done { ok: true }))
+            }
+            Command::Move { tab, workspace } => {
+                let tab = tab.unwrap_or(self.state.active);
+                if let Some(id) = workspace {
+                    anyhow::ensure!(
+                        catalog.workspaces.iter().any(|w| w.id == id),
+                        "Workspace {id} does not exist"
+                    );
+                }
+                self.state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.id == tab)
+                    .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?
+                    .workspace = workspace;
+                self.select_visible();
+                Ok(self.saved_result(CommandOutput::Done { ok: true }))
+            }
+        }
+    }
+    fn control(&mut self, mut request: Value) -> anyhow::Result<Value> {
         let method = request["method"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
+        if crate::control::Command::supports(method) {
+            let command = serde_json::from_value(request)?;
+            return Ok(serde_json::to_value(self.execute(command)?)?);
+        }
         match method {
             "_hello" => Ok(json!({"version":transport::VERSION,"quitting":self.quitting})),
             "daemon-info" => Ok(
                 json!({"version":transport::VERSION,"pid":std::process::id(),"attached":self.frontend.as_ref().is_some_and(|f|f.attached),"panes":self.sessions.len(),"uptime_seconds":self.started.elapsed().as_secs(),"snapshots":self.snapshots,"sent_rows":self.sent_rows}),
             ),
-            "_state" => {
-                self.refresh_state();
-                Ok(json!({"session":self.state}))
+            "_busy" => {
+                let ids: Vec<u64> = serde_json::from_value(request["panes"].take())?;
+                let busy = ids
+                    .into_iter()
+                    .any(|id| self.sessions.get(&id).is_some_and(TerminalSession::busy));
+                Ok(json!({"busy":busy}))
             }
-            "_save" => {
-                let mut state: Session = serde_json::from_value(request["session"].clone())?;
-                let mut used = HashSet::new();
-                for tab in &state.tabs {
-                    tab.validate()?;
-                    anyhow::ensure!(used.insert(tab.id), "Duplicate tab ID");
-                    for id in tab.layout.ids() {
-                        anyhow::ensure!(used.insert(id), "Duplicate pane ID");
-                    }
+            "_command" => {
+                let command: Command = serde_json::from_value(request["command"].take())?;
+                let result = self.execute(command)?;
+                let metadata: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .map(|(&id, session)| {
+                        Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))
+                    })
+                    .collect();
+                Ok(serde_json::to_value(CommandReply {
+                    result,
+                    session: self.state.clone(),
+                    catalog: Self::catalog()?,
+                    metadata,
+                })?)
+            }
+            "_presentation" => {
+                let state: Session = serde_json::from_value(request["session"].take())?;
+                self.state.width = state.width;
+                self.state.height = state.height;
+                self.state.maximized = state.maximized;
+                self.state.filter = state.filter;
+                if state.active == 0 || self.state.tabs.iter().any(|t| t.id == state.active) {
+                    self.state.active = state.active;
                 }
-                // A child may have exited since the frontend's last update.
-                state.tabs.retain_mut(|tab| {
-                    let mut layout = Some(tab.layout.clone());
-                    for id in tab.layout.ids() {
-                        if !self.sessions.contains_key(&id) {
-                            layout = layout.and_then(|l| l.remove(id));
+                for saved in state.tabs {
+                    if let Some(tab) = self.state.tabs.iter_mut().find(|t| t.id == saved.id) {
+                        if tab.layout.ids() == saved.layout.ids() {
+                            tab.layout.update_ratios(&saved.layout);
+                            if tab.layout.ids().contains(&saved.active) {
+                                tab.active = saved.active;
+                            }
+                        }
+                        if !tab.custom_name {
+                            tab.name = saved.name;
                         }
                     }
-                    if let Some(layout) = layout {
-                        tab.layout = layout;
-                        if !tab.layout.ids().contains(&tab.active) {
-                            tab.active = tab.layout.ids()[0];
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if state.active != 0 && !state.tabs.iter().any(|tab| tab.id == state.active) {
-                    state.active = state
-                        .tabs
-                        .iter()
-                        .find(|tab| state.filter.matches(tab.workspace))
-                        .map(|tab| tab.id)
-                        .unwrap_or(0);
                 }
-                anyhow::ensure!(
-                    self.sessions.keys().all(|id| used.contains(id)),
-                    "Layout update omitted a running pane"
-                );
-                self.state = state;
                 self.save()?;
                 Ok(json!({"ok":true}))
             }
-            "_spawn" => {
-                anyhow::ensure!(!self.quitting, "Daemon is stopping");
-                let id = request["pane"]
-                    .as_u64()
-                    .filter(|id| *id > 0 && *id < u64::MAX)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid pane ID"))?;
-                let tab_id = request["tab"]
-                    .as_u64()
-                    .filter(|tab| *tab > 0 && *tab < u64::MAX && *tab != id)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid tab ID"))?;
-                if self.sessions.contains_key(&id) {
-                    anyhow::ensure!(
-                        self.state
-                            .tabs
-                            .iter()
-                            .any(|tab| tab.id == tab_id && tab.layout.ids().contains(&id)),
-                        "Pane belongs to another tab"
-                    );
-                } else {
-                    let catalog = Self::catalog();
-                    anyhow::ensure!(
-                        !catalog
-                            .workspaces
-                            .iter()
-                            .any(|workspace| workspace.id == id || workspace.id == tab_id)
-                            && !self
-                                .state
-                                .tabs
-                                .iter()
-                                .any(|tab| tab.id == id || tab.layout.ids().contains(&tab_id)),
-                        "Pane IDs conflict with existing tabs or workspaces"
-                    );
-                    if let Some(tab) = self.state.tabs.iter().find(|tab| tab.id == tab_id) {
-                        anyhow::ensure!(
-                            tab.layout.ids().len() < 24,
-                            "A tab can have at most 24 panes"
-                        );
-                    }
-                    let directory: PathBuf = serde_json::from_value(request["directory"].clone())?;
-                    anyhow::ensure!(
-                        directory.is_dir(),
-                        "{} is not a directory",
-                        directory.display()
-                    );
-                    let style = serde_json::from_value(request["style"].clone())?;
-                    let theme = serde_json::from_value(request["theme"].clone())?;
-                    let session =
-                        TerminalSession::spawn(id, tab_id, directory.clone(), style, &theme)?;
-                    self.sessions.insert(id, session);
-                    // Record the pane before replying so a frontend crash cannot orphan it.
-                    // The frontend immediately saves the requested name, membership, and split direction.
-                    if let Some(tab) = self.state.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                        tab.layout.split(tab.active, id, false);
-                        tab.directories.insert(id, directory);
-                        tab.active = id;
-                    } else {
-                        self.state.tabs.insert(
-                            0,
-                            SavedTab {
-                                id: tab_id,
-                                name: model::directory_name(&directory),
-                                custom_name: false,
-                                workspace: None,
-                                layout: Layout::Pane(id),
-                                directories: HashMap::from([(id, directory)]),
-                                active: id,
-                            },
-                        );
-                    }
-                    self.state.active = tab_id;
-                    if let Err(error) = self.save() {
-                        self.close(id);
-                        return Err(error);
-                    }
-                }
-                self.changed.insert(id);
+            "_state" => {
+                self.refresh_state();
                 Ok(
-                    json!({"meta":Self::metadata(&self.sessions[&id], self.unread.get(&id).copied().unwrap_or(0))}),
+                    json!({"session":self.state,"metadata":self.sessions.iter().map(|(&id, s)|Self::metadata(s,self.unread.get(&id).copied().unwrap_or(0))).collect::<Vec<_>>() }),
                 )
             }
             "_metadata" => {
@@ -457,28 +693,31 @@ impl Daemon {
                     json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))}),
                 )
             }
+            "_copy" => {
+                let id = self.pane_id(&request)?;
+                Ok(json!({"text":self.sessions[&id].copy()?}))
+            }
             "_read" | "read" => {
                 let id = self.pane_id(&request)?;
                 Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
             }
-            "_close" | "close" => {
-                if method == "close" {
-                    self.pane_id(&request)?;
-                }
+            "_close" => {
                 let id = request["pane"]
                     .as_u64()
                     .or_else(|| self.pane_id(&request).ok())
                     .ok_or_else(|| anyhow::anyhow!("close requires pane"))?;
                 self.close(id);
-                self.save()?;
-                Ok(json!({"ok":true}))
+                Ok(self.save_result(json!({"ok":true})))
             }
             "quit" => {
-                self.save()?;
+                let warning = self
+                    .save()
+                    .err()
+                    .map(|e| format!("Could not save layout: {e}"));
                 self.quitting = true;
-                Ok(json!({"ok":true}))
+                Ok(json!({"ok":true,"warning":warning}))
             }
-            "list" => Ok(self.list()),
+            "list" => self.list(),
             "send" => {
                 let id = self.pane_id(&request)?;
                 let text = request["text"]
@@ -500,103 +739,6 @@ impl Daemon {
                 self.queue_notifications(id, [message.to_owned()]);
                 Ok(json!({"ok":true}))
             }
-            "new" => {
-                let workspace = if request.get("workspace").is_some() {
-                    request["workspace"].as_u64()
-                } else {
-                    match self.state.filter {
-                        TabFilter::Workspace(id) => Some(id),
-                        _ => None,
-                    }
-                };
-                let catalog = Self::catalog();
-                let definition = workspace
-                    .map(|id| {
-                        catalog
-                            .workspaces
-                            .iter()
-                            .find(|w| w.id == id)
-                            .ok_or_else(|| anyhow::anyhow!("Workspace {id} does not exist"))
-                    })
-                    .transpose()?;
-                let directory = request["directory"]
-                    .as_str()
-                    .map(PathBuf::from)
-                    .or_else(|| definition.map(|w| w.directory.clone()))
-                    .unwrap_or_else(model::home);
-                anyhow::ensure!(
-                    directory.is_dir(),
-                    "{} is not a directory",
-                    directory.display()
-                );
-                let tab = self.next()?;
-                let id = tab
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("No IDs remain"))?;
-                let settings = model::load::<Settings>("settings.json");
-                let session = TerminalSession::spawn(
-                    id,
-                    tab,
-                    directory.clone(),
-                    settings.cursor_style,
-                    &Theme::adwaita(settings.appearance != "light"),
-                )?;
-                self.sessions.insert(id, session);
-                let name = request["name"].as_str().filter(|n| !n.trim().is_empty());
-                self.state.tabs.insert(
-                    0,
-                    SavedTab {
-                        id: tab,
-                        name: name
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| model::directory_name(&directory)),
-                        custom_name: name.is_some(),
-                        workspace,
-                        layout: Layout::Pane(id),
-                        directories: HashMap::from([(id, directory)]),
-                        active: id,
-                    },
-                );
-                self.state.active = tab;
-                self.save()?;
-                Ok(json!({"tab":tab,"pane":id,"workspace":workspace}))
-            }
-            "split" => {
-                let target = self.pane_id(&request)?;
-                let tab = self
-                    .state
-                    .tabs
-                    .iter()
-                    .find(|t| t.layout.ids().contains(&target))
-                    .ok_or_else(|| anyhow::anyhow!("Pane has no tab"))?;
-                anyhow::ensure!(
-                    tab.layout.ids().len() < 24,
-                    "A tab can have at most 24 panes"
-                );
-                let tab_id = tab.id;
-                self.sessions.get_mut(&target).unwrap().refresh_directory();
-                let directory = self.sessions[&target].directory().to_path_buf();
-                let id = self.next()?;
-                let settings = model::load::<Settings>("settings.json");
-                self.sessions.insert(
-                    id,
-                    TerminalSession::spawn(
-                        id,
-                        tab_id,
-                        directory.clone(),
-                        settings.cursor_style,
-                        &Theme::adwaita(settings.appearance != "light"),
-                    )?,
-                );
-                let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
-                tab.layout
-                    .split(target, id, request["down"].as_bool().unwrap_or(false));
-                tab.active = id;
-                tab.directories.insert(id, directory);
-                self.state.active = tab_id;
-                self.save()?;
-                Ok(json!({"pane":id}))
-            }
             "focus" => {
                 if let Some(id) = request["pane"].as_u64() {
                     self.pane_id(&request)?;
@@ -617,7 +759,7 @@ impl Daemon {
                     self.state.active = id;
                 } else if let Some(id) = request["workspace"].as_u64() {
                     anyhow::ensure!(
-                        Self::catalog().workspaces.iter().any(|w| w.id == id),
+                        Self::catalog()?.workspaces.iter().any(|w| w.id == id),
                         "Workspace {id} does not exist"
                     );
                     self.state.filter = TabFilter::Workspace(id);
@@ -625,84 +767,7 @@ impl Daemon {
                 } else {
                     anyhow::bail!("focus requires a tab, pane, or workspace");
                 }
-                self.save()?;
-                Ok(json!({"ok":true}))
-            }
-            "workspace-new" => {
-                let name = request["name"]
-                    .as_str()
-                    .filter(|n| !n.trim().is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("Enter a workspace name"))?;
-                let directory = request["directory"]
-                    .as_str()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(model::home);
-                anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
-                let mut catalog = Self::catalog();
-                anyhow::ensure!(
-                    !catalog
-                        .workspaces
-                        .iter()
-                        .any(|w| w.name.eq_ignore_ascii_case(name)),
-                    "A workspace with that name already exists"
-                );
-                let id = self.next()?;
-                catalog.workspaces.push(model::WorkspaceDefinition {
-                    id,
-                    name: name.trim().to_owned(),
-                    directory,
-                });
-                model::save("workspaces.json", &catalog)?;
-                Ok(json!({"workspace":id}))
-            }
-            "workspace-delete" => {
-                let id = request["workspace"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("workspace-delete requires a workspace"))?;
-                let mut catalog = Self::catalog();
-                anyhow::ensure!(
-                    catalog.workspaces.iter().any(|w| w.id == id),
-                    "Workspace {id} does not exist"
-                );
-                catalog.workspaces.retain(|w| w.id != id);
-                model::save("workspaces.json", &catalog)?;
-                for tab in &mut self.state.tabs {
-                    if tab.workspace == Some(id) {
-                        tab.workspace = None;
-                    }
-                }
-                if self.state.filter == TabFilter::Workspace(id) {
-                    self.state.filter = TabFilter::Unassigned;
-                }
-                self.select_visible();
-                self.save()?;
-                Ok(json!({"ok":true}))
-            }
-            "move" => {
-                let id = request["tab"].as_u64().unwrap_or(self.state.active);
-                let value = request
-                    .get("workspace")
-                    .ok_or_else(|| anyhow::anyhow!("move requires workspace or null"))?;
-                anyhow::ensure!(
-                    value.is_null() || value.is_u64(),
-                    "workspace must be an ID or null"
-                );
-                let workspace = value.as_u64();
-                if let Some(id) = workspace {
-                    anyhow::ensure!(
-                        Self::catalog().workspaces.iter().any(|w| w.id == id),
-                        "Workspace {id} does not exist"
-                    );
-                }
-                self.state
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("Tab {id} does not exist"))?
-                    .workspace = workspace;
-                self.select_visible();
-                self.save()?;
-                Ok(json!({"ok":true}))
+                Ok(self.save_result(json!({"ok":true})))
             }
             _ => anyhow::bail!("Method {method} requires an open gmux window"),
         }
@@ -723,6 +788,15 @@ impl Daemon {
             self.frontend.as_ref().is_some_and(|f| f.attached),
             "Frontend must attach first"
         );
+        if method == "_invalid" {
+            self.frontend.as_mut().unwrap().paste = None;
+            anyhow::bail!(
+                "{}",
+                request["error"]
+                    .as_str()
+                    .unwrap_or("Invalid frontend command")
+            );
+        }
         if method == "subscribe" {
             let ids: HashSet<u64> = serde_json::from_value(request["panes"].clone())?;
             let frontend = self.frontend.as_mut().unwrap();
@@ -737,6 +811,63 @@ impl Daemon {
             return Ok(());
         }
         let id = self.pane_id(&request)?;
+        match method {
+            "paste-begin" => {
+                self.frontend.as_mut().unwrap().paste = None;
+                let size = request["size"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("Paste requires a size"))?;
+                anyhow::ensure!(
+                    size <= transport::MAX_PASTE as u64,
+                    "Paste is too large. The limit is 4 MiB."
+                );
+                self.frontend.as_mut().unwrap().paste = Some(Paste {
+                    pane: id,
+                    size: size as usize,
+                    text: String::with_capacity(size as usize),
+                    request,
+                });
+                return Ok(());
+            }
+            "paste-data" => {
+                let mut paste = self
+                    .frontend
+                    .as_mut()
+                    .unwrap()
+                    .paste
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("No paste is in progress"))?;
+                let text = request["text"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Paste requires text"))?;
+                anyhow::ensure!(
+                    paste.pane == id
+                        && text.len() <= transport::PASTE_CHUNK
+                        && paste.text.len() + text.len() <= paste.size,
+                    "Invalid paste chunk"
+                );
+                paste.text.push_str(text);
+                self.frontend.as_mut().unwrap().paste = Some(paste);
+                return Ok(());
+            }
+            "paste-end" => {
+                let mut paste = self
+                    .frontend
+                    .as_mut()
+                    .unwrap()
+                    .paste
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("No paste is in progress"))?;
+                anyhow::ensure!(
+                    paste.pane == id && paste.text.len() == paste.size,
+                    "Incomplete paste"
+                );
+                paste.request["method"] = json!("paste");
+                paste.request["text"] = json!(paste.text);
+                return self.input(paste.request);
+            }
+            _ => {}
+        }
         if method == "mark-read" {
             let through = request["through"]
                 .as_u64()
@@ -753,6 +884,16 @@ impl Daemon {
         }
         let session = self.sessions.get_mut(&id).unwrap();
         match method {
+            "copy" => {
+                self.clipboard.insert(id, session.copy()?);
+            }
+            "find" => session.find(request["query"].as_str().unwrap_or("")),
+            "find-advance" => session.find_advance(request["previous"].as_bool().unwrap_or(false)),
+            "select" => session.select(
+                serde_json::from_value(request["start"].clone())?,
+                serde_json::from_value(request["end"].clone())?,
+            )?,
+            "clear-selection" => session.clear_selection(),
             "input" => {
                 let bytes: Vec<u8> = serde_json::from_value(request["bytes"].clone())?;
                 session.send(&bytes)?;
@@ -761,6 +902,10 @@ impl Daemon {
                 let text = request["text"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("paste requires text"))?;
+                anyhow::ensure!(
+                    text.len() <= transport::MAX_PASTE,
+                    "Paste is too large. The limit is 4 MiB."
+                );
                 let mut bytes =
                     session.paste(text, request["clipboard"].as_bool().unwrap_or(false))?;
                 if request["enter"].as_bool().unwrap_or(false) {
@@ -858,6 +1003,7 @@ impl Daemon {
                 .into_iter()
                 .collect();
             let error = self.errors.remove(&id);
+            let mut copy = self.clipboard.remove(&id);
             let changed = self.changed.contains(&id);
             let screen =
                 frontend.visible.contains(&id) && (changed || !frontend.screens.contains_key(&id));
@@ -866,6 +1012,7 @@ impl Daemon {
                 && !screen
                 && notify.is_empty()
                 && error.is_none()
+                && copy.is_none()
                 && frontend.metadata.contains_key(&id)
             {
                 continue;
@@ -874,6 +1021,7 @@ impl Daemon {
             if !screen
                 && notify.is_empty()
                 && error.is_none()
+                && copy.is_none()
                 && frontend.metadata.get(&id) == Some(&meta)
             {
                 continue;
@@ -900,12 +1048,53 @@ impl Daemon {
                 }
                 self.sent_rows += rows.len() as u64;
                 // A client can discard every row while detached; attachment always resends a full viewport.
+                let serial = frontend.scroll_serials.get(&id).copied().unwrap_or(0);
+                let send = full
+                    || !rows.is_empty()
+                    || old.frame != snapshot.frame
+                    || frontend.sent_scroll_serials.get(&id) != Some(&serial);
                 old.frame = snapshot.frame;
-                Some(snapshot.frame)
+                send.then_some(snapshot.frame)
             } else {
                 None
             };
+            let find = session.find_state();
+            let selection = session.selection();
+            let find_changed = frontend.find.get(&id) != Some(&find);
+            let selection_changed = frontend.selections.get(&id) != Some(&selection);
+            if frame.is_none()
+                && !find_changed
+                && !selection_changed
+                && notify.is_empty()
+                && error.is_none()
+                && copy.is_none()
+                && frontend.metadata.get(&id) == Some(&meta)
+            {
+                continue;
+            }
+            frontend.find.insert(id, find.clone());
+            frontend.selections.insert(id, selection);
             frontend.metadata.insert(id, meta.clone());
+            frontend
+                .sent_scroll_serials
+                .insert(id, frontend.scroll_serials.get(&id).copied().unwrap_or(0));
+            // Large selections should not share the size limit of a full viewport.
+            if let Some(text) = copy.take() {
+                frontend.queue(Packet {
+                    header: Header {
+                        meta: meta.clone(),
+                        frame: None,
+                        scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
+                        rows: Vec::new(),
+                        notifications: Vec::new(),
+                        error: None,
+                        find: None,
+                        selection,
+                        copy: Some(text),
+                    },
+                    cells: Vec::new(),
+                })?;
+            }
             frontend.queue(Packet {
                 header: Header {
                     meta,
@@ -914,6 +1103,9 @@ impl Daemon {
                     rows,
                     notifications: notify,
                     error,
+                    find: find_changed.then_some(find),
+                    selection,
+                    copy,
                 },
                 cells,
             })?;
@@ -1044,12 +1236,14 @@ pub fn run() -> anyhow::Result<()> {
             && (!daemon.changed.is_empty()
                 || !daemon.notifications.is_empty()
                 || !daemon.errors.is_empty());
+        let searching = daemon.sessions.values().any(TerminalSession::find_pending);
         let held = daemon.sessions.values().any(TerminalSession::render_held);
         let mut deadline = quit_at;
         for next in [
             attached.then_some(next_metadata),
             pending.then_some(next_frame),
             held.then_some(now + Duration::from_millis(100)),
+            searching.then_some(now + Duration::from_millis(5)),
         ]
         .into_iter()
         .flatten()
@@ -1087,6 +1281,11 @@ pub fn run() -> anyhow::Result<()> {
                             screens: HashMap::new(),
                             metadata: HashMap::new(),
                             scroll_serials: HashMap::new(),
+                            sent_scroll_serials: HashMap::new(),
+                            find: HashMap::new(),
+                            selections: HashMap::new(),
+                            discarding: false,
+                            paste: None,
                         });
                         next_metadata = Instant::now();
                     }
@@ -1126,13 +1325,16 @@ pub fn run() -> anyhow::Result<()> {
             match frontend.requests() {
                 Ok(requests) => {
                     for request in requests {
-                        let id = request["pane"].as_u64();
+                        let id = daemon.pane_id(&request).ok();
+                        let attach = request["method"] == "attach";
                         if let Err(e) = daemon.input(request) {
-                            if let Some(id) = id {
-                                daemon.errors.insert(id, e.to_string());
-                            } else {
+                            if attach {
                                 daemon.frontend = None;
                                 break;
+                            } else if let Some(id) = id {
+                                daemon.errors.insert(id, e.to_string());
+                            } else {
+                                eprintln!("Frontend command failed: {e}");
                             }
                         }
                     }
@@ -1177,9 +1379,12 @@ pub fn run() -> anyhow::Result<()> {
                 .filter(|(_, index)| fds[*index].revents != 0)
                 .map(|(id, _)| *id),
         );
-        if child_event || metadata_due || held {
+        if child_event || metadata_due {
             ready.extend(daemon.sessions.keys().copied());
         }
+        ready.extend(daemon.sessions.iter().filter_map(|(&id, session)| {
+            (session.render_held() || session.find_pending()).then_some(id)
+        }));
         // Flush queued input immediately, including terminal protocol replies.
         ready.extend(daemon.sessions.iter().filter_map(|(&id, s)| {
             s.poll_fd()
@@ -1240,7 +1445,9 @@ pub fn run() -> anyhow::Result<()> {
             daemon.errors.clear();
         }
     }
-    daemon.save()?;
+    if let Err(error) = daemon.save() {
+        eprintln!("Could not save layout during shutdown: {error}");
+    }
     Ok(())
 }
 
@@ -1278,6 +1485,11 @@ mod tests {
             screens: HashMap::new(),
             metadata: HashMap::new(),
             scroll_serials: HashMap::new(),
+            sent_scroll_serials: HashMap::new(),
+            find: HashMap::new(),
+            selections: HashMap::new(),
+            discarding: false,
+            paste: None,
         };
         let packet = |text| {
             let mut cell = Cell::default();
@@ -1303,6 +1515,9 @@ mod tests {
                     rows: (0..24).collect(),
                     notifications: Vec::new(),
                     error: None,
+                    find: None,
+                    selection: None,
+                    copy: None,
                 },
                 cells: vec![cell; 80 * 24],
             }

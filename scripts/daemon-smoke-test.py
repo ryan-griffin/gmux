@@ -6,6 +6,8 @@ GTK_A11Y=none dbus-run-session -- python3 scripts/daemon-smoke-test.py --native.
 """
 import argparse
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 import select
@@ -24,16 +26,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 
-def wait_for(condition, timeout=12):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if value := condition():
-                return value
-        except (OSError, ValueError, KeyError):
-            pass
-        time.sleep(0.025)
-    raise AssertionError("Timed out waiting for daemon state")
+wait_for = partial(shared_wait_for, exceptions=(OSError, ValueError, KeyError))
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
@@ -49,13 +42,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
     stream = None
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def start_daemon():
         # Prove the backend has no display requirement even during native checks.
@@ -133,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=3)
+        command("attach", version=5)
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header

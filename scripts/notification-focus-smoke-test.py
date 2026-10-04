@@ -5,9 +5,10 @@ Run python3 scripts/notification-focus-smoke-test.py. The test uses an isolated
 Mutter compositor, notification server, settings, sockets, and shells.
 """
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import tempfile
@@ -23,16 +24,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 
-def wait_for(predicate):
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        try:
-            if value := predicate():
-                return value
-        except (OSError, KeyError):
-            pass
-        time.sleep(0.025)
-    raise AssertionError("Notification focus state did not settle")
+wait_for = partial(shared_wait_for, exceptions=(OSError, KeyError))
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-notification-focus-") as directory:
@@ -50,13 +42,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notification-focus-") as directory
     suppressed = []
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def pane_state(pane):
         return next(p for tab in rpc("list")["tabs"] for p in tab["panes"] if p["id"] == pane)

@@ -5,9 +5,10 @@ Run with GDK_BACKEND=wayland dbus-run-session -- python3
 scripts/commands-smoke-test.py. Uses a private accessibility bus and settings.
 """
 import json
+from functools import partial
+from test_support import rpc as shared_rpc, descendants, wait_for as shared_wait_for
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
 import time
@@ -25,27 +26,7 @@ artifacts.mkdir(exist_ok=True)
 context = GLib.MainContext.default()
 
 
-def wait_for(predicate):
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        while context.pending():
-            context.iteration(False)
-        try:
-            if result := predicate():
-                return result
-        except (FileNotFoundError, ConnectionRefusedError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Timed out waiting for command dialog state")
-
-
-def descendants(obj):
-    obj.clear_cache()
-    yield obj
-    for index in range(obj.get_child_count()):
-        child = obj.get_child_at_index(index)
-        if child:
-            yield from descendants(child)
+wait_for = partial(shared_wait_for, timeout=10, context=context)
 
 
 def focused(obj):
@@ -82,15 +63,10 @@ try:
             app = subprocess.Popen([str(root / "target/debug/gmux")], env=env,
                                    stdout=log, stderr=log)
             def rpc(method, **params):
-                with socket.socket(socket.AF_UNIX) as connection:
-                    connection.settimeout(5)
-                    connection.connect(env["GMUX_SOCKET"])
-                    connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-                    result = json.loads(connection.makefile("rb").readline())
-                    assert "error" not in result, result
-                    return result
+                return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
             wait_for(lambda: rpc("daemon-info")["attached"])
+            wait_for(lambda: rpc("renderer-info")["window_active"])
             desktop = Atspi.get_desktop(0)
 
             def find(name, role=None):

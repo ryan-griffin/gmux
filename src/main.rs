@@ -1,5 +1,6 @@
 #![deny(deprecated)]
 
+mod accessible_terminal;
 mod app;
 mod branch;
 mod commands;
@@ -12,7 +13,7 @@ mod terminal;
 mod terminal_canvas;
 
 use clap::{Parser, Subcommand};
-use gmux::{ipc, model, search, theme};
+use gmux::{ipc, model, theme};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -119,25 +120,29 @@ fn main() -> anyhow::Result<()> {
                 name,
                 directory,
                 workspace,
-            } => {
-                let mut request = json!({"method":"new", "name":name, "directory":directory.map(std::path::absolute).transpose()?});
-                if let Some(workspace) = workspace {
-                    request["workspace"] = json!(workspace);
-                }
-                request
-            }
+            } => serde_json::to_value(gmux::control::Command::New {
+                name,
+                directory: directory.map(std::path::absolute).transpose()?,
+                workspace: workspace.map(Some),
+            })?,
             Command::Workspace { command } => match command {
                 WorkspaceCommand::New { name, directory } => {
-                    json!({"method":"workspace-new", "name":name, "directory":directory.map(std::path::absolute).transpose()?})
+                    serde_json::to_value(gmux::control::Command::WorkspaceNew {
+                        name,
+                        directory: directory.map(std::path::absolute).transpose()?,
+                        tab: None,
+                    })?
                 }
                 WorkspaceCommand::Delete { id } => {
-                    json!({"method":"workspace-delete", "workspace":id})
+                    serde_json::to_value(gmux::control::Command::WorkspaceDelete { workspace: id })?
                 }
             },
             Command::Move { tab, workspace } => {
-                json!({"method":"move", "tab":tab, "workspace":workspace})
+                serde_json::to_value(gmux::control::Command::Move { tab, workspace })?
             }
-            Command::Split { pane, down } => json!({"method":"split", "pane":pane, "down":down}),
+            Command::Split { pane, down } => {
+                serde_json::to_value(gmux::control::Command::Split { pane, down })?
+            }
             Command::Send { text, pane, enter } => {
                 json!({"method":"send", "pane":pane, "text":text, "paste":true, "enter":enter})
             }
@@ -152,7 +157,9 @@ fn main() -> anyhow::Result<()> {
             } => {
                 json!({"method":"focus", "tab":tab, "workspace":workspace, "pane":pane})
             }
-            Command::Close { pane } => json!({"method":"close", "pane":pane}),
+            Command::Close { pane } => {
+                serde_json::to_value(gmux::control::Command::Close { pane })?
+            }
             Command::Screenshot { path } => {
                 json!({"method":"screenshot", "path":std::path::absolute(path)?})
             }

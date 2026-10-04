@@ -5,10 +5,10 @@ Run with GTK_A11Y=none dbus-run-session -- python3 scripts/terminal-renderer-smo
 Requires Vim and top. Uses isolated settings, shell, and daemon.
 """
 import json
+from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
 import shlex
-import socket
 import subprocess
 import tempfile
 import time
@@ -18,18 +18,6 @@ from daemon_test_support import stop_daemon
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-
-
-def wait_for(predicate, timeout=12):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if result := predicate():
-                return result
-        except (FileNotFoundError, ConnectionRefusedError, KeyError):
-            pass
-        time.sleep(0.05)
-    raise AssertionError("Terminal renderer did not reach the expected state")
 
 
 with tempfile.TemporaryDirectory(prefix="gmux-terminal-renderer-") as directory:
@@ -52,13 +40,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-renderer-") as directory:
     app = None
 
     def rpc(method, **params):
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(6)
-            connection.connect(env["GMUX_SOCKET"])
-            connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-            result = json.loads(connection.makefile("rb").readline())
-            assert "error" not in result, result
-            return result
+        return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     def output(pane):
         return rpc("read", pane=pane)["text"]

@@ -34,7 +34,7 @@ pub fn directory_name(path: &Path) -> String {
         .into_owned()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Layout {
     Pane(u64),
     Split {
@@ -45,15 +45,45 @@ pub enum Layout {
     },
 }
 impl Layout {
+    pub fn update_ratios(&mut self, saved: &Self) {
+        if let (
+            Self::Split {
+                vertical,
+                first,
+                second,
+                ratio,
+            },
+            Self::Split {
+                vertical: saved_vertical,
+                first: saved_first,
+                second: saved_second,
+                ratio: saved_ratio,
+            },
+        ) = (self, saved)
+            && vertical == saved_vertical
+            && first.ids() == saved_first.ids()
+            && second.ids() == saved_second.ids()
+        {
+            if saved_ratio.is_finite() {
+                *ratio = saved_ratio.clamp(0.05, 0.95);
+            }
+            first.update_ratios(saved_first);
+            second.update_ratios(saved_second);
+        }
+    }
     pub fn ids(&self) -> Vec<u64> {
-        match self {
-            Self::Pane(id) => vec![*id],
-            Self::Split { first, second, .. } => {
-                let mut ids = first.ids();
-                ids.extend(second.ids());
-                ids
+        fn collect(layout: &Layout, ids: &mut Vec<u64>) {
+            match layout {
+                Layout::Pane(id) => ids.push(*id),
+                Layout::Split { first, second, .. } => {
+                    collect(first, ids);
+                    collect(second, ids);
+                }
             }
         }
+        let mut ids = Vec::new();
+        collect(self, &mut ids);
+        ids
     }
     pub fn split(&mut self, target: u64, new_id: u64, vertical: bool) -> bool {
         match self {
@@ -197,18 +227,48 @@ pub struct WorkspaceDefinition {
 pub struct WorkspaceCatalog {
     pub workspaces: Vec<WorkspaceDefinition>,
 }
-pub fn load<T: serde::de::DeserializeOwned + Default>(name: &str) -> T {
-    match std::fs::read(config_dir().join(name)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            eprintln!("Could not read {name}: {error}");
-            T::default()
-        }),
-        Err(_) => T::default(),
+impl WorkspaceCatalog {
+    pub fn validate_name(&self, name: &str, editing: Option<u64>) -> anyhow::Result<String> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "Enter a workspace name");
+        anyhow::ensure!(
+            !self
+                .workspaces
+                .iter()
+                .any(|w| Some(w.id) != editing && w.name.eq_ignore_ascii_case(name)),
+            "A workspace with that name already exists"
+        );
+        Ok(name.to_owned())
     }
 }
-pub fn save<T: Serialize>(name: &str, value: &T) -> anyhow::Result<()> {
+pub fn load<T: serde::de::DeserializeOwned + Default>(name: &str) -> anyhow::Result<T> {
+    load_at(&config_dir().join(name))
+}
+fn load_at<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
+    use anyhow::Context;
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+            format!("Could not load {}. The file is unchanged. Repair it or move it aside to start with defaults", path.display())
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
+    }
+}
+pub fn save<T: Serialize + serde::de::DeserializeOwned + Default>(
+    name: &str,
+    value: &T,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(config_dir())?;
     let path = config_dir().join(name);
+    save_at(&path, value)
+}
+fn save_at<T: Serialize + serde::de::DeserializeOwned + Default>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    // An autosave must not replace a file that became unreadable or invalid
+    // after startup. Missing files are the only case that starts from defaults.
+    let _: T = load_at(path)?;
     let temp = path.with_extension("tmp");
     std::fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
     std::fs::rename(temp, path)?;
@@ -218,6 +278,29 @@ pub fn save<T: Serialize>(name: &str, value: &T) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_state_uses_defaults_but_invalid_and_unreadable_state_is_preserved() {
+        let path = std::env::temp_dir().join(format!(
+            "gmux-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let file = path.join("session.json");
+        assert!(load_at::<Session>(&file).unwrap().tabs.is_empty());
+        assert!(load_at::<Session>(&path).is_err());
+        for bytes in [b"{broken".as_slice(), b"{\"tabs\":\"invalid\"}".as_slice()] {
+            std::fs::write(&file, bytes).unwrap();
+            assert!(load_at::<Session>(&file).is_err());
+            assert!(save_at(&file, &Session::default()).is_err());
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+            assert!(!file.with_extension("tmp").exists());
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn unassigned_filter_matches_only_unassigned_tabs() {
         assert!(TabFilter::All.matches(None));
