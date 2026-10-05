@@ -86,7 +86,7 @@ pub(super) fn reconcile_selection(
                     .tabs
                     .get(&saved.id)
                     .is_some_and(|before| before.active != tab.active)
-                && saved.layout.ids().contains(&tab.active)
+                && saved.layout.contains(tab.active)
             {
                 saved.active = tab.active;
             }

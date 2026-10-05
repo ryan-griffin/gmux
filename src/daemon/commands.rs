@@ -191,9 +191,69 @@ impl Daemon {
     pub(super) fn list(&mut self) -> anyhow::Result<Value> {
         self.refresh_state();
         let catalog = storage::load_catalog()?;
-        Ok(
-            json!({"active_tab":(self.state.active!=0).then_some(self.state.active),"filter":self.state.filter,"tab_search":"","workspaces":catalog.workspaces.iter().map(|w|json!({"id":w.id,"name":w.name,"directory":w.directory,"tabs":self.state.tabs.iter().filter(|t|t.workspace==Some(w.id)).count(),"unread":self.state.tabs.iter().any(|t|t.workspace==Some(w.id)&&t.layout.ids().iter().any(|id|self.unread.contains_key(id)))})).collect::<Vec<_>>(),"tabs":self.state.tabs.iter().map(|t| json!({"id":t.id,"name":t.name,"workspace":t.workspace,"visible":self.state.filter.matches(t.workspace),"active_pane":t.active,"unread":t.layout.ids().iter().any(|id|self.unread.contains_key(id)),"layout":t.layout,"panes":t.layout.ids().iter().filter_map(|id|self.sessions.get(id)).map(|s|json!({"id":s.id(),"title":s.title(),"directory":s.directory(),"exited":s.exited(),"unread":self.unread.contains_key(&s.id())})).collect::<Vec<_>>()})).collect::<Vec<_>>()}),
-        )
+        let workspaces: Vec<_> = catalog
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                let mut tabs = self
+                    .state
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.workspace == Some(workspace.id));
+                let count = tabs.clone().count();
+                let unread = tabs.any(|tab| {
+                    tab.layout
+                        .ids()
+                        .iter()
+                        .any(|id| self.unread.contains_key(id))
+                });
+                json!({
+                    "id": workspace.id,
+                    "name": workspace.name,
+                    "directory": workspace.directory,
+                    "tabs": count,
+                    "unread": unread,
+                })
+            })
+            .collect();
+        let tabs: Vec<_> = self
+            .state
+            .tabs
+            .iter()
+            .map(|tab| {
+                let ids = tab.layout.ids();
+                let panes: Vec<_> = ids
+                    .iter()
+                    .filter_map(|id| self.sessions.get(id))
+                    .map(|session| {
+                        json!({
+                            "id": session.id(),
+                            "title": session.title(),
+                            "directory": session.directory(),
+                            "exited": session.exited(),
+                            "unread": self.unread.contains_key(&session.id()),
+                        })
+                    })
+                    .collect();
+                json!({
+                    "id": tab.id,
+                    "name": tab.name,
+                    "workspace": tab.workspace,
+                    "visible": self.state.filter.matches(tab.workspace),
+                    "active_pane": tab.active,
+                    "unread": ids.iter().any(|id| self.unread.contains_key(id)),
+                    "layout": tab.layout,
+                    "panes": panes,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "active_tab": (self.state.active != 0).then_some(self.state.active),
+            "filter": self.state.filter,
+            "tab_search": "",
+            "workspaces": workspaces,
+            "tabs": tabs,
+        }))
     }
     pub(super) fn result_with_session_save(&mut self, output: CommandOutput) -> CommandResult {
         self.prepare_session_save();
@@ -267,7 +327,7 @@ impl Daemon {
                     .state
                     .tabs
                     .iter()
-                    .find(|t| t.layout.ids().contains(&target))
+                    .find(|t| t.layout.contains(target))
                     .ok_or_else(|| anyhow::anyhow!("Pane has no tab"))?;
                 anyhow::ensure!(
                     tab.layout.ids().len() < 24,
@@ -433,7 +493,7 @@ impl Daemon {
                         .find(|tab| tab.id == tab_id)
                         .ok_or_else(|| anyhow::anyhow!("Tab {tab_id} does not exist"))?;
                     anyhow::ensure!(
-                        tab.layout.ids().contains(&pane),
+                        tab.layout.contains(pane),
                         "Pane {pane} does not belong to tab {tab_id}"
                     );
                     tab.active = pane;
@@ -453,7 +513,7 @@ impl Daemon {
                     if let Some(tab) = self.state.tabs.iter_mut().find(|t| t.id == saved.id) {
                         if tab.layout.ids() == saved.layout.ids() {
                             tab.layout.update_ratios(&saved.layout);
-                            if tab.layout.ids().contains(&saved.active) {
+                            if tab.layout.contains(saved.active) {
                                 tab.active = saved.active;
                             }
                         }
@@ -532,7 +592,7 @@ impl Daemon {
                         .state
                         .tabs
                         .iter_mut()
-                        .find(|t| t.layout.ids().contains(&id))
+                        .find(|t| t.layout.contains(id))
                         .unwrap();
                     tab.active = id;
                     let tab_id = tab.id;

@@ -173,13 +173,13 @@ impl HistorySearch {
         if self.query == query {
             return;
         }
-        self.query = query.clone();
+        self.dirty = !query.is_empty();
+        self.query = query;
         self.matcher.clear();
         self.matches.clear();
         self.scanning.clear();
         self.current = 0;
         self.pending = false;
-        self.dirty = !query.is_empty();
     }
     pub fn invalidate(&mut self) {
         self.dirty |= !self.query.is_empty();

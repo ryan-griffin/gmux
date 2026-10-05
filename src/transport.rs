@@ -71,20 +71,30 @@ impl Packet {
     }
 
     pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
-        let header = serde_json::to_vec(&self.header)?;
-        let size = 4 + header.len() + self.cells.len() * CELL_BYTES;
-        anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
-        bytes.reserve(size + 4);
-        bytes.extend_from_slice(&(size as u32).to_le_bytes());
-        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&header);
-        for cell in &self.cells {
-            bytes.extend_from_slice(&cell.text);
-            bytes.extend_from_slice(&cell.fg);
-            bytes.extend_from_slice(&cell.bg);
-            bytes.push(cell.flags);
+        let start = bytes.len();
+        // Serialize into the reusable output buffer, then fill the lengths.
+        // A failed packet must leave previously queued packets untouched.
+        bytes.extend_from_slice(&[0; 8]);
+        let result = (|| {
+            serde_json::to_writer(&mut *bytes, &self.header)?;
+            let header_size = bytes.len() - start - 8;
+            let size = 4 + header_size + self.cells.len() * CELL_BYTES;
+            anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
+            bytes[start..start + 4].copy_from_slice(&(size as u32).to_le_bytes());
+            bytes[start + 4..start + 8].copy_from_slice(&(header_size as u32).to_le_bytes());
+            bytes.reserve(self.cells.len() * CELL_BYTES);
+            for cell in &self.cells {
+                bytes.extend_from_slice(&cell.text);
+                bytes.extend_from_slice(&cell.fg);
+                bytes.extend_from_slice(&cell.bg);
+                bytes.push(cell.flags);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            bytes.truncate(start);
         }
-        Ok(())
+        result
     }
 
     pub fn read(reader: &mut impl Read) -> anyhow::Result<Self> {
@@ -248,5 +258,23 @@ mod tests {
         packet.encode_into(&mut encoded).unwrap();
         assert!(Packet::read(&mut &encoded[..]).is_err());
         assert!(Packet::read(&mut &u32::MAX.to_le_bytes()[..]).is_err());
+    }
+    #[test]
+    fn failed_encoding_preserves_previously_queued_packets() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut packet = packet();
+        let mut encoded = Vec::new();
+        packet.encode_into(&mut encoded).unwrap();
+        let original = encoded.clone();
+        packet.header.meta.directory = std::ffi::OsString::from_vec(vec![0xff]).into();
+        assert!(packet.encode_into(&mut encoded).is_err());
+        assert_eq!(encoded, original);
+
+        packet.header.meta.directory = "/tmp".into();
+        packet.header.copy = Some("x".repeat(MAX_PACKET));
+        assert!(packet.encode_into(&mut encoded).is_err());
+        assert_eq!(encoded, original);
+        let decoded = Packet::read(&mut &encoded[..]).unwrap();
+        assert!(decoded.cells == packet.cells);
     }
 }

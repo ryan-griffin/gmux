@@ -62,8 +62,7 @@ impl Ui {
                 .borrow()
                 .workspaces
                 .iter()
-                .any(|workspace| workspace.id == saved.id
-                    || saved.layout.ids().contains(&workspace.id)),
+                .any(|workspace| workspace.id == saved.id || saved.layout.contains(workspace.id)),
             "Saved tab IDs conflict with a workspace"
         );
         let ids = saved.layout.ids();

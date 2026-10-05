@@ -24,6 +24,8 @@ def close_shortcut(native):
     time.sleep(0.05)
     for key in reversed(keys):
         native.key(key, False)
+    # Let Mutter process the releases before a second chord reuses these keys.
+    time.sleep(0.05)
 
 
 with (artifacts / "window-close-smoke.log").open("w") as log, WaylandInput() as native:

@@ -21,7 +21,8 @@ spacing errors between cells. Each row retains its background and foreground
 nodes. Up to eight pending text batches can combine glyphs with the same font
 and color across fallback-font changes. Ink extents prevent combining batches
 when that would reorder overlapping glyphs. Cell graphics flush the batches
-before drawing, and the buffers serve subsequent rows in the same snapshot.
+before drawing. The renderer reuses the batch and glyph buffers across rows and
+snapshots, and releases them when the font or Pango context changes.
 Changes to output, selection, search highlights, and block cursors rebuild
 the affected rows. Font descriptions, Pango context changes, cell metrics,
 colors, and device pixel alignment invalidate the relevant caches. Font

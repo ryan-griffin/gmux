@@ -63,6 +63,8 @@ pub struct Request {
 pub struct Server {
     pub receiver: mpsc::Receiver<Request>,
     path: PathBuf,
+    stop: Wake,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 pub fn socket_path() -> PathBuf {
     std::env::var_os("GMUX_SOCKET")
@@ -98,12 +100,43 @@ impl Server {
         }
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        let stop = Wake::new()?;
+        let stopping = stop.clone();
         let (sender, receiver) = mpsc::sync_channel(32);
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
+        let thread = std::thread::spawn(move || {
+            let mut fds = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stopping.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            loop {
+                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
                     break;
+                }
+                if fds[1].revents != 0 {
+                    break;
+                }
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
                 };
                 use std::sync::atomic::Ordering;
                 if active.fetch_add(1, Ordering::Relaxed) >= 64 {
@@ -146,11 +179,20 @@ impl Server {
                 });
             }
         });
-        Ok(Self { receiver, path })
+        Ok(Self {
+            receiver,
+            path,
+            stop,
+            thread: Some(thread),
+        })
     }
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        self.stop.notify();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -303,6 +345,33 @@ pub fn companion_path(suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_server_releases_its_listener_and_allows_restarting() {
+        let path = std::env::temp_dir().join(format!(
+            "gmux-server-lifecycle-test-{}.sock",
+            std::process::id()
+        ));
+        let wake = Wake::new().unwrap();
+        let retained_wake = Arc::downgrade(&wake.0);
+        let server = Server::start_at(path.clone(), wake).unwrap();
+        assert!(retained_wake.upgrade().is_some());
+        drop(server);
+        assert!(retained_wake.upgrade().is_none());
+        assert!(!path.exists());
+
+        let server = Server::start_at(path.clone(), Wake::new().unwrap()).unwrap();
+        let client = std::thread::spawn(move || {
+            call_at(&path, serde_json::json!({"method": "hello"})).unwrap()
+        });
+        let request = server
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(request.body["method"], "hello");
+        request.reply.send(serde_json::json!({"ok": true})).unwrap();
+        assert_eq!(client.join().unwrap()["ok"], true);
+    }
 
     #[test]
     fn slow_requests_leave_the_caller_free_and_focus_and_saves_preserve_command_order() {

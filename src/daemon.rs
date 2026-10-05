@@ -296,7 +296,7 @@ impl Daemon {
             frontend.selections.remove(&id);
         }
         self.state.tabs.retain_mut(|tab| {
-            if !tab.layout.ids().contains(&id) {
+            if !tab.layout.contains(id) {
                 return true;
             }
             let Some(layout) = tab.layout.clone().remove(id) else {

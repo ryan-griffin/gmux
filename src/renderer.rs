@@ -209,6 +209,7 @@ struct CachedRow {
 pub struct Renderer {
     font: Option<FontKey>,
     glyphs: GlyphCache,
+    batches: TextBatches,
     appearance: Option<Appearance>,
     rows: Vec<CachedRow>,
 }
@@ -220,6 +221,7 @@ impl Renderer {
 
     pub fn clear(&mut self) {
         self.glyphs = GlyphCache::default();
+        self.batches = TextBatches::default();
         self.font = None;
         self.rows.clear();
         self.appearance = None;
@@ -312,7 +314,7 @@ impl Renderer {
         let cols = scene.frame.cols as usize;
         self.reuse_scrolled_rows(scene.cells, cols);
         let mut stats = RenderStats::default();
-        let mut batch = TextBatches::default();
+        let batch = &mut self.batches;
         for (y, cells) in scene.cells.chunks(cols).enumerate() {
             let base = y * cols;
             let highlights = scene.matches.get(base..base + cells.len()).unwrap_or(&[]);

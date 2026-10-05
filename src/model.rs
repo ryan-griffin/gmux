@@ -39,6 +39,12 @@ pub enum Layout {
     },
 }
 impl Layout {
+    pub fn contains(&self, target: u64) -> bool {
+        match self {
+            Self::Pane(id) => *id == target,
+            Self::Split { first, second, .. } => first.contains(target) || second.contains(target),
+        }
+    }
     pub fn update_ratios(&mut self, saved: &Self) {
         if let (
             Self::Split {
