@@ -24,6 +24,15 @@ fn main() {
     let prefix = env::var_os("GHOSTTY_PREFIX")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(".deps/ghostty"));
+    // Native headers and libraries can change without a Rust source edit.
+    println!(
+        "cargo:rerun-if-changed={}",
+        prefix.join("include").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        prefix.join("lib/libghostty-vt.so").display()
+    );
     if !prefix.join("include/ghostty/vt/terminal.h").exists() {
         panic!(
             "libghostty-vt terminal API is missing. Run ./scripts/bootstrap-ghostty.sh first, or set GHOSTTY_PREFIX to a compatible installation."

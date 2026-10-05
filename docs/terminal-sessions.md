@@ -32,6 +32,10 @@ state across frontend reconnects; selecting a pane acknowledges the alerts the
 frontend has seen.
 Sequence numbers prevent a delayed acknowledgement from clearing a newer alert.
 Unread state and queued alerts are kept in memory, not across daemon restarts.
+Alerts from a newly created pane can arrive before its command reply creates the
+frontend widget. The frontend delivers these with the title "Terminal" and keeps
+the pane ID as their focus target. Clicking before the widget exists does not
+change focus.
 
 ## Ownership and scheduling
 
@@ -150,6 +154,12 @@ returns authoritative layout, catalog, and process metadata for reconciliation.
 The frontend persists presentation state and divider proportions without replacing
 daemon topology. Completed live changes return their resulting state even if
 saving the layout fails, with a separate persistence warning.
+
+The daemon does not reuse allocated tab, pane, or workspace IDs while it runs.
+The frontend records terminal exits while command replies are pending and removes
+those panes from older returned layouts, including panes that exit before their
+widgets exist. Delayed replies also preserve later tab, pane, and workspace
+selections when those targets still exist.
 
 Missing settings, workspace, and session files use defaults. Invalid or unreadable
 files produce a recovery error and remain unchanged. Startup failures show the

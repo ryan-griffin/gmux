@@ -1,6 +1,53 @@
 //! Backend requests, state reconciliation, and presentation persistence.
 use super::*;
 
+mod reconcile;
+use reconcile::{Selection, TabSelection, reconcile_selection, remove_exited_panes};
+
+impl Selection {
+    fn capture(ui: &Ui) -> Self {
+        Self {
+            active: ui.active.get(),
+            filter: ui.filter.get(),
+            tabs: ui
+                .tabs
+                .borrow()
+                .iter()
+                .map(|tab| {
+                    (
+                        tab.id,
+                        TabSelection {
+                            active: tab.active,
+                            workspace: tab.workspace,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct RequestTargets {
+    pub(super) pane: Option<u64>,
+    tab: Option<u64>,
+    workspace: Option<u64>,
+}
+
+impl RequestTargets {
+    pub(super) fn decode(request: &Value) -> anyhow::Result<Self> {
+        Ok(serde::Deserialize::deserialize(request)?)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SendOptions {
+    #[serde(default)]
+    paste: bool,
+    #[serde(default)]
+    enter: bool,
+}
+
 impl Ui {
     pub(super) fn request(
         self: &Rc<Self>,
@@ -20,31 +67,44 @@ impl Ui {
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>) + 'static,
     ) {
         let reveal = matches!(command, Command::New { .. } | Command::Split { .. });
+        let selection = Selection::capture(self);
         self.save_session();
+        self.command_count.set(self.command_count.get() + 1);
         self.request(InternalRequest::Command { command }, move |ui, result| {
             let result = result.and_then(|value| {
                 let reply: CommandReply = serde_json::from_value(value)?;
-                let result = ui.apply_backend(reply, reveal)?;
+                let result = ui.apply_backend(reply, reveal, selection)?;
                 if let Some(warning) = result.warning.as_deref() {
                     ui.message(warning);
                 }
                 Ok(result)
             });
+            ui.command_count.set(ui.command_count.get() - 1);
+            if ui.command_count.get() == 0 {
+                ui.command_exits.borrow_mut().clear();
+            }
             callback(ui, result);
         });
     }
-    pub(super) fn apply_backend(
+    fn apply_backend(
         self: &Rc<Self>,
         reply: CommandReply,
         reveal: bool,
+        selection: Selection,
     ) -> anyhow::Result<CommandResult> {
         let previous_active = self.active.get();
+        let mut reply = reply;
+        // Keep observed exits until every outstanding snapshot is handled,
+        // including panes that exited before they could be attached.
+        remove_exited_panes(&mut reply, &self.command_exits.borrow());
         let CommandReply {
             result,
-            session: state,
+            session: mut state,
             catalog,
             metadata,
         } = reply;
+        let current = Selection::capture(self);
+        reconcile_selection(&mut state, &catalog, &selection, &current, reveal);
         *self.catalog.borrow_mut() = catalog;
         self.sessions.borrow_mut().install_metadata(metadata);
         let ids: HashSet<_> = state.tabs.iter().flat_map(|t| t.layout.ids()).collect();
@@ -168,7 +228,8 @@ impl Ui {
             .get("method")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
-        let pane_id = request.get("pane").and_then(Value::as_u64);
+        let targets = RequestTargets::decode(&request)?;
+        let pane_id = targets.pane;
         match method {
             "detach" => {
                 let window = self.window.clone();
@@ -228,7 +289,7 @@ impl Ui {
                 Ok(json!({"ok": true}))
             }
             "filter" => {
-                let filter = if let Some(id) = request.get("workspace").and_then(Value::as_u64) {
+                let filter = if let Some(id) = targets.workspace {
                     anyhow::ensure!(
                         self.catalog
                             .borrow()
@@ -251,23 +312,14 @@ impl Ui {
                 Ok(json!({"ok": true}))
             }
             "send" => {
+                let options: SendOptions = serde::Deserialize::deserialize(&request)?;
                 let pane = self.pane(pane_id)?;
                 let text = request
                     .get("text")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("send requires text"))?;
-                if request
-                    .get("paste")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    pane.send_text(
-                        text,
-                        request
-                            .get("enter")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    )?;
+                if options.paste {
+                    pane.send_text(text, options.enter)?;
                 } else {
                     pane.send(text.as_bytes())?;
                 }
@@ -277,14 +329,14 @@ impl Ui {
                 if let Some(pane) = pane_id {
                     self.pane(Some(pane))?;
                     self.jump_to_pane(pane);
-                } else if let Some(id) = request.get("tab").and_then(Value::as_u64) {
+                } else if let Some(id) = targets.tab {
                     anyhow::ensure!(
                         self.tabs.borrow().iter().any(|w| w.id == id),
                         "Tab {id} does not exist"
                     );
                     self.switch(id);
                     self.window.present();
-                } else if let Some(id) = request.get("workspace").and_then(Value::as_u64) {
+                } else if let Some(id) = targets.workspace {
                     anyhow::ensure!(
                         self.catalog
                             .borrow()

@@ -206,6 +206,7 @@ impl Ui {
             adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 700sp").unwrap());
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
+        let keyboard = crate::terminal::KeyboardModifiers::install(&window);
         let ui = Rc::new(Self {
             app: app.clone(),
             window,
@@ -241,6 +242,9 @@ impl Ui {
             server,
             backend: ipc::Client::new(wake.clone()),
             pending: RefCell::new(HashMap::new()),
+            command_count: Cell::new(0),
+            command_exits: RefCell::new(HashSet::new()),
+            keyboard,
             wake: wake.clone(),
             update_source: RefCell::new(None),
             branches: BranchWorker::new(wake.clone()),
@@ -464,12 +468,18 @@ impl Ui {
                     return glib::ControlFlow::Continue;
                 }
                 for (id, update) in updates {
+                    if update.exited && ui.command_count.get() > 0 {
+                        ui.command_exits.borrow_mut().insert(id);
+                    }
                     let pane = ui
                         .tabs
                         .borrow()
                         .iter()
                         .find_map(|tab| tab.panes.get(&id).map(|pane| (tab.id, pane.clone())));
                     let Some((tab, pane)) = pane else {
+                        for message in update.notifications {
+                            ui.notify(0, id, message);
+                        }
                         continue;
                     };
                     if update.directory_changed {
@@ -483,7 +493,7 @@ impl Ui {
                     for message in update.notifications {
                         ui.notify(tab, pane.id, message);
                     }
-                    if pane.exited()
+                    if (update.exited || pane.exited())
                         && let Err(error) = ui.close_pane(pane.id)
                     {
                         ui.message(&error.to_string());
@@ -556,7 +566,9 @@ impl Ui {
                         continue;
                     }
                     if method == "read" {
-                        let pane = match ui.pane(request.body["pane"].as_u64()) {
+                        let pane = match backend::RequestTargets::decode(&request.body)
+                            .and_then(|targets| ui.pane(targets.pane))
+                        {
                             Ok(pane) => pane.id,
                             Err(error) => {
                                 let _ = request.reply.try_send(json!({"error":error.to_string()}));

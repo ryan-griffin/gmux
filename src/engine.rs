@@ -152,6 +152,7 @@ pub struct Engine {
     events: Box<Events>,
     pub frame: Frame,
     pub cells: Vec<Cell>,
+    size: (u16, u16),
     revision: u64,
     find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
@@ -167,6 +168,7 @@ impl Engine {
             events,
             frame: Frame::default(),
             cells: vec![Cell::default(); 80 * 24],
+            size: (80, 24),
             revision: 0,
             find: crate::search::HistorySearch::default(),
             find_row: Vec::new(),
@@ -201,10 +203,13 @@ impl Engine {
     pub fn resize(&mut self, cols: u16, rows: u16, cw: u32, ch: u32) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_resize(self.raw.as_ptr(), cols, rows, cw, ch) };
         anyhow::ensure!(result == 0, "Ghostty resize failed ({result})");
-        self.find.invalidate();
-        self.find.pending = false;
-        self.cells
-            .resize(cols as usize * rows as usize, Cell::default());
+        if self.size != (cols, rows) {
+            self.find.invalidate();
+            self.find.pending = false;
+            self.cells
+                .resize(cols as usize * rows as usize, Cell::default());
+            self.size = (cols, rows);
+        }
         Ok(())
     }
     /// Refresh frame metadata and changed rows, returning whether cells changed.
@@ -492,6 +497,31 @@ mod tests {
             "Reflow must retain selection endpoints"
         );
     }
+
+    #[test]
+    fn cell_metric_updates_preserve_completed_and_pending_history_searches() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(30, 3, 8, 16).unwrap();
+        for i in 0..200 {
+            engine.write(format!("needle {i}\r\n").as_bytes());
+        }
+        engine.find("needle");
+        engine.poll_find();
+        assert!(engine.find.pending);
+        let next = engine.find.next;
+        engine.resize(30, 3, 9, 18).unwrap();
+        assert!(engine.find.pending);
+        assert_eq!(engine.find.next, next);
+        while engine.find_pending() {
+            engine.poll_find();
+        }
+        assert_eq!(engine.find_state().total, 200);
+        engine.resize(30, 3, 10, 20).unwrap();
+        assert!(!engine.find_pending());
+        assert_eq!(engine.find_state().total, 200);
+        engine.resize(15, 3, 10, 20).unwrap();
+        assert!(engine.find_pending(), "Grid reflow must restart the search");
+    }
     #[test]
     fn reading_text_preserves_blank_rows_indentation_and_unicode() {
         let mut engine = Engine::new().unwrap();
@@ -747,6 +777,33 @@ mod tests {
         assert_eq!(e.key("KP_1", '1' as u32, 0, false, "1"), b"1");
         e.write(b"\x1b[>31u");
         assert_eq!(e.key("KP_1", '1' as u32, 0, false, "1"), b"\x1b[57400;;49u");
+    }
+
+    #[test]
+    fn extended_keyboard_reports_modifier_and_lock_keys() {
+        let mut engine = Engine::new().unwrap();
+        assert!(engine.key("Shift_L", 0, 0, false, "").is_empty());
+        assert!(engine.key("Control_R", 0, 0, true, "").is_empty());
+        assert_eq!(engine.key("Menu", 0, 2, false, ""), b"\x1b[29;5~");
+        assert_eq!(engine.key("Menu", 0, 1, false, ""), b"\x1b[29;2~");
+        engine.write(b"\x1b[>31u");
+        assert_eq!(engine.key("Shift_L", 0, 1, false, ""), b"\x1b[57441;2u");
+        assert_eq!(engine.key("Shift_L", 0, 0, true, ""), b"\x1b[57441;1:3u");
+        assert_eq!(engine.key("Control_R", 0, 2, false, ""), b"\x1b[57448;5u");
+        assert_eq!(engine.key("Alt_L", 0, 4, false, ""), b"\x1b[57443;3u");
+        assert_eq!(engine.key("Super_R", 0, 8, false, ""), b"\x1b[57450;9u");
+        for (name, code) in [
+            ("Caps_Lock", 57358),
+            ("Scroll_Lock", 57359),
+            ("Num_Lock", 57360),
+            ("Print", 57361),
+            ("Pause", 57362),
+        ] {
+            assert_eq!(
+                engine.key(name, 0, 0, false, ""),
+                format!("\x1b[{code}u").as_bytes()
+            );
+        }
     }
 
     #[test]

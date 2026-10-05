@@ -36,10 +36,14 @@ with AppFixture() as fixture:
     closed = command("close", pane=second)
     assert closed["session"]["tabs"][0]["layout"] == {"Pane": pane}
     assert closed["session"]["tabs"][0]["name"] == "Builds"
+    replacement = command("split", pane=pane)["result"]["pane"]
+    assert replacement > second, "A closed pane ID must not identify a later pane"
+    command("close", pane=replacement)
     # Typed commands keep missing and explicit-null workspace selection distinct.
     fixture.rpc("focus", workspace=workspace)
     inherited = command("new", directory=str(root))
     assert inherited["result"]["workspace"] == workspace
+    assert inherited["result"]["tab"] > replacement, "New tabs must reserve IDs beyond all closed panes"
     unassigned = command("new", directory=str(root), workspace=None)
     assert unassigned["result"]["workspace"] is None
     assert unassigned["session"]["filter"] == "all", "A newly selected tab must be visible"
@@ -50,10 +54,24 @@ with AppFixture() as fixture:
         assert focused["filter"] == "all" and focused["active_tab"] == unassigned["result"]["tab"]
         assert next(t for t in focused["tabs"] if t["id"] == focused["active_tab"])["visible"]
     fixture.rpc("focus", workspace=workspace)
+    fixture.rpc("_focus", tab=unassigned["result"]["tab"], pane=unassigned["result"]["pane"])
+    focused = fixture.rpc("list")
+    assert focused["filter"] == "all" and focused["active_tab"] == unassigned["result"]["tab"], "Immediate frontend focus must keep the selected tab visible"
+    fixture.rpc("focus", workspace=workspace)
+    hidden_split = command("split", pane=unassigned["result"]["pane"])
+    assert hidden_split["session"]["filter"] == "all", "Splitting a hidden tab must make the selected tab visible"
+    assert hidden_split["session"]["active"] == unassigned["result"]["tab"]
+    command("close", pane=hidden_split["result"]["pane"])
+    fixture.rpc("focus", workspace=workspace)
     fixture.rpc("focus", pane=pane)
     assert fixture.rpc("list")["filter"] == {"workspace": workspace}, "Keep filters that include the focused tab"
     command("close-tab", tab=inherited["result"]["tab"])
     command("close-tab", tab=unassigned["result"]["tab"])
+    retired_workspace = command("workspace-new", name="Retired")["result"]["workspace"]
+    command("workspace-delete", workspace=retired_workspace)
+    later_workspace = command("workspace-new", name="Later")["result"]["workspace"]
+    assert later_workspace > retired_workspace, "Deleted workspace IDs remain reserved during this daemon's lifetime"
+    command("workspace-delete", workspace=later_workspace)
     invalid = rpc(fixture.env["GMUX_SOCKET"], "move", tab=tab, check=False)
     assert "error" in invalid
 
@@ -160,6 +178,14 @@ with AppFixture() as fixture:
         send("paste-data", pane=pane, text="xx")
         header = wait_for(lambda: (h if (h := packet())["error"] else None))
         assert "Invalid paste chunk" in header["error"]
+        send("paste-end", pane=pane)
+        header = wait_for(lambda: (h if (h := packet())["error"] else None))
+        assert "No paste is in progress" in header["error"]
+
+        # A paste chunk targeting a missing pane must cancel the old operation.
+        send("paste-begin", pane=pane, size=1, clipboard=True)
+        send("paste-data", pane=pane, text="x")
+        send("paste-data", pane=2**64-1, text="")
         send("paste-end", pane=pane)
         header = wait_for(lambda: (h if (h := packet())["error"] else None))
         assert "No paste is in progress" in header["error"]

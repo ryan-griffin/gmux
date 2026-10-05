@@ -193,6 +193,7 @@ pub struct BranchWorker {
     running: RefCell<[Option<PathBuf>; WORKERS]>,
     queued: RefCell<BTreeMap<u64, PathBuf>>,
     generation: Cell<u64>,
+    last_dispatched: Cell<u64>,
 }
 
 impl BranchWorker {
@@ -236,6 +237,7 @@ impl BranchWorker {
             running: RefCell::new([None, None]),
             queued: RefCell::new(BTreeMap::new()),
             generation: Cell::new(0),
+            last_dispatched: Cell::new(0),
         }
     }
 
@@ -254,17 +256,22 @@ impl BranchWorker {
             if running[worker].is_some() {
                 continue;
             }
-            let Some(directory) = queued
-                .values()
-                .find(|directory| {
+            // Rotate through tab IDs so repeated refreshes of a low-ID tab
+            // cannot indefinitely delay another directory's queued lookup.
+            let last = self.last_dispatched.get();
+            let Some((&id, directory)) = queued
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                .chain(queued.range(..=last))
+                .find(|(_, directory)| {
                     !running
                         .iter()
                         .any(|active| active.as_ref() == Some(directory))
                 })
-                .cloned()
             else {
                 break;
             };
+            let directory = directory.clone();
+            self.last_dispatched.set(id);
             let tabs: Vec<_> = queued
                 .iter()
                 .filter(|(_, path)| **path == directory)
@@ -425,6 +432,43 @@ mod tests {
             HashSet::from([PathBuf::from("latest"), PathBuf::from("other")])
         );
         assert!(lookups.try_recv().is_err());
+    }
+
+    #[test]
+    fn repeated_refreshes_do_not_jump_ahead_of_other_queued_directories() {
+        let (started, lookups) = mpsc::channel();
+        let (release_a, gate_a) = mpsc::channel();
+        let (release_b, gate_b) = mpsc::channel();
+        let gate_a = Mutex::new(Some(gate_a));
+        let gate_b = Mutex::new(Some(gate_b));
+        let wake = crate::ipc::Wake::new().unwrap();
+        let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
+            started.send(directory.to_path_buf()).unwrap();
+            let gate = if directory == Path::new("a") {
+                gate_a.lock().unwrap().take()
+            } else if directory == Path::new("b") {
+                gate_b.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some(gate) = gate {
+                gate.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            Some(Branch::default())
+        });
+        worker.refresh_subset(vec![(1, "a".into()), (2, "b".into())]);
+        for _ in 0..2 {
+            lookups.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        worker.refresh_subset(vec![(3, "c".into()), (1, "a".into())]);
+        release_a.send(()).unwrap();
+        let mut results = wait_results(&worker, &wake);
+        let next = lookups.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_b.send(()).unwrap();
+        while results.len() < 4 {
+            results.extend(wait_results(&worker, &wake));
+        }
+        assert_eq!(next, Path::new("c"));
     }
 
     #[test]

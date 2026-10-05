@@ -1,5 +1,6 @@
 """Shared socket calls, waits, accessibility traversal, and private app fixtures."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -76,6 +77,84 @@ def scenario(name):
         print(f"FAIL: {name}", flush=True)
         raise
     print(f"PASS: {name}", flush=True)
+
+
+@contextmanager
+def delayed_command_reply(fixture, method, *, match=None):
+    """Hold a prepared command reply while frontend navigation stays live."""
+    original = fixture.env["GMUX_SOCKET"]
+    proxy = str(fixture.path / "command-proxy")
+    Path(proxy + ".stream").symlink_to(original + ".stream")
+    Path(original + ".ui").symlink_to(proxy + ".ui")
+    arrived, release = threading.Event(), threading.Event()
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(proxy)
+    listener.listen()
+    closed = threading.Event()
+
+    def relay(connection):
+        with connection, socket.socket(socket.AF_UNIX) as backend:
+            request = connection.makefile("rb").readline()
+            body = json.loads(request)
+            backend.connect(original)
+            backend.sendall(request)
+            response = backend.makefile("rb").readline()
+            command = body.get("command", {})
+            if (body.get("method") == "_command" and command.get("method") == method
+                    and (match is None or match(command))):
+                arrived.set()
+                if not release.wait(5):
+                    return
+            try:
+                connection.sendall(response)
+            except OSError:
+                pass  # Fixture cleanup can close a request that failed its assertion.
+
+    def serve():
+        while not closed.is_set():
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=relay, args=(connection,), daemon=True).start()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    fixture.env["GMUX_SOCKET"] = proxy
+    try:
+        yield arrived, release
+    finally:
+        release.set()
+        fixture.env["GMUX_SOCKET"] = original
+        closed.set()
+        listener.shutdown(socket.SHUT_RDWR)
+        listener.close()
+        server.join(timeout=1)
+        Path(proxy).unlink()
+        Path(proxy + ".stream").unlink()
+        Path(original + ".ui").unlink()
+
+
+class DelayedCommand:
+    def __init__(self, fixture, method, arrived, release):
+        self.fixture = fixture
+        self.method = method
+        self.arrived = arrived
+        self.release = release
+
+    @contextmanager
+    def command(self, **params):
+        """Run navigation assertions while a prepared command reply is held."""
+        self.arrived.clear()
+        self.release.clear()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            command = pool.submit(self.fixture.rpc, self.method, **params)
+            try:
+                assert self.arrived.wait(3), f"The {self.method} reply did not reach the delay gate"
+                yield
+            finally:
+                self.release.set()
+            command.result(timeout=3)
 
 
 def wait_accessible(predicate, timeout=12, **kwargs):
@@ -214,6 +293,16 @@ class AppFixture:
         assert process.poll() is None, "Application exited before attaching to its daemon"
         wait_for(lambda: self.rpc("renderer-info")["gtk"], message="Application did not construct its window")
         return process
+
+    @contextmanager
+    def delayed_app(self, binary, method, *, match=None, **kwargs):
+        """Restart with a command proxy before the app connects to its daemon."""
+        self.stop()
+        self.start(Path(binary).with_name("gmux-daemon"), **kwargs)
+        wait_for(lambda: self.rpc("daemon-info"))
+        with delayed_command_reply(self, method, match=match) as (arrived, release):
+            self.start_app(binary, **kwargs)
+            yield DelayedCommand(self, method, arrived, release)
 
     def stop(self):
         try:

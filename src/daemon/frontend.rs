@@ -130,7 +130,13 @@ impl Daemon {
             frontend.visible = panes;
             return Ok(());
         }
-        let id = self.resolve_pane(pane)?;
+        let id = match self.resolve_pane(pane) {
+            Ok(id) => id,
+            Err(error) => {
+                self.frontend.as_mut().unwrap().paste = None;
+                return Err(error);
+            }
+        };
         match command {
             StreamCommand::PasteBegin { size, options } => {
                 self.frontend.as_mut().unwrap().paste = None;

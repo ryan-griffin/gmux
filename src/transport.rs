@@ -138,11 +138,15 @@ impl Packet {
     }
 }
 
-pub(crate) fn command(writer: &mut impl Write, request: &impl Serialize) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(request)?;
+pub(crate) fn command_bytes(request: &impl Serialize) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(request)?;
     anyhow::ensure!(bytes.len() <= 1_048_576, "Frontend command is too large");
-    writer.write_all(&bytes)?;
-    writer.write_all(b"\n")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub(crate) fn command(writer: &mut impl Write, request: &impl Serialize) -> anyhow::Result<()> {
+    writer.write_all(&command_bytes(request)?)?;
     Ok(())
 }
 

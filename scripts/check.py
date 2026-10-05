@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-HEADLESS = ["daemon", "control", "icon"]
+HEADLESS = ["bootstrap", "daemon", "control", "icon"]
 DESKTOP = ["state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
            "title", "scheduling", "resize", "font", "find", "commands", "main-menu",
            "terminal-context-menu", "terminal-scrollbar", "terminal-renderer",

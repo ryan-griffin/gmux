@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Check desktop delivery, click navigation, and unread indicators through splits."""
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from notification_server import NotificationServer
-from test_support import AppFixture, assert_stays, scenario, wait_for
+from test_support import AppFixture, assert_stays, delayed_command_reply, rpc as direct_rpc, scenario, wait_for
 
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
@@ -68,6 +69,56 @@ def split_unread(fixture, notifications, app):
     assert not tab(fixture, first["tab"])["unread"], "Closing the last unread pane left its tab unread"
 
 
+def preattachment_delivery(fixture, notifications, app):
+    for enabled in (True, False):
+        with scenario("preattachment desktop alerts enabled" if enabled else "preattachment desktop alerts disabled"):
+            fixture.stop()
+            fixture.set_settings(dict(desktop_notifications=enabled))
+            fixture.start(root / "target/debug/gmux-daemon", stdout=log, stderr=log)
+            wait_for(lambda: fixture.rpc("daemon-info"))
+            armed = False
+            with delayed_command_reply(fixture, "new", match=lambda _: armed) as (arrived, release):
+                fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+                foreground = fixture.rpc("new", name="Foreground")
+                known = {p["id"] for t in fixture.rpc("list")["tabs"] for p in t["panes"]}
+                original = str(fixture.path / "socket")
+                message = "GMUX_PREATTACH_ENABLED" if enabled else "GMUX_PREATTACH_DISABLED"
+                armed = True
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    creating = pool.submit(fixture.rpc, "new", name="Delayed new pane")
+                    try:
+                        assert arrived.wait(3), "The new pane reply did not reach the delay gate"
+                        pane = next(m["id"] for m in direct_rpc(original, "_state")["metadata"] if m["id"] not in known)
+                        ui_path = Path(original + ".ui")
+                        ui_path.unlink()
+                        try:
+                            direct_rpc(original, "send", pane=pane,
+                                       text=f"printf '\\033]9;{message}\\007'", paste=True, enter=True)
+                        finally:
+                            ui_path.symlink_to(fixture.env["GMUX_SOCKET"] + ".ui")
+                        if enabled:
+                            alert = wait_for(lambda: next((n for n in notifications.received if n["body"] == message), None))
+                            assert alert["summary"] == "Terminal"
+                        else:
+                            wait_for(lambda: direct_rpc(original, "_metadata", pane=pane)["meta"]["unread"] > 0)
+                            fixture.rpc("send", pane=foreground["pane"],
+                                        text="printf '\\033]2;PREATTACH_ALERT_PROCESSED\\007'", paste=True, enter=True)
+                            wait_for(lambda: any(p["id"] == foreground["pane"] and p["title"] == "PREATTACH_ALERT_PROCESSED"
+                                                 for t in fixture.rpc("list")["tabs"] for p in t["panes"]))
+                            assert_stays(lambda: not any(n["body"] == message for n in notifications.received), .3,
+                                         message="Disabled preattachment notifications reached the desktop")
+                    finally:
+                        release.set()
+                    created = creating.result(timeout=3)
+                assert created["pane"] == pane
+                assert_stays(lambda: sum(n["body"] == message for n in notifications.received) == int(enabled), .3,
+                             message="Attaching the pane duplicated or lost its desktop alert")
+                if enabled:
+                    fixture.rpc("focus", pane=foreground["pane"])
+                    notifications.click(alert)
+                    wait_for(lambda: fixture.rpc("list")["active_tab"] == created["tab"])
+
+
 def disabled_delivery(fixture, notifications, app):
     disabled = fixture.rpc("new", name="Disabled notifications")
     foreground = fixture.rpc("new", name="Foreground")
@@ -93,6 +144,7 @@ def disabled_delivery(fixture, notifications, app):
 
 cases = [("OSC and CLI desktop delivery and click navigation", desktop_delivery),
          ("split-pane unread indicators survive focus and pane closure", split_unread),
+         ("alerts before pane attachment respect delivery settings and click navigation", preattachment_delivery),
          ("disabling desktop delivery after reconnect preserves unread indicators", disabled_delivery)]
 with (artifacts / "notification-delivery-smoke.log").open("w") as log:
     for name, test in cases:

@@ -68,6 +68,16 @@ fn poll_timeout(deadline: Option<Instant>, now: Instant) -> i32 {
     })
 }
 
+fn reserve_id_range(last_id: &mut u64, count: u64) -> anyhow::Result<u64> {
+    let last = last_id
+        .checked_add(count)
+        .filter(|id| *id < u64::MAX)
+        .ok_or_else(|| anyhow::anyhow!("No IDs remain"))?;
+    let first = *last_id + 1;
+    *last_id = last;
+    Ok(first)
+}
+
 struct Daemon {
     sessions: HashMap<u64, TerminalSession>,
     state: Session,
@@ -78,6 +88,7 @@ struct Daemon {
     errors: HashMap<u64, String>,
     unread: HashMap<u64, u64>,
     alert_sequence: u64,
+    last_id: u64,
     quitting: bool,
     snapshots: u64,
     sent_rows: u64,
@@ -109,6 +120,7 @@ impl Daemon {
             errors: HashMap::new(),
             unread: HashMap::new(),
             alert_sequence: 0,
+            last_id: 0,
             quitting: false,
             snapshots: 0,
             sent_rows: 0,
@@ -116,13 +128,30 @@ impl Daemon {
             pending_write: None,
         };
         let catalog = storage::load_catalog()?;
+        if let TabFilter::Workspace(id) = daemon.state.filter
+            && !catalog
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == id)
+        {
+            daemon.state.filter = TabFilter::All;
+        }
         let mut used: HashSet<_> = catalog.workspaces.iter().map(|w| w.id).collect();
-        for tab in saved.tabs {
+        for mut tab in saved.tabs {
             if let Err(e) = tab.validate() {
                 eprintln!("Skipping invalid saved tab: {e}");
                 continue;
             }
+            tab.workspace = tab.workspace.filter(|id| {
+                catalog
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == *id)
+            });
             let ids = tab.layout.ids();
+            if !ids.contains(&tab.active) {
+                tab.active = ids[0];
+            }
             if used.contains(&tab.id) || ids.iter().any(|id| used.contains(id)) {
                 eprintln!("Skipping duplicate saved IDs");
                 continue;
@@ -159,6 +188,8 @@ impl Daemon {
             used.extend(ids);
             daemon.state.tabs.push(tab);
         }
+        daemon.last_id = used.into_iter().max().unwrap_or(0);
+        daemon.select_visible();
         Ok(daemon)
     }
     fn metadata(session: &TerminalSession, unread: u64) -> Metadata {
@@ -194,17 +225,17 @@ impl Daemon {
         anyhow::ensure!(self.sessions.contains_key(&id), "Pane {id} does not exist");
         Ok(id)
     }
-    fn next(&self) -> anyhow::Result<u64> {
-        self.state
-            .tabs
+    fn reserve_ids(&mut self, count: u64) -> anyhow::Result<u64> {
+        // Closed panes can still appear in queued packets and command replies.
+        // Keep their IDs reserved until this daemon stops, across all ID types.
+        self.last_id = storage::load_catalog()?
+            .workspaces
             .iter()
-            .flat_map(|t| std::iter::once(t.id).chain(t.layout.ids()))
-            .chain(self.sessions.keys().copied())
-            .chain(storage::load_catalog()?.workspaces.iter().map(|w| w.id))
+            .map(|workspace| workspace.id)
+            .chain(std::iter::once(self.last_id))
             .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("No IDs remain"))
+            .unwrap_or(0);
+        reserve_id_range(&mut self.last_id, count)
     }
     fn select_visible(&mut self) {
         if !self
@@ -328,6 +359,25 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_ranges_reserve_both_new_ids_and_preserve_the_last_valid_id_after_failure() {
+        let mut last = u64::MAX - 3;
+        assert_eq!(reserve_id_range(&mut last, 2).unwrap(), u64::MAX - 2);
+        assert_eq!(last, u64::MAX - 1);
+        assert!(reserve_id_range(&mut last, 1).is_err());
+        assert_eq!(last, u64::MAX - 1);
+
+        let mut last = u64::MAX - 2;
+        assert!(reserve_id_range(&mut last, 2).is_err());
+        assert_eq!(
+            last,
+            u64::MAX - 2,
+            "A failed New must not reserve half its IDs"
+        );
+        assert_eq!(reserve_id_range(&mut last, 1).unwrap(), u64::MAX - 1);
+        assert!(reserve_id_range(&mut last, 1).is_err());
+    }
 
     #[test]
     fn notification_queues_keep_recent_messages_within_count_and_byte_limits() {

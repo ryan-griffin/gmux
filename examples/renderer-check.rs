@@ -386,6 +386,11 @@ fn validate_scroll_cache(
                     assert_eq!(stats.rebuilt_rows, 1, "Scrolling should reuse seven rows");
                 }
                 let fresh = node(&mut Renderer::new(), &scene, font, context).0;
+                // Step zero only primes the cache. Both renderers are fresh;
+                // avoid redundant GPU readbacks when their nodes match.
+                if step == 0 && cached.serialize() == fresh.serialize() {
+                    continue;
+                }
                 let actual = render(gpu, &cached, &scene);
                 let expected = render(gpu, &fresh, &scene);
                 if pixels(&actual) != pixels(&expected) {

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Check the native resize overlay, PTY sizing, and dismissal deadline."""
 from pathlib import Path
+import json
 import re
+import shlex
 import time
 
 import gi
@@ -30,13 +32,21 @@ def central_text(image):
 
 with (artifacts / "resize-smoke.log").open("w") as log, AppFixture(
     dict(appearance="dark", restore=False), prefix="gmux-resize-",
-    env={"GTK_A11Y": "none", "GDK_DEBUG": "no-vsync"},
+    env={"GTK_A11Y": "none", "GDK_DEBUG": "no-portals,no-vsync"},
     shell_script="#!/bin/sh\nexport PS1='GMUX_RESIZE> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n",
 ) as fixture:
     rpc = fixture.rpc
     fixture.start_app(root / "target/debug/gmux", "--directory", root, stdout=log, stderr=log)
     pane = rpc("list")["tabs"][0]["active_pane"]
     wait_for(lambda: "GMUX_RESIZE>" in rpc("read", pane=pane)["text"])
+    geometry_probe = fixture.path / "geometry.py"
+    geometry_result = fixture.path / "geometry.json"
+    geometry_probe.write_text(
+        "import fcntl, json, struct, sys, termios\n"
+        "from pathlib import Path\n"
+        "Path(sys.argv[1]).write_text(json.dumps(struct.unpack('HHHH', "
+        "fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8)))))\n"
+    )
 
     def capture(name):
         path = artifacts / f"{name}.png"
@@ -48,6 +58,15 @@ with (artifacts / "resize-smoke.log").open("w") as log, AppFixture(
         match = wait_for(lambda: re.search(rf"^{marker} (\d+) (\d+)$",
                                           rpc("read", pane=pane)["text"], re.MULTILINE))
         return tuple(map(int, match.groups()))
+
+    def geometry():
+        # Keep probe results out of the pixels sampled for the resize overlay.
+        geometry_result.unlink(missing_ok=True)
+        rpc("send", pane=pane,
+            text=f"python3 {shlex.quote(str(geometry_probe))} {shlex.quote(str(geometry_result))}",
+            paste=True, enter=True)
+        return wait_for(lambda: tuple(json.loads(geometry_result.read_text())),
+                        exceptions=(OSError, json.JSONDecodeError))
 
     with scenario("resize shows the overlay and dismissal preserves PTY dimensions"):
         wait_for(lambda: central_text(capture("resize-initial")) == 0,
@@ -77,3 +96,22 @@ with (artifacts / "resize-smoke.log").open("w") as log, AppFixture(
         assert central_text(capture("resize-repeat")) > 30, "The later resize did not restart dismissal"
         wait_for(lambda: central_text(capture("resize-repeat-after")) == 0, timeout=3,
                  message="The restarted resize overlay did not dismiss")
+
+    with scenario("pixel-only resize updates PTY geometry without showing a grid overlay"):
+        viewport = rpc("renderer-info", pane=pane)["viewport"]
+        before = geometry()
+        assert before == (viewport["rows"], viewport["cols"], viewport["width"], viewport["height"])
+        # Move within the current cell so rows and columns remain unchanged.
+        delta = -1 if viewport["width"] % viewport["cell_width"] >= 1 else 1
+        rpc("resize", width=1040 + delta, height=680)
+
+        def resized_viewport():
+            capture("resize-pixel-only")
+            current = rpc("renderer-info", pane=pane)["viewport"]
+            return current if current["width"] == viewport["width"] + delta else None
+
+        resized = wait_for(resized_viewport, message="The one-pixel resize did not reach the canvas")
+        assert (resized["rows"], resized["cols"]) == before[:2], resized
+        expected = (*before[:2], resized["width"], resized["height"])
+        wait_for(lambda: geometry() == expected, message="PTY pixel size stayed stale at the same grid size")
+        assert central_text(capture("resize-pixel-only-overlay")) == 0, "A pixel-only resize showed a grid overlay"

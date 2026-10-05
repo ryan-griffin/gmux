@@ -28,9 +28,20 @@ pub fn setup_popover(popover: &impl IsA<gtk::Popover>, label: &str) {
     popover.connect_show(|popover| label_items(popover.upcast_ref()));
 }
 
+pub fn shortcut_modifiers(modifiers: gdk::ModifierType) -> gdk::ModifierType {
+    modifiers
+        & (gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SUPER_MASK
+            | gdk::ModifierType::HYPER_MASK
+            | gdk::ModifierType::META_MASK)
+}
+
 pub fn context_menu_shortcut(key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
-    key == gdk::Key::Menu
-        || key == gdk::Key::F10 && modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+    let modifiers = shortcut_modifiers(modifiers);
+    key == gdk::Key::Menu && modifiers.is_empty()
+        || key == gdk::Key::F10 && modifiers == gdk::ModifierType::SHIFT_MASK
 }
 
 pub fn mnemonic_label(label: &str, used: &mut HashSet<char>) -> String {
@@ -95,4 +106,38 @@ fn item_label(widget: &gtk::Widget) -> Option<glib::GString> {
         child = item.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_menu_shortcuts_require_their_bound_modifiers_and_ignore_locks() {
+        for locks in [gdk::ModifierType::empty(), gdk::ModifierType::LOCK_MASK] {
+            assert!(context_menu_shortcut(gdk::Key::Menu, locks));
+            assert!(context_menu_shortcut(
+                gdk::Key::F10,
+                gdk::ModifierType::SHIFT_MASK | locks
+            ));
+            assert!(!context_menu_shortcut(gdk::Key::F10, locks));
+            for modifier in [
+                gdk::ModifierType::CONTROL_MASK,
+                gdk::ModifierType::ALT_MASK,
+                gdk::ModifierType::SUPER_MASK,
+                gdk::ModifierType::HYPER_MASK,
+                gdk::ModifierType::META_MASK,
+            ] {
+                assert!(!context_menu_shortcut(gdk::Key::Menu, modifier | locks));
+                assert!(!context_menu_shortcut(
+                    gdk::Key::F10,
+                    gdk::ModifierType::SHIFT_MASK | modifier | locks
+                ));
+            }
+            assert!(!context_menu_shortcut(
+                gdk::Key::Menu,
+                gdk::ModifierType::SHIFT_MASK | locks
+            ));
+        }
+    }
 }

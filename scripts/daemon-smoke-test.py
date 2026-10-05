@@ -214,13 +214,53 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         assert not (temp / "socket").exists() and not (temp / "socket.stream").exists()
 
         # Stopping the backend preserves the layout, then starts fresh shells.
+        session_path = temp / "config/gmux/session.json"
+        saved = json.loads(session_path.read_text())
+        saved["active"] = 999999
+        saved["filter"] = {"workspace": 999999}
+        saved["tabs"].append(dict(
+            id=999997, name="Deleted workspace", custom_name=True,
+            workspace=999999, layout={"Pane": 999998},
+            directories={"999998": str(root)}, active=999998,
+        ))
+        for tab in saved["tabs"]:
+            tab["active"] = 999999
+        saved_bytes = json.dumps(saved).encode()
+        session_path.write_bytes(saved_bytes)
         daemon = start_daemon()
-        assert [p["id"] for p in rpc("list")["tabs"][0]["panes"]] == [pane, hidden]
+        restored = rpc("list")
+        assert [p["id"] for p in restored["tabs"][0]["panes"]] == [pane, hidden]
+        assert restored["filter"] == "all", "Recover a saved filter whose workspace no longer exists"
+        assert restored["active_tab"] == restored["tabs"][0]["id"], "Recover a stale saved active tab"
+        assert restored["tabs"][0]["active_pane"] == pane, "Recover a stale saved active pane"
+        assert restored["tabs"][0]["workspace"] == workspace, "Keep membership in an existing workspace"
+        assert next(tab for tab in restored["tabs"] if tab["id"] == 999997)["workspace"] is None, "Move a restored tab from a deleted workspace to Unassigned"
+        assert session_path.read_bytes() == saved_bytes, "Loading must not rewrite the saved session"
         assert "HEADLESS_READY" not in rpc("read", pane=pane)["text"]
+        restored_split = rpc("split", pane=pane)["pane"]
+        assert restored_split > 999998, "New pane IDs must exceed every restored tab and pane ID"
+        rpc("close", pane=restored_split)
+        rpc("send", text="printf 'RESTORED_FOCUS_READY\\n'", paste=True, enter=True)
+        wait_for(lambda: "RESTORED_FOCUS_READY" in rpc("read")["text"])
         daemon.terminate()
         assert daemon.wait(timeout=8) == 0
         daemon = None
         assert not (temp / "socket").exists(), "SIGTERM must clean up the socket"
+
+        # A valid empty workspace remains selected even with other restored tabs.
+        saved = json.loads(session_path.read_text())
+        saved["filter"] = {"workspace": empty_workspace}
+        saved_bytes = json.dumps(saved).encode()
+        session_path.write_bytes(saved_bytes)
+        daemon = start_daemon()
+        restored = rpc("list")
+        assert restored["filter"] == {"workspace": empty_workspace}, "Keep a valid saved empty workspace filter"
+        assert restored["active_tab"] is None and restored["tabs"], "An empty workspace must not select another restored tab"
+        assert all(not tab["visible"] for tab in restored["tabs"])
+        assert session_path.read_bytes() == saved_bytes, "Loading must not rewrite a valid empty workspace filter"
+        daemon.terminate()
+        assert daemon.wait(timeout=8) == 0
+        daemon = None
         print(f"PASS: headless PTYs, background workspaces and focus, {idle_ticks} idle CPU ticks, one-row packets, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Quit/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and daemon Quit closing the frontend" if args.native else ""))
     finally:
         if stream:

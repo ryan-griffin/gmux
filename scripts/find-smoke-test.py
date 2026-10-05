@@ -6,6 +6,8 @@ scripts/find-smoke-test.py. Uses its own app, settings, and accessibility bus.
 """
 from test_support import AccessibilityFixture, AppFixture, descendants, wait_accessible as wait_for
 from pathlib import Path
+import os
+import shlex
 
 import gi
 
@@ -27,15 +29,24 @@ def sensitive(element):
     return element.get_state_set().contains(Atspi.StateType.SENSITIVE)
 
 
+def sidebar_directory(directory):
+    return next((row for row in descendants(Atspi.get_desktop(0))
+                 if row.get_process_id() == app.pid and row.get_role_name() == "list item"
+                 and any(label.get_role_name() == "label" and label.get_name() == str(directory)
+                         for label in descendants(row))), None)
+
+
 with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdout=log, stderr=log):
     for appearance in ("dark", "light"):
         with AppFixture(dict(restore=False, desktop_notifications=False, appearance=appearance),
-            prefix="gmux-find-", env={"GTK_A11Y": "atspi", "GDK_DEBUG": "no-vsync"},
+            prefix="gmux-find-", env={"GTK_A11Y": "atspi", "GDK_DEBUG": os.environ.get("GDK_DEBUG", "") + ":no-vsync"},
             shell_script="#!/bin/sh\nexport PS1='GMUX_FIND> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n",
         ) as fixture:
             rpc = fixture.rpc
             app = fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
-            first = rpc("new", name="Find Test")
+            first_directory = fixture.path / "first-directory"
+            first_directory.mkdir()
+            first = rpc("new", name="Find Test", directory=str(first_directory))
             wait_for(lambda: "GMUX_FIND>" in rpc("read", pane=first["pane"])["text"])
             rpc("send", pane=first["pane"], text="printf '\\033[2J\\033[HAlpha beta ALPHA\\nalpha\\n'", paste=True, enter=True)
             wait_for(lambda: "Alpha beta ALPHA" in rpc("read", pane=first["pane"])["text"])
@@ -94,9 +105,22 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             wait_for(lambda: not sensitive(previous) and not sensitive(following))
             rpc("focus", pane=first["pane"])
             wait_for(lambda: find("1 of 4", "label"))
-            rpc("split", pane=first["pane"])
+            other_pane = rpc("split", pane=first["pane"])["pane"]
             wait_for(lambda: not sensitive(previous) and not sensitive(following))
             rpc("focus", pane=first["pane"])
+            wait_for(lambda: find("1 of 4", "label"))
+            # Sidebar paths must follow focus when split panes use different directories.
+            second_directory = fixture.path / "second-directory"
+            second_directory.mkdir()
+            rpc("send", pane=other_pane, text=f"cd {shlex.quote(str(second_directory))}", paste=True, enter=True)
+            wait_for(lambda: any(p["id"] == other_pane and p["directory"] == str(second_directory)
+                                 for t in rpc("list")["tabs"] for p in t["panes"]))
+            wait_for(lambda: sidebar_directory(first_directory))
+            rpc("focus", pane=other_pane)
+            wait_for(lambda: sidebar_directory(second_directory),
+                     message="The sidebar kept the previously focused pane's directory")
+            rpc("focus", pane=first["pane"])
+            wait_for(lambda: sidebar_directory(first_directory))
             wait_for(lambda: find("1 of 4", "label"))
             clear = wait_for(lambda: find("Clear search", "button"))
             assert clear.get_action_iface().do_action(0)
@@ -125,4 +149,4 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             assert entry.get_editable_text_iface().set_text_contents("needle")
             wait_for(lambda: find("1 of 1", "label"))
 
-print("PASS: dark/light find bars, Unicode history search, offscreen navigation, match counts, wrapping, live output, tab/pane switching, clearing and reopening")
+print("PASS: dark/light find bars, Unicode history search, offscreen navigation, match counts, wrapping, live output, tab/pane switching, focused sidebar directories, clearing and reopening")

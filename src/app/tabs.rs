@@ -25,6 +25,7 @@ impl Ui {
             focus,
             close,
             self.app.upcast_ref(),
+            self.keyboard.clone(),
         ))
     }
     pub(super) fn new_tab(self: &Rc<Self>, directory: PathBuf, name: Option<String>) {
@@ -410,18 +411,14 @@ impl Ui {
             w.id
         };
         self.refresh_tab_title(tab);
-        self.refresh_branches();
+        self.refresh_metadata();
         if self.active.get() != tab {
             self.switch(tab);
         }
         self.mark_read(id);
         self.sync_focus();
         self.mark_dirty();
-        if let Some(p) = self.active_pane() {
-            self.heading
-                .set_subtitle(&model::display_path(&p.directory()));
-            self.refresh_search();
-        }
+        self.refresh_search();
     }
     pub(super) fn active_pane(&self) -> Option<Rc<Terminal>> {
         self.tabs

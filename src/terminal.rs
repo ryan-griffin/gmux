@@ -27,6 +27,32 @@ const CONTEXT_MENU_SECTIONS: &[&[(&str, &str)]] = &[
     &[("C_lose Pane", "win.close")],
 ];
 
+#[derive(Default)]
+struct SearchHighlights {
+    ranges: Vec<(usize, usize, u8)>,
+    cells: Vec<u8>,
+}
+
+impl SearchHighlights {
+    fn update(&mut self, len: usize, ranges: &[(usize, usize, u8)]) -> &[u8] {
+        if ranges.is_empty() {
+            self.ranges.clear();
+            self.cells.clear();
+        } else if self.cells.len() != len || self.ranges != ranges {
+            self.ranges.clear();
+            self.ranges.extend_from_slice(ranges);
+            self.cells.resize(len, 0);
+            self.cells.fill(0);
+            for &(start, end, value) in ranges {
+                if let Some(range) = self.cells.get_mut(start..end) {
+                    range.fill(value);
+                }
+            }
+        }
+        &self.cells
+    }
+}
+
 pub struct Terminal {
     pub id: u64,
     pub root: gtk::Box,
@@ -48,12 +74,12 @@ pub struct Terminal {
     drag_selection_tick: RefCell<Option<gtk::TickCallbackId>>,
     drag_scroll_timer: RefCell<Option<glib::SourceId>>,
     drag_kinetic_scrolling: ValueCell<Option<bool>>,
-    search: RefCell<Vec<u8>>,
+    search: RefCell<SearchHighlights>,
     search_query: RefCell<String>,
     selection_anchor: ValueCell<Option<usize>>,
     metrics: ValueCell<(f64, f64)>,
     grid: ValueCell<(u16, u16)>,
-    grid_initialized: ValueCell<bool>,
+    pixel_geometry: ValueCell<Option<(u32, u32, u16, u16)>>,
     pending_size: ValueCell<Option<(u16, u16)>>,
     size_timer: RefCell<Option<glib::SourceId>>,
     zoom: ValueCell<f64>,
@@ -68,14 +94,17 @@ pub struct Terminal {
     chrome_css: gtk::CssProvider,
 }
 mod input;
+pub(crate) use input::KeyboardModifiers;
+use input::mods;
 
 impl Terminal {
-    pub fn new(
+    pub(crate) fn new(
         session: SessionHandle,
         settings: Rc<RefCell<Settings>>,
         on_focus: Rc<dyn Fn(u64)>,
         on_close: Rc<dyn Fn(u64)>,
         application: &gtk::Application,
+        keyboard: Rc<RefCell<KeyboardModifiers>>,
     ) -> Rc<Self> {
         let id = session.borrow().id();
         let directory = session.borrow().directory().to_path_buf();
@@ -203,12 +232,12 @@ impl Terminal {
             drag_selection_tick: RefCell::new(None),
             drag_scroll_timer: RefCell::new(None),
             drag_kinetic_scrolling: ValueCell::new(None),
-            search: RefCell::new(Vec::new()),
+            search: RefCell::new(SearchHighlights::default()),
             search_query: RefCell::new(String::new()),
             selection_anchor: ValueCell::new(None),
             metrics: ValueCell::new((9.6, 22.0)),
             grid: ValueCell::new(grid),
-            grid_initialized: ValueCell::new(false),
+            pixel_geometry: ValueCell::new(None),
             pending_size: ValueCell::new(None),
             size_timer: RefCell::new(None),
             settings,
@@ -232,7 +261,7 @@ impl Terminal {
         terminal.install_focus(&canvas, on_focus);
         terminal.install_canvas_callbacks();
         close.connect_clicked(move |_| on_close(id));
-        terminal.install_keyboard(application);
+        terminal.install_keyboard(application, keyboard);
         terminal.install_pointer();
         terminal.install_selection();
         terminal.install_scrolling(&canvas);
@@ -677,40 +706,38 @@ impl Terminal {
         );
         let mut session = self.session.borrow_mut();
         let exited = session.exited();
-        let initialized = self.grid_initialized.get();
-        if self.grid.get() != (cols, rows) {
+        let pixel_geometry = (
+            cw as u32,
+            ch as u32,
+            width.clamp(0, u16::MAX as i32) as u16,
+            height.clamp(0, u16::MAX as i32) as u16,
+        );
+        let grid_changed = self.grid.get() != (cols, rows);
+        if grid_changed || self.pixel_geometry.get() != Some(pixel_geometry) {
             if let Err(error) = session.resize(
                 cols,
                 rows,
-                cw as u32,
-                ch as u32,
-                width.max(0) as u16,
-                height.max(0) as u16,
+                pixel_geometry.0,
+                pixel_geometry.1,
+                pixel_geometry.2,
+                pixel_geometry.3,
             ) {
                 eprintln!("{error}");
                 return;
             }
+            let initialized = self.pixel_geometry.replace(Some(pixel_geometry)).is_some();
             self.grid.set((cols, rows));
-            self.selection.borrow_mut().take();
-            if initialized && !exited {
-                self.show_size(cols, rows);
-            }
-        }
-        self.grid_initialized.set(true);
-        let e = session.snapshot();
-        let mut search = self.search.borrow_mut();
-        let find = session.find_state();
-        if find.highlights.is_empty() {
-            search.clear();
-        } else {
-            search.resize(e.cells.len(), 0);
-            search.fill(0);
-            for &(start, end, value) in &find.highlights {
-                if let Some(range) = search.get_mut(start..end) {
-                    range.fill(value);
+            if grid_changed {
+                self.selection.borrow_mut().take();
+                if initialized && !exited {
+                    self.show_size(cols, rows);
                 }
             }
         }
+        let e = session.snapshot();
+        let mut search = self.search.borrow_mut();
+        let find = session.find_state();
+        let matches = search.update(e.cells.len(), &find.highlights);
         let base = e.frame.scrollback.offset as usize * e.frame.cols as usize;
         let selection = self.selection.borrow().and_then(|(start, end)| {
             let start = start.max(base);
@@ -728,7 +755,7 @@ impl Terminal {
             height,
             theme: self.theme.get(),
             selection,
-            matches: &search,
+            matches,
             focused: self.area.has_focus(),
             exited,
         };
@@ -764,35 +791,6 @@ impl Terminal {
             .unwrap_or((1.0, (0.0, 0.0)))
     }
 }
-fn scroll_shortcut(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<bool> {
-    if !modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
-        return None;
-    }
-    match key {
-        gdk::Key::Page_Up => Some(true),
-        gdk::Key::Page_Down => Some(false),
-        _ => None,
-    }
-}
-fn application_shortcut(
-    controller: &gtk::EventControllerKey,
-    shortcuts: &[(gdk::Key, gdk::ModifierType)],
-) -> bool {
-    controller
-        .current_event()
-        .and_then(|event| event.downcast::<gdk::KeyEvent>().ok())
-        .is_some_and(|event| {
-            shortcuts
-                .iter()
-                .any(|&(key, modifiers)| event.matches(key, modifiers) != gdk::KeyMatch::None)
-        })
-}
-fn mods(m: gdk::ModifierType) -> u16 {
-    (m.contains(gdk::ModifierType::SHIFT_MASK) as u16)
-        | ((m.contains(gdk::ModifierType::CONTROL_MASK) as u16) << 1)
-        | ((m.contains(gdk::ModifierType::ALT_MASK) as u16) << 2)
-        | ((m.contains(gdk::ModifierType::SUPER_MASK) as u16) << 3)
-}
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.context_menu.unparent();
@@ -806,5 +804,30 @@ impl Drop for Terminal {
             tick.remove();
         }
         gtk::style_context_remove_provider_for_display(&self.root.display(), &self.chrome_css);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_highlights_follow_ranges_navigation_and_viewport_size() {
+        let mut cache = SearchHighlights::default();
+        assert!(cache.update(6, &[]).is_empty());
+        assert_eq!(cache.cells.capacity(), 0);
+        let ranges = [(0, 2, 1), (3, 5, 2)];
+        assert_eq!(cache.update(6, &ranges), [1, 1, 0, 2, 2, 0]);
+        // An unchanged snapshot retains the populated cells without rebuilding.
+        cache.cells[2] = 9;
+        assert_eq!(cache.update(6, &ranges), [1, 1, 9, 2, 2, 0]);
+        assert_eq!(cache.update(7, &ranges), [1, 1, 0, 2, 2, 0, 0]);
+        assert_eq!(
+            cache.update(7, &[(0, 2, 2), (3, 5, 1)]),
+            [2, 2, 0, 1, 1, 0, 0]
+        );
+        assert_eq!(cache.update(3, &[(1, 3, 2)]), [0, 2, 2]);
+        assert!(cache.update(3, &[]).is_empty());
+        assert_eq!(cache.update(3, &[(1, 3, 2)]), [0, 2, 2]);
     }
 }

@@ -228,10 +228,8 @@ impl Daemon {
                     "{} is not a directory",
                     directory.display()
                 );
-                let tab = self.next()?;
-                let pane = tab
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("No IDs remain"))?;
+                let tab = self.reserve_ids(2)?;
+                let pane = tab + 1;
                 let settings = storage::load::<Settings>("settings.json")?;
                 let session = TerminalSession::spawn(
                     pane,
@@ -278,7 +276,7 @@ impl Daemon {
                 let tab_id = tab.id;
                 self.sessions.get_mut(&target).unwrap().refresh_directory();
                 let directory = self.sessions[&target].directory().to_path_buf();
-                let pane = self.next()?;
+                let pane = self.reserve_ids(1)?;
                 let settings = storage::load::<Settings>("settings.json")?;
                 let session = TerminalSession::spawn(
                     pane,
@@ -292,7 +290,7 @@ impl Daemon {
                 tab.layout.split(target, pane, down);
                 tab.active = pane;
                 tab.directories.insert(pane, directory);
-                self.state.active = tab_id;
+                self.focus_tab(tab_id)?;
                 Ok(self.result_with_session_save(CommandOutput::Split { pane }))
             }
             Command::Close { pane } => {
@@ -341,7 +339,7 @@ impl Daemon {
                         "The tab has been closed"
                     );
                 }
-                let workspace = self.next()?;
+                let workspace = self.reserve_ids(1)?;
                 catalog.workspaces.push(model::WorkspaceDefinition {
                     id: workspace,
                     name,
@@ -439,7 +437,7 @@ impl Daemon {
                         "Pane {pane} does not belong to tab {tab_id}"
                     );
                     tab.active = pane;
-                    self.state.active = tab_id;
+                    self.focus_tab(tab_id)?;
                 }
                 Ok(json!({"ok":true}))
             }

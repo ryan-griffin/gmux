@@ -32,27 +32,63 @@ struct Connection {
     pending_bytes: Arc<AtomicUsize>,
     socket: UnixStream,
 }
-struct Outgoing {
-    request: StreamRequest,
-    bytes: usize,
+enum Outgoing {
+    Command(Vec<u8>),
+    Paste {
+        pane: Option<u64>,
+        text: String,
+        options: PasteOptions,
+    },
+}
+
+impl Outgoing {
+    fn prepare(request: StreamRequest) -> anyhow::Result<Self> {
+        if let StreamCommand::Paste { text, options } = request.command {
+            anyhow::ensure!(
+                text.len() <= transport::MAX_PASTE,
+                "Paste is too large. The limit is 4 MiB."
+            );
+            Ok(Self::Paste {
+                pane: request.pane,
+                text,
+                options,
+            })
+        } else {
+            // Reject oversized commands before handing them to the writer. A
+            // local validation error must not close the frontend connection.
+            Ok(Self::Command(transport::command_bytes(&request)?))
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Command(bytes) => bytes.len(),
+            Self::Paste { text, .. } => text.len(),
+        }
+    }
+
+    fn write(self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+        match self {
+            Self::Command(bytes) => Ok(writer.write_all(&bytes)?),
+            Self::Paste {
+                pane,
+                text,
+                options,
+            } => write_paste(writer, pane, &text, options),
+        }
+    }
 }
 
 impl Connection {
     fn send(&self, request: StreamRequest) -> anyhow::Result<()> {
-        let bytes = match &request.command {
-            StreamCommand::Paste { text, .. } => text.len(),
-            _ => 0,
-        };
-        anyhow::ensure!(
-            bytes <= transport::MAX_PASTE,
-            "Paste is too large. The limit is 4 MiB."
-        );
+        let outgoing = Outgoing::prepare(request)?;
+        let bytes = outgoing.bytes();
         self.pending_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                 (pending + bytes <= 2 * transport::MAX_PASTE).then_some(pending + bytes)
             })
             .map_err(|_| anyhow::anyhow!("Terminal input queue is full"))?;
-        if let Err(error) = self.commands.try_send(Outgoing { request, bytes }) {
+        if let Err(error) = self.commands.try_send(outgoing) {
             self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
             anyhow::bail!("Could not queue daemon command: {error}");
         }
@@ -60,11 +96,12 @@ impl Connection {
     }
 }
 
-fn write_request(writer: &mut impl std::io::Write, request: StreamRequest) -> anyhow::Result<()> {
-    let StreamCommand::Paste { text, options } = request.command else {
-        return transport::command(writer, &request);
-    };
-    let pane = request.pane;
+fn write_paste(
+    writer: &mut impl std::io::Write,
+    pane: Option<u64>,
+    text: &str,
+    options: PasteOptions,
+) -> anyhow::Result<()> {
     transport::command(
         writer,
         &StreamRequest {
@@ -203,8 +240,9 @@ impl SessionManager {
         let writer_wake = wake.clone();
         std::thread::spawn(move || {
             while let Ok(outgoing) = queue.recv() {
-                let result = write_request(&mut writer, outgoing.request);
-                writer_bytes.fetch_sub(outgoing.bytes, Ordering::Relaxed);
+                let bytes = outgoing.bytes();
+                let result = outgoing.write(&mut writer);
+                writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
                 if let Err(error) = result {
                     let _ = errors.send(Err(error.to_string()));
                     writer_wake.notify();
@@ -357,6 +395,11 @@ impl SessionManager {
             match self.receiver.try_recv() {
                 Ok(Ok(packet)) => {
                     let id = packet.header.meta.id;
+                    if packet.header.meta.exited || !packet.header.notifications.is_empty() {
+                        let update = updates.entry(id).or_default();
+                        update.exited |= packet.header.meta.exited;
+                        update.notifications.extend(packet.header.notifications);
+                    }
                     if let Some(session) = self.sessions.get(&id) {
                         let mut session = session.borrow_mut();
                         let update = updates.entry(id).or_default();
@@ -388,7 +431,6 @@ impl SessionManager {
                             }
                             update.changed = true;
                         }
-                        update.notifications.extend(packet.header.notifications);
                         if packet.header.copy.is_some() {
                             update.copy = packet.header.copy;
                         }
@@ -623,14 +665,16 @@ mod tests {
     fn request(value: Value) -> StreamRequest {
         serde_json::from_value(value).unwrap()
     }
-    fn wire(request: StreamRequest) -> Value {
-        serde_json::to_value(request).unwrap()
+    fn wire(outgoing: Outgoing) -> Value {
+        let mut bytes = Vec::new();
+        outgoing.write(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
     #[test]
     fn large_pastes_use_bounded_utf8_chunks_and_preserve_operation_options() {
         let text = "a界\n\0".repeat(transport::MAX_PASTE / 6);
         let mut bytes = Vec::new();
-        write_request(&mut bytes, request(json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true}))).unwrap();
+        Outgoing::prepare(request(json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true}))).unwrap().write(&mut bytes).unwrap();
         let commands: Vec<Value> = bytes
             .split(|b| *b == b'\n')
             .filter(|line| !line.is_empty())
@@ -688,6 +732,66 @@ mod tests {
             2 * transport::MAX_PASTE
         );
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn oversized_commands_fail_before_enqueue_and_leave_later_input_usable() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(2);
+        let connection = Connection {
+            commands,
+            socket,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        for command in [
+            json!({"method":"find","query":"\u{1}".repeat(200_000)}),
+            json!({"method":"input","bytes":vec![255u8; 300_000]}),
+        ] {
+            assert!(
+                connection
+                    .send(request(command))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("too large")
+            );
+            assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), 0);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+        connection
+            .send(request(json!({"method":"input","bytes":[97]})))
+            .unwrap();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"input","bytes":[97]})
+        );
+    }
+
+    #[test]
+    fn ordinary_commands_share_the_outgoing_byte_budget_with_pastes() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(16);
+        let connection = Connection {
+            commands,
+            socket,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        connection
+            .send(request(
+                json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE)}),
+            ))
+            .unwrap();
+        let input = || request(json!({"method":"input","bytes":vec![255u8; 250_000]}));
+        for _ in 0..4 {
+            connection.send(input()).unwrap();
+        }
+        let before = connection.pending_bytes.load(Ordering::Relaxed);
+        assert!(before <= 2 * transport::MAX_PASTE);
+        assert!(connection.send(input()).is_err());
+        assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), before);
+        assert_eq!(receiver.try_iter().count(), 5);
     }
     use crate::transport::Header;
     use std::path::PathBuf;
@@ -782,6 +886,80 @@ mod tests {
     }
 
     #[test]
+    fn exits_arrive_for_unattached_panes_and_survive_update_coalescing() {
+        let (mut manager, sender, session) = manager();
+        for (id, exited) in [(2, false), (2, true), (1, true), (1, false)] {
+            let mut meta = session.borrow().meta.clone();
+            meta.id = id;
+            meta.exited = exited;
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta,
+                        frame: None,
+                        scroll_serial: 0,
+                        rows: vec![],
+                        notifications: vec![],
+                        error: None,
+                        find: None,
+                        selection: None,
+                        copy: None,
+                    },
+                    cells: vec![],
+                }))
+                .unwrap();
+        }
+        let updates = manager.poll();
+        assert_eq!(updates.len(), 2);
+        assert!(updates[&1].exited);
+        assert!(updates[&2].exited);
+        assert!(!manager.sessions.contains_key(&2));
+        assert!(!manager.metadata.contains_key(&2));
+        assert!(manager.poll().is_empty());
+    }
+
+    #[test]
+    fn unattached_notifications_arrive_in_order_without_empty_metadata_updates() {
+        let (mut manager, sender, session) = manager();
+        for (notifications, exited) in [
+            (vec![], false),
+            (vec!["first"], false),
+            (vec!["second"], true),
+        ] {
+            let mut meta = session.borrow().meta.clone();
+            meta.id = 2;
+            meta.exited = exited;
+            let empty = notifications.is_empty();
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta,
+                        frame: None,
+                        scroll_serial: 0,
+                        rows: vec![],
+                        notifications: notifications.into_iter().map(str::to_owned).collect(),
+                        error: None,
+                        find: None,
+                        selection: None,
+                        copy: None,
+                    },
+                    cells: vec![],
+                }))
+                .unwrap();
+            if empty {
+                assert!(manager.poll().is_empty());
+            }
+        }
+        let updates = manager.poll();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[&2].notifications, ["first", "second"]);
+        assert!(updates[&2].exited);
+        assert!(!manager.sessions.contains_key(&2));
+        assert!(!manager.metadata.contains_key(&2));
+        assert!(manager.poll().is_empty());
+    }
+
+    #[test]
     fn queued_rows_coalesce_without_losing_cells_or_cursor_changes() {
         let (mut manager, sender, session) = manager();
         let mut frame = session.borrow().frame;
@@ -825,10 +1003,7 @@ mod tests {
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
         commands
-            .send(Outgoing {
-                request: request(json!({"method":"input","bytes":[]})),
-                bytes: 0,
-            })
+            .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
             .unwrap();
         let connection = Rc::new(Connection {
             commands,
@@ -840,13 +1015,10 @@ mod tests {
         session.borrow().scroll_to(10);
         session.borrow().scroll_to(20);
         assert!(session.borrow().scroll_pending());
-        assert_eq!(
-            wire(receiver.try_recv().unwrap().request)["method"],
-            "input"
-        );
+        assert_eq!(wire(receiver.try_recv().unwrap())["method"], "input");
         manager.poll();
         assert_eq!(
-            wire(receiver.try_recv().unwrap().request),
+            wire(receiver.try_recv().unwrap()),
             json!({"method":"scroll-to","pane":1,"row":20,"serial":2})
         );
         for serial in [1, 2] {
@@ -890,10 +1062,7 @@ mod tests {
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
         commands
-            .send(Outgoing {
-                request: request(json!({"method":"input","bytes":[]})),
-                bytes: 0,
-            })
+            .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
             .unwrap();
         manager.connection = Rc::new(Connection {
             commands,
@@ -901,13 +1070,10 @@ mod tests {
             socket,
         });
         assert!(manager.set_visible(HashSet::from([1])).is_err());
-        assert_eq!(
-            wire(receiver.try_recv().unwrap().request)["method"],
-            "input"
-        );
+        assert_eq!(wire(receiver.try_recv().unwrap())["method"], "input");
         assert!(manager.poll().is_empty());
         assert_eq!(
-            wire(receiver.try_recv().unwrap().request),
+            wire(receiver.try_recv().unwrap()),
             json!({"method":"subscribe","panes":[1]})
         );
         assert!(manager.poll().is_empty());
@@ -951,10 +1117,7 @@ mod tests {
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
         commands
-            .send(Outgoing {
-                request: request(json!({"method":"input","bytes":[]})),
-                bytes: 0,
-            })
+            .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
             .unwrap();
         manager.connection = Rc::new(Connection {
             commands,
@@ -964,13 +1127,10 @@ mod tests {
         session.borrow_mut().meta.unread = 7;
         manager.mark_read(1);
         assert!(!session.borrow().unread());
-        assert_eq!(
-            wire(receiver.try_recv().unwrap().request)["method"],
-            "input"
-        );
+        assert_eq!(wire(receiver.try_recv().unwrap())["method"], "input");
         manager.poll();
         assert_eq!(
-            wire(receiver.try_recv().unwrap().request),
+            wire(receiver.try_recv().unwrap()),
             json!({"method":"mark-read","pane":1,"through":7})
         );
         manager.poll();

@@ -26,6 +26,7 @@ pub struct ScreenSnapshot<'a> {
 #[derive(Default)]
 pub struct SessionUpdate {
     pub changed: bool,
+    pub exited: bool,
     pub directory_changed: bool,
     pub unread: Option<bool>,
     pub error: Option<String>,
@@ -265,6 +266,7 @@ impl TerminalSession {
             pty.child = None;
             self.exited = true;
         }
+        update.exited = self.exited;
         update
     }
 

@@ -297,6 +297,16 @@ static GhosttyKey key_for(uint32_t cp, const char *name) {
     KEY("KP_Page_Up", NUMPAD_PAGE_UP); KEY("KP_Page_Down", NUMPAD_PAGE_DOWN);
     KEY("KP_Insert", NUMPAD_INSERT); KEY("KP_Delete", NUMPAD_DELETE);
     KEY("KP_Begin", NUMPAD_BEGIN);
+    // Extended keyboard mode can report these keys even though they produce
+    // no Unicode text. Keep left and right modifiers distinct.
+    KEY("Shift_L", SHIFT_LEFT); KEY("Shift_R", SHIFT_RIGHT);
+    KEY("Control_L", CONTROL_LEFT); KEY("Control_R", CONTROL_RIGHT);
+    KEY("Alt_L", ALT_LEFT); KEY("Alt_R", ALT_RIGHT);
+    KEY("Super_L", META_LEFT); KEY("Super_R", META_RIGHT);
+    KEY("Meta_L", META_LEFT); KEY("Meta_R", META_RIGHT);
+    KEY("Caps_Lock", CAPS_LOCK); KEY("Num_Lock", NUM_LOCK);
+    KEY("Scroll_Lock", SCROLL_LOCK); KEY("Print", PRINT_SCREEN); KEY("Pause", PAUSE);
+    KEY("Menu", CONTEXT_MENU);
     if (cp >= 'A' && cp <= 'Z') cp += 'a' - 'A';
     if (cp >= 'a' && cp <= 'z') return GHOSTTY_KEY_A + cp - 'a';
     if (cp >= '0' && cp <= '9') return GHOSTTY_KEY_DIGIT_0 + cp - '0';

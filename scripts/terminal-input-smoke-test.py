@@ -77,6 +77,49 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             assert rpc("renderer-info")["display"] == "GdkWaylandDisplay"
             rpc("screenshot", path=str(artifacts / "terminal-input-initial.png"))
 
+            # Capture actual GTK events in Kitty mode, including a release
+            # while the other side of the same modifier is still held.
+            keyboard_probe = temp / "keyboard.py"
+            keyboard_result = temp / "keyboard.json"
+            keyboard_probe.write_text("""import json, os, select, sys, termios, time, tty
+from pathlib import Path
+old = termios.tcgetattr(0)
+data = bytearray()
+try:
+    tty.setraw(0)
+    os.write(1, b'\\x1b[>31u\\x1b]2;KITTY_MODIFIERS_READY\\x07')
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if select.select([0], [], [], max(0, deadline - time.monotonic()))[0]:
+            data.extend(os.read(0, 4096))
+finally:
+    os.write(1, b'\\x1b[<u')
+    termios.tcsetattr(0, termios.TCSANOW, old)
+Path(sys.argv[1]).write_text(json.dumps(list(data)))
+""")
+            rpc("send", pane=pane,
+                text=f"python3 {shlex.quote(str(keyboard_probe))} {shlex.quote(str(keyboard_result))}",
+                paste=True, enter=True)
+            wait_for(lambda: any(p["id"] == pane and p["title"] == "KITTY_MODIFIERS_READY"
+                                 for t in rpc("list")["tabs"] for p in t["panes"]))
+            events = [(Gdk.KEY_Shift_L, True), (Gdk.KEY_Shift_R, True),
+                      (Gdk.KEY_Shift_L, False), (Gdk.KEY_Shift_R, False),
+                      (Gdk.KEY_Control_R, True), (Gdk.KEY_Control_L, True),
+                      (Gdk.KEY_Control_R, False), (Gdk.KEY_Control_L, False),
+                      (Gdk.KEY_Alt_L, True), (Gdk.KEY_Alt_L, False),
+                      (Gdk.KEY_Caps_Lock, True), (Gdk.KEY_Caps_Lock, False),
+                      (Gdk.KEY_Caps_Lock, True), (Gdk.KEY_Caps_Lock, False)]
+            for symbol, pressed in events:
+                native.key(symbol, pressed)
+                time.sleep(.01)
+            actual = bytes(wait_for(lambda: json.loads(keyboard_result.read_text()),
+                                    exceptions=(OSError, json.JSONDecodeError)))
+            expected = (b"\x1b[57441;2u\x1b[57447;2u\x1b[57441;2:3u\x1b[57447;1:3u"
+                        b"\x1b[57448;5u\x1b[57442;5u\x1b[57448;5:3u\x1b[57442;1:3u"
+                        b"\x1b[57443;3u\x1b[57443;1:3u"
+                        b"\x1b[57358;65u\x1b[57358;65:3u\x1b[57358u\x1b[57358;1:3u")
+            assert actual == expected, ("GTK modifier events did not include their own state change", actual, expected)
+
             command = r"printf '\033[2J\033[H\033[48;2;230;30;45mKEYBOARD_INPUT_OK\033[0m\n'"
             for char in command + "\n":
                 symbol = Gdk.KEY_Return if char == "\n" else Gdk.unicode_to_keyval(ord(char))
@@ -327,7 +370,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             expected_hash = hashlib.sha256(b"\x1b[200~" + encoded + b"\x1b[201~").hexdigest()
             wait_for(lambda: expected_hash in rpc("read", pane=pane)["text"], context=GLib.MainContext.default())
             assert rpc("daemon-info")["attached"] and app.poll() is None
-            print("PASS: native Wayland keyboard input, accessible terminal text, caret and selection, composited output, "
+            print("PASS: native Wayland keyboard input, Kitty modifier presses/releases with both sides and Caps Lock, "
+                  "accessible terminal text, caret and selection, composited output, "
                   "wide-glyph geometry, stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
                   "fast edge drags during overscroll without viewport bouncing, "
                   "edge and release cancellation, "
