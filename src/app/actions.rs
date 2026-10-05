@@ -8,13 +8,17 @@ impl Ui {
             ("open-folder", &["<Control><Shift>o"]),
             ("split-right", &["<Control><Shift>d"]),
             ("split-down", &["<Control><Shift>e"]),
-            ("close", &["<Control><Shift>w"]),
+            ("close", &[CLOSE_SHORTCUT]),
+            ("close-empty-window", &[]),
+            ("close-window", &[]),
             ("close-active-tab", &[]),
             ("copy", &["<Control><Shift>c"]),
             ("paste", &["<Control><Shift>v"]),
             ("find", &["<Control><Shift>f"]),
             ("sidebar", &["<Control><Shift>b"]),
+            ("search-tabs", &[]),
             ("palette", &["<Control><Shift>p"]),
+            ("main-menu", &["F10"]),
             ("next-tab", &["<Control>Tab", "<Control>Page_Down"]),
             ("previous-tab", &["<Control><Shift>Tab", "<Control>Page_Up"]),
             ("next-pane", &["<Control><Shift>Right"]),
@@ -79,6 +83,15 @@ impl Ui {
             self.app
                 .set_accels_for_action(&format!("win.{name}"), shortcuts);
         }
+        let empty_shortcuts = gtk::ShortcutController::new();
+        empty_shortcuts.set_scope(gtk::ShortcutScope::Global);
+        // The pane action is disabled on the empty page. Attach its fallback
+        // here so it only participates while this page is mapped.
+        empty_shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string(CLOSE_SHORTCUT),
+            Some(gtk::NamedAction::new("win.close-empty-window")),
+        ));
+        self.empty.add_controller(empty_shortcuts);
         let action =
             gio::SimpleAction::new("focus-notification", Some(&u64::static_variant_type()));
         let weak = Rc::downgrade(self);
@@ -185,6 +198,8 @@ impl Ui {
                     self.request_close(p.id);
                 }
             }
+            "close-empty-window" if self.active.get() == 0 => self.window.close(),
+            "close-window" => self.window.close(),
             "close-active-tab" => self.request_close_tab(self.active.get()),
             "copy" => {
                 if let Some(p) = self.active_pane()
@@ -206,7 +221,15 @@ impl Ui {
                 }
             }
             "sidebar" => self.split.set_show_sidebar(!self.split.shows_sidebar()),
+            "search-tabs" => {
+                self.split.set_show_sidebar(true);
+                self.sidebar_search.grab_focus();
+            }
             "palette" => self.palette(),
+            "main-menu" => {
+                self.split.set_show_sidebar(true);
+                self.sidebar_main_menu.popup();
+            }
             "next-tab" | "previous-tab" => {
                 let ids = self
                     .tabs
@@ -269,6 +292,8 @@ impl Ui {
         }
     }
 }
+
+const CLOSE_SHORTCUT: &str = "<Control><Shift>w";
 
 pub(super) const TAB_ACTIONS: &[&str] = &[
     "split-right",

@@ -81,9 +81,11 @@ impl Ui {
         crate::menu::setup_menu_button(&workspace_filter, "Workspace Filter");
         sidebar_header.set_title_widget(Some(&workspace_filter));
         let new_tab_menu = gio::Menu::new();
+        let sidebar_main_menu = main_menu_button(&new_tab_menu);
+        sidebar_header.pack_end(&sidebar_main_menu);
         let new = adw::SplitButton::builder()
             .icon_name("list-add-symbolic")
-            .tooltip_text("New tab (Ctrl+Shift+T)")
+            .tooltip_text("New Tab (Ctrl+Shift+T)")
             .dropdown_tooltip("New tab options")
             .action_name("win.new")
             .menu_model(&new_tab_menu)
@@ -122,14 +124,15 @@ impl Ui {
         header.set_show_start_title_buttons(false);
         let toggle = icon_button(
             "sidebar-show-symbolic",
-            "Show or hide tabs (Ctrl+Shift+B)",
+            "Show or Hide Tabs (Ctrl+Shift+B)",
             "win.sidebar",
         );
         header.pack_start(&toggle);
         let heading = adw::WindowTitle::new("Gmux", "");
         header.set_title_widget(Some(&heading));
-        header.pack_end(&main_menu_button(&new_tab_menu));
-        header.pack_end(&terminal_menu_button());
+        let terminal_menu = terminal_menu_button();
+        terminal_menu.set_visible(false);
+        header.pack_end(&terminal_menu);
         content_view.add_top_bar(&header);
         let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let search = gtk::SearchBar::new();
@@ -187,7 +190,7 @@ impl Ui {
             .label("New Tab")
             .action_name("win.new")
             .menu_model(&new_tab_menu)
-            .tooltip_text("New tab (Ctrl+Shift+T)")
+            .tooltip_text("New Tab (Ctrl+Shift+T)")
             .dropdown_tooltip("New tab options")
             .halign(gtk::Align::Center)
             .build();
@@ -215,6 +218,8 @@ impl Ui {
             sidebar,
             sidebar_search,
             sidebar_placeholder: no_tabs,
+            sidebar_main_menu,
+            terminal_menu,
             heading,
             toast,
             settings,
@@ -619,11 +624,10 @@ fn icon_button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
 }
 fn main_menu_button(tabs: &gio::Menu) -> gtk::MenuButton {
     let menu = gio::Menu::new();
+    let fullscreen = gio::Menu::new();
+    fullscreen.append(Some("_Fullscreen"), Some("win.fullscreen"));
+    menu.append_section(None, &fullscreen);
     menu.append_section(None, tabs);
-    let visibility = gio::Menu::new();
-    visibility.append(Some("Show _Tabs"), Some("win.sidebar"));
-    visibility.append(Some("_Fullscreen"), Some("win.fullscreen"));
-    menu.append_section(None, &visibility);
     let tools = gio::Menu::new();
     tools.append(Some("_Manage Workspaces…"), Some("win.manage-workspaces"));
     tools.append(Some("_Commands…"), Some("win.palette"));
@@ -636,12 +640,13 @@ fn main_menu_button(tabs: &gio::Menu) -> gtk::MenuButton {
     app.append(Some("_Keyboard Shortcuts"), Some("win.shortcuts"));
     app.append(Some("_About Gmux"), Some("win.about"));
     menu.append_section(None, &app);
-    let button = menu_button("open-menu-symbolic", "Main Menu", &menu);
-    button.set_primary(true);
-    button
+    menu_button("open-menu-symbolic", "Main Menu", &menu)
 }
 fn terminal_menu_button() -> gtk::MenuButton {
     let menu = gio::Menu::new();
+    let tab = gio::Menu::new();
+    tab.append(Some("Re_name Tab…"), Some("win.rename"));
+    menu.append_section(None, &tab);
     let terminal = gio::Menu::new();
     terminal.append(Some("Split _Right"), Some("win.split-right"));
     terminal.append(Some("Split _Down"), Some("win.split-down"));

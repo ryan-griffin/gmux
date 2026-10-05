@@ -261,9 +261,29 @@ impl Ui {
                     .sync_create()
                     .build();
             }
-            if let Some(shortcut) = self.app.accels_for_action(&format!("win.{action}")).first() {
+            let shortcut_action = if action == "close-window" {
+                "close"
+            } else {
+                action
+            };
+            if let Some(shortcut) = self
+                .app
+                .accels_for_action(&format!("win.{shortcut_action}"))
+                .first()
+            {
                 let key = adw::ShortcutLabel::new(shortcut);
                 key.set_valign(gtk::Align::Center);
+                if action == "close-window" {
+                    // Close Window is always available, but it shares the
+                    // pane shortcut only while the empty page is shown.
+                    key.set_visible(false);
+                    if let Some(empty_close) = self.window.lookup_action("close-empty-window") {
+                        empty_close
+                            .bind_property("enabled", &key, "visible")
+                            .sync_create()
+                            .build();
+                    }
+                }
                 row.add_suffix(&key);
             }
             list.append(&row);
@@ -405,52 +425,54 @@ impl Ui {
             (
                 "Tabs",
                 &[
-                    ("New tab", "new"),
-                    ("New tab in directory", "open-folder"),
-                    ("Next tab", "next-tab"),
-                    ("Previous tab", "previous-tab"),
-                    ("Show or hide tabs", "sidebar"),
+                    ("New Tab", "new"),
+                    ("New Tab in Directory…", "open-folder"),
+                    ("Next Tab", "next-tab"),
+                    ("Previous Tab", "previous-tab"),
+                    ("Show or Hide Tabs", "sidebar"),
                 ],
             ),
             (
                 "Panes",
                 &[
-                    ("Split right", "split-right"),
-                    ("Split down", "split-down"),
-                    ("Close pane", "close"),
-                    ("Next pane", "next-pane"),
-                    ("Previous pane", "previous-pane"),
+                    ("Split Right", "split-right"),
+                    ("Split Down", "split-down"),
+                    ("Close Pane", "close"),
+                    ("Next Pane", "next-pane"),
+                    ("Previous Pane", "previous-pane"),
                 ],
             ),
             (
                 "Terminal",
                 &[
-                    ("Copy selection", "copy"),
+                    ("Copy Selection", "copy"),
                     ("Paste", "paste"),
-                    ("Find in terminal", "find"),
-                    ("Zoom in", "zoom-in"),
-                    ("Zoom out", "zoom-out"),
-                    ("Reset zoom", "zoom-reset"),
+                    ("Find in Terminal…", "find"),
+                    ("Zoom In", "zoom-in"),
+                    ("Zoom Out", "zoom-out"),
+                    ("Reset Zoom", "zoom-reset"),
                 ],
             ),
             (
                 "Application",
                 &[
-                    ("Commands", "palette"),
+                    ("Main Menu", "main-menu"),
+                    ("Commands…", "palette"),
                     ("Preferences", "preferences"),
-                    ("Keyboard shortcuts", "shortcuts"),
-                    ("Toggle fullscreen", "fullscreen"),
-                    ("Quit", "quit"),
+                    ("Keyboard Shortcuts", "shortcuts"),
+                    ("Toggle Fullscreen", "fullscreen"),
+                    ("Quit Gmux", "quit"),
                 ],
             ),
         ];
         for (title, actions) in sections {
             let section = adw::ShortcutsSection::new(Some(title));
             for (title, action) in *actions {
-                section.add(adw::ShortcutsItem::from_action(
-                    title,
-                    &format!("win.{action}"),
-                ));
+                let item = adw::ShortcutsItem::from_action(title, &format!("win.{action}"));
+                if *action == "close" {
+                    item.set_subtitle("Closes the window when the empty state is shown");
+                }
+                section.add(item);
             }
             dialog.add(section);
         }

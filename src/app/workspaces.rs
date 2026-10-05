@@ -253,6 +253,12 @@ impl Ui {
             } else {
                 membership.append(Some("_Move to Workspace"), Some("tab.move-unavailable"));
             }
+            let create = gio::MenuItem::new(Some("Move to _New Workspace…"), None);
+            create.set_action_and_target_value(
+                Some("win.new-workspace-for-tab"),
+                Some(&tab.id.to_variant()),
+            );
+            membership.append_item(&create);
             if tab.workspace.is_some() {
                 let unassign = gio::MenuItem::new(Some("Remove _from Workspace"), None);
                 unassign.set_action_and_target_value(
@@ -261,12 +267,6 @@ impl Ui {
                 );
                 membership.append_item(&unassign);
             }
-            let create = gio::MenuItem::new(Some("Move to _New Workspace…"), None);
-            create.set_action_and_target_value(
-                Some("win.new-workspace-for-tab"),
-                Some(&tab.id.to_variant()),
-            );
-            membership.append_item(&create);
             menu.append_section(None, &membership);
             let closing = gio::Menu::new();
             let close = gio::MenuItem::new(Some("_Close Tab"), None);

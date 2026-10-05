@@ -21,7 +21,7 @@ pub const COMMANDS: &[Command] = &[
         keywords: "create new group project",
     },
     Command {
-        title: "Manage Workspaces",
+        title: "Manage Workspaces…",
         action: "manage-workspaces",
         keywords: "edit remove delete groups projects",
     },
@@ -41,6 +41,11 @@ pub const COMMANDS: &[Command] = &[
         keywords: "remove terminal",
     },
     Command {
+        title: "Close Tab",
+        action: "close-active-tab",
+        keywords: "remove terminals whole all panes",
+    },
+    Command {
         title: "Find in Terminal…",
         action: "find",
         keywords: "search text match locate",
@@ -51,9 +56,29 @@ pub const COMMANDS: &[Command] = &[
         keywords: "edit name title",
     },
     Command {
-        title: "Toggle Sidebar",
+        title: "Show or Hide Tabs",
         action: "sidebar",
-        keywords: "show hide tabs panel",
+        keywords: "toggle sidebar panel",
+    },
+    Command {
+        title: "Search Tabs…",
+        action: "search-tabs",
+        keywords: "find titles workspaces directories branches sidebar",
+    },
+    Command {
+        title: "Zoom In",
+        action: "zoom-in",
+        keywords: "increase enlarge text size",
+    },
+    Command {
+        title: "Zoom Out",
+        action: "zoom-out",
+        keywords: "decrease shrink text size",
+    },
+    Command {
+        title: "Reset Zoom",
+        action: "zoom-reset",
+        keywords: "normal default text size restore",
     },
     Command {
         title: "Preferences",
@@ -69,6 +94,16 @@ pub const COMMANDS: &[Command] = &[
         title: "Toggle Fullscreen",
         action: "fullscreen",
         keywords: "maximize full screen window",
+    },
+    Command {
+        title: "Close Window",
+        action: "close-window",
+        keywords: "detach keep terminals running background",
+    },
+    Command {
+        title: "Quit Gmux",
+        action: "quit",
+        keywords: "exit stop daemon terminals shutdown",
     },
 ];
 

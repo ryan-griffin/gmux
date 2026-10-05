@@ -25,30 +25,34 @@ its focus ring and error state.
 ## Menus and focus
 
 The main menu and both New Tab dropdowns share a menu model with live workspace
-choices. Show Tabs and Fullscreen use stateful actions whose checkmarks follow
-the widgets. The separate Terminal Actions menu targets the active pane and
-includes split, Find, zoom, Close Pane, and Close Tab actions.
+choices. Fullscreen uses a stateful action whose checkmark follows the window.
+The main menu stays above the sidebar, including in the narrow sidebar overlay.
+The separate Terminal Actions menu includes Rename Tab and
+Close Tab for the active tab, and split, Find, zoom, and Close Pane for its active
+pane. Its button is hidden when there is no active terminal.
 
 Menus use accessible names, keyboard navigation, and distinct mnemonics. Dynamic
 workspace labels escape literal underscores before choosing mnemonics. Tab
 context-menu actions target the clicked tab, including workspace moves and
 creation. Terminal context-menu actions target the clicked pane.
 
-The main menu is GTK's primary menu for F10. The Menu key and Shift+F10 open a
-terminal context menu; Shift+right-click overrides terminal mouse tracking.
+F10 reveals the sidebar and opens its main menu. The Menu key and Shift+F10 open
+a terminal context menu; Shift+right-click overrides terminal mouse tracking.
 Sidebar arrow navigation keeps focus in the list. Clicking a tab or pressing
 Enter activates it and focuses its terminal.
 
-Quit Gmux remains in the main menu because closing the window leaves terminal
-processes running. Close Pane, Close Tab, and Quit ask for confirmation when
-affected panes have busy processes. [Session lifecycle](terminal-sessions.md) describes detach and
-shutdown behavior.
+Quit Gmux remains in the main menu as an explicit exception to the GNOME HIG
+because closing the window leaves terminal processes running. Close Pane,
+Close Tab, and Quit ask for confirmation when affected panes have busy processes.
+[Session lifecycle](terminal-sessions.md) describes detach and shutdown behavior.
 
 ## Command palette and accessibility
 
 Command rows use `AdwActionRow` and `AdwShortcutLabel`. Shortcut labels read the
 registered application accelerators. Disabled commands remain visible and
 keyboard navigation skips them. `AdwStatusPage` handles an empty search result.
+Close Window shows the Close Pane shortcut only when the empty state is shown;
+the label follows the empty-window action's availability while the palette is open.
 
 Search ranks command labels before related terms and small spelling mistakes,
 and combines words in any order. The search field retains keyboard focus while
@@ -73,6 +77,12 @@ Terminal key handlers match GTK's registered accelerators for presses and
 releases. Scrollback shortcuts also consume their releases. This keeps
 application shortcuts out of programs that request extended keyboard reporting
 while allowing unbound keys to reach the terminal.
+
+Keyboard Shortcuts lists F10 for the main menu. The Close Pane shortcut item
+explains that Ctrl+Shift+W closes the window when the empty state is shown.
+Action labels use the same wording and capitalization in the command palette
+and shortcut dialog. Copy Selection clarifies the terminal's Copy action, and
+the checked Fullscreen menu item names the setting rather than its toggle action.
 
 GTK 4.22 and libadwaita 1.9 feature levels are declared in
 [`Cargo.toml`](../Cargo.toml). The binaries deny deprecated Rust API use except

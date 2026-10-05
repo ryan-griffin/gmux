@@ -123,19 +123,25 @@ pane-specific split and close actions, busy-process confirmation, and the
 Shift+right-click override in mouse-tracking applications. Pointer motion and
 wheel input must stay in the open menu.
 
-The main menu test checks accessible item names, unavailable terminal actions
+The main menu test checks accessible item names, the hidden Terminal Actions menu
 in an empty window, tab creation with the sidebar hidden, workspace destinations
 and starting directories, workspace menu updates and mnemonics, directory selection
 cancellation, zoom, keyboard mnemonics, standard dialogs, and busy-process Quit
 confirmation. It checks the separate Terminal Actions menu, active-pane splits,
-Find focus, pane closure, and whole-tab closure with busy-process confirmations.
-Show Tabs and Fullscreen checkmarks must also follow changes made through keyboard
-shortcuts. It saves main-menu, workspace,
-and terminal-menu screenshots under `artifacts/`. It also checks workspace
-management with the sidebar hidden, radio states and mnemonics in the workspace
-filter, both New Tab dropdowns, and keyboard and pointer invocation of tab context
+Find focus, active-tab renaming with the sidebar hidden, pane closure, and
+whole-tab closure with busy-process confirmations.
+The Fullscreen checkmark must also follow changes made through F11. The sidebar
+shortcut must toggle visibility, and F10 must reveal the sidebar and open its
+main menu. It saves main-menu, workspace, and terminal-menu screenshots under
+`artifacts/`. It also checks workspace management, radio states and mnemonics in
+the workspace filter, both New Tab dropdowns, and keyboard and pointer invocation of tab context
 menus. Workspace commands must target the clicked tab, preserve its panes, and
 leave unrelated tabs alone.
+
+The window-close test checks Ctrl+Shift+W on an empty startup window, after the
+last pane closes, and in an empty workspace with a hidden running terminal.
+It also checks the Close Window command with a running terminal. Window closure
+must detach the app while preserving the daemon and any running terminals.
 
 The interactive smoke test runs Vim and top through input, edit/save, scrolling,
 splits, zoom, resize, and detach/reattach while both applications keep running.

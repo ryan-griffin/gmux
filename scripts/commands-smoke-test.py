@@ -66,6 +66,18 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         assert controls and controls[0].get_target(0) == command_list
         assert "Up and Down" in entry.get_description()
 
+        def shortcut_labels(row):
+            return {obj.get_name() for obj in descendants(row)
+                    if obj.get_role_name() == "label" and obj.get_name() != row.get_name()
+                    and obj.get_name() and obj.get_state_set().contains(Atspi.StateType.SHOWING)}
+
+        close_pane = wait_for(lambda: find("Close Pane", "list item"))
+        close_window = wait_for(lambda: find("Close Window", "list item"))
+        pane_shortcut = wait_for(lambda: shortcut_labels(close_pane))
+        wait_for(lambda: shortcut_labels(close_window) == pane_shortcut)
+        assert not close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE)
+        assert close_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
+
         def selected(name):
             return selection.get_n_selected_children() == 1 and (
                 selection.get_selected_child(0).get_name() == name)
@@ -84,13 +96,19 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         assert selection.get_n_selected_children() == 0
         split = wait_for(lambda: find("Split Right", "list item"))
         assert not split.get_state_set().contains(Atspi.StateType.SENSITIVE)
-        rpc("new", name="Command Test")
+        created = rpc("new", name="Command Test")
         search("", "New Tab")
+        wait_for(lambda: close_window.get_state_set().contains(Atspi.StateType.SHOWING))
+        wait_for(lambda: not shortcut_labels(close_window))
+        wait_for(lambda: close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        assert shortcut_labels(close_pane) == pane_shortcut
+        assert close_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
         for query, name in [
             ("settings", "Preferences"), ("settigns", "Preferences"),
             ("font", "Preferences"), ("keybindings", "Keyboard Shortcuts"),
             ("new directory", "New Tab in Directory…"),
             ("splti riht", "Split Right"), ("name", "Rename Tab…"),
+            ("toggle sidebar", "Show or Hide Tabs"), ("manage", "Manage Workspaces…"),
         ]:
             search(query, name)
 
@@ -119,9 +137,26 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         assert selection.get_n_selected_children() == 0
         wait_for(lambda: find("No Matching Commands", "label"))
         search("new", "New Tab")
+        search("close window", "Close Window")
+        rpc("close", pane=created["pane"])
+        wait_for(lambda: shortcut_labels(close_window) == pane_shortcut)
+        wait_for(lambda: not close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        assert close_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
+        rpc("action", name="shortcuts")
+        wait_for(lambda: find("Closes the window when the empty state is shown", "label"))
+        shortcuts_dialog = wait_for(lambda: find("Main Menu", "label"))
+        while shortcuts_dialog and shortcuts_dialog.get_role_name() != "dialog":
+            shortcuts_dialog = shortcuts_dialog.get_parent()
+        assert shortcuts_dialog, "Main Menu help must belong to the shortcuts dialog"
+        for title in ("New Tab", "New Tab in Directory…", "Show or Hide Tabs", "Split Right",
+                      "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out", "Reset Zoom",
+                      "Main Menu", "Commands…", "Toggle Fullscreen", "Quit Gmux"):
+            wait_for(lambda: any(obj.get_role_name() == "label" and obj.get_name() == title
+                                for obj in descendants(shortcuts_dialog)))
         print("PASS: command labels, related terms, typo matching, ranking, disabled matches, "
               "uniform rows, retained search focus, selection and no-result announcements, "
-              "and search-to-list accessibility relation")
+              "search-to-list accessibility relation, conditional Close Window shortcut labels, "
+              "and the Close Pane shortcut explanation")
     finally:
         if listener:
             listener.deregister("object:announcement")

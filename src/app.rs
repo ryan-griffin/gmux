@@ -72,6 +72,8 @@ pub struct Ui {
     sidebar: gtk::ListBox,
     sidebar_search: gtk::SearchEntry,
     sidebar_placeholder: adw::StatusPage,
+    sidebar_main_menu: gtk::MenuButton,
+    terminal_menu: gtk::MenuButton,
     heading: adw::WindowTitle,
     toast: adw::ToastOverlay,
     settings: Rc<RefCell<Settings>>,

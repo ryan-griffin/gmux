@@ -355,6 +355,17 @@ impl Ui {
         }
     }
     pub(super) fn update_tab_actions(&self, enabled: bool) {
+        if !enabled {
+            self.terminal_menu.popdown();
+        }
+        self.terminal_menu.set_visible(enabled);
+        if let Some(action) = self
+            .window
+            .lookup_action("close-empty-window")
+            .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
+        {
+            action.set_enabled(!enabled);
+        }
         for name in TAB_ACTIONS {
             if let Some(action) = self
                 .window

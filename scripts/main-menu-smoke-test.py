@@ -26,10 +26,11 @@ artifacts.mkdir(exist_ok=True)
 appearance = os.environ.get("GMUX_REVIEW_APPEARANCE", "dark")
 assert appearance in ("light", "dark"), appearance
 variant = appearance + ("-hc" if os.environ.get("ADW_DEBUG_HIGH_CONTRAST") == "1" else "")
-main_items = ("New Tab", "New Tab in Directory…", "New Tab in Workspace",
-              "Show Tabs", "Fullscreen", "Manage Workspaces…", "Commands…", "Quit Gmux", "Preferences",
+tab_items = ("New Tab", "New Tab in Directory…", "New Tab in Workspace")
+main_items = ("Fullscreen", *tab_items,
+              "Manage Workspaces…", "Commands…", "Quit Gmux", "Preferences",
               "Keyboard Shortcuts", "About Gmux")
-terminal_items = ("Split Right", "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out",
+terminal_items = ("Rename Tab…", "Split Right", "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out",
                   "Reset Zoom", "Close Pane", "Close Tab")
 
 
@@ -104,10 +105,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
 
     def open_menu(terminal=False):
         dismiss()
+        if not terminal and not rpc("list")["sidebar_visible"]:
+            key(Gdk.KEY_F10)
+            wait_for(lambda: item("New Tab"))
+            return
         label = "Terminal Actions" if terminal else "Main Menu"
         button = wait_for(lambda: find(label, "toggle button") or find(label, "button"))
         assert button.get_action_iface().do_action(0)
-        wait_for(lambda: item("Split Right" if terminal else "New Tab"))
+        wait_for(lambda: item("Rename Tab…" if terminal else "New Tab"))
 
     def open_options():
         dismiss()
@@ -145,7 +150,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             open_menu()
             dismiss()
             for _ in range(12):
-                chord(Gdk.KEY_Shift_L, Gdk.KEY_Tab)
+                key(Gdk.KEY_Tab)
                 time.sleep(0.05)
                 if tab_row(name).get_state_set().contains(Atspi.StateType.FOCUSED):
                     break
@@ -208,7 +213,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             key(Gdk.KEY_F10)
             wait_for(lambda: find("Main Menu", "menu"))
             dismiss()
-            chord(Gdk.KEY_Shift_L, Gdk.KEY_Tab)
+            for _ in range(12):
+                key(Gdk.KEY_Tab)
+                if (button := find("Terminal Actions", "toggle button")) \
+                        and button.get_state_set().contains(Atspi.StateType.FOCUSED):
+                    break
             wait_for(lambda: (button := find("Terminal Actions", "toggle button"))
                 and button.get_state_set().contains(Atspi.StateType.FOCUSED))
             key(Gdk.KEY_space)
@@ -220,23 +229,24 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             for name in main_items:
                 wait_for(lambda: item(name))
             assert not item("New Tab in Workspace").get_state_set().contains(Atspi.StateType.SENSITIVE)
-            assert not checked("Show Tabs") and not checked("Fullscreen")
+            assert item("Show Tabs") is None
+            assert not checked("Fullscreen")
             assert not any(item(name) for name in terminal_items), "Terminal actions belong in their own menu"
-            open_menu(terminal=True)
-            for name in terminal_items:
-                wait_for(lambda: item(name))
-                assert not item(name).get_state_set().contains(Atspi.StateType.SENSITIVE), name
-            assert not any(item(name) for name in main_items), "App actions belong in the main menu"
+            assert find("Terminal Actions", "toggle button") is None
+            assert find("Terminal Actions", "button") is None
 
             # The empty-window SplitButton has the same accessible menu model.
             open_options()
-            for name in main_items[:3]:
+            for name in tab_items:
                 wait_for(lambda: item(name))
             assert not item("New Tab in Workspace").get_state_set().contains(Atspi.StateType.SENSITIVE)
 
             # Tab creation remains available with the sidebar hidden.
-            open_menu()
-            key(Gdk.KEY_n)
+            dismiss()
+            rpc("action", name="sidebar")
+            assert not rpc("list")["sidebar_visible"]
+            wait_for(lambda: find("Main Menu", "toggle button") is None)
+            chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_t)
             tabs = wait_for(lambda: rpc("list")["tabs"])
             assert len(tabs) == 1, tabs
             pane = tabs[0]["panes"][0]["id"]
@@ -249,7 +259,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
                 workspace = rpc("workspace-new", name=name, directory=str(folder))["workspace"]
                 workspaces.append((workspace, name, folder))
             open_menu()
-            wait_for(lambda: item("New Tab").get_state_set().contains(Atspi.StateType.FOCUSED))
+            # GTK remembers the last selection. Reach the first item with
+            # arrow keys before checking navigation through the whole menu.
+            for _ in range(len(main_items)):
+                if item(main_items[0]).get_state_set().contains(Atspi.StateType.FOCUSED):
+                    break
+                key(Gdk.KEY_Up)
+                time.sleep(0.05)
+            wait_for(lambda: item(main_items[0]).get_state_set().contains(Atspi.StateType.FOCUSED))
             for name in main_items[1:]:
                 key(Gdk.KEY_Down)
                 wait_for(lambda: item(name).get_state_set().contains(Atspi.StateType.FOCUSED))
@@ -257,7 +274,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             native.frame(timeout=2)
             capture(variant)
             open_menu(terminal=True)
-            wait_for(lambda: item("Split Right").get_state_set().contains(Atspi.StateType.FOCUSED))
+            wait_for(lambda: item(terminal_items[0]).get_state_set().contains(Atspi.StateType.FOCUSED))
             for name in terminal_items[1:]:
                 key(Gdk.KEY_Down)
                 wait_for(lambda: item(name).get_state_set().contains(Atspi.StateType.FOCUSED))
@@ -274,16 +291,16 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
                 wait_for(predicate)
                 wait_for(lambda: not menu_visible())
 
-            open_menu()
-            key(Gdk.KEY_t)
-            wait_for(lambda: json.loads(settings.read_text())["show_sidebar"])
-            open_menu()
-            wait_for(lambda: checked("Show Tabs"))
             dismiss()
             chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_b)
             wait_for(lambda: not json.loads(settings.read_text())["show_sidebar"])
+            wait_for(lambda: find("Main Menu", "toggle button") is None)
+            chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_b)
+            wait_for(lambda: json.loads(settings.read_text())["show_sidebar"])
+            chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_b)
+            wait_for(lambda: not json.loads(settings.read_text())["show_sidebar"])
             open_menu()
-            assert not checked("Show Tabs"), "Sidebar shortcut must update the menu checkmark"
+            assert rpc("list")["sidebar_visible"], "F10 must reveal the sidebar before opening its menu"
 
             before = viewport()["height"]
             activate("Fullscreen")
@@ -321,6 +338,38 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             wait_for(lambda: len(tab(original_tab)["panes"]) == 3)
             down = tab(original_tab)["active_pane"]
             assert down not in (pane, right)
+
+            # Rename remains available without the sidebar and changes only
+            # the active tab, preserving its complete pane set.
+            other = rpc("new", name="Rename other tab")
+            rpc("focus", pane=down)
+            original_name = tab(original_tab)["name"]
+            chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_b)
+            wait_for(lambda: not rpc("list")["sidebar_visible"])
+            open_menu(terminal=True)
+            key(Gdk.KEY_n)
+            wait_for(lambda: find("Rename Tab"))
+            key(Gdk.KEY_Escape)
+            wait_for(lambda: find(role="dialog") is None)
+            assert tab(original_tab)["name"] == original_name
+            open_menu(terminal=True)
+            activate("Rename Tab…")
+            wait_for(lambda: find("Rename Tab"))
+            entry = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
+                if obj.get_process_id() == app.pid and obj.get_role_name() in ("entry", "text")
+                and obj.get_state_set().contains(Atspi.StateType.FOCUSED)), None))
+            assert entry.get_editable_text_iface().set_text_contents("Renamed terminal tab")
+            assert wait_for(lambda: find("Rename", "button")).get_action_iface().do_action(0)
+            wait_for(lambda: tab(original_tab)["name"] == "Renamed terminal tab")
+            wait_for(lambda: find(role="dialog") is None)
+            assert {p["id"] for p in tab(original_tab)["panes"]} == {pane, right, down}
+            assert tab(other["tab"])["name"] == "Rename other tab"
+            assert rpc("list")["active_tab"] == original_tab
+            assert not rpc("list")["sidebar_visible"]
+            rpc("close", pane=other["pane"])
+            wait_for(lambda: len(rpc("list")["tabs"]) == 1)
+            chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_b)
+            wait_for(lambda: rpc("list")["sidebar_visible"])
 
             ready = temp / "pane-busy-ready"
             command = f"from pathlib import Path; import time; Path({str(ready)!r}).touch(); time.sleep(60)"
@@ -372,8 +421,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             wait_for(lambda: find("Close tab?") is None)
             rpc("focus", pane=pane)
 
-            # Workspace choices share the existing action and stay available
-            # with the sidebar hidden, even with another workspace selected.
+            # Workspace choices share the existing action, even with another
+            # workspace selected.
             for (workspace, name, folder), mnemonic in zip(workspaces, (Gdk.KEY_p, Gdk.KEY_r, Gdk.KEY_m)):
                 rpc("filter", workspace=workspaces[0][0])
                 open_menu()
@@ -390,7 +439,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
                 created_pane = created["panes"][0]["id"]
                 wait_for(lambda: next(tab for tab in rpc("list")["tabs"]
                     if tab["id"] == created["id"])["panes"][0]["directory"] == str(folder))
-                assert not rpc("list")["sidebar_visible"]
+                assert rpc("list")["sidebar_visible"]
                 rpc("close", pane=created_pane)
                 wait_for(lambda: len(rpc("list")["tabs"]) == 1)
 
@@ -398,7 +447,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             # escapes names, and reserves the management commands' mnemonics.
             dismiss()
             rpc("filter", value="all")
-            rpc("action", name="sidebar")
+            if not rpc("list")["sidebar_visible"]:
+                rpc("action", name="sidebar")
             wait_for(lambda: rpc("list")["sidebar_visible"])
             open_filter()
             for name in ("All Tabs", "No Workspace", "Add Workspace…", "Manage Workspaces…"):
@@ -486,6 +536,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             rpc("focus", pane=pane)
             open_tab_menu(target_name, keyboard=True)
             wait_for(lambda: item("Remove from Workspace"))
+            wait_for(lambda: item("Rename Tab…").get_state_set().contains(Atspi.StateType.FOCUSED))
+            for name in ("Move to Workspace", "Move to New Workspace…", "Remove from Workspace", "Close Tab"):
+                key(Gdk.KEY_Down)
+                wait_for(lambda: item(name).get_state_set().contains(Atspi.StateType.FOCUSED))
+            capture(variant + "-tab-assigned")
             key(Gdk.KEY_m)
             workspace_choices(("Product", "My_Project"))
             assert item("Project") is None, "Current workspace must not be a move destination"
@@ -551,7 +606,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
                 key(mnemonic)
                 wait_for(lambda: find(role="dialog"))
                 if mnemonic == Gdk.KEY_m:
-                    assert not rpc("list")["sidebar_visible"]
+                    assert rpc("list")["sidebar_visible"]
                     wait_for(lambda: find("Add Workspace…", "button"))
                 key(Gdk.KEY_Escape)
                 wait_for(lambda: find(role="dialog") is None)
@@ -569,9 +624,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             assert rpc("daemon-info")["attached"] and len(rpc("list")["tabs"]) == 2
             print(f"PASS ({variant}): accessible main menu, empty-window sensitivity, "
                   "tab and workspace creation, dynamic workspace choices and mnemonics, "
-                  "directory dialog, separate terminal menu, active-pane splits and zoom, "
+                  "directory dialog, separate terminal menu, active-tab rename, active-pane splits and zoom, "
                   "Find focus, pane and whole-tab closure with busy confirmations, synchronized "
-                  "visibility and fullscreen checkmarks, workspace filter and creation dropdowns, "
+                  "sidebar visibility and fullscreen checkmark, workspace filter and creation dropdowns, "
                   "clicked-tab workspace moves and creation, keyboard invocation and navigation, "
                   "workspace management, standard dialogs, and Quit confirmation")
         except Exception:

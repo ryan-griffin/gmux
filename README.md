@@ -33,9 +33,9 @@ Closing the window keeps panes and commands running in a headless daemon. Reopen
 
 Create tabs with the plus button. Manage Workspaces in the main menu lets you add, edit, or remove saved workspaces. The sidebar filter also offers workspace management. Sidebar visibility is remembered when you reopen Gmux. Right-click a tab to rename it, move it to an existing or new workspace, or remove its workspace membership; middle-click to close it. Deleting a workspace keeps its tabs open and unassigned. Exiting a shell closes its pane.
 
-The main menu also creates tabs, including in a chosen directory or workspace. New Tab in Workspace lists saved workspaces and is disabled when none exist. Show Tabs and Fullscreen are checked items. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
+The main menu stays above the sidebar and creates tabs, including in a chosen directory or workspace. F10 reveals the sidebar and opens the menu. New Tab in Workspace lists saved workspaces and is disabled when none exist. Fullscreen is a checked item. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
 
-The three-dot Terminal Actions menu in the content header contains Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both ask for confirmation when processes are running. This menu is available with the sidebar hidden.
+The three-dot Terminal Actions menu in the content header contains Rename Tab, Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Rename Tab changes the active tab's name. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both close actions ask for confirmation when processes are running. This menu is available with the sidebar hidden.
 
 Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close Pane. In apps that capture mouse input, use Shift+right-click to open the menu. The Menu key and Shift+F10 also open it.
 
@@ -44,7 +44,7 @@ Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close
 | New tab | Ctrl+Shift+T |
 | New tab in directory | Ctrl+Shift+O |
 | Split right / down | Ctrl+Shift+D / Ctrl+Shift+E |
-| Close pane | Ctrl+Shift+W |
+| Close pane, or window when the empty state is shown | Ctrl+Shift+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
 | Find in terminal history | Ctrl+Shift+F |

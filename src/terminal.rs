@@ -136,7 +136,7 @@ impl Terminal {
         toolbar.set_center_widget(Some(&title));
         let close = gtk::Button::builder()
             .icon_name("window-close-symbolic")
-            .tooltip_text("Close pane (Ctrl+Shift+W)")
+            .tooltip_text("Close Pane (Ctrl+Shift+W)")
             .build();
         close.add_css_class("circular");
         close.add_css_class("flat");
