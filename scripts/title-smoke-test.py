@@ -67,7 +67,7 @@ time.sleep(30)
 
     def interrupt(pane, tab_name=None):
         rpc("send", pane=pane, text="\x03")
-        expect(pane, "gmux", tab_name)
+        expect(pane, root.name, tab_name)
 
     def ready(pane):
         run(pane, "printf 'GMUX_READY\\n'")
@@ -80,7 +80,7 @@ time.sleep(30)
             tab = wait_for(lambda: rpc("list")["tabs"])[0]
             pane = tab["active_pane"]
             ready(pane)
-            expect(pane, "gmux")
+            expect(pane, root.name)
             for mode in ["title", "title", "clear", "exec"]:
                 run(pane, f"python3 {shlex.quote(str(job))} {mode}")
                 expect(pane, "OpenCode")
@@ -120,10 +120,16 @@ time.sleep(30)
             run(named["pane"], f"python3 {shlex.quote(str(job))} title")
             expect(named["pane"], "OpenCode", "Pinned title")
             assert next(t for t in rpc("list")["tabs"] if t["id"] == named["tab"])["name"] == "Pinned title"
-            interrupt(named["pane"], "Pinned title")
+            rpc("remove-tab-name", tab=named["tab"])
+            expect(named["pane"], "OpenCode")
+            interrupt(named["pane"])
+            run(named["pane"], "sleep 30")
+            expect(named["pane"], "sleep")
+            interrupt(named["pane"])
             print("PASS: foreground titles, repeated OSC titles, empty title reset, exec, "
                   "silent commands, shell directory fallback, independent split titles, "
-                  "tab titles immediately following the selected pane, and explicit tab names")
+                  "tab titles immediately following the selected pane, explicit tab names, "
+                  "and restored automatic names")
         finally:
             app.terminate()
             app.wait(timeout=10)

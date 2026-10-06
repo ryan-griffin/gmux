@@ -30,7 +30,7 @@ tab_items = ("New Tab", "New Tab in Directory…", "New Tab in Workspace")
 main_items = ("Fullscreen", *tab_items,
               "Manage Workspaces…", "Commands…", "Quit Gmux", "Preferences",
               "Keyboard Shortcuts", "About Gmux")
-terminal_items = ("Rename Tab…", "Split Right", "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out",
+terminal_items = ("Rename Tab…", "Remove Tab Name", "Split Right", "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out",
                   "Reset Zoom", "Close Pane", "Close Tab")
 
 
@@ -276,6 +276,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             open_menu(terminal=True)
             wait_for(lambda: item(terminal_items[0]).get_state_set().contains(Atspi.StateType.FOCUSED))
             for name in terminal_items[1:]:
+                if name == "Remove Tab Name" and item(name) is None:
+                    continue
                 key(Gdk.KEY_Down)
                 wait_for(lambda: item(name).get_state_set().contains(Atspi.StateType.FOCUSED))
             open_menu(terminal=True)
@@ -366,6 +368,19 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             assert tab(other["tab"])["name"] == "Rename other tab"
             assert rpc("list")["active_tab"] == original_tab
             assert not rpc("list")["sidebar_visible"]
+            rpc("search-tabs", query="Renamed terminal tab")
+            open_menu(terminal=True)
+            activate("Remove Tab Name")
+            wait_for(lambda: tab(original_tab)["name"] == next(
+                p["title"] for p in tab(original_tab)["panes"] if p["id"] == down))
+            assert find(role="dialog") is None
+            assert tab(other["tab"])["name"] == "Rename other tab"
+            assert rpc("list")["active_tab"] == original_tab
+            assert rpc("list")["tab_search"] == "Renamed terminal tab"
+            open_menu(terminal=True)
+            assert item("Remove Tab Name") is None
+            dismiss()
+            rpc("search-tabs", query="")
             rpc("close", pane=other["pane"])
             wait_for(lambda: len(rpc("list")["tabs"]) == 1)
             chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_b)
@@ -563,7 +578,17 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             wait_for(lambda: tab(original_tab)["workspace"] == new_workspace["id"])
             assert {p["id"] for p in tab(original_tab)["panes"]} == expected_panes
             assert tab(other["tab"])["workspace"] is None
+            rpc("send", pane=other["pane"], text="printf '\\033]2;Automatic other\\007'", paste=True, enter=True)
+            wait_for(lambda: tab(other["tab"])["panes"][0]["title"] == "Automatic other")
             open_tab_menu("Workspace menu other")
+            original_name = tab(original_tab)["name"]
+            assert rpc("list")["active_tab"] == original_tab
+            activate("Remove Tab Name")
+            wait_for(lambda: tab(other["tab"])["name"] == tab(other["tab"])["panes"][0]["title"])
+            assert tab(original_tab)["name"] == original_name
+            assert rpc("list")["active_tab"] == original_tab
+            open_tab_menu(tab(other["tab"])["name"])
+            assert item("Remove Tab Name") is None
             key(Gdk.KEY_c)
             wait_for(lambda: len(rpc("list")["tabs"]) == 1)
             assert rpc("list")["tabs"][0]["id"] == original_tab

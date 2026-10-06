@@ -52,6 +52,9 @@ pub enum Command {
         tab: u64,
         name: String,
     },
+    RemoveTabName {
+        tab: u64,
+    },
 }
 
 // Missing means inherit the current filter; explicit null means unassigned.
@@ -201,6 +204,7 @@ impl Command {
                 | "workspace-delete"
                 | "move"
                 | "rename"
+                | "remove-tab-name"
         )
     }
 }

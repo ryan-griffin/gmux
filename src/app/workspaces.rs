@@ -232,6 +232,14 @@ impl Ui {
             let rename = gio::MenuItem::new(Some("_Rename Tab…"), None);
             rename.set_action_and_target_value(Some("win.rename-tab"), Some(&tab.id.to_variant()));
             menu.append_item(&rename);
+            if tab.custom_name {
+                let remove_name = gio::MenuItem::new(Some("R_emove Tab Name"), None);
+                remove_name.set_action_and_target_value(
+                    Some("win.remove-tab-name"),
+                    Some(&tab.id.to_variant()),
+                );
+                menu.append_item(&remove_name);
+            }
             let membership = gio::Menu::new();
             let destinations = gio::Menu::new();
             let mut mnemonics = HashSet::from(['m']);
