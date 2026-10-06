@@ -165,6 +165,7 @@ impl Ui {
             .is_some_and(|tab| self.tab_is_visible(tab));
         if state.active == previous_active && !visible && !reveal {
             // Typing in the sidebar can hide the active row without changing its terminal.
+            self.update_tab_actions(state.active != 0);
         } else if state.active != 0 && (reveal || visible) {
             self.switch(state.active);
         } else if state.active != 0 {

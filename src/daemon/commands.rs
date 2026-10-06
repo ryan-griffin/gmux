@@ -385,6 +385,22 @@ impl Daemon {
                 tab.custom_name = true;
                 Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
             }
+            Command::RemoveTabName { tab } => {
+                let tab = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.id == tab)
+                    .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?;
+                let session = self
+                    .sessions
+                    .get_mut(&tab.active)
+                    .ok_or_else(|| anyhow::anyhow!("The tab's active pane has been closed"))?;
+                session.refresh_directory();
+                tab.name = session.title();
+                tab.custom_name = false;
+                Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
+            }
             Command::WorkspaceNew {
                 name,
                 directory,

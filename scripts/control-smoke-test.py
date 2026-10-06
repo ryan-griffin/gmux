@@ -32,6 +32,17 @@ with AppFixture() as fixture:
     fixture.rpc("_presentation", session=presentation)
     assert fixture.rpc("list")["tabs"][0]["layout"]["Split"]["vertical"], "Presentation saves must preserve daemon topology"
     command("rename", tab=tab, name="Builds")
+    invalid = rpc(fixture.env["GMUX_SOCKET"], "remove-tab-name", tab=0, check=False)
+    assert "Tab 0 does not exist" in invalid["error"]
+    assert fixture.rpc("list")["tabs"][0]["name"] == "Builds"
+    removed = command("remove-tab-name", tab=tab)
+    automatic_tab = next(t for t in removed["session"]["tabs"] if t["id"] == tab)
+    active_title = next(p["title"] for p in removed["metadata"] if p["id"] == second)
+    assert not automatic_tab["custom_name"] and automatic_tab["name"] == active_title
+    saved = json.loads((fixture.path / "config/gmux/session.json").read_text())
+    saved_tab = next(t for t in saved["tabs"] if t["id"] == tab)
+    assert not saved_tab["custom_name"] and saved_tab["name"] == automatic_tab["name"]
+    command("rename", tab=tab, name="Builds")
     command("workspace-edit", workspace=workspace, name="Renamed", directory=str(root))
     closed = command("close", pane=second)
     assert closed["session"]["tabs"][0]["layout"] == {"Pane": pane}

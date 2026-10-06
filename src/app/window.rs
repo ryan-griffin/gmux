@@ -646,6 +646,10 @@ fn terminal_menu_button() -> gtk::MenuButton {
     let menu = gio::Menu::new();
     let tab = gio::Menu::new();
     tab.append(Some("Re_name Tab…"), Some("win.rename"));
+    let remove_name =
+        gio::MenuItem::new(Some("R_emove Tab Name"), Some("win.remove-active-tab-name"));
+    remove_name.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+    tab.append_item(&remove_name);
     menu.append_section(None, &tab);
     let terminal = gio::Menu::new();
     terminal.append(Some("Split _Right"), Some("win.split-right"));

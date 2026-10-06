@@ -31,6 +31,10 @@ The separate Terminal Actions menu includes Rename Tab and
 Close Tab for the active tab, and split, Find, zoom, and Close Pane for its active
 pane. Its button is hidden when there is no active terminal.
 
+Remove Tab Name sits beside Rename Tab in both tab menus and is hidden for
+automatic names. It restores automatic title updates immediately and targets
+the clicked tab in the context menu.
+
 Menus use accessible names, keyboard navigation, and distinct mnemonics. Dynamic
 workspace labels escape literal underscores before choosing mnemonics. Tab
 context-menu actions target the clicked tab, including workspace moves and

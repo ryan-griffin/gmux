@@ -371,7 +371,14 @@ impl Ui {
                 .lookup_action(name)
                 .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
             {
-                action.set_enabled(enabled);
+                let available = enabled
+                    && (*name != "remove-active-tab-name"
+                        || self
+                            .tabs
+                            .borrow()
+                            .iter()
+                            .any(|tab| tab.id == self.active.get() && tab.custom_name));
+                action.set_enabled(available);
             }
         }
     }

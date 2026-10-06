@@ -35,7 +35,7 @@ Create tabs with the plus button. Manage Workspaces in the main menu lets you ad
 
 The main menu stays above the sidebar and creates tabs, including in a chosen directory or workspace. F10 reveals the sidebar and opens the menu. New Tab in Workspace lists saved workspaces and is disabled when none exist. Fullscreen is a checked item. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
 
-The three-dot Terminal Actions menu in the content header contains Rename Tab, Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Rename Tab changes the active tab's name. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both close actions ask for confirmation when processes are running. This menu is available with the sidebar hidden.
+The three-dot Terminal Actions menu in the content header contains Rename Tab, Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Rename Tab changes the active tab's name. To remove a custom name, choose Remove Tab Name beside Rename Tab in the Terminal Actions menu or the tab's context menu. The tab then follows the active pane's title again. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both close actions ask for confirmation when processes are running. This menu is available with the sidebar hidden.
 
 Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close Pane. In apps that capture mouse input, use Shift+right-click to open the menu. The Menu key and Shift+F10 also open it.
 
