@@ -20,7 +20,8 @@ struct Permit {
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.budget.state.lock().unwrap().bytes -= self.bytes;
+        let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes = state.bytes.saturating_sub(self.bytes);
         self.budget.ready.notify_all();
     }
 }
@@ -60,15 +61,19 @@ impl Sender {
     pub(crate) fn send(&self, item: Result<Packet, String>) -> anyhow::Result<()> {
         let bytes = match &item {
             Ok(packet) => packet_size(packet),
-            Err(error) => std::mem::size_of::<Message>() + error.capacity(),
+            Err(error) => std::mem::size_of::<Message>() + error.len(),
         };
         anyhow::ensure!(
             bytes <= self.budget.limit,
             "Incoming packet exceeds memory budget"
         );
-        let mut state = self.budget.state.lock().unwrap();
+        let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
         while !state.closed && state.bytes + bytes > self.budget.limit {
-            state = self.budget.ready.wait(state).unwrap();
+            state = self
+                .budget
+                .ready
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
         anyhow::ensure!(!state.closed, "Incoming stream is closed");
         state.bytes += bytes;
@@ -92,7 +97,11 @@ impl Receiver {
 }
 impl Drop for Receiver {
     fn drop(&mut self) {
-        self.budget.state.lock().unwrap().closed = true;
+        self.budget
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed = true;
         self.budget.ready.notify_all();
     }
 }
@@ -134,5 +143,20 @@ mod tests {
         let worker = std::thread::spawn(move || sender.send(Err("b".repeat(1024))));
         drop(receiver);
         assert!(worker.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn poisoned_budget_recovers_instead_of_panicking() {
+        let (sender, receiver) = channel(8 * 1024, 8);
+        let budget = sender.budget.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _guard = budget.state.lock().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+        assert!(poisoned.is_err());
+        sender.send(Err("recovered".to_owned())).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Err(text)) if text == "recovered"));
+        drop(receiver);
     }
 }

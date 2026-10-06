@@ -141,14 +141,25 @@ impl Server {
                 use std::sync::atomic::Ordering;
                 if active.fetch_add(1, Ordering::Relaxed) >= 64 {
                     active.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("Dropping IPC connection: over 64 active connections");
                     continue;
                 }
                 let active = active.clone();
                 let sender = sender.clone();
                 let wake = wake.clone();
                 std::thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    if stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .is_err()
+                    {
+                        eprintln!("Could not set IPC read timeout");
+                    }
+                    if stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .is_err()
+                    {
+                        eprintln!("Could not set IPC write timeout");
+                    }
                     let mut line = String::new();
                     use std::io::Read;
                     let response = if BufReader::new(&stream)
@@ -174,7 +185,9 @@ impl Server {
                     } else {
                         serde_json::json!({"error": "Invalid JSON request"})
                     };
-                    let _ = writeln!(stream, "{response}");
+                    if writeln!(stream, "{response}").is_err() {
+                        eprintln!("Could not write IPC response");
+                    }
                     active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -190,10 +203,13 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.notify();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("IPC server thread panicked during shutdown");
         }
-        let _ = std::fs::remove_file(&self.path);
+        // DeleteOnDrop logs removal failures; NotFound is ignored.
+        let _guard = crate::guard::DeleteOnDrop(self.path.clone());
     }
 }
 pub fn call(request: impl serde::Serialize) -> anyhow::Result<Value> {
@@ -247,9 +263,9 @@ impl Client {
             loop {
                 let job = {
                     let (lock, ready) = &*worker;
-                    let mut jobs = lock.lock().unwrap();
+                    let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
                     while jobs.queue.is_empty() && !jobs.closed {
-                        jobs = ready.wait(jobs).unwrap();
+                        jobs = ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
                     }
                     let Some(job) = jobs.queue.pop_front() else {
                         break;
@@ -306,7 +322,7 @@ impl Client {
     }
     fn enqueue(&self, job: Job) -> anyhow::Result<()> {
         let (lock, ready) = &*self.jobs;
-        let mut jobs = lock.lock().unwrap();
+        let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         // Only adjacent saves coalesce. A layout command is an ordering barrier.
         match (job, jobs.queue.back_mut()) {
             (Job::Focus(tab, pane), Some(Job::Focus(last_tab, last_pane))) => {
@@ -330,7 +346,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         let (lock, ready) = &*self.jobs;
-        lock.lock().unwrap().closed = true;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
         ready.notify_one();
     }
 }

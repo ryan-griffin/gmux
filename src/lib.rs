@@ -3,6 +3,7 @@
 pub mod control;
 pub mod daemon;
 mod engine;
+pub(crate) mod guard;
 mod incoming;
 pub mod ipc;
 pub mod model;

@@ -6,7 +6,7 @@ impl Ui {
         self.request(
             InternalRequest::Busy { panes: vec![id] },
             move |ui, result| match result {
-                Ok(value) => ui.confirm_close(id, value["busy"].as_bool().unwrap_or(true)),
+                Ok(value) => ui.confirm_close(id, busy_from_reply(&value)),
                 Err(e) => ui.message(&e.to_string()),
             },
         );
@@ -49,7 +49,7 @@ impl Ui {
             .flat_map(|t| t.panes.keys().copied())
             .collect();
         self.request(InternalRequest::Busy { panes }, |ui, result| match result {
-            Ok(value) => ui.confirm_quit(value["busy"].as_bool().unwrap_or(true)),
+            Ok(value) => ui.confirm_quit(busy_from_reply(&value)),
             Err(e) => ui.message(&e.to_string()),
         });
     }
@@ -494,5 +494,15 @@ impl Ui {
 fn announce_command(search: &gtk::SearchEntry, row: &gtk::ListBoxRow) {
     if let Some(row) = row.downcast_ref::<adw::ActionRow>() {
         search.announce(&row.title(), gtk::AccessibleAnnouncementPriority::Medium);
+    }
+}
+
+pub(crate) fn busy_from_reply(value: &serde_json::Value) -> bool {
+    match value.get("busy").and_then(|busy| busy.as_bool()) {
+        Some(busy) => busy,
+        None => {
+            eprintln!("Backend busy reply missing boolean; assuming busy");
+            true
+        }
     }
 }

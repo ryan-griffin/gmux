@@ -162,7 +162,11 @@ impl GlyphCache {
         // Evict one cluster at a time instead of clearing the entire cache
         // during Unicode-heavy output. Cached row nodes retain their fonts.
         if self.entries.len() == MAX_GLYPHS && !self.entries.contains_key(&key) {
-            self.entries.remove(&self.order.pop_front().unwrap());
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            } else {
+                debug_assert!(false, "glyph cache order is empty while the cache is full");
+            }
         }
         self.entries.entry(key).or_insert_with(|| {
             self.order.push_back(key);
@@ -592,15 +596,17 @@ impl TextBatch {
         glyphs.set_size(self.glyphs.len() as i32);
         glyphs.glyph_info_mut().clone_from_slice(&self.glyphs);
         glyphs.log_clusters_mut().fill(0);
-        let mut color = self.color.unwrap();
+        let Some(mut color) = self.color else {
+            self.glyphs.clear();
+            return 0;
+        };
         let alpha = color.alpha();
         color.set_alpha(1.0);
-        let node = gsk::TextNode::new(
-            self.font.as_ref().unwrap(),
-            &glyphs,
-            &color,
-            &graphene::Point::new(0.0, 0.0),
-        );
+        let Some(font) = self.font.as_ref() else {
+            self.glyphs.clear();
+            return 0;
+        };
+        let node = gsk::TextNode::new(font, &glyphs, &color, &graphene::Point::new(0.0, 0.0));
         self.glyphs.clear();
         if let Some(node) = node {
             // Color emoji ignore a text node's foreground color, including

@@ -7,8 +7,11 @@ impl Ui {
         directory: Option<PathBuf>,
     ) -> anyhow::Result<Rc<Self>> {
         gio::resources_register_include!("gmux.gresource")?;
-        gtk::IconTheme::for_display(&gdk::Display::default().unwrap())
-            .add_resource_path("/dev/gmux/Gmux/icons");
+        let Some(display) = gdk::Display::default() else {
+            eprintln!("No display available");
+            anyhow::bail!("No display available");
+        };
+        gtk::IconTheme::for_display(&display).add_resource_path("/dev/gmux/Gmux/icons");
         let settings = Rc::new(RefCell::new(storage::load::<Settings>("settings.json")?));
         let desktop_settings = font::desktop_settings();
         if let Some(desktop) = &desktop_settings {
@@ -53,7 +56,7 @@ impl Ui {
         let css = gtk::CssProvider::new();
         css.load_from_string(include_str!("../../data/style.css"));
         gtk::style_context_add_provider_for_display(
-            &gdk::Display::default().unwrap(),
+            &display,
             &css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
@@ -205,8 +208,10 @@ impl Ui {
         let toast = adw::ToastOverlay::new();
         toast.set_child(Some(&split));
         window.set_content(Some(&toast));
-        let breakpoint =
-            adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 700sp").unwrap());
+        let breakpoint = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 700sp")
+                .expect("static breakpoint expression must parse"),
+        );
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
         let keyboard = crate::terminal::KeyboardModifiers::install(&window);
@@ -549,7 +554,9 @@ impl Ui {
                             let response = result
                                 .map(|_| json!({"ok":true}))
                                 .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                            let _ = reply.try_send(response);
+                            if reply.try_send(response).is_err() {
+                                eprintln!("Control reply was dropped: receiver is gone");
+                            }
                         });
                         continue;
                     }
@@ -558,7 +565,9 @@ impl Ui {
                         let command = match serde_json::from_value(request.body) {
                             Ok(command) => command,
                             Err(error) => {
-                                let _ = reply.try_send(json!({"error":error.to_string()}));
+                                if reply.try_send(json!({"error":error.to_string()})).is_err() {
+                                    eprintln!("Control reply was dropped: receiver is gone");
+                                }
                                 continue;
                             }
                         };
@@ -566,7 +575,9 @@ impl Ui {
                             let response = result
                                 .and_then(|result| Ok(serde_json::to_value(result)?))
                                 .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                            let _ = reply.try_send(response);
+                            if reply.try_send(response).is_err() {
+                                eprintln!("Control reply was dropped: receiver is gone");
+                            }
                         });
                         continue;
                     }
@@ -576,16 +587,25 @@ impl Ui {
                         {
                             Ok(pane) => pane.id,
                             Err(error) => {
-                                let _ = request.reply.try_send(json!({"error":error.to_string()}));
+                                if request
+                                    .reply
+                                    .try_send(json!({"error":error.to_string()}))
+                                    .is_err()
+                                {
+                                    eprintln!("Control reply was dropped: receiver is gone");
+                                }
                                 continue;
                             }
                         };
                         let body = InternalRequest::Read { pane: Some(pane) };
                         let reply = request.reply;
                         ui.request(body, move |_, result| {
-                            let _ = reply.try_send(
-                                result.unwrap_or_else(|e| json!({"error":e.to_string()})),
-                            );
+                            if reply
+                                .try_send(result.unwrap_or_else(|e| json!({"error":e.to_string()})))
+                                .is_err()
+                            {
+                                eprintln!("Control reply was dropped: receiver is gone");
+                            }
                         });
                         continue;
                     }
@@ -595,7 +615,9 @@ impl Ui {
                     if ui.dirty.replace(false) {
                         ui.save_session();
                     }
-                    let _ = request.reply.try_send(response);
+                    if request.reply.try_send(response).is_err() {
+                        eprintln!("Control reply was dropped: receiver is gone");
+                    }
                 }
                 // Requests already queued when the fd was drained need another turn.
                 ui.wake.notify();

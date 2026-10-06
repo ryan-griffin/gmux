@@ -83,16 +83,52 @@ mod imp {
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
             match pspec.name() {
                 "hadjustment" => {
-                    let adjustment: Option<gtk::Adjustment> = value.get().unwrap();
+                    let adjustment: Option<gtk::Adjustment> = match value.get() {
+                        Ok(adjustment) => adjustment,
+                        Err(e) => {
+                            eprintln!("Invalid terminal property {}: {e}", pspec.name());
+                            return;
+                        }
+                    };
                     if let Some(adjustment) = &adjustment {
                         adjustment.configure(0.0, 0.0, 0.0, 1.0, 1.0, 0.0);
                     }
                     self.hadjustment.replace(adjustment);
                 }
-                "vadjustment" => self.set_vadjustment(value.get().unwrap()),
-                "hscroll-policy" => self.hscroll_policy.set(value.get().unwrap()),
-                "vscroll-policy" => self.vscroll_policy.set(value.get().unwrap()),
-                name => unreachable!("Unknown property {name}"),
+                "vadjustment" => {
+                    let adjustment: Option<gtk::Adjustment> = match value.get() {
+                        Ok(adjustment) => adjustment,
+                        Err(e) => {
+                            eprintln!("Invalid terminal property {}: {e}", pspec.name());
+                            return;
+                        }
+                    };
+                    self.set_vadjustment(adjustment);
+                }
+                "hscroll-policy" => {
+                    let policy: gtk::ScrollablePolicy = match value.get() {
+                        Ok(policy) => policy,
+                        Err(e) => {
+                            eprintln!("Invalid terminal property {}: {e}", pspec.name());
+                            return;
+                        }
+                    };
+                    self.hscroll_policy.set(policy);
+                }
+                "vscroll-policy" => {
+                    let policy: gtk::ScrollablePolicy = match value.get() {
+                        Ok(policy) => policy,
+                        Err(e) => {
+                            eprintln!("Invalid terminal property {}: {e}", pspec.name());
+                            return;
+                        }
+                    };
+                    self.vscroll_policy.set(policy);
+                }
+                name => {
+                    eprintln!("Unknown terminal property {name}; ignoring");
+                    return;
+                }
             }
             self.obj().queue_allocate();
         }

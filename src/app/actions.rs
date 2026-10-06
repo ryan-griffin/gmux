@@ -253,11 +253,20 @@ impl Ui {
             "next-pane" | "previous-pane" => {
                 let (ids, active) = {
                     let list = self.tabs.borrow();
-                    let w = list.iter().find(|w| w.id == self.active.get()).unwrap();
+                    let Some(w) = list.iter().find(|w| w.id == self.active.get()) else {
+                        eprintln!("Active tab {} missing for pane switch", self.active.get());
+                        return;
+                    };
                     let ids = w.layout.borrow().ids();
                     (ids, w.active)
                 };
-                let index = ids.iter().position(|id| *id == active).unwrap();
+                if ids.is_empty() {
+                    return;
+                }
+                let Some(index) = ids.iter().position(|id| *id == active) else {
+                    eprintln!("Active pane {active} missing for pane switch");
+                    return;
+                };
                 let next = (index
                     + if name == "next-pane" {
                         1

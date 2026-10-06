@@ -22,7 +22,6 @@ use std::{
             net::{UnixListener, UnixStream},
         },
     },
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -50,7 +49,12 @@ impl NotificationQueue {
         while self.messages.len() >= MAX_NOTIFICATIONS
             || self.bytes + message.len() > MAX_NOTIFICATION_BYTES
         {
-            self.bytes -= self.messages.pop_front().unwrap().len();
+            if let Some(old) = self.messages.pop_front() {
+                self.bytes -= old.len();
+            } else {
+                debug_assert!(false, "NotificationQueue over limit with empty queue");
+                break;
+            }
         }
         self.bytes += message.len();
         self.messages.push_back(message);
@@ -228,6 +232,8 @@ impl Daemon {
     fn reserve_ids(&mut self, count: u64) -> anyhow::Result<u64> {
         // Closed panes can still appear in queued packets and command replies.
         // Keep their IDs reserved until this daemon stops, across all ID types.
+        // New/Split/WorkspaceNew are per user command (not per tick), so reload
+        // the catalog each time: external edits to workspaces.json stay safe.
         self.last_id = storage::load_catalog()?
             .workspaces
             .iter()
@@ -337,6 +343,11 @@ impl Daemon {
         self.select_visible();
     }
     fn refresh_state(&mut self) {
+        // Called for on-demand snapshots (State/List/saves), not per frame:
+        // per-tick streaming uses `updates(metadata_due)` and the 1s
+        // `metadata_due` refresh in event_loop.rs. Keep the per-pane
+        // `/proc` + OSC reads here so replies and saves stay current.
+        // TODO: skip panes whose poll showed no change if this ever profiles hot.
         for tab in &mut self.state.tabs {
             for id in tab.layout.ids() {
                 if let Some(session) = self.sessions.get_mut(&id) {
@@ -359,6 +370,7 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn id_ranges_reserve_both_new_ids_and_preserve_the_last_valid_id_after_failure() {

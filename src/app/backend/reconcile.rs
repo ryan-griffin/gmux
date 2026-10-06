@@ -37,6 +37,10 @@ pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<u64
             return false;
         };
         let ids = layout.ids();
+        let Some(fallback) = ids.last().copied() else {
+            eprintln!("Exited panes emptied tab {}; dropping it", saved.id);
+            return false;
+        };
         if !ids.contains(&saved.active) {
             let index = old_ids
                 .iter()
@@ -46,7 +50,7 @@ pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<u64
                 .iter()
                 .find(|id| ids.contains(id))
                 .copied()
-                .unwrap_or_else(|| *ids.last().unwrap());
+                .unwrap_or(fallback);
         }
         saved.layout = layout;
         true

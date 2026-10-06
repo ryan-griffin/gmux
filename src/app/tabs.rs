@@ -474,7 +474,10 @@ impl Ui {
         let was_active = self.active.get() == tab;
         let remaining = {
             let mut tabs = self.tabs.borrow_mut();
-            let w = tabs.iter_mut().find(|w| w.id == tab).unwrap();
+            let Some(w) = tabs.iter_mut().find(|w| w.id == tab) else {
+                eprintln!("Tab {tab} vanished while closing pane {id}; ignoring");
+                return Err(anyhow::anyhow!("Tab {tab} does not exist"));
+            };
             let old_ids = w.layout.borrow().ids();
             let layout = w.layout.borrow().clone().remove(id);
             if let Some(p) = w.panes.remove(&id) {
@@ -502,7 +505,17 @@ impl Ui {
         } else {
             let (w, index) = {
                 let mut list = self.tabs.borrow_mut();
-                let index = list.iter().position(|w| w.id == tab).unwrap();
+                let Some(index) = list.iter().position(|w| w.id == tab) else {
+                    eprintln!("Tab {tab} vanished while closing its last pane; showing empty view");
+                    drop(list);
+                    if was_active {
+                        self.show_empty();
+                    }
+                    self.refresh_branches();
+                    self.refresh_sidebar();
+                    self.mark_dirty();
+                    return Ok(());
+                };
                 let visible_index = list[..index]
                     .iter()
                     .filter(|tab| self.tab_is_visible(tab))
@@ -613,7 +626,13 @@ fn layout_widget(
     ui: std::rc::Weak<Ui>,
 ) -> gtk::Widget {
     match layout {
-        Layout::Pane(id) => panes[id].root.clone().upcast(),
+        Layout::Pane(id) => match panes.get(id) {
+            Some(pane) => pane.root.clone().upcast(),
+            None => {
+                eprintln!("Missing pane {id} in layout; showing placeholder");
+                gtk::Box::new(gtk::Orientation::Vertical, 0).upcast()
+            }
+        },
         Layout::Split {
             vertical,
             first,

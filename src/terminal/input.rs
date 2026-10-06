@@ -138,8 +138,10 @@ impl Terminal {
         focus.connect_enter(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.im.focus_in();
-                if t.session.borrow().mode(1004) {
-                    let _ = t.send(b"\x1b[I");
+                if t.session.borrow().mode(1004)
+                    && let Err(error) = t.send(b"\x1b[I")
+                {
+                    eprintln!("Failed to send focus event: {error}");
                 }
                 on_focus(t.id);
             }
@@ -148,8 +150,10 @@ impl Terminal {
         focus.connect_leave(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.im.focus_out();
-                if t.session.borrow().mode(1004) {
-                    let _ = t.send(b"\x1b[O");
+                if t.session.borrow().mode(1004)
+                    && let Err(error) = t.send(b"\x1b[O")
+                {
+                    eprintln!("Failed to send focus event: {error}");
                 }
                 t.area.queue_draw();
             }
@@ -194,8 +198,10 @@ impl Terminal {
         let weak = Rc::downgrade(self);
         self.im.connect_commit(move |_, text| {
             if let Some(t) = weak.upgrade() {
-                if t.selection.borrow_mut().take().is_some() {
-                    let _ = t.session.borrow().clear_selection();
+                if t.selection.borrow_mut().take().is_some()
+                    && let Err(error) = t.session.borrow().clear_selection()
+                {
+                    eprintln!("Failed to clear selection: {error}");
                 }
                 let pending = pending.borrow();
                 t.key_input(&pending.0, pending.1, pending.2, false, text);
@@ -260,8 +266,10 @@ impl Terminal {
             });
             if !modifier {
                 t.stop_selection_drag();
-                if t.selection.borrow_mut().take().is_some() {
-                    let _ = t.session.borrow().clear_selection();
+                if t.selection.borrow_mut().take().is_some()
+                    && let Err(error) = t.session.borrow().clear_selection()
+                {
+                    eprintln!("Failed to clear selection: {error}");
                 }
             }
             t.key_input(
@@ -387,7 +395,9 @@ impl Terminal {
                 t.selection_anchor
                     .set(Some(offset * cols + t.cell_at(x, y)));
                 t.selection.borrow_mut().take();
-                let _ = t.session.borrow().clear_selection();
+                if let Err(error) = t.session.borrow().clear_selection() {
+                    eprintln!("Failed to clear selection: {error}");
+                }
                 t.area.queue_draw();
             }
         });

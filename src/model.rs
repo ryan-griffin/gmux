@@ -5,7 +5,19 @@ use std::{
 };
 
 pub fn home() -> PathBuf {
-    directories::BaseDirs::new().unwrap().home_dir().to_owned()
+    if let Some(dirs) = directories::BaseDirs::new() {
+        let home = dirs.home_dir().to_owned();
+        if !home.as_os_str().is_empty() {
+            return home;
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if !home.as_os_str().is_empty() {
+            return home;
+        }
+    }
+    PathBuf::from("/")
 }
 pub fn display_path(path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(home()) {
@@ -332,6 +344,22 @@ mod tests {
         let layout = layout.remove(2).unwrap();
         assert_eq!(layout.ids(), vec![1, 3]);
         assert_eq!(layout.remove(1).unwrap().ids(), vec![3]);
+    }
+    #[test]
+    fn home_never_panics_and_root_paths_display_without_panicking() {
+        let home = super::home();
+        assert!(!home.as_os_str().is_empty());
+        assert_eq!(super::display_path(&home), "~");
+        assert_eq!(super::directory_name(&home), "~");
+        let root = Path::new("/");
+        assert!(!super::display_path(root).is_empty());
+        assert!(!super::directory_name(root).is_empty());
+        if home.as_os_str() == "/" {
+            assert_eq!(super::display_path(root), "~");
+            assert_eq!(super::directory_name(root), "~");
+            assert_eq!(super::display_path(Path::new("/foo")), "~/foo");
+            assert_eq!(super::directory_name(Path::new("/foo")), "foo");
+        }
     }
     #[test]
     fn saved_tabs_reject_duplicate_and_overflowing_ids() {

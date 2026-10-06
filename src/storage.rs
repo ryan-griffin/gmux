@@ -1,13 +1,28 @@
 //! State-file reads and durable, serialized atomic writes.
-use crate::model::WorkspaceCatalog;
+use crate::{guard::DeleteOnDrop, model::WorkspaceCatalog};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "gmux")
-        .unwrap()
-        .config_dir()
-        .to_owned()
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "gmux") {
+        let dir = dirs.config_dir().to_owned();
+        if !dir.as_os_str().is_empty() {
+            return dir;
+        }
+    }
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() {
+            return dir.join("gmux");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if !home.as_os_str().is_empty() {
+            return home.join(".config").join("gmux");
+        }
+    }
+    PathBuf::from("/.config/gmux")
 }
 pub fn load<T: serde::de::DeserializeOwned + Default>(name: &str) -> anyhow::Result<T> {
     load_at(&config_dir().join(name))
@@ -86,13 +101,7 @@ fn save_at<T: Serialize + serde::de::DeserializeOwned + Default>(
             Err(error) => return Err(error.into()),
         }
     };
-    struct Temporary(PathBuf);
-    impl Drop for Temporary {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let temp = Temporary(temp);
+    let temp = DeleteOnDrop(temp);
     let mut writer = std::io::BufWriter::new(&mut file);
     serde_json::to_writer_pretty(&mut writer, value)?;
     writer.flush()?;

@@ -133,17 +133,26 @@ impl Packet {
             data.len() == expected * CELL_BYTES,
             "Invalid viewport cell data"
         );
-        let cells = data
-            .as_chunks::<CELL_BYTES>()
-            .0
-            .iter()
-            .map(|bytes| Cell {
-                text: bytes[..64].try_into().unwrap(),
-                fg: bytes[64..67].try_into().unwrap(),
-                bg: bytes[67..70].try_into().unwrap(),
+        let chunks = data.as_chunks::<CELL_BYTES>().0;
+        let mut cells = Vec::with_capacity(expected);
+        for bytes in chunks {
+            use anyhow::Context;
+            let text: [u8; 64] = bytes[..64]
+                .try_into()
+                .context("Invalid viewport cell text")?;
+            let fg: [u8; 3] = bytes[64..67]
+                .try_into()
+                .context("Invalid viewport cell fg")?;
+            let bg: [u8; 3] = bytes[67..70]
+                .try_into()
+                .context("Invalid viewport cell bg")?;
+            cells.push(Cell {
+                text,
+                fg,
+                bg,
                 flags: bytes[70],
-            })
-            .collect();
+            });
+        }
         Ok(Self { header, cells })
     }
 }

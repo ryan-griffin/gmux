@@ -136,7 +136,9 @@ fn write_paste(
 }
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        if let Err(error) = self.socket.shutdown(std::net::Shutdown::Both) {
+            eprintln!("Failed to shut down daemon connection: {error}");
+        }
     }
 }
 
@@ -161,10 +163,22 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
                 value["version"] == transport::VERSION,
                 "Incompatible gmux daemon. Stop it with gmux quit before upgrading."
             );
-            if !value["quitting"].as_bool().unwrap_or(false) {
+            let quitting = match value.get("quitting") {
+                None => false,
+                Some(flag) => match flag.as_bool() {
+                    Some(quitting) => quitting,
+                    None => {
+                        eprintln!("Ignoring non-boolean daemon quitting flag: {flag}");
+                        false
+                    }
+                },
+            };
+            if !quitting {
                 if let Some(mut child) = child.take() {
                     std::thread::spawn(move || {
-                        let _ = child.wait();
+                        if let Err(error) = child.wait() {
+                            eprintln!("Failed to reap daemon child: {error}");
+                        }
                     });
                 }
                 return Ok(());
@@ -244,9 +258,13 @@ impl SessionManager {
                 let result = outgoing.write(&mut writer);
                 writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
                 if let Err(error) = result {
-                    let _ = errors.send(Err(error.to_string()));
+                    if let Err(send_error) = errors.send(Err(error.to_string())) {
+                        eprintln!("Failed to report daemon write error: {send_error}");
+                    }
                     writer_wake.notify();
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
+                    if let Err(error) = writer.shutdown(std::net::Shutdown::Both) {
+                        eprintln!("Failed to shut down daemon writer: {error}");
+                    }
                     break;
                 }
                 // Retry state commands after queue backpressure without a timer.
@@ -385,7 +403,9 @@ impl SessionManager {
     }
     pub fn poll(&mut self) -> HashMap<u64, SessionUpdate> {
         // A full command queue must not lose a tab's viewport subscription.
-        let _ = self.subscribe();
+        if let Err(error) = self.subscribe() {
+            eprintln!("Failed to subscribe to daemon viewports: {error}");
+        }
         self.flush_reads();
         for session in self.sessions.values() {
             session.borrow().flush_scroll();
@@ -464,7 +484,9 @@ impl SessionManager {
     }
     pub fn clear(&mut self) {
         self.sessions.clear();
-        let _ = self.connection.socket.shutdown(std::net::Shutdown::Both);
+        if let Err(error) = self.connection.socket.shutdown(std::net::Shutdown::Both) {
+            eprintln!("Failed to shut down daemon connection: {error}");
+        }
     }
 }
 impl Drop for SessionManager {
@@ -662,6 +684,9 @@ impl RemoteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn session_meta(session: &SessionHandle) -> Metadata {
+        session.borrow().meta.clone()
+    }
     fn request(value: Value) -> StreamRequest {
         serde_json::from_value(value).unwrap()
     }
@@ -852,7 +877,7 @@ mod tests {
     fn idle_and_metadata_updates_do_not_repaint_or_change_cells() {
         let (mut manager, sender, session) = manager();
         assert!(manager.poll().is_empty());
-        let mut meta = session.borrow().meta.clone();
+        let mut meta = session_meta(&session);
         meta.directory = PathBuf::from("/tmp/project");
         meta.title = "worker".into();
         sender
@@ -889,7 +914,7 @@ mod tests {
     fn exits_arrive_for_unattached_panes_and_survive_update_coalescing() {
         let (mut manager, sender, session) = manager();
         for (id, exited) in [(2, false), (2, true), (1, true), (1, false)] {
-            let mut meta = session.borrow().meta.clone();
+            let mut meta = session_meta(&session);
             meta.id = id;
             meta.exited = exited;
             sender
@@ -926,7 +951,7 @@ mod tests {
             (vec!["first"], false),
             (vec!["second"], true),
         ] {
-            let mut meta = session.borrow().meta.clone();
+            let mut meta = session_meta(&session);
             meta.id = 2;
             meta.exited = exited;
             let empty = notifications.is_empty();
@@ -970,7 +995,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        meta: session.borrow().meta.clone(),
+                        meta: session_meta(&session),
                         frame: Some(frame),
                         scroll_serial: 0,
                         rows: vec![row],
@@ -1031,7 +1056,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        meta: session.borrow().meta.clone(),
+                        meta: session_meta(&session),
                         frame: Some(frame),
                         scroll_serial: serial,
                         rows: vec![],
@@ -1088,7 +1113,7 @@ mod tests {
         manager.mark_read(1);
         assert!(!session.borrow().unread());
         for (sequence, expected) in [(7, false), (0, false), (8, true)] {
-            let mut meta = session.borrow().meta.clone();
+            let mut meta = session_meta(&session);
             meta.unread = sequence;
             sender
                 .send(Ok(Packet {

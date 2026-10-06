@@ -50,13 +50,7 @@ pub fn run() -> anyhow::Result<()> {
     let listener = UnixListener::bind(&stream_path)?;
     std::fs::set_permissions(&stream_path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    struct SocketCleanup(PathBuf);
-    impl Drop for SocketCleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _cleanup = SocketCleanup(stream_path);
+    let _cleanup = crate::guard::DeleteOnDrop(stream_path);
     let mut daemon = Daemon::new()?;
     let mut persistence = Worker::new(wake.clone());
     let mut saving: Option<PendingControl> = None;
@@ -181,10 +175,11 @@ pub fn run() -> anyhow::Result<()> {
         }
         for (id, result) in persistence.results() {
             if saving.as_ref().is_some_and(|pending| pending.id == id) {
-                saving = saving
-                    .take()
-                    .unwrap()
-                    .complete(&mut daemon, &persistence, result);
+                if let Some(pending) = saving.take() {
+                    saving = pending.complete(&mut daemon, &persistence, result);
+                } else {
+                    debug_assert!(false, "save completion without pending save");
+                }
             } else if let Err(error) = result {
                 eprintln!("Could not save layout: {error}");
             }
@@ -259,7 +254,9 @@ pub fn run() -> anyhow::Result<()> {
                 std::thread::spawn(move || {
                     let response = ipc::call_at(&ipc::companion_path(".ui"), request.body)
                         .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                    let _ = request.reply.try_send(response);
+                    if request.reply.try_send(response).is_err() {
+                        eprintln!("UI forward reply was dropped: receiver is gone");
+                    }
                 });
             } else {
                 let Some(request) = ControlRequest::decode(request) else {

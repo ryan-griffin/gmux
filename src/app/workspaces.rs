@@ -97,9 +97,11 @@ impl Ui {
                 .workspaces
                 .iter()
                 .find(|w| w.id == id)
-                .unwrap()
-                .name
-                .clone(),
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| {
+                    eprintln!("Workspace {id} missing; showing all tabs");
+                    "All Tabs".into()
+                }),
         };
         self.filter_title.set_title(&title);
         let target = match filter {
@@ -590,7 +592,7 @@ impl Ui {
         self.request(
             InternalRequest::Busy { panes },
             move |ui, result| match result {
-                Ok(value) => ui.confirm_close_tab(id, value["busy"].as_bool().unwrap_or(true)),
+                Ok(value) => ui.confirm_close_tab(id, super::dialogs::busy_from_reply(&value)),
                 Err(e) => ui.message(&e.to_string()),
             },
         );

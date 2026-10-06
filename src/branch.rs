@@ -46,6 +46,15 @@ impl BranchCache {
     }
 }
 
+fn reap_child(child: &mut std::process::Child) {
+    if let Err(error) = child.kill() {
+        eprintln!("Failed to kill git lookup: {error}");
+    }
+    if let Err(error) = child.wait() {
+        eprintln!("Failed to reap git lookup: {error}");
+    }
+}
+
 fn bounded_output(command: &mut Command, timeout: Duration) -> io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
@@ -54,7 +63,10 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> io::Result<Output
         .process_group(0)
         .spawn()?;
     let result = (|| {
-        let mut stdout = child.stdout.take().expect("Git stdout is piped");
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("Git stdout is not piped"))?;
         let fd = stdout.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -124,8 +136,7 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> io::Result<Output
         unsafe {
             libc::killpg(child.id() as i32, libc::SIGKILL);
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        reap_child(&mut child);
     }
     result
 }
@@ -281,11 +292,12 @@ impl BranchWorker {
                 queued.remove(id);
             }
             running[worker] = Some(directory.clone());
+            // Practically infallible: requires more than u64::MAX dispatches.
             let generation = self
                 .generation
                 .get()
                 .checked_add(1)
-                .expect("Git generation overflow");
+                .expect("Git generation counter overflowed after u64::MAX dispatches");
             self.generation.set(generation);
             if self.senders[worker]
                 .try_send(Job {

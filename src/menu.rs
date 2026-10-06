@@ -46,7 +46,14 @@ pub fn context_menu_shortcut(key: gdk::Key, modifiers: gdk::ModifierType) -> boo
 
 pub fn mnemonic_label(label: &str, used: &mut HashSet<char>) -> String {
     let available = |character: char| {
-        character.is_alphanumeric() && !used.contains(&character.to_lowercase().next().unwrap())
+        if !character.is_alphanumeric() {
+            return false;
+        }
+        if let Some(lower) = character.to_lowercase().next() {
+            !used.contains(&lower)
+        } else {
+            !used.contains(&character)
+        }
     };
     let mnemonic = label
         .char_indices()
@@ -60,7 +67,11 @@ pub fn mnemonic_label(label: &str, used: &mut HashSet<char>) -> String {
                 .find(|&(_, character)| available(character))
         })
         .map(|(index, character)| {
-            used.insert(character.to_lowercase().next().unwrap());
+            if let Some(lower) = character.to_lowercase().next() {
+                used.insert(lower);
+            } else {
+                used.insert(character);
+            }
             index
         });
     let mut result = String::with_capacity(label.len() + 1);

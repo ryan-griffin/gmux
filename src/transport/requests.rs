@@ -36,7 +36,10 @@ impl StreamRequest {
             Err(error) => {
                 // Invalid requests still need their pane for error delivery, and
                 // a malformed attach must disconnect just like a version mismatch.
-                let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+                let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_else(|e| {
+                    eprintln!("Ignoring malformed frontend command envelope: {e}");
+                    serde_json::Value::default()
+                });
                 Self {
                     pane: raw["pane"].as_u64(),
                     command: StreamCommand::Invalid {

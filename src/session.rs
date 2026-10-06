@@ -41,19 +41,27 @@ struct Pty {
     eof: bool,
 }
 
+fn reap_child(mut child: Box<dyn Child + Send + Sync>) {
+    if let Err(error) = child.kill() {
+        eprintln!("Failed to kill terminal child: {error}");
+    }
+    // Reap asynchronously so closing a session does not block its owner.
+    std::thread::spawn(move || {
+        if let Err(error) = child.wait() {
+            eprintln!("Failed to reap terminal child: {error}");
+        }
+    });
+}
+
 impl Drop for Pty {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        if let Some(child) = self.child.take() {
             if let Some(fg) = self.master.process_group_leader().filter(|pid| *pid > 1) {
                 unsafe {
                     libc::kill(-fg, libc::SIGHUP);
                 }
             }
-            let _ = child.kill();
-            // Reap asynchronously so closing a session does not block its owner.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            reap_child(child);
         }
     }
 }
@@ -200,56 +208,62 @@ impl TerminalSession {
             ..SessionUpdate::default()
         };
         if let Some(pty) = &mut self.pty {
-            let fd = pty.master.as_raw_fd().unwrap();
-            let mut pending = pty.pending.borrow_mut();
-            let mut budget = 512 * 1024;
-            while !pending.is_empty() && budget > 0 {
-                let (bytes, _) = pending.as_slices();
-                let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len().min(budget)) };
-                if n > 0 {
-                    pending.drain(..n as usize);
-                    budget -= n as usize;
-                } else {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
+            if let Some(fd) = pty.master.as_raw_fd() {
+                let mut pending = pty.pending.borrow_mut();
+                let mut budget = 512 * 1024;
+                while !pending.is_empty() && budget > 0 {
+                    let (bytes, _) = pending.as_slices();
+                    let n =
+                        unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len().min(budget)) };
+                    if n > 0 {
+                        pending.drain(..n as usize);
+                        budget -= n as usize;
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.kind() != std::io::ErrorKind::WouldBlock {
+                            update.error = Some(error.to_string());
+                            pending.clear();
+                        }
+                        break;
                     }
-                    if error.kind() != std::io::ErrorKind::WouldBlock {
-                        update.error = Some(error.to_string());
-                        pending.clear();
-                    }
-                    break;
                 }
-            }
-            // Bound work per session so a noisy process cannot block its owner.
-            let mut buffer = [0u8; 16384];
-            for _ in 0..32 {
-                if pty.eof {
-                    break;
-                }
-                let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-                if n > 0 {
-                    self.engine.write(&buffer[..n as usize]);
-                    update.changed = true;
-                } else if n == 0 {
-                    pty.eof = true;
-                    break;
-                } else {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
+                // Bound work per session so a noisy process cannot block its owner.
+                let mut buffer = [0u8; 16384];
+                for _ in 0..32 {
+                    if pty.eof {
+                        break;
                     }
-                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                    let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+                    if n > 0 {
+                        self.engine.write(&buffer[..n as usize]);
+                        update.changed = true;
+                    } else if n == 0 {
                         pty.eof = true;
+                        break;
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.kind() != std::io::ErrorKind::WouldBlock {
+                            pty.eof = true;
+                        }
+                        break;
                     }
-                    break;
                 }
+            } else {
+                update.error = Some("PTY has no file descriptor".to_owned());
             }
         }
         let (replies, notifications) = self.engine.take_events();
         update.notifications = notifications;
-        if !replies.is_empty() {
-            let _ = self.send(&replies);
+        if !replies.is_empty()
+            && let Err(error) = self.send(&replies)
+        {
+            eprintln!("Failed to send terminal reply: {error}");
         }
         update.changed |= self.engine.poll_find();
         if self.engine.take_directory_update() {
@@ -296,9 +310,25 @@ impl TerminalSession {
     }
 
     pub fn refresh_directory(&mut self) {
-        let actual_directory = self
-            .foreground_pid()
-            .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok());
+        // Deliberately no throttle here: callers already gate the rate.
+        // `poll` only refreshes after an OSC directory update, the event loop
+        // bulk-refreshes at most once per second (`metadata_due`, 1s tick),
+        // and all other callers are single-pane on-demand paths (Split,
+        // Metadata, State/List snapshots). Adding a second throttle here would
+        // delay cwd display for no measurable gain.
+        // TODO: add a cheap early-out (e.g. skip when the foreground pid is
+        // unchanged and no OSC update arrived) only if this profiles hot.
+        let actual_directory = self.foreground_pid().and_then(|pid| {
+            let link = format!("/proc/{pid}/cwd");
+            match std::fs::read_link(&link) {
+                Ok(directory) => Some(directory),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    eprintln!("Failed to read {link}: {error}");
+                    None
+                }
+            }
+        });
         if let Some(directory) = actual_directory {
             self.directory = directory;
         } else {
@@ -472,7 +502,14 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if let Err(error) = std::fs::remove_dir_all(&self.0)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "failed to remove test directory {}: {error}",
+                    self.0.display()
+                );
+            }
         }
     }
 

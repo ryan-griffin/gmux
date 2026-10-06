@@ -617,7 +617,9 @@ impl Terminal {
             if let (Some(t), Ok(Some(text))) = (weak.upgrade(), result) {
                 t.stop_selection_drag();
                 t.selection.borrow_mut().take();
-                let _ = t.session.borrow().clear_selection();
+                if let Err(error) = t.session.borrow().clear_selection() {
+                    eprintln!("{error}");
+                }
                 if let Err(error) = t.session.borrow().paste(&text) {
                     t.show_status(&error.to_string());
                 }

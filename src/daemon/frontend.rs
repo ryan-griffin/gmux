@@ -30,6 +30,10 @@ pub(super) struct Paste {
     pub(super) options: PasteOptions,
 }
 impl Frontend {
+    fn scroll_serial(&self, id: u64) -> u64 {
+        self.scroll_serials.get(&id).copied().unwrap_or(0)
+    }
+
     pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
         // Compact after consuming at least half the buffer, rather than moving
         // pending packets for every partial socket write.
@@ -105,11 +109,16 @@ impl Daemon {
                     version == transport::VERSION,
                     "Incompatible frontend protocol"
                 );
-                self.frontend.as_mut().unwrap().attached = true;
+                self.frontend
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
+                    .attached = true;
                 return Ok(());
             }
             StreamCommand::Invalid { message, .. } => {
-                self.frontend.as_mut().unwrap().paste = None;
+                if let Some(frontend) = self.frontend.as_mut() {
+                    frontend.paste = None;
+                }
                 anyhow::bail!("{message}");
             }
             _ => {}
@@ -119,7 +128,10 @@ impl Daemon {
             "Frontend must attach first"
         );
         if let StreamCommand::Subscribe { panes } = command {
-            let frontend = self.frontend.as_mut().unwrap();
+            let frontend = self
+                .frontend
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?;
             for id in &panes {
                 if !frontend.visible.contains(id) {
                     frontend.screens.remove(id);
@@ -133,18 +145,26 @@ impl Daemon {
         let id = match self.resolve_pane(pane) {
             Ok(id) => id,
             Err(error) => {
-                self.frontend.as_mut().unwrap().paste = None;
+                if let Some(frontend) = self.frontend.as_mut() {
+                    frontend.paste = None;
+                }
                 return Err(error);
             }
         };
         match command {
             StreamCommand::PasteBegin { size, options } => {
-                self.frontend.as_mut().unwrap().paste = None;
+                self.frontend
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
+                    .paste = None;
                 anyhow::ensure!(
                     size <= transport::MAX_PASTE,
                     "Paste is too large. The limit is 4 MiB."
                 );
-                self.frontend.as_mut().unwrap().paste = Some(Paste {
+                self.frontend
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
+                    .paste = Some(Paste {
                     pane: id,
                     size,
                     text: String::with_capacity(size),
@@ -156,7 +176,7 @@ impl Daemon {
                 let mut paste = self
                     .frontend
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
                     .paste
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("No paste is in progress"))?;
@@ -167,14 +187,17 @@ impl Daemon {
                     "Invalid paste chunk"
                 );
                 paste.text.push_str(&text);
-                self.frontend.as_mut().unwrap().paste = Some(paste);
+                self.frontend
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
+                    .paste = Some(paste);
                 return Ok(());
             }
             StreamCommand::PasteEnd => {
                 let paste = self
                     .frontend
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
                     .paste
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("No paste is in progress"))?;
@@ -203,7 +226,10 @@ impl Daemon {
             }
             _ => {}
         }
-        let session = self.sessions.get_mut(&id).unwrap();
+        let session = self
+            .sessions
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?;
         match command {
             StreamCommand::Copy => {
                 self.clipboard.insert(id, session.copy()?);
@@ -260,7 +286,7 @@ impl Daemon {
                 session.scroll_to(row);
                 self.frontend
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| anyhow::anyhow!("Frontend disconnected"))?
                     .scroll_serials
                     .insert(id, serial);
             }
@@ -335,6 +361,7 @@ impl Daemon {
                 let snapshot = session.snapshot()?;
                 self.snapshots += 1;
                 let cols = snapshot.frame.cols as usize;
+                let serial = frontend.scroll_serial(id);
                 let old = frontend.screens.entry(id).or_default();
                 let full =
                     old.frame.cols != snapshot.frame.cols || old.frame.rows != snapshot.frame.rows;
@@ -351,7 +378,6 @@ impl Daemon {
                 }
                 self.sent_rows += rows.len() as u64;
                 // A client can discard every row while detached; attachment always resends a full viewport.
-                let serial = frontend.scroll_serials.get(&id).copied().unwrap_or(0);
                 let send = full
                     || !rows.is_empty()
                     || old.frame != snapshot.frame
@@ -378,16 +404,15 @@ impl Daemon {
             frontend.find.insert(id, find.clone());
             frontend.selections.insert(id, selection);
             frontend.metadata.insert(id, meta.clone());
-            frontend
-                .sent_scroll_serials
-                .insert(id, frontend.scroll_serials.get(&id).copied().unwrap_or(0));
+            let serial = frontend.scroll_serial(id);
+            frontend.sent_scroll_serials.insert(id, serial);
             // Large selections should not share the size limit of a full viewport.
             if let Some(text) = copy.take() {
                 frontend.queue(Packet {
                     header: Header {
                         meta: meta.clone(),
                         frame: None,
-                        scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
+                        scroll_serial: serial,
                         rows: Vec::new(),
                         notifications: Vec::new(),
                         error: None,
@@ -402,7 +427,7 @@ impl Daemon {
                 header: Header {
                     meta,
                     frame,
-                    scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
+                    scroll_serial: serial,
                     rows,
                     notifications: notify,
                     error,

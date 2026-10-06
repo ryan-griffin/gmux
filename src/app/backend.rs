@@ -126,7 +126,10 @@ impl Ui {
             }
             let new_ids: Vec<_> = {
                 let tabs = self.tabs.borrow();
-                let tab = tabs.iter().find(|t| t.id == saved.id).unwrap();
+                let Some(tab) = tabs.iter().find(|t| t.id == saved.id) else {
+                    eprintln!("Tab {} missing during backend apply; skipping", saved.id);
+                    continue;
+                };
                 saved
                     .layout
                     .ids()
@@ -140,7 +143,10 @@ impl Ui {
             }
             let changed = {
                 let mut tabs = self.tabs.borrow_mut();
-                let tab = tabs.iter_mut().find(|t| t.id == saved.id).unwrap();
+                let Some(tab) = tabs.iter_mut().find(|t| t.id == saved.id) else {
+                    eprintln!("Tab {} missing during backend apply; skipping", saved.id);
+                    continue;
+                };
                 let changed = *tab.layout.borrow() != saved.layout;
                 *tab.layout.borrow_mut() = saved.layout;
                 tab.panes.extend(new_panes);

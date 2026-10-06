@@ -62,7 +62,13 @@ impl ControlRequest {
                 reply: request.reply,
             }),
             Err(error) => {
-                let _ = request.reply.try_send(json!({"error": error.to_string()}));
+                if request
+                    .reply
+                    .try_send(json!({"error": error.to_string()}))
+                    .is_err()
+                {
+                    eprintln!("Control reply was dropped: receiver is gone");
+                }
                 None
             }
         }
@@ -164,6 +170,11 @@ impl ControlReply {
         if self.kind == ReplyKind::Command && self.value.get("error").is_none() {
             let result = (|| -> anyhow::Result<()> {
                 self.value["session"] = serde_json::to_value(&daemon.state)?;
+                // Per-command reply, not a per-tick path; re-read so the
+                // reply reflects the just-persisted catalog. Reusing the
+                // catalog loaded in `execute` would need plumbing through
+                // `CommandResult` for one saved read per command.
+                // TODO: pass the already-loaded catalog through when cheap.
                 self.value["catalog"] = serde_json::to_value(storage::load_catalog()?)?;
                 self.value["metadata"] = json!(
                     daemon
@@ -180,7 +191,9 @@ impl ControlReply {
                 self.value = json!({"error":error.to_string()});
             }
         }
-        let _ = self.sender.try_send(self.value);
+        if self.sender.try_send(self.value).is_err() {
+            eprintln!("Control reply was dropped: receiver is gone");
+        }
     }
 }
 impl Daemon {
@@ -190,6 +203,8 @@ impl Daemon {
     }
     pub(super) fn list(&mut self) -> anyhow::Result<Value> {
         self.refresh_state();
+        // On-demand listing (CLI), not a per-tick path, so read the catalog
+        // directly instead of caching it in Daemon and risking stale data.
         let catalog = storage::load_catalog()?;
         let workspaces: Vec<_> = catalog
             .workspaces
@@ -260,7 +275,12 @@ impl Daemon {
         output.into()
     }
     pub(super) fn execute(&mut self, command: Command) -> anyhow::Result<CommandResult> {
-        let mut catalog = storage::load_catalog()?;
+        // NOTE: catalog/settings reads below are per user command (New, Split,
+        // workspace mutations, ...), not per tick or per frame. `execute` used
+        // to reload workspaces.json unconditionally; arms that need no catalog
+        // (Split, Close, CloseTab, Rename, unassigned New/Move) now skip that
+        // read. Caching the full catalog or Settings in Daemon would make
+        // on-disk edits lag, so keep direct loads where validation needs them.
         match command {
             Command::New {
                 directory,
@@ -271,15 +291,18 @@ impl Daemon {
                     TabFilter::Workspace(id) => Some(id),
                     _ => None,
                 });
-                let definition = workspace
-                    .map(|id| {
-                        catalog
+                // Only hit workspaces.json when a workspace must be resolved.
+                let definition = match workspace {
+                    Some(id) => Some(
+                        storage::load_catalog()?
                             .workspaces
                             .iter()
                             .find(|w| w.id == id)
-                            .ok_or_else(|| anyhow::anyhow!("Workspace {id} does not exist"))
-                    })
-                    .transpose()?;
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("Workspace {id} does not exist"))?,
+                    ),
+                    None => None,
+                };
                 let directory = directory
                     .or_else(|| definition.map(|w| w.directory.clone()))
                     .unwrap_or_else(model::home);
@@ -290,6 +313,8 @@ impl Daemon {
                 );
                 let tab = self.reserve_ids(2)?;
                 let pane = tab + 1;
+                // Per pane creation, not per tick; re-read so cursor/theme
+                // edits apply without a daemon restart.
                 let settings = storage::load::<Settings>("settings.json")?;
                 let session = TerminalSession::spawn(
                     pane,
@@ -334,9 +359,20 @@ impl Daemon {
                     "A tab can have at most 24 panes"
                 );
                 let tab_id = tab.id;
-                self.sessions.get_mut(&target).unwrap().refresh_directory();
-                let directory = self.sessions[&target].directory().to_path_buf();
+                // Single-pane refresh so the split starts in the target's live
+                // cwd; bulk refreshes stay on the 1s `metadata_due` tick.
+                self.sessions
+                    .get_mut(&target)
+                    .ok_or_else(|| anyhow::anyhow!("Pane {target} does not exist"))?
+                    .refresh_directory();
+                let directory = self
+                    .sessions
+                    .get(&target)
+                    .ok_or_else(|| anyhow::anyhow!("Pane {target} does not exist"))?
+                    .directory()
+                    .to_path_buf();
                 let pane = self.reserve_ids(1)?;
+                // Per pane creation, not per tick; see New above.
                 let settings = storage::load::<Settings>("settings.json")?;
                 let session = TerminalSession::spawn(
                     pane,
@@ -346,7 +382,12 @@ impl Daemon {
                     &Theme::adwaita(settings.appearance != "light"),
                 )?;
                 self.sessions.insert(pane, session);
-                let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
+                let tab = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.id == tab_id)
+                    .ok_or_else(|| anyhow::anyhow!("Tab {tab_id} does not exist"))?;
                 tab.layout.split(target, pane, down);
                 tab.active = pane;
                 tab.directories.insert(pane, directory);
@@ -392,6 +433,7 @@ impl Daemon {
             } => {
                 let directory = directory.unwrap_or_else(model::home);
                 anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
+                let mut catalog = storage::load_catalog()?;
                 let name = catalog.validate_name(&name, None)?;
                 if let Some(id) = tab {
                     anyhow::ensure!(
@@ -416,6 +458,7 @@ impl Daemon {
                 name,
                 directory,
             } => {
+                let mut catalog = storage::load_catalog()?;
                 let name = catalog.validate_name(&name, Some(workspace))?;
                 anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
                 let definition = catalog
@@ -432,6 +475,7 @@ impl Daemon {
                 Ok(CommandOutput::Workspace { workspace }.into())
             }
             Command::WorkspaceDelete { workspace } => {
+                let mut catalog = storage::load_catalog()?;
                 anyhow::ensure!(
                     catalog.workspaces.iter().any(|w| w.id == workspace),
                     "Workspace {workspace} does not exist"
@@ -447,7 +491,10 @@ impl Daemon {
                 let tab = tab.unwrap_or(self.state.active);
                 if let Some(id) = workspace {
                     anyhow::ensure!(
-                        catalog.workspaces.iter().any(|w| w.id == id),
+                        storage::load_catalog()?
+                            .workspaces
+                            .iter()
+                            .any(|w| w.id == id),
                         "Workspace {id} does not exist"
                     );
                 }
@@ -526,6 +573,9 @@ impl Daemon {
                 Ok(json!({"ok":true}))
             }
             Request::Internal(InternalRequest::State) => {
+                // On-demand snapshot for remote clients, not the per-frame
+                // streaming path (`updates`). Refresh here so the reply is
+                // current; the streaming path stays gated by `metadata_due`.
                 self.refresh_state();
                 Ok(
                     json!({"session":self.state,"metadata":self.sessions.iter().map(|(&id, s)|Self::metadata(s,self.unread.get(&id).copied().unwrap_or(0))).collect::<Vec<_>>() }),
@@ -533,7 +583,12 @@ impl Daemon {
             }
             Request::Internal(InternalRequest::Metadata { pane }) => {
                 let id = self.resolve_pane(pane)?;
-                let session = self.sessions.get_mut(&id).unwrap();
+                let session = self
+                    .sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?;
+                // Single-pane on-demand refresh; bulk refreshes stay on the
+                // 1s `metadata_due` tick in event_loop.rs.
                 session.refresh_directory();
                 Ok(
                     json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))}),
@@ -541,14 +596,23 @@ impl Daemon {
             }
             Request::Internal(InternalRequest::Copy { pane }) => {
                 let id = self.resolve_pane(pane)?;
-                Ok(json!({"text":self.sessions[&id].copy()?}))
+                let text = self
+                    .sessions
+                    .get(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?
+                    .copy()?;
+                Ok(json!({"text":text}))
             }
             Request::Internal(InternalRequest::Read { pane })
             | Request::Public(PublicRequest::Read { pane }) => {
                 let id = self.resolve_pane(pane)?;
-                Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
+                Ok(
+                    json!({"text":self.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?.text()?}),
+                )
             }
             Request::Internal(InternalRequest::Close { pane }) => {
+                // An explicit pane is preferred; fall back to the active pane for parity
+                // with layouts that omit it. Closed panes stay reserved, so close() is safe.
                 let id = pane
                     .or_else(|| self.resolve_pane(None).ok())
                     .ok_or_else(|| anyhow::anyhow!("close requires pane"))?;
@@ -568,7 +632,10 @@ impl Daemon {
                 enter,
             }) => {
                 let id = self.resolve_pane(pane)?;
-                let session = self.sessions.get_mut(&id).unwrap();
+                let session = self
+                    .sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?;
                 if paste {
                     session.send_text(&text, enter)?;
                 } else {
@@ -588,19 +655,23 @@ impl Daemon {
             }) => {
                 if let Some(id) = pane {
                     self.resolve_pane(pane)?;
-                    let tab = self
-                        .state
-                        .tabs
-                        .iter_mut()
-                        .find(|t| t.layout.contains(id))
-                        .unwrap();
-                    tab.active = id;
-                    let tab_id = tab.id;
+                    let tab_id = {
+                        let tab = self
+                            .state
+                            .tabs
+                            .iter_mut()
+                            .find(|t| t.layout.contains(id))
+                            .ok_or_else(|| anyhow::anyhow!("Pane {id} has no tab"))?;
+                        tab.active = id;
+                        tab.id
+                    };
                     self.focus_tab(tab_id)?;
                     self.unread.remove(&id);
                 } else if let Some(id) = tab {
                     self.focus_tab(id)?;
                 } else if let Some(id) = workspace {
+                    // Per user focus, not per tick; needs existence, not just
+                    // the cached max ID, so keep the direct read.
                     anyhow::ensure!(
                         storage::load_catalog()?
                             .workspaces
