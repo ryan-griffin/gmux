@@ -202,6 +202,35 @@ mod tests {
         }
     }
     #[test]
+    fn viewport_encoding_preserves_frame_json_and_fixed_width_cells() {
+        let packet = packet();
+        let mut encoded = Vec::new();
+        packet.encode_into(&mut encoded).unwrap();
+        let header_len = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&encoded[8..8 + header_len]).unwrap();
+        let frame_json = r#"{"cols":2,"rows":3,"cursor_x":0,"cursor_y":0,"cursor_visible":0,"cursor_style":0,"background":[0,0,0],"foreground":[0,0,0],"cursor":[0,0,0],"scrollback":{"total":500,"offset":200,"len":3}}"#;
+        assert_eq!(
+            header["frame"],
+            serde_json::from_str::<serde_json::Value>(frame_json).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&packet.header.frame.unwrap()).unwrap(),
+            frame_json
+        );
+
+        let mut cells = [0; 142];
+        cells[..5].copy_from_slice("界é".as_bytes());
+        cells[64..67].copy_from_slice(&[1, 2, 3]);
+        cells[70] = 65;
+        assert_eq!(&encoded[8 + header_len..], &cells);
+        assert_eq!(
+            u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize,
+            encoded.len() - 4
+        );
+    }
+
+    #[test]
     fn binary_rows_round_trip_without_losing_cell_flags_or_unicode() {
         let packet = packet();
         let mut encoded = Vec::new();

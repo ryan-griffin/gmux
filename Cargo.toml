@@ -21,6 +21,7 @@ glib = "0.22"
 glib-unix = "0.22"
 
 [build-dependencies]
+bindgen = { version = "0.73", default-features = false, features = ["runtime"] }
 cc = "1"
 
 # The renderer smoke suite runs these tools. Their included render module's
