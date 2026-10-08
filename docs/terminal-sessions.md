@@ -293,12 +293,21 @@ smoke test checks that saved envelopes declare that pin.
 denied, builds, and the bootstrap, daemon, scrollback, control, and icon suites.
 Selected native Wayland checks passed for daemon reconnect, state recovery,
 window closure, terminal scrolling, terminal input, and fresh mapped and occluded
-screenshots at 100% and 125% monitor scale. Earlier native Find checks timed out
-at the sidebar directory assertion at line 118, both with the scrollback changes
-and an untouched build of baseline `686a272`. Its later history checks remain
-unverified in that suite. Known baseline native Resize and Find failures were
-excluded from this validation. History unit tests and headless checkpoint
+screenshots at 100% and 125% monitor scale. In that original validation, native
+Find timed out at the sidebar directory assertion at line 118, both with the
+scrollback changes and an untouched build of baseline `686a272`. Its later
+history checks were then unverified. Known baseline native Resize and Find
+failures were excluded from that run. History unit tests and headless checkpoint
 regressions passed. The full native suite was not run.
+
+A follow-up on main `5d20a97` fixed an unnecessary Wayland unmaximize request
+in the resize diagnostic that returned Find's window to its narrow layout and
+hid the sidebar. The full native Find suite then passed in dark and light
+appearance. It now also verifies checkpoint-restored Unicode and wrapped
+history after Quit and daemon restart, offscreen match navigation, and search
+after grid reflow. The selected sidebar row still follows the focused pane's
+directory. See the [Find diagnosis](screenshot-diagnostics.md#native-find-follow-up)
+for the original failure and the follow-up evidence.
 
 The notification test covers unread state after delivery and reconnect, GUI
 acknowledgements, stale acknowledgements racing with new alerts, and the latest

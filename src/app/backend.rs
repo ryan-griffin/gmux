@@ -378,7 +378,11 @@ impl Ui {
                     (360..=7680).contains(&width) && (280..=4320).contains(&height),
                     "Window size is outside the supported range"
                 );
-                self.window.unmaximize();
+                // On a normal Wayland window, an unnecessary unmaximize can
+                // trigger an old-size configure after the requested resize.
+                if self.window.is_maximized() {
+                    self.window.unmaximize();
+                }
                 self.window.set_default_size(width as i32, height as i32);
                 Ok(json!({"ok":true}))
             }

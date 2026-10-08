@@ -109,6 +109,14 @@ building or starting services. Unknown names and desktop selections without
 | `smoke`, `audit`, `icon` | Application workflows, pane lifecycle cases, and icon decoding. |
 | `screenshot` | Fresh mapped, occluded, and revealed captures, window decoration, paused frame clocks, and logical PNG dimensions at 100% and 125% monitor scale. |
 
+The `find` suite runs both dark and light appearance, including retained and
+checkpoint-restored Unicode and wrapped history, offscreen navigation, grid
+reflow, and the selected sidebar row's directory after pane focus changes.
+It waits for native window dimensions and the expanded sidebar after widening;
+terminal width alone can change when a collapsed sidebar hides. Engine unit
+tests also check copying restored history across reflow, and `terminal-input`
+checks native selection and clipboard copying across scrollback.
+
 Detailed rendering checks are in [renderer validation](renderer.md#validation).
 Backend cases are in [session validation](terminal-sessions.md#validation).
 Test counts come from the runner output; the suite changes as regressions are
