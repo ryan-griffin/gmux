@@ -35,10 +35,9 @@ impl Ui {
                 let direct = w.id == id && w.branch_directory == directory;
                 let shared = branch.head.is_some() && w.branch_head == branch.head;
                 if !(direct || shared)
-                    || !w
-                        .panes
+                    || w.panes
                         .get(&w.active)
-                        .is_some_and(|pane| pane.directory() == w.branch_directory)
+                        .is_none_or(|pane| pane.directory() != w.branch_directory)
                 {
                     continue;
                 }

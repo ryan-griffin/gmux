@@ -9,7 +9,10 @@ A GNOME terminal inspired by [cmux](https://cmux.com/), built with Rust, GTK 4, 
 
 ## Run
 
-Requires Linux, Rust stable, a C compiler, libclang for FFI binding generation, pkg-config, GTK 4.22+, libadwaita 1.9+, GLib's `glib-compile-resources`, curl, and Python 3.12+.
+Requires Linux, Rust 1.95+, a C compiler, libclang for FFI binding generation, pkg-config, GTK 4.22+, libadwaita 1.9+, GLib's `glib-compile-resources`, curl, and Python 3.12+.
+With rustup, [`rust-toolchain.toml`](rust-toolchain.toml) selects Rust 1.99.0
+with rustfmt and Clippy for development. The [testing guide](docs/testing.md#rust-requirements)
+explains the minimum compiler and provides the pinned Linux build environment.
 
 ```sh
 ./scripts/run.sh
@@ -83,6 +86,8 @@ python3 scripts/check.py --native
 ```
 
 The runner checks formatting, Rust tests, Clippy, builds, and smoke tests.
+GitHub Actions runs the headless checks on Rust 1.95.0 and 1.99.0 in a pinned
+Linux container. Run native compositor checks separately with `--native`.
 Use the [testing guide](docs/testing.md) for prerequisites, selected checks,
 rendering backends, appearance variants, and failure logs.
 
