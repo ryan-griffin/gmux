@@ -6,6 +6,7 @@ scripts/find-smoke-test.py. Uses its own app, settings, and accessibility bus.
 """
 from test_support import AccessibilityFixture, AppFixture, descendants, wait_accessible as wait_for
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import os
 import shlex
 
@@ -51,7 +52,7 @@ def window_size():
         return bounds.width, bounds.height
 
 
-with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdout=log, stderr=log), WaylandInput() as native:
+with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(), WaylandInput() as native:
     clipboard = ClipboardObserver(native)
     for appearance in ("dark", "light"):
         with AppFixture(dict(restore=True, desktop_notifications=False, appearance=appearance),
@@ -59,7 +60,7 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             shell_script="#!/bin/sh\nexport PS1='GMUX_FIND> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n",
         ) as fixture:
             rpc = fixture.rpc
-            app = fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+            app = fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
             first_directory = fixture.path / "first-directory"
             first_directory.mkdir()
             first = rpc("new", name="Find Test", directory=str(first_directory))
@@ -183,7 +184,7 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             result = rpc("quit")
             assert result["ok"] and not result.get("warning"), result
             assert app.wait(timeout=8) == 0
-            app = fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+            app = fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
             wait_for(lambda: "GMUX_FIND>" in rpc("read", pane=first["pane"])["text"])
             rpc("focus", pane=first["pane"])
             wait_for(lambda: sidebar_directory(first_directory))

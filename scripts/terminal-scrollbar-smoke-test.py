@@ -6,6 +6,7 @@ from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import math
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
 import subprocess
 import tempfile
@@ -155,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-scrollbar-") as directory:
 
     with (artifacts / "terminal-scrollbar-smoke.log").open("w") as log, WaylandInput() as native:
         try:
-            app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             pane = rpc("new", name="Native scrollbars")["pane"]
             wait_for(lambda: geometry()["rows"] > 3)
@@ -256,7 +257,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-scrollbar-") as directory:
             assert app.wait(timeout=8) == 0
             settings["appearance"] = "light"
             (config / "settings.json").write_text(json.dumps(settings))
-            app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             state = wait_for(lambda: settled(lambda state: state["scrollbar"]["visible"]))
             # Zoom is frontend state, so reopening also reflows the viewport.

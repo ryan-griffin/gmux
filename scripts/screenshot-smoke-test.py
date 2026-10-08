@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import sys
 import time
 
@@ -93,7 +94,7 @@ with (artifacts / f"screenshot-{appearance}-smoke.log").open("w") as log:
                 tabs=[], filter="all", active=0,
                 width=window_size[0], height=window_size[1], maximized=False,
             )))
-            fixture.start_app(root / "target/debug/gmux", "--directory", root,
+            fixture.start_app(cargo_binary("gmux"), "--directory", root,
                               stdout=log, stderr=log)
             pane = fixture.rpc("list")["tabs"][0]["active_pane"]
 

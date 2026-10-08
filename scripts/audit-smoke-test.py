@@ -2,6 +2,7 @@
 """Check focus, directory, screenshot, activation, and restoration regressions."""
 import json
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import resource
 import shlex
 import subprocess
@@ -87,7 +88,7 @@ def activation(fixture, app, log):
     count = len(fixture.rpc("list")["tabs"])
     opened = fixture.path / "open-directory"
     opened.mkdir()
-    result = subprocess.run([str(root / "target/debug/gmux"), "--directory", str(opened)],
+    result = subprocess.run([str(cargo_binary("gmux")), "--directory", str(opened)],
                             env=fixture.env, cwd=root, stdout=log, stderr=log, timeout=10)
     assert result.returncode == 0
     wait_for(lambda: len(fixture.rpc("list")["tabs"]) == count + 1, timeout=3)
@@ -122,7 +123,7 @@ def malformed_request_targets(fixture, app, log):
 
 
 def delayed_navigation(fixture, app, log):
-    with fixture.delayed_app(root / "target/debug/gmux", "rename", cwd=root, stdout=log, stderr=log) as delay:
+    with fixture.delayed_app(cargo_binary("gmux"), "rename", cwd=root, stdout=log, stderr=log) as delay:
         a = fixture.rpc("new", name="Pending rename")
         b = fixture.rpc("new", name="Later selection")
         fixture.rpc("split", pane=b["pane"])
@@ -154,7 +155,7 @@ def delayed_workspace_moves(fixture, app, log):
                 "delayed move into a selected empty workspace" if into_empty else
                 "delayed move out of the later selected workspace")
         with scenario(name):
-            with fixture.delayed_app(root / "target/debug/gmux", "move", cwd=root, stdout=log, stderr=log) as delay:
+            with fixture.delayed_app(cargo_binary("gmux"), "move", cwd=root, stdout=log, stderr=log) as delay:
                 suffix = "search" if populated else "incoming" if into_empty else "outgoing"
                 source = fixture.rpc("workspace-new", name=f"Source {suffix}", directory=str(root))["workspace"]
                 destination = fixture.rpc("workspace-new", name=f"Destination {suffix}", directory=str(root))["workspace"]
@@ -189,7 +190,7 @@ def delayed_workspace_moves(fixture, app, log):
 
 
 def delayed_closed_selection(fixture, app, log):
-    with fixture.delayed_app(root / "target/debug/gmux", "close", cwd=root, stdout=log, stderr=log) as delay:
+    with fixture.delayed_app(cargo_binary("gmux"), "close", cwd=root, stdout=log, stderr=log) as delay:
         closing = fixture.rpc("new", name="Closing tab")
         remaining = fixture.rpc("new", name="Remaining tab")
         with delay.command(pane=closing["pane"]):
@@ -202,7 +203,7 @@ def delayed_closed_selection(fixture, app, log):
 def delayed_deleted_workspace_filter(fixture, app, log):
     for populated in (False, True):
         with scenario("delayed deletion of a populated workspace" if populated else "delayed deletion of an empty workspace"):
-            with fixture.delayed_app(root / "target/debug/gmux", "workspace-delete", cwd=root, stdout=log, stderr=log) as delay:
+            with fixture.delayed_app(cargo_binary("gmux"), "workspace-delete", cwd=root, stdout=log, stderr=log) as delay:
                 survivor = fixture.rpc("new", name="Visible survivor")
                 workspace = fixture.rpc("workspace-new", name="Deleted workspace", directory=str(root))["workspace"]
                 if populated:
@@ -222,7 +223,7 @@ def delayed_shell_exits(fixture, app, log):
     for method in ("rename", "new", "split"):
         with scenario(f"shell exit before a delayed {method} reply"):
             armed = False
-            with fixture.delayed_app(root / "target/debug/gmux", method, match=lambda _: armed, cwd=root, stdout=log, stderr=log) as delay:
+            with fixture.delayed_app(cargo_binary("gmux"), method, match=lambda _: armed, cwd=root, stdout=log, stderr=log) as delay:
                 survivor = fixture.rpc("new", name="Surviving tab")
                 original = str(fixture.path / "socket")
                 if method == "new":
@@ -316,7 +317,7 @@ def invalid_saved_ids(fixture, app, log):
     duplicate_pane = dict(duplicate, id=10_000, name="Duplicate pane")
     saved["tabs"] = [invalid, valid[0], duplicate, duplicate_pane] + valid[1:]
     session_path.write_text(json.dumps(saved))
-    app = fixture.start_app(root / "target/debug/gmux", cwd=root, stdout=log, stderr=log)
+    app = fixture.start_app(cargo_binary("gmux"), cwd=root, stdout=log, stderr=log)
     restored = wait_for(lambda: fixture.rpc("list")["tabs"])
     for key in ("name", "id", "layout", "workspace"):
         assert [t[key] for t in restored] == [t.get(key) for t in valid], key
@@ -353,6 +354,6 @@ with (artifacts / "audit-smoke.log").open("w") as log:
             env={"GTK_A11Y": "none"},
             shell_script="#!/bin/sh\nexport PS1='GMUX_AUDIT> '\nexport PROMPT_COMMAND=''\nexec /bin/bash --noprofile --norc -i\n",
         ) as fixture:
-            app = fixture.start_app(root / "target/debug/gmux", "--directory", root,
+            app = fixture.start_app(cargo_binary("gmux"), "--directory", root,
                                     cwd=root, stdout=log, stderr=log)
             test(fixture, app, log)

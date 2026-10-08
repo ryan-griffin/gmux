@@ -9,6 +9,7 @@ from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import socket
 import struct
 import subprocess
@@ -47,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
 
         def start():
             global app
-            app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
 

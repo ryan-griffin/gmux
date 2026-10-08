@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from cargo_test_support import cargo_binary
 
 from notification_server import NotificationServer
 from test_support import AppFixture, assert_stays, delayed_command_reply, rpc as direct_rpc, scenario, wait_for
@@ -74,11 +75,11 @@ def preattachment_delivery(fixture, notifications, app):
         with scenario("preattachment desktop alerts enabled" if enabled else "preattachment desktop alerts disabled"):
             fixture.stop()
             fixture.set_settings(dict(desktop_notifications=enabled))
-            fixture.start(root / "target/debug/gmux-daemon", stdout=log, stderr=log)
+            fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)
             wait_for(lambda: fixture.rpc("daemon-info"))
             armed = False
             with delayed_command_reply(fixture, "new", match=lambda _: armed) as (arrived, release):
-                fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+                fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
                 foreground = fixture.rpc("new", name="Foreground")
                 known = {p["id"] for t in fixture.rpc("list")["tabs"] for p in t["panes"]}
                 original = str(fixture.path / "socket")
@@ -131,7 +132,7 @@ def disabled_delivery(fixture, notifications, app):
     fixture.rpc("detach")
     assert app.wait(timeout=8) == 0
     fixture.set_settings(dict(desktop_notifications=False))
-    fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+    fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
     assert fixture.rpc("daemon-info")["pid"] == daemon_pid
     assert not tab(fixture, disabled["tab"])["unread"]
     fixture.rpc("notify", pane=disabled["pane"], message="GMUX_DISABLED_ALERT")
@@ -154,5 +155,5 @@ with (artifacts / "notification-delivery-smoke.log").open("w") as log:
             fixture = cleanup.enter_context(AppFixture(dict(desktop_notifications=True),
                 prefix="gmux-delivery-", env={"GTK_A11Y": "none"},
                 shell_script="#!/bin/sh\nexport PS1='GMUX_DELIVERY> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n"))
-            app = fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+            app = fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
             test(fixture, notifications, app)

@@ -8,6 +8,7 @@ import json
 from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import subprocess
 import tempfile
 import time
@@ -47,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-workspaces-") as directory:
         rpc("send", pane=pane, text=text, paste=True, enter=True)
 
     def start(log):
-        app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+        app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
         wait_for(lambda: rpc("daemon-info")["attached"])
         wait_for(state)
         return app

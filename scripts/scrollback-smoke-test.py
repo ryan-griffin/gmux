@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import json
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import runpy
 import socket
 import struct
@@ -94,7 +95,7 @@ with AppFixture({"restore": True, "appearance": "dark"}, prefix="gmux-scrollback
     (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY\\n'\nexec /bin/bash --noprofile --norc -i\n")
 
     def start():
-        daemon = fixture.start(root / "target/debug/gmux-daemon", stdout=log, stderr=log)
+        daemon = fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)
         wait_for(lambda: fixture.rpc("daemon-info"))
         assert daemon.poll() is None
         return daemon

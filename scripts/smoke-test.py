@@ -6,9 +6,11 @@ Run with scripts/check.py --native --only smoke for the isolated Wayland fixture
 import argparse
 from contextlib import ExitStack
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
-import socket
+import os
 import subprocess
+import tempfile
 
 from test_support import AppFixture, scenario, stop_process, wait_for
 
@@ -17,7 +19,7 @@ parser.add_argument("--native", action="store_true")
 parser.add_argument("--binary", type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
-binary = args.binary.resolve() if args.binary else root / "target/debug/gmux"
+binary = args.binary.resolve() if args.binary else cargo_binary("gmux")
 assert binary.is_file(), "Run cargo build first"
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
@@ -118,15 +120,16 @@ cases = [("empty startup and invalid requests", empty_startup),
 with ExitStack() as cleanup:
     env = {"GTK_A11Y": "none"}
     if not args.native:
-        env.update(GDK_BACKEND="broadway", BROADWAY_DISPLAY=":29")
-        server = subprocess.Popen(["gtk4-broadwayd", "-a", "127.0.0.1", "-p", "8099", ":29"],
+        runtime = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="gmux-broadway-")))
+        env.update(GDK_BACKEND="broadway", BROADWAY_DISPLAY=":0", XDG_RUNTIME_DIR=str(runtime))
+        server = subprocess.Popen(["gtk4-broadwayd", "--unixsocket=" + str(runtime / "http.socket"), ":0"],
+                                  env=dict(os.environ, **env),
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cleanup.callback(stop_process, server)
 
         def broadway_ready():
             assert server.poll() is None, "Broadway server failed to start"
-            with socket.create_connection(("127.0.0.1", 8099), timeout=0.1):
-                return True
+            return (runtime / "broadway1.socket").is_socket()
 
         wait_for(broadway_ready)
     with (artifacts / ("smoke-native.log" if args.native else "smoke.log")).open("w") as log:

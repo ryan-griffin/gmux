@@ -5,6 +5,8 @@ from functools import partial
 from test_support import rpc as shared_rpc, descendants, wait_for as shared_wait_for
 import os
 from pathlib import Path
+from test_support import AccessibilityFixture
+from cargo_test_support import cargo_binary
 import shlex
 import subprocess
 import tempfile
@@ -14,7 +16,7 @@ import gi
 gi.require_version("Atspi", "2.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Atspi, Gdk, GdkPixbuf, Gio, GLib
+from gi.repository import Atspi, Gdk, GdkPixbuf, GLib
 
 from daemon_test_support import stop_daemon
 from wayland_test_support import ensure_wayland_session, WaylandInput
@@ -50,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
         restore=False, show_sidebar=False, desktop_notifications=False)))
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
-    app = registry = pane = None
+    app = pane = None
 
     def rpc(method, **params):
         return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
@@ -192,15 +194,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             GdkPixbuf.Colorspace.RGB, True, 8, frame.width, frame.height, frame.stride)
         pixels.savev(str(artifacts / f"main-menu-{name}.png"), "png", [], [])
 
-    with (artifacts / f"main-menu-{variant}.log").open("w") as log, WaylandInput() as native:
+    with (artifacts / f"main-menu-{variant}.log").open("w") as log, WaylandInput() as native, AccessibilityFixture():
         try:
-            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-            address = bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
-                "GetAddress", None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE,
-                5000, None).unpack()[0]
-            registry = subprocess.Popen(["/usr/lib/at-spi2-registryd"], stdout=log, stderr=log,
-                env=dict(env, AT_SPI_BUS_ADDRESS=address, DBUS_SESSION_BUS_ADDRESS=address))
-            app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
 
             # A colored terminal marker establishes native keyboard focus before
@@ -670,6 +666,3 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
                 app.terminate()
                 app.wait(timeout=8)
             stop_daemon(env["GMUX_SOCKET"])
-            if registry is not None:
-                registry.terminate()
-                registry.wait(timeout=8)

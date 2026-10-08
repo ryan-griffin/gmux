@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check that damaged saved state shows recovery instructions and stays unchanged."""
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import subprocess
 
 import gi
@@ -10,7 +11,7 @@ from gi.repository import Atspi
 from test_support import AccessibilityFixture, AppFixture, descendants, scenario, wait_accessible
 
 root = Path(__file__).resolve().parent.parent
-with AccessibilityFixture(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL):
+with AccessibilityFixture():
     for name in ("settings.json", "workspaces.json", "session.json"):
         with scenario(f"startup recovery preserves damaged {name}"), AppFixture(
             {"restore": True}, env={"GTK_A11Y": "atspi"},
@@ -18,7 +19,7 @@ with AccessibilityFixture(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL):
             path = fixture.config / name
             damaged = b'{"broken":'
             path.write_bytes(damaged)
-            app = fixture.start(root / "target/debug/gmux", stdout=subprocess.DEVNULL,
+            app = fixture.start(cargo_binary("gmux"), stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
             def elements():

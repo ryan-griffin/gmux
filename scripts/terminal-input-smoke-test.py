@@ -9,6 +9,8 @@ from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport
 import os
 from pathlib import Path
+from test_support import AccessibilityFixture
+from cargo_test_support import cargo_binary
 import shlex
 import subprocess
 import tempfile
@@ -17,7 +19,7 @@ import time
 import gi
 gi.require_version("Atspi", "2.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Atspi, Gdk, Gio, GLib
+from gi.repository import Atspi, Gdk, GLib
 
 from daemon_test_support import stop_daemon
 from wayland_test_support import ensure_wayland_session, WaylandInput, REMOTE
@@ -46,24 +48,17 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
     app = daemon = None
-    registry = None
     pane = None
 
     def rpc(method, **params):
         return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     with (artifacts / "terminal-input-smoke.log").open("w") as log, WaylandInput() as native, \
-            DelayedViewport(env["GMUX_SOCKET"], temp / "frontend") as proxy:
+            DelayedViewport(env["GMUX_SOCKET"], temp / "frontend") as proxy, AccessibilityFixture():
         try:
-            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-            address = bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
-                "GetAddress", None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE,
-                5000, None).unpack()[0]
-            registry = subprocess.Popen(["/usr/lib/at-spi2-registryd"], stdout=log, stderr=log,
-                env=dict(env, AT_SPI_BUS_ADDRESS=address, DBUS_SESSION_BUS_ADDRESS=address))
-            daemon = subprocess.Popen([str(root / "target/debug/gmux-daemon")], env=env, stdout=log, stderr=log)
+            daemon = subprocess.Popen([str(cargo_binary("gmux-daemon"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info"))
-            app = subprocess.Popen([str(root / "target/debug/gmux")],
+            app = subprocess.Popen([str(cargo_binary("gmux"))],
                 env=dict(env, GMUX_SOCKET=proxy.proxy_path), stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             pane = rpc("new", name="Native Wayland input")["pane"]
@@ -388,6 +383,3 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             stop_daemon(env["GMUX_SOCKET"])
             if daemon is not None:
                 daemon.wait(timeout=8)
-            if registry is not None:
-                registry.terminate()
-                registry.wait(timeout=8)

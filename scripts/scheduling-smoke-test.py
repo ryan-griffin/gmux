@@ -4,6 +4,7 @@ from functools import partial
 import json
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
 import shutil
 import subprocess
@@ -90,7 +91,7 @@ with AppFixture(dict(restore=False, show_sidebar=False, desktop_notifications=Fa
                  message=f"Branch {branch} did not update promptly")
 
     with (artifacts / "scheduling-smoke.log").open("w") as log, WaylandInput() as native:
-        fixture.start(root / "target/debug/gmux", cwd=root, stdout=log, stderr=log)
+        fixture.start(cargo_binary("gmux"), cwd=root, stdout=log, stderr=log)
         wait_for(lambda: fixture.rpc("daemon-info")["attached"])
         tabs = []
         for name in ("a", "b"):

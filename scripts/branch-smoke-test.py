@@ -2,6 +2,7 @@
 """Check prompt Git branch updates in the native sidebar, including worktrees."""
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
 import shutil
 import subprocess
@@ -57,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-branch-") as directory:
                     for p in tab["panes"] if p["id"] == pane)
 
     with (artifacts / "branch-smoke.log").open("w") as log:
-        app = subprocess.Popen([str(root / "target/debug/gmux")], env=env,
+        app = subprocess.Popen([str(cargo_binary("gmux"))], env=env,
                                stdout=log, stderr=log)
         try:
             wait_for(lambda: rpc("daemon-info")["attached"])

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check system font changes, zoom, and custom fonts on the isolated native display."""
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import re
 import subprocess
 
@@ -42,7 +43,7 @@ with (artifacts / "font-smoke.log").open("w") as log, AppFixture(
     with scenario("system font changes resize both PTYs and zoom reset follows GNOME"):
         set_font(9)
         fixture.set_settings(dict(use_system_font=True, font="Monospace", font_size=12))
-        app = fixture.start_app(root / "target/debug/gmux", "--directory", root,
+        app = fixture.start_app(cargo_binary("gmux"), "--directory", root,
                                 cwd=root, stdout=log, stderr=log)
         first = rpc("list")["tabs"][0]["active_pane"]
         second = rpc("split", pane=first)["pane"]
@@ -81,7 +82,7 @@ with (artifacts / "font-smoke.log").open("w") as log, AppFixture(
 
     with scenario("custom fonts stay fixed when GNOME's font changes"):
         fixture.set_settings(dict(use_system_font=False, font="Monospace", font_size=12))
-        fixture.start_app(root / "target/debug/gmux", "--directory", root,
+        fixture.start_app(cargo_binary("gmux"), "--directory", root,
                           cwd=root, stdout=log, stderr=log)
         pane = rpc("list")["tabs"][0]["active_pane"]
         custom, custom_metrics = grid(pane), metrics(pane)

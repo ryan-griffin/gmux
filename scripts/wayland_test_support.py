@@ -69,6 +69,37 @@ def monitor_scale(scale):
         apply(original)
 
 
+def session_environment(directory):
+    """Private desktop state, retaining deliberate renderer and appearance options."""
+    env = dict(os.environ, XDG_RUNTIME_DIR=directory, GDK_BACKEND="wayland", DISPLAY="",
+               WAYLAND_DISPLAY="gmux-test", GDK_SCALE="1", GDK_DPI_SCALE="1",
+               XDG_SESSION_TYPE="wayland", PIPEWIRE_RUNTIME_DIR=directory,
+               PIPEWIRE_REMOTE="pipewire-0", GSETTINGS_BACKEND="memory", GIO_USE_VFS="local")
+    # Keep build tool locations while isolating ~/.fonts and desktop state.
+    env.setdefault("CARGO_HOME", str(Path.home() / ".cargo"))
+    env.setdefault("RUSTUP_HOME", str(Path.home() / ".rustup"))
+    env["HOME"] = str(Path(directory, "home"))
+    Path(env["HOME"]).mkdir()
+    env.update(LANG="C.UTF-8", LC_ALL="C.UTF-8", XDG_DATA_DIRS="/usr/local/share:/usr/share",
+               XDG_CONFIG_DIRS="/etc/xdg", HISTFILE=str(Path(directory, "bash_history")))
+    for category in ("CONFIG", "CACHE", "STATE", "DATA"):
+        env[f"XDG_{category}_HOME"] = str(Path(directory, category.lower()))
+        Path(env[f"XDG_{category}_HOME"]).mkdir()
+    wp_config = Path(env["XDG_CONFIG_HOME"], "wireplumber/wireplumber.conf.d")
+    wp_config.mkdir(parents=True)
+    (wp_config / "gmux-tests.conf").write_text(
+        "wireplumber.profiles = { video-only = { hardware.video-capture = disabled } }\n")
+    for name in ("GDK_DEBUG", "WAYLAND_SOCKET", "AT_SPI_BUS_ADDRESS", "LANGUAGE",
+                 "FONTCONFIG_FILE", "FONTCONFIG_PATH", "GTK_THEME", "GTK_PATH", "GSETTINGS_SCHEMA_DIR",
+                 "DBUS_SESSION_BUS_ADDRESS", "DBUS_SESSION_BUS_PID", "DBUS_SESSION_BUS_WINDOWID"):
+        env.pop(name, None)
+    # The isolated compositor owns these tests; avoid starting desktop portals
+    # whose document FUSE mount can outlive the private D-Bus session.
+    env["GDK_DEBUG"] = "no-portals"
+    env["ADW_DISABLE_PORTAL"] = "1"
+    return env
+
+
 def ensure_wayland_session():
     if os.environ.get("GMUX_WAYLAND_TEST") == "1":
         assert os.environ["GDK_BACKEND"] == "wayland" and not os.environ.get("DISPLAY")
@@ -78,22 +109,7 @@ def ensure_wayland_session():
         if not shutil.which(command):
             raise SystemExit(f"Native Wayland tests require {command}; see docs/renderer.md")
     with tempfile.TemporaryDirectory(prefix="gmux-wayland-") as directory:
-        env = dict(os.environ, XDG_RUNTIME_DIR=directory, GDK_BACKEND="wayland", DISPLAY="",
-                   WAYLAND_DISPLAY="gmux-test", GDK_SCALE="1", GDK_DPI_SCALE="1",
-                   XDG_SESSION_TYPE="wayland", PIPEWIRE_RUNTIME_DIR=directory,
-                   PIPEWIRE_REMOTE="pipewire-0", GSETTINGS_BACKEND="memory", GIO_USE_VFS="local")
-        for category in ("CONFIG", "CACHE", "STATE"):
-            env[f"XDG_{category}_HOME"] = str(Path(directory, category.lower()))
-        wp_config = Path(env["XDG_CONFIG_HOME"], "wireplumber/wireplumber.conf.d")
-        wp_config.mkdir(parents=True)
-        (wp_config / "gmux-tests.conf").write_text(
-            "wireplumber.profiles = { video-only = { hardware.video-capture = disabled } }\n")
-        for name in ("GDK_DEBUG", "WAYLAND_SOCKET", "AT_SPI_BUS_ADDRESS"):
-            env.pop(name, None)
-        # The isolated compositor owns these tests; avoid starting desktop portals
-        # whose document FUSE mount can outlive the private D-Bus session.
-        env["GDK_DEBUG"] = "no-portals"
-        env["ADW_DISABLE_PORTAL"] = "1"
+        env = session_environment(directory)
         command = ["dbus-run-session", "--", sys.executable, __file__, str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
         artifacts = Path(__file__).resolve().parent.parent / "artifacts"
         artifacts.mkdir(exist_ok=True)

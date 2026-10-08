@@ -4,6 +4,7 @@ import fcntl
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import socket
 import struct
 import subprocess
@@ -13,7 +14,7 @@ from test_support import AppFixture, rpc, wait_for
 
 root = Path(__file__).resolve().parent.parent
 with AppFixture() as fixture:
-    daemon = fixture.start(root / "target/debug/gmux-daemon", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    daemon = fixture.start(cargo_binary("gmux-daemon"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_for(lambda: (fixture.path / "socket.stream").exists())
 
     def command(method, **params):
@@ -264,7 +265,7 @@ for name in ["settings.json", "session.json", "workspaces.json"]:
         damaged = fixture.path / "config/gmux" / name
         damaged.write_bytes(b'{"broken":')
         with (fixture.path / "error.log").open("w") as log:
-            daemon = fixture.start(root / "target/debug/gmux-daemon", stdout=log, stderr=log)
+            daemon = fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)
             assert daemon.wait(timeout=8) != 0
         assert damaged.read_bytes() == b'{"broken":'
         assert name in (fixture.path / "error.log").read_text()

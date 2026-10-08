@@ -164,10 +164,8 @@ def wait_accessible(predicate, timeout=12, **kwargs):
 
 
 class AccessibilityFixture:
-    """Wait for the private accessibility registry and stop it if we started it."""
-    def __init__(self, **process_options):
-        self.process_options = process_options
-        self.process = None
+    """Activate the registry through the private accessibility bus's service file."""
+    def __init__(self):
         self.connection = None
 
     def __enter__(self):
@@ -186,9 +184,10 @@ class AccessibilityFixture:
 
         try:
             if not ready():
-                self.process = subprocess.Popen(["/usr/lib/at-spi2-registryd"],
-                    env=dict(os.environ, AT_SPI_BUS_ADDRESS=address, DBUS_SESSION_BUS_ADDRESS=address),
-                    **self.process_options)
+                self.connection.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "StartServiceByName",
+                    GLib.Variant("(su)", ("org.a11y.atspi.Registry", 0)),
+                    GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 5000, None)
             wait_accessible(ready, message="Accessibility registry did not acquire its bus name")
         except Exception:
             self.__exit__(None, None, None)
@@ -196,11 +195,8 @@ class AccessibilityFixture:
         return self
 
     def __exit__(self, *_):
-        try:
-            stop_process(self.process)
-        finally:
-            if self.connection is not None:
-                self.connection.close_sync(None)
+        if self.connection is not None:
+            self.connection.close_sync(None)
 
 
 class DelayedViewport:
@@ -307,7 +303,8 @@ class AppFixture:
         shell.write_text(shell_script or "#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
         shell.chmod(0o700)
         self.env = dict(os.environ, GMUX_SOCKET=str(self.path / "socket"),
-                        XDG_CONFIG_HOME=str(self.path / "config"), SHELL=str(shell))
+                        XDG_CONFIG_HOME=str(self.path / "config"), SHELL=str(shell),
+                        HISTFILE=str(self.path / "bash_history"))
         self.env.update(env or {})
         self.processes = []
 

@@ -9,6 +9,7 @@ from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import subprocess
 import sys
 import tempfile
@@ -72,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notification-focus-") as directory
     with (artifacts / "notification-focus-smoke.log").open("w") as log, WaylandInput() as native:
         try:
             notifications = NotificationServer()
-            app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             first = rpc("new", name="Focused notification test", directory=str(temp))
             pane = first["pane"]
@@ -131,7 +132,7 @@ GLib.MainLoop().run()
             assert app.wait(timeout=8) == 0
             app = None
             assert rpc("_metadata", pane=sibling)["meta"]["unread"] == 0
-            app = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
             assert not pane_state(sibling)["unread"]

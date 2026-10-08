@@ -8,6 +8,7 @@ Requires gtk4-rendernode-tool.
 import argparse
 import json
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import re
 import subprocess
 
@@ -17,8 +18,8 @@ parser.add_argument("--check-binary", type=Path)
 parser.add_argument("--output", type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
-binary = args.binary or root / "target/debug/examples/renderer-benchmark"
-check_binary = args.check_binary or root / "target/debug/examples/renderer-check"
+binary = args.binary or cargo_binary("renderer-benchmark", example=True)
+check_binary = args.check_binary or cargo_binary("renderer-check", example=True)
 output = args.output or root / "artifacts/renderer-validation"
 output.mkdir(parents=True, exist_ok=True)
 with (output / "check.log").open("w") as log:

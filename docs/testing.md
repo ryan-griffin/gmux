@@ -36,8 +36,9 @@ The native suite and application benchmark also need:
   `--virtual-monitor` support, PipeWire, and WirePlumber 0.5+.
 - GStreamer with `pipewiresrc` and `videoconvert`, plus introspection data for
   GStreamer 1.0, GstVideo 1.0, GDK 4, GdkPixbuf 2, and AT-SPI 2.
-- The accessibility registry at `/usr/lib/at-spi2-registryd` and GNOME desktop
-  settings schemas for the font tests.
+- The AT-SPI accessibility bus and registry D-Bus service files, and GNOME
+  desktop settings schemas for the font tests. The fixture activates the registry
+  by its bus name, using the distribution's service file to locate the executable.
 - `gtk4-rendernode-tool` for renderer checks, Git for branch checks, and Vim
   and `top` for interactive terminal checks.
 
@@ -73,66 +74,91 @@ RUSTUP_TOOLCHAIN=1.95.0 python3 scripts/check.py
 
 ## Linux container and CI
 
-[`ci/Containerfile`](../ci/Containerfile) pins the official x86_64 Arch Linux
-base image by digest and installs packages from the 2026-10-01 Arch Linux
-Archive snapshot. The snapshot supplies GTK 4.22.5, libadwaita 1.9.4, a C
-compiler, Clang 23.1.1 and its libclang library, pkg-config, GLib resource tools,
-curl, Git, Python, PyGObject, GdkPixbuf introspection data, and librsvg's SVG
-loader. Pacman verifies package signatures. The image build checks the GTK,
-libadwaita, and Python minimums,
-libclang loading, and the availability of SVG decoding.
+[`Validation`](../.github/workflows/check.yml) uses the official x86_64
+Fedora 44 container pinned by digest. Fedora 44 is a
+[supported stable release](https://fedoraproject.org/workstation/download/).
+Its normal signed `fedora` and `updates` repositories supply
+[GTK 4.22.5](https://packages.fedoraproject.org/pkgs/gtk4/gtk4/)
+and [libadwaita 1.9.4](https://packages.fedoraproject.org/pkgs/libadwaita/libadwaita-devel/).
+Fedora 43's GTK 4.20 does not meet the requirement.
 
-Run the same environment with Docker from the repository root:
+GitHub's `ubuntu-24.04` runner supplies the Docker host. Dependency installation,
+Ghostty bootstrap, Rust toolchain installation, builds, and checks all run inside
+the Fedora job container. There is no custom image build, image publication, or
+self-hosted runner. The container uses its existing root account and home;
+rootless Podman maps that account to the local caller without creating users.
+Docker bind mounts can leave root-owned cache and artifact files on the host.
+
+[`ci/install-deps.sh`](../ci/install-deps.sh) installs GCC, Clang and its built-in headers, libclang,
+pkg-config, GTK and libadwaita development packages, GLib resource tools,
+Python 3.12+, PyGObject, GdkPixbuf introspection data and SVG decoding, curl,
+Git, and cache archive tools through DNF. It verifies the library minimums,
+libclang discovery/loading, Python, and SVG loader availability. Fedora packages
+`rustup-init`; [`ci/check.sh`](../ci/check.sh) uses it to install Cargo's proxies
+and then the selected compiler, rustfmt, and Clippy.
+
+Run the same environment with rootless Podman from the repository root:
 
 ```sh
-docker build --tag gmux-ci:local --file ci/Containerfile ci
-docker run --rm --init --user 0:0 \
-  --env GMUX_CI_UID="$(id -u)" --env GMUX_CI_GID="$(id -g)" \
-  --volume "$PWD:/workspace" gmux-ci:local bash ci/run.sh
+# Copy this digest from .github/workflows/check.yml when updating the image.
+gmux_ci_image=registry.fedoraproject.org/fedora:44@sha256:cd3513b19e87220eb6fba1aeb041cf88f9c00c3b1de213c36db7532c383f4a1c
+podman run --rm --init --volume "$PWD:$PWD:Z" --workdir "$PWD" \
+  --env CARGO_TARGET_DIR="$PWD/.ci-cache/target" \
+  "$gmux_ci_image" bash -c 'bash ci/install-deps.sh && bash ci/check.sh'
 # Test the minimum compiler in the same image:
-docker run --rm --init --user 0:0 \
-  --env GMUX_CI_UID="$(id -u)" --env GMUX_CI_GID="$(id -g)" \
+podman run --rm --init --volume "$PWD:$PWD:Z" --workdir "$PWD" \
+  --env CARGO_TARGET_DIR="$PWD/.ci-cache/target-minimum" \
   --env RUSTUP_TOOLCHAIN=1.95.0 \
-  --volume "$PWD:/workspace" gmux-ci:local bash ci/run.sh
+  "$gmux_ci_image" bash -c 'bash ci/install-deps.sh && bash ci/check.sh'
 ```
 
-Podman accepts the same build and run commands. For rootless Podman, add
-`--userns=keep-id` to each run. The checkout stores caches in `.ci-cache/`,
-`.deps/`, and `target/`, all ignored by Git. The container installs the selected
-compiler, bootstraps this checkout's pinned Ghostty revision, and invokes
-`scripts/check.py`. Bootstrap verifies the Ghostty source archive's checked-in
-SHA-256 on every run, including cache hits. It verifies the Zig download against
-the pinned release's upstream SHA-256, and Zig verifies its dependency package
-hashes. CI bootstraps its own library under `.deps/ghostty`.
+Docker accepts the same commands without the SELinux `:Z` volume suffix.
+The checkout stores ignored caches in `.ci-cache/` and `.deps/`. Start with fresh
+caches when comparing environments. CI keys caches by architecture, compiler,
+workflow/install/bootstrap inputs, and the installed RPM manifest; Cargo's
+lockfile also keys Rust build outputs. Package updates therefore cannot restore
+outputs built against an older system environment. The two compiler jobs use
+independent Rust caches.
 
-The container starts as root to create an account matching the checkout owner's
-UID and GID. It then runs bootstrap and checks as that account. This supplies a
-valid home directory for application tests and keeps caches and reports owned
-by the caller. A numeric `--user` alone does not create a home or passwd entry.
+The container always bootstraps this checkout's pinned Ghostty revision. It sets
+`GHOSTTY_PREFIX` and `LD_LIBRARY_PATH` to that installation, overriding inherited
+values, and checks both binaries' resolved Ghostty linkage. Bootstrap verifies
+the source archive's checked-in SHA-256 on every run, including cache hits.
+It verifies a newly downloaded Zig archive against the pinned release's upstream
+SHA-256, and Zig verifies its dependency package hashes.
 
-[`Validation`](../.github/workflows/check.yml) runs on pushes to main, pull requests,
-and manual dispatches. Its independent Rust 1.95.0 and 1.99.0 jobs cover
-formatting, locked Rust tests, Clippy with warnings denied, binary and example
-builds, and every headless smoke suite selected by `scripts/check.py`. New
-headless suites added to the runner are included automatically. Actions use
-pinned commit IDs. The workflow caches the container layers, Cargo downloads,
-compiler installations and build outputs, and Ghostty/Zig dependencies. Cache
-keys separate compilers and change with the Linux environment or bootstrap pin.
+The image digest, Rust versions, Cargo lockfile, Ghostty revision and source
+checksum, Zig version, and action commit IDs are fixed inputs. DNF deliberately
+uses Fedora's supported stable package updates, with signature verification;
+this is not a frozen RPM archive or a claim of bit-for-bit build reproducibility.
+Each run preserves the full installed RPM manifest and enabled repositories.
+Review image, compiler, action, and source-pin updates in PRs and rerun both
+compiler jobs. Move to a supported Fedora release before this one reaches end of
+life. A package update that breaks a check must be investigated, not hidden by
+loosening assertions or skipping a suite.
+
+The independent Rust 1.95.0 and 1.99.0 jobs run formatting, locked Rust tests,
+Clippy with warnings denied, binary and example builds, and every headless suite
+selected by `scripts/check.py`. New headless suites are included automatically.
+The jobs run on pushes to main, pull requests, and manual dispatches.
 
 CI does not run `--native` or validate frontend drawing, input, accessibility,
-notifications, or compositor integration. Run that suite separately in an
-environment with the native prerequisites above. The headless container does
-not supply Mutter, PipeWire, or the desktop fixture's remaining dependencies.
+notifications, GPU drivers, or compositor integration. It does not cover aarch64
+or cross compilation. Run native checks separately with the prerequisites above.
+The headless job does not install Mutter, PipeWire, or the remaining native
+fixture services. Native font tests compare metric changes, not one machine's
+fixed pixel values. Renderer cache comparisons retain the exact Cairo oracle
+and the optional selected-GPU diagnostic described in [renderer validation](renderer.md#validation).
 
-The container writes bootstrap and runner output to `artifacts/ci.log`.
-GitHub Actions uploads `artifacts/` after success or failure and retains reports
-for 14 days. Image-build and cache-setup failures remain in the Actions step
-logs. To validate workflow edits locally, run:
+The container writes installation output to `artifacts/packages.log`, its RPM
+manifest to `artifacts/packages.txt`, and bootstrap, runner, compiler and linkage
+output to `artifacts/ci.log`. GitHub uploads `artifacts/` after success or failure
+and retains reports for 14 days. Failures before checkout remain in Actions step
+logs. Validate workflow edits with:
 
 ```sh
 actionlint .github/workflows/check.yml
-bash -n ci/check.sh
-bash -n ci/run.sh
+bash -n ci/install-deps.sh ci/check.sh
 ```
 
 ## Run checks
@@ -162,7 +188,13 @@ examples; the `renderer` smoke suite runs the tools to check drawing and cache
 behavior.
 
 The fixture creates a 1280 × 960 virtual monitor and private D-Bus, PipeWire,
-settings, runtime sockets, and caches. Keyboard, pointer, and clipboard input
+settings, runtime sockets, home, and XDG config/cache/state/data directories.
+It clears inherited display sockets, accessibility and session bus addresses,
+user fontconfig overrides, and GTK theme overrides. System fonts and schemas
+come from the selected distribution. `C.UTF-8` fixes translated toolkit labels
+and UTF-8 text behavior. Monitor scale starts at 100%; scale cases explicitly
+change the private monitor. `GSK_RENDERER`, appearance, and high-contrast
+selections remain deliberate inputs. Keyboard, pointer, and clipboard input
 stay in that compositor. The fixture stops its processes when the run ends.
 
 ## Select smoke tests
@@ -178,6 +210,10 @@ python3 scripts/check.py --skip-build --only control icon
 Use `smoke` for `smoke-test.py`. Rust checks still run unless `--skip-build` is
 set; that option skips all formatting, Rust tests, Clippy, and build steps.
 Use it after a successful build while checking an unchanged binary.
+All smoke and benchmark defaults resolve Cargo's output directory with locked
+`cargo metadata`, including `CARGO_TARGET_DIR` and Cargo config `build.target-dir`.
+Explicit `--binary` and `--check-binary` options still select the supplied paths.
+This avoids testing old binaries under `target/debug` after a redirected build.
 Include `--native` for desktop tests so the runner provides their isolated
 display and services.
 
@@ -232,6 +268,9 @@ Test counts come from the runner output; the suite changes as regressions are
 added.
 
 The general `smoke` suite covers startup, PTY workflows, and session reconnects.
+The runner selects its native mode. A direct invocation without `--native`
+uses Broadway with private runtime and HTTP Unix sockets, avoiding fixed display
+sockets and TCP ports; that mode does not validate native Wayland integration.
 Notification edge cases belong to the notification suites. The `audit` suite
 runs each regression in a separate application fixture. Named scenarios print
 their status so failures identify the behavior being checked.
@@ -278,8 +317,14 @@ ADW_DEBUG_HIGH_CONTRAST=1 python3 scripts/check.py --native --skip-build --only 
 
 ## Failures and artifacts
 
-The runner stops at the first failed command and gives each check a five-minute
-timeout. Read the command's output and its files under `artifacts/`. Native
+The runner stops at the first failed command. Each Cargo command has a
+20-minute build deadline; each smoke suite retains a five-minute deadline.
+Use `--build-timeout SECONDS` and `--smoke-timeout SECONDS` to configure them.
+These command deadlines do not change native readiness or dismissal assertions.
+The final output names the smoke suites that passed, reports omitted Rust checks
+with `--skip-build`, and states when native suites were not selected. The optional
+`btop` title case reports its omission when that executable is absent.
+Read the command's output and its files under `artifacts/`. Native
 fixture logs include `check-session.log` and `check-wayland.log`; individual
 checks write their own logs, screenshots, and render-node reports.
 
@@ -295,7 +340,9 @@ capture helpers live in
 
 `AppFixture` tracks processes before waiting for startup, supplies private state
 and a shell, and shuts down the daemon even if the frontend has already exited.
-`AccessibilityFixture` waits for the registry's D-Bus name and stops it only if
-it started the process. Readiness checks wait for observable state. Timed
+Shell fixtures write history within their temporary directories.
+`AccessibilityFixture` activates and waits for the registry's D-Bus name.
+The registry belongs to the private accessibility bus and ends with that bus;
+closing a fixture does not kill a service shared by later suites. Readiness checks wait for observable state. Timed
 observations remain where a check needs to verify dismissal deadlines or the
 absence of delayed updates.
