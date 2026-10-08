@@ -1,0 +1,1618 @@
+color {
+  bounds: 0 0 400 168;
+  color: color(srgb 0.12 0.12 0.13);
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "A";
+  offset: 0 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "m";
+  offset: 10 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: 170 9.59961;
+  offset: 20 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR 16px";
+  glyphs: 27105 16;
+  offset: 30 18.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 50 16;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial 16px";
+  glyphs: 993 5.40625;
+  offset: 70 14.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono 16px";
+  glyphs: 5465 9.59961;
+  offset: 80 15.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "j";
+  offset: 90 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "A";
+  offset: 100 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "m";
+  offset: 110 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: 170 9.59961;
+  offset: 120 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR 16px";
+  glyphs: 27105 16;
+  offset: 130 18.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 150 16;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial 16px";
+  glyphs: 993 5.40625;
+  offset: 170 14.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono 16px";
+  glyphs: 5465 9.59961;
+  offset: 180 15.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "j";
+  offset: 190 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "A";
+  offset: 200 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "m";
+  offset: 210 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: 170 9.59961;
+  offset: 220 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR 16px";
+  glyphs: 27105 16;
+  offset: 230 18.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 250 16;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial 16px";
+  glyphs: 993 5.40625;
+  offset: 270 14.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono 16px";
+  glyphs: 5465 9.59961;
+  offset: 280 15.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "j";
+  offset: 290 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "A";
+  offset: 300 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "m";
+  offset: 310 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: 170 9.59961;
+  offset: 320 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR 16px";
+  glyphs: 27105 16;
+  offset: 330 18.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 350 16;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial 16px";
+  glyphs: 993 5.40625;
+  offset: 370 14.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono 16px";
+  glyphs: 5465 9.59961;
+  offset: 380 15.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono 16px";
+  glyphs: "j";
+  offset: 390 17.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 0 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 10 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 20 39.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 40 37;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 60 35.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 70 36.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 80 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 90 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 100 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 110 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 120 39.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 140 37;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 160 35.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 170 36.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 180 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 190 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 200 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 210 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 220 39.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 240 37;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 260 35.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 270 36.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 280 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 290 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 300 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 310 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 320 39.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 340 37;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 360 35.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 370 36.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 380 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 390 38.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 0 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 10 60.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 30 58;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 50 56.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 60 57.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 70 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 80 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 90 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 100 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 110 60.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 130 58;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 150 56.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 160 57.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 170 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 180 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 190 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 200 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 210 60.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 230 58;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 250 56.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 260 57.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 270 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 280 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 290 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 300 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 310 60.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 330 58;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 350 56.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 360 57.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 370 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 380 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 390 59.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 0 81.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 20 79;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 40 77.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 50 78.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 60 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 70 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 80 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 90 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 100 81.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 120 79;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 140 77.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 150 78.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 160 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 170 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 180 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 190 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 200 81.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 220 79;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 240 77.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 250 78.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 260 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 270 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 280 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 290 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 300 81.5596;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 320 79;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 340 77.4844;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 350 78.4404;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 360 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 370 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 380 80.1035;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 390 80.1035;
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Apple Color Emoji 20px";
+    glyphs: 1438 16 0 0 color;
+    offset: 0 100;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Liberation Mono 16px";
+    glyphs: 1279 9.60156;
+    offset: 20 97.3203;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Arial 16px";
+    glyphs: 993 5.40625;
+    offset: 30 98.4844;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Adwaita Mono 16px";
+    glyphs: 5465 9.59961;
+    offset: 40 99.4404;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "j";
+    offset: 50 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "A";
+    offset: 60 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "m";
+    offset: 70 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: 170 9.59961;
+    offset: 80 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono CJK KR 16px";
+    glyphs: 27105 16;
+    offset: 90 102.56;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Apple Color Emoji 20px";
+    glyphs: 2165 16 0 0 color;
+    offset: 110 100;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Arial 16px";
+    glyphs: 993 5.40625;
+    offset: 130 98.4844;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Adwaita Mono 16px";
+    glyphs: 5465 9.59961;
+    offset: 140 99.4404;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "j";
+    offset: 150 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "A";
+    offset: 160 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "m";
+    offset: 170 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: 170 9.59961;
+    offset: 180 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono CJK KR 16px";
+    glyphs: 27105 16;
+    offset: 190 102.56;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Apple Color Emoji 20px";
+    glyphs: 2165 16 0 0 color;
+    offset: 210 100;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Arial 16px";
+    glyphs: 993 5.40625;
+    offset: 230 98.4844;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Adwaita Mono 16px";
+    glyphs: 5465 9.59961;
+    offset: 240 99.4404;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "j";
+    offset: 250 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "A";
+    offset: 260 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "m";
+    offset: 270 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: 170 9.59961;
+    offset: 280 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono CJK KR 16px";
+    glyphs: 27105 16;
+    offset: 290 102.56;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Apple Color Emoji 20px";
+    glyphs: 2165 16 0 0 color;
+    offset: 310 100;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Arial 16px";
+    glyphs: 993 5.40625;
+    offset: 330 98.4844;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Adwaita Mono 16px";
+    glyphs: 5465 9.59961;
+    offset: 340 99.4404;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "j";
+    offset: 350 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "A";
+    offset: 360 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: "m";
+    offset: 370 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono 16px";
+    glyphs: 170 9.59961;
+    offset: 380 101.104;
+  }
+}
+opacity {
+  child: text {
+    color: rgb(255,255,255);
+    font: "Noto Sans Mono CJK KR 16px";
+    glyphs: 27105 16;
+    offset: 390 102.56;
+  }
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 0 121;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 20 119.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 30 120.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 40 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 50 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 60 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 70 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 80 123.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 100 121;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 120 119.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 130 120.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 140 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 150 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 160 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 170 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 180 123.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 200 121;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 220 119.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 230 120.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 240 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 250 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 260 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 270 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 280 123.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 300 121;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold 16px";
+  glyphs: 993 5.76562;
+  offset: 320 119.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold 16px";
+  glyphs: 5465 9.59961;
+  offset: 330 120.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "j";
+  offset: 340 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "A";
+  offset: 350 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: "m";
+  offset: 360 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold 16px";
+  glyphs: 170 9.59961;
+  offset: 370 122.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold 16px";
+  glyphs: 27105 16;
+  offset: 380 123.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Liberation Mono Italic 16px";
+  glyphs: 1279 9.60156;
+  offset: 0 139.32;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 10 140.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 20 141.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 30 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 40 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 50 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 60 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 70 144.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 90 142;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 110 140.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 120 141.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 130 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 140 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 150 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 160 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 170 144.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 190 142;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 210 140.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 220 141.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 230 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 240 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 250 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 260 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 270 144.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 290 142;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Oblique 16px";
+  glyphs: 993 5.40625;
+  offset: 310 140.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 320 141.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "j";
+  offset: 330 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "A";
+  offset: 340 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: "m";
+  offset: 350 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 360 143.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Oblique 16px";
+  glyphs: 27105 16;
+  offset: 370 144.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 390 142;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 0 161.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 10 162.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 20 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 30 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 40 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 50 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 60 165.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 80 163;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 100 161.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 110 162.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 120 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 130 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 140 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 150 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 160 165.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 180 163;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 200 161.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 210 162.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 220 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 230 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 240 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 250 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 260 165.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 280 163;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Arial Bold Oblique 16px";
+  glyphs: 993 5.76562;
+  offset: 300 161.484;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Adwaita Mono Bold Italic 16px";
+  glyphs: 5469 9.59961;
+  offset: 310 162.44;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "j";
+  offset: 320 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "A";
+  offset: 330 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: "m";
+  offset: 340 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono Bold Oblique 16px";
+  glyphs: 170 9.59961;
+  offset: 350 164.104;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Noto Sans Mono CJK KR Bold Oblique 16px";
+  glyphs: 27105 16;
+  offset: 360 165.56;
+}
+text {
+  color: rgb(255,255,255);
+  font: "Apple Color Emoji Bold Oblique 20px";
+  glyphs: 2165 16 0 0 color;
+  offset: 380 163;
+}

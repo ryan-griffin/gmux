@@ -1,0 +1,7 @@
+{
+  "sequence":"fixed", "same_node":true, "keep_node":true, "pair":411, "gtk_renderer":"GskVulkanRenderer",
+  "size":[400,168], "scale":1, "origin":[0,0], "step":0,
+  "nodes_equal":true, "differing_pixels":1, "bounds":[265,138,265,138], "max_channel_delta":182,
+  "first":[{"x":265,"y":138,"actual_bgra":[255,255,255,255],"expected_bgra":[75,73,73,255]}], "three_downloads_stable":true, "diagnostic_render_pairs_equal":[true,true,true],
+  "diagnostic_actual_matches_original":[false,false,false], "diagnostic_expected_matches_original":[true,true,true]
+}

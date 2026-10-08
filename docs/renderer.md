@@ -232,6 +232,10 @@ Investigation logs and probes live in ignored `artifacts/renderer-investigation/
 Repeat-run results above describe the checker and this graphics stack; they do
 not prove Vulkan output is deterministic or validate other GPU vendors.
 
+The follow-up [GTK/Pango reproducer and upstream-report draft](vulkan-texture-report.md)
+records a failure outside Gmux's renderer, bounded mismatch artifacts, backend
+comparisons and the limits of GTK/Mesa attribution.
+
 ## Benchmarks
 
 The [application benchmark](performance.md) measures frontend and daemon CPU,

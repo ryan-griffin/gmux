@@ -1,0 +1,156 @@
+{
+  "started_at": "2026-10-08T22:22:02.895150+00:00",
+  "options": {
+    "backend": "vulkan",
+    "runs": 10,
+    "sequence": "fixed",
+    "rounds": 1000,
+    "keep_node": true,
+    "same_node": false,
+    "no_prelude": false,
+    "no_context": false,
+    "no_churn": false,
+    "output": "/home/ryang/.t3/worktrees/gmux/t3-reproduce-vulkan-texture-instability/artifacts/vulkan-repro/kept-vulkan"
+  },
+  "source_sha256": "763f5cb70486390937d324b28544ea034e3bbbcf517f199079983f38ad5558d2",
+  "binary_sha256": "e302868105be7b02e160864ac550867bc8467c18350599fdd41fe50ee4ce7086",
+  "build": [
+    "cc",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-O0",
+    "-g",
+    "/home/ryang/.t3/worktrees/gmux/t3-reproduce-vulkan-texture-instability/scripts/gsk-texture-repro.c",
+    "-o",
+    "/home/ryang/.t3/worktrees/gmux/t3-reproduce-vulkan-texture-instability/artifacts/vulkan-repro/kept-vulkan/gsk-texture-repro",
+    "-I/usr/include/gtk-4.0",
+    "-I/usr/include/pango-1.0",
+    "-I/usr/include/fribidi",
+    "-I/usr/include/harfbuzz",
+    "-I/usr/include/gdk-pixbuf-2.0",
+    "-I/usr/include/glycin-2",
+    "-I/usr/include/cairo",
+    "-I/usr/include/freetype2",
+    "-I/usr/include/libpng16",
+    "-I/usr/include/pixman-1",
+    "-I/usr/include/graphene-1.0",
+    "-I/usr/lib/graphene-1.0/include",
+    "-mfpmath=sse",
+    "-msse",
+    "-msse2",
+    "-I/usr/include/glib-2.0",
+    "-I/usr/lib/glib-2.0/include",
+    "-I/usr/include/libmount",
+    "-I/usr/include/blkid",
+    "-I/usr/include/sysprof-6",
+    "-pthread",
+    "-lgtk-4",
+    "-lpangocairo-1.0",
+    "-lpango-1.0",
+    "-lharfbuzz",
+    "-lgdk_pixbuf-2.0",
+    "-lcairo-gobject",
+    "-lcairo",
+    "-lvulkan",
+    "-lgraphene-1.0",
+    "-lgio-2.0",
+    "-lgobject-2.0",
+    "-lglib-2.0",
+    "-lm"
+  ],
+  "environment": {
+    "GDK_BACKEND": "wayland",
+    "GDK_SCALE": "1",
+    "GDK_DPI_SCALE": "1",
+    "GDK_DEBUG": "no-portals",
+    "GSK_RENDERER": "vulkan",
+    "GTK_A11Y": "none"
+  },
+  "inventory": [
+    {
+      "command": [
+        "git",
+        "-C",
+        "/home/ryang/.t3/worktrees/gmux/t3-reproduce-vulkan-texture-instability",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "555b8efe5faec1537a66b9ae396cf9407964fee8\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "uname",
+        "-a"
+      ],
+      "exit": 0,
+      "stdout": "Linux laptop 7.2.9-arch1-1 #1 SMP PREEMPT_DYNAMIC Sat, 03 Oct 2026 11:43:28 +0000 x86_64 GNU/Linux\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "pkg-config",
+        "--modversion",
+        "gtk4",
+        "pango",
+        "glib-2.0",
+        "cairo",
+        "fontconfig"
+      ],
+      "exit": 0,
+      "stdout": "4.24.1\n1.58.2\n2.90.1\n1.18.6\n2.18.3\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "mutter",
+        "--version"
+      ],
+      "exit": 0,
+      "stdout": "mutter 51.0\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "vulkaninfo",
+        "--summary"
+      ],
+      "exit": 0,
+      "stdout": "==========\nVULKANINFO\n==========\n\nVulkan Instance Version: 1.4.363\n\n\nInstance Extensions: count = 26\n-------------------------------\nVK_EXT_acquire_drm_display             : extension revision 1\nVK_EXT_acquire_xlib_display            : extension revision 1\nVK_EXT_debug_report                    : extension revision 10\nVK_EXT_debug_utils                     : extension revision 2\nVK_EXT_direct_mode_display             : extension revision 1\nVK_EXT_display_surface_counter         : extension revision 1\nVK_EXT_headless_surface                : extension revision 1\nVK_EXT_layer_settings                  : extension revision 2\nVK_EXT_surface_maintenance1            : extension revision 1\nVK_EXT_swapchain_colorspace            : extension revision 5\nVK_KHR_device_group_creation           : extension revision 1\nVK_KHR_display                         : extension revision 23\nVK_KHR_external_fence_capabilities     : extension revision 1\nVK_KHR_external_memory_capabilities    : extension revision 1\nVK_KHR_external_semaphore_capabilities : extension revision 1\nVK_KHR_get_display_properties2         : extension revision 1\nVK_KHR_get_physical_device_properties2 : extension revision 2\nVK_KHR_get_surface_capabilities2       : extension revision 1\nVK_KHR_portability_enumeration         : extension revision 1\nVK_KHR_surface                         : extension revision 25\nVK_KHR_surface_maintenance1            : extension revision 1\nVK_KHR_surface_protected_capabilities  : extension revision 1\nVK_KHR_wayland_surface                 : extension revision 6\nVK_KHR_xcb_surface                     : extension revision 6\nVK_KHR_xlib_surface                    : extension revision 6\nVK_LUNARG_direct_driver_loading        : extension revision 1\n\nInstance Layers: count = 6\n--------------------------\nVK_LAYER_MESA_anti_lag            Open-source implementation of the VK_AMD_anti_lag extension. 1.4.303  version 1\nVK_LAYER_MESA_device_select       Linux device selection layer                                 1.4.303  version 1\nVK_LAYER_VALVE_steam_fossilize_32 Steam Pipeline Caching Layer                                 1.3.207  version 1\nVK_LAYER_VALVE_steam_fossilize_64 Steam Pipeline Caching Layer                                 1.3.207  version 1\nVK_LAYER_VALVE_steam_overlay_32   Steam Overlay Layer                                          1.3.207  version 1\nVK_LAYER_VALVE_steam_overlay_64   Steam Overlay Layer                                          1.3.207  version 1\n\nDevices:\n========\nGPU0:\n\tapiVersion         = 1.4.354\n\tdriverVersion      = 26.2.4\n\tvendorID           = 0x8086\n\tdeviceID           = 0xa7a0\n\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU\n\tdeviceName         = Intel(R) Iris(R) Xe Graphics (RPL-P)\n\tdriverID           = DRIVER_ID_INTEL_OPEN_SOURCE_MESA\n\tdriverName         = Intel open-source Mesa driver\n\tdriverInfo         = Mesa 26.2.4-arch1.1\n\tconformanceVersion = 1.4.0.0\n\tdeviceUUID         = 8680a0a7-0400-0000-0002-000000000000\n\tdriverUUID         = eca2adc9-df1e-210d-0535-01e259917722\n",
+      "stderr": "'DISPLAY' environment variable not set... skipping surface info\n"
+    },
+    {
+      "command": [
+        "lspci",
+        "-nnk",
+        "-d",
+        "::03xx"
+      ],
+      "exit": 0,
+      "stdout": "0000:00:02.0 VGA compatible controller [0300]: Intel Corporation Raptor Lake-P [Iris Xe Graphics] [8086:a7a0] (rev 04)\n\tSubsystem: Acer Incorporated [ALI] Device [1025:169a]\n\tKernel driver in use: i915\n\tKernel modules: i915, xe\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "fc-match",
+        "Monospace"
+      ],
+      "exit": 0,
+      "stdout": "NotoSansMono-Regular.ttf: \"Noto Sans Mono\" \"Regular\"\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "fc-match",
+        "emoji"
+      ],
+      "exit": 0,
+      "stdout": "apple-color-emoji.ttf: \"Apple Color Emoji\" \"Regular\"\n",
+      "stderr": ""
+    }
+  ],
+  "capture_run": 1,
+  "capture_source": "artifacts/vulkan-repro/kept-vulkan/run-001"
+}
