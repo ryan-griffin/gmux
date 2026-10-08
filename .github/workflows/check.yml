@@ -1,0 +1,101 @@
+name: Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless:
+    name: Headless / ${{ matrix.toolchain }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [minimum, development]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read the Rust requirements
+        id: rust
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          if os.environ["TOOLCHAIN"] == "minimum":
+              version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["rust-version"]
+              if version.count(".") == 1:
+                  version += ".0"
+          else:
+              version = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"version={version}", file=output)
+          PY
+
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .ci-cache/cargo/registry
+            .ci-cache/cargo/git
+            .ci-cache/rustup
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('ci/Containerfile', 'scripts/bootstrap-ghostty.py') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('ci/Containerfile', 'scripts/bootstrap-ghostty.py') }}-
+
+      - name: Cache Ghostty and Zig dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .deps
+            .ci-cache/zig
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/Containerfile', 'scripts/bootstrap-ghostty.py') }}
+
+      - name: Set up the image builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the Linux validation environment
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ci
+          file: ci/Containerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: gmux-ci:local
+          cache-from: type=gha,scope=gmux-ci
+          cache-to: type=gha,mode=max,scope=gmux-ci
+
+      - name: Bootstrap Ghostty and run the headless checks
+        env:
+          RUST_VERSION: ${{ steps.rust.outputs.version }}
+        run: |
+          docker run --rm --init \
+            --user 0:0 \
+            --env GMUX_CI_UID="$(id -u)" --env GMUX_CI_GID="$(id -g)" \
+            --env RUSTUP_TOOLCHAIN="$RUST_VERSION" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            gmux-ci:local bash ci/run.sh
+
+      - name: Preserve check output and reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: headless-${{ matrix.toolchain }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

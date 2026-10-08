@@ -1,5 +1,6 @@
 /target/
 /.deps/
+/.ci-cache/
 /artifacts/
 *.log
 __pycache__/

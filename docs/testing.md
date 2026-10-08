@@ -46,6 +46,95 @@ interfaces. The recorded environment used Mutter 50.5, PipeWire 1.6.9,
 WirePlumber 0.5.18, and GStreamer 1.28.7. These are tested versions, not minimum
 requirements beyond those stated above.
 
+## Rust requirements
+
+`Cargo.toml` declares Rust 1.95 as the minimum supported compiler.
+`src/remote.rs` uses `AtomicUsize::try_update`, which
+[became stable in Rust 1.95](https://github.com/rust-lang/rust/blob/1.95.0/library/core/src/sync/atomic.rs).
+Rust 1.94 fails to compile that call with `E0658` for `atomic_try_update`.
+The locked GTK and GLib crates also declare Rust 1.92 as their minimum.
+The locked bindgen 0.73.2 dependency declares Rust 1.71 and does not raise
+the minimum. Its generated declarations use the bridge compiler's target C
+flags and undergo layout checks with both supported compilers.
+Rust 2024 edition support alone does not satisfy these requirements.
+
+[`rust-toolchain.toml`](../rust-toolchain.toml) pins development to Rust 1.99.0
+and installs rustfmt and Clippy with rustup. CI reads both TOML files to select
+its compilers. Both compilers run the full headless runner with the locked
+dependencies. Compiler and dependency updates must keep the minimum run passing
+or deliberately raise `rust-version`.
+
+To check the minimum compiler locally after bootstrapping Ghostty:
+
+```sh
+rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+RUSTUP_TOOLCHAIN=1.95.0 python3 scripts/check.py
+```
+
+## Linux container and CI
+
+[`ci/Containerfile`](../ci/Containerfile) pins the official x86_64 Arch Linux
+base image by digest and installs packages from the 2026-10-01 Arch Linux
+Archive snapshot. The snapshot supplies GTK 4.22.5, libadwaita 1.9.4, a C
+compiler, Clang 23.1.1 and its libclang library, pkg-config, GLib resource tools,
+curl, Git, Python, PyGObject, GdkPixbuf introspection data, and librsvg's SVG
+loader. Pacman verifies package signatures. The image build checks the GTK,
+libadwaita, and Python minimums,
+libclang loading, and the availability of SVG decoding.
+
+Run the same environment with Docker from the repository root:
+
+```sh
+docker build --tag gmux-ci:local --file ci/Containerfile ci
+docker run --rm --init --user 0:0 \
+  --env GMUX_CI_UID="$(id -u)" --env GMUX_CI_GID="$(id -g)" \
+  --volume "$PWD:/workspace" gmux-ci:local bash ci/run.sh
+# Test the minimum compiler in the same image:
+docker run --rm --init --user 0:0 \
+  --env GMUX_CI_UID="$(id -u)" --env GMUX_CI_GID="$(id -g)" \
+  --env RUSTUP_TOOLCHAIN=1.95.0 \
+  --volume "$PWD:/workspace" gmux-ci:local bash ci/run.sh
+```
+
+Podman accepts the same build and run commands. For rootless Podman, add
+`--userns=keep-id` to each run. The checkout stores caches in `.ci-cache/`,
+`.deps/`, and `target/`, all ignored by Git. The container installs the selected
+compiler, bootstraps this checkout's pinned Ghostty revision, and invokes
+`scripts/check.py`. Bootstrap verifies the Ghostty source archive's checked-in
+SHA-256 on every run, including cache hits. It verifies the Zig download against
+the pinned release's upstream SHA-256, and Zig verifies its dependency package
+hashes. CI bootstraps its own library under `.deps/ghostty`.
+
+The container starts as root to create an account matching the checkout owner's
+UID and GID. It then runs bootstrap and checks as that account. This supplies a
+valid home directory for application tests and keeps caches and reports owned
+by the caller. A numeric `--user` alone does not create a home or passwd entry.
+
+[`Validation`](../.github/workflows/check.yml) runs on pushes to main, pull requests,
+and manual dispatches. Its independent Rust 1.95.0 and 1.99.0 jobs cover
+formatting, locked Rust tests, Clippy with warnings denied, binary and example
+builds, and every headless smoke suite selected by `scripts/check.py`. New
+headless suites added to the runner are included automatically. Actions use
+pinned commit IDs. The workflow caches the container layers, Cargo downloads,
+compiler installations and build outputs, and Ghostty/Zig dependencies. Cache
+keys separate compilers and change with the Linux environment or bootstrap pin.
+
+CI does not run `--native` or validate frontend drawing, input, accessibility,
+notifications, or compositor integration. Run that suite separately in an
+environment with the native prerequisites above. The headless container does
+not supply Mutter, PipeWire, or the desktop fixture's remaining dependencies.
+
+The container writes bootstrap and runner output to `artifacts/ci.log`.
+GitHub Actions uploads `artifacts/` after success or failure and retains reports
+for 14 days. Image-build and cache-setup failures remain in the Actions step
+logs. To validate workflow edits locally, run:
+
+```sh
+actionlint .github/workflows/check.yml
+bash -n ci/check.sh
+bash -n ci/run.sh
+```
+
 ## Run checks
 
 ```sh
