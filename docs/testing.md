@@ -10,6 +10,20 @@ the previous pin cannot validate the upgrade. Update `SOURCE_SHA256` with the
 source archive hash and check `ZIG_VERSION` against upstream's `build.zig.zon`
 and `src/build/zig.zig` requirements.
 
+The build also needs libclang, which bindgen uses to read
+[`src/ghostty_bridge.h`](../src/ghostty_bridge.h). Set `LIBCLANG_PATH` to its
+directory if it is not discoverable. Every Rust build checks the generated FFI
+struct sizes, alignments, and field offsets; the C compiler checks exported
+function prototypes. See the [boundary documentation](code-organization.md#shared-data-and-protocols)
+for the source of truth.
+
+Bindings use Cargo's target, including x86_64 and aarch64 Linux. Cross builds
+need a target C toolchain and sysroot, target GTK and Ghostty libraries, and the
+Rust target. Bindgen receives the C compiler's flags, including target header
+search paths and ABI options. They must also be accepted by libclang. Use
+`BINDGEN_EXTRA_CLANG_ARGS_<TARGET>` for additional Clang header search paths
+if needed; avoid overriding the shared ABI options there.
+
 ## Prerequisites
 
 The headless smoke tests need Python 3.12+, PyGObject, GdkPixbuf 2 introspection

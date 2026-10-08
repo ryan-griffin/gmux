@@ -1,17 +1,16 @@
 use crate::{model::CursorStyle, theme::Theme};
 use std::{
-    ffi::{CString, c_char, c_void},
+    ffi::{CString, c_void},
     ptr::NonNull,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct Cell {
-    pub text: [u8; 64],
-    pub fg: [u8; 3],
-    pub bg: [u8; 3],
-    pub flags: u8,
+// Generated declarations and compile-time layout checks for our C shim.
+mod ffi {
+    include!(concat!(env!("OUT_DIR"), "/ghostty_bridge.rs"));
 }
+use ffi::*;
+pub use ffi::{Cell, Frame, Scrollback};
+
 impl Default for Cell {
     fn default() -> Self {
         Self {
@@ -27,27 +26,6 @@ impl Cell {
         let end = self.text.iter().position(|&x| x == 0).unwrap_or(64);
         std::str::from_utf8(&self.text[..end]).unwrap_or("\u{fffd}")
     }
-}
-#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[repr(C)]
-pub struct Frame {
-    pub cols: u16,
-    pub rows: u16,
-    pub cursor_x: u16,
-    pub cursor_y: u16,
-    pub cursor_visible: u8,
-    pub cursor_style: u8,
-    pub background: [u8; 3],
-    pub foreground: [u8; 3],
-    pub cursor: [u8; 3],
-    pub scrollback: Scrollback,
-}
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[repr(C)]
-pub struct Scrollback {
-    pub total: u64,
-    pub offset: u64,
-    pub len: u64,
 }
 #[derive(Default)]
 struct Events {
@@ -75,80 +53,9 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
         _ => {}
     }
 }
-unsafe extern "C" {
-    fn gmux_engine_new(
-        ud: *mut c_void,
-        cb: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize),
-    ) -> *mut c_void;
-    fn gmux_engine_free(engine: *mut c_void);
-    fn gmux_engine_history_size(engine: *mut c_void, cols: *mut u16, rows: *mut usize) -> i32;
-    fn gmux_engine_history_row(
-        engine: *mut c_void,
-        row: u32,
-        cells: *mut Cell,
-        cols: usize,
-        wrapped: *mut bool,
-    ) -> i32;
-    fn gmux_engine_select(engine: *mut c_void, sx: u16, sy: u32, ex: u16, ey: u32) -> i32;
-    fn gmux_engine_clear_selection(engine: *mut c_void);
-    fn gmux_engine_selection(engine: *mut c_void, start: *mut u64, end: *mut u64) -> i32;
-    fn gmux_engine_copy(
-        engine: *mut c_void,
-        bytes: *mut u8,
-        cap: usize,
-        written: *mut usize,
-    ) -> i32;
-    fn gmux_engine_theme(
-        engine: *mut c_void,
-        background: *const u8,
-        foreground: *const u8,
-        cursor: *const u8,
-        palette: *const u8,
-        dark: bool,
-    ) -> i32;
-    fn gmux_engine_write(engine: *mut c_void, data: *const u8, len: usize);
-    fn gmux_engine_cursor_style(engine: *mut c_void, style: u8) -> i32;
-    fn gmux_engine_resize(engine: *mut c_void, cols: u16, rows: u16, cw: u32, ch: u32) -> i32;
-    fn gmux_engine_snapshot(
-        engine: *mut c_void,
-        frame: *mut Frame,
-        cells: *mut Cell,
-        cap: usize,
-    ) -> i32;
-    fn gmux_engine_scroll(engine: *mut c_void, delta: isize, bottom: bool);
-    fn gmux_engine_scroll_to(engine: *mut c_void, row: u64);
-    fn gmux_engine_expire_render_hold(engine: *mut c_void) -> bool;
-    fn gmux_engine_string(engine: *mut c_void, pwd: i32, out: *mut u8, cap: usize) -> usize;
-    fn gmux_engine_mode(engine: *mut c_void, mode: i32) -> i32;
-    fn gmux_engine_paste(engine: *mut c_void, data: *const u8, len: usize, clipboard: bool) -> i32;
-    fn gmux_engine_key(
-        engine: *mut c_void,
-        name: *const c_char,
-        cp: u32,
-        mods: u16,
-        release: bool,
-        text: *const c_char,
-        len: usize,
-        out: *mut u8,
-        cap: usize,
-    ) -> usize;
-    fn gmux_engine_mouse(
-        engine: *mut c_void,
-        x: f32,
-        y: f32,
-        cw: u32,
-        ch: u32,
-        action: i32,
-        button: i32,
-        mods: u16,
-        pressed: bool,
-        out: *mut u8,
-        cap: usize,
-    ) -> usize;
-}
 
 pub struct Engine {
-    raw: NonNull<c_void>,
+    raw: NonNull<GmuxEngine>,
     events: Box<Events>,
     pub frame: Frame,
     pub cells: Vec<Cell>,
@@ -160,9 +67,10 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> anyhow::Result<Self> {
         let mut events = Box::<Events>::default();
-        let raw =
-            NonNull::new(unsafe { gmux_engine_new((&mut *events as *mut Events).cast(), event) })
-                .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
+        let raw = NonNull::new(unsafe {
+            gmux_engine_new((&mut *events as *mut Events).cast(), Some(event))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
         let mut engine = Self {
             raw,
             events,

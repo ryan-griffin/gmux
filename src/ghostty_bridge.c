@@ -1,25 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
+#include "ghostty_bridge.h"
 #include <ghostty/vt.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 // Keep the moving libghostty ABI on this side of the Rust boundary.
-typedef struct {
-    char text[64];
-    uint8_t fg[3], bg[3];
-    uint8_t flags; // bold, italic, faint, underline, strike, invisible
-} GmuxCell;
-typedef struct {
-    uint64_t total, offset, len;
-} GmuxScrollback;
-typedef struct {
-    uint16_t cols, rows, cursor_x, cursor_y;
-    uint8_t cursor_visible, cursor_style, background[3], foreground[3], cursor[3];
-    GmuxScrollback scrollback;
-} GmuxFrame;
-typedef void (*GmuxEventFn)(void *, int, const uint8_t *, size_t);
-typedef struct {
+struct GmuxEngine {
     GhosttyTerminal terminal;
     GhosttyRenderState render;
     GhosttyTerminalScrollbar scrollbar;
@@ -35,7 +22,7 @@ typedef struct {
     bool held;
     GhosttyTrackedGridRef selection_start, selection_end;
     uint64_t hold_started_ms;
-} GmuxEngine;
+};
 
 static uint64_t now_ms(void) {
     struct timespec now;

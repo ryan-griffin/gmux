@@ -54,6 +54,26 @@ their ordering, deferred workspace changes, and failure behavior.
 
 ## Shared data and protocols
 
+`src/ghostty_bridge.h` is the source of truth for the C/Rust engine boundary.
+It defines `GmuxCell`, `GmuxFrame`, `GmuxScrollback`, the event callback, and all
+exported engine function signatures using C types. `src/ghostty_bridge.c` includes that
+header and keeps upstream Ghostty types private, including the opaque engine.
+The C compiler rejects conflicting definitions and exported functions without
+header prototypes.
+
+`build.rs` uses bindgen to generate the Rust declarations in `OUT_DIR` for
+Cargo's target architecture, using the C compiler's flags and include paths.
+The generated code checks each struct's size, alignment, and every member
+offset at compile time against Clang's C layout.
+These checks run during ordinary builds and tests on x86_64 and aarch64 Linux;
+they do not run a host executable or assume the host's pointer width. Edit the
+header for ABI changes, and keep ownership and callback handling in
+`src/engine.rs`. Generated declarations are not tracked.
+
+`Frame` and `Scrollback` retain their serde derives and field order. Viewport
+packets still serialize JSON metadata and individual cell fields rather than
+copying C struct memory or padding.
+
 `src/model.rs` contains settings, layouts, sessions, and workspace definitions.
 Its catalog validation removes invalid IDs, blank names, and duplicate IDs.
 `src/storage.rs` reads state files and publishes durable atomic writes.

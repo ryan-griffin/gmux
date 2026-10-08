@@ -9,7 +9,7 @@ A GNOME terminal inspired by [cmux](https://cmux.com/), built with Rust, GTK 4, 
 
 ## Run
 
-Requires Linux, Rust stable, a C compiler, pkg-config, GTK 4.22+, libadwaita 1.9+, GLib's `glib-compile-resources`, curl, and Python 3.12+.
+Requires Linux, Rust stable, a C compiler, libclang for FFI binding generation, pkg-config, GTK 4.22+, libadwaita 1.9+, GLib's `glib-compile-resources`, curl, and Python 3.12+.
 
 ```sh
 ./scripts/run.sh
