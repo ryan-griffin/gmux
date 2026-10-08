@@ -6,17 +6,34 @@ mod render;
 #[path = "../src/renderer.rs"]
 mod renderer;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use gmux::{Cell, Frame, theme::Theme};
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
 use renderer::{Renderer, Scene};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 struct Options {
     #[arg(long, default_value = "artifacts/renderer-check")]
     output: PathBuf,
+    /// Use the selected GTK backend for cache pixels instead of the Cairo oracle.
+    #[arg(long, value_enum, default_value_t = CacheBackend::Cairo)]
+    cache_renderer: CacheBackend,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CacheBackend {
+    Cairo,
+    Selected,
+}
+
+struct OffscreenRenderer(gsk::Renderer);
+
+impl Drop for OffscreenRenderer {
+    fn drop(&mut self) {
+        self.0.unrealize();
+    }
 }
 
 fn cell(text: &str, theme: Theme, flags: u8) -> Cell {
@@ -181,6 +198,90 @@ fn pixels(texture: &gdk::Texture) -> Vec<u8> {
     pixels
 }
 
+// Cache correctness needs a deterministic pixel oracle. Some Vulkan drivers
+// produce transient outliers even for identical nodes. Compare exact Cairo
+// pixels; selected-backend drawing stays covered by the independent Pango and
+// geometry checks below. Node serialization belongs in failure diagnostics:
+// serializing every pair is much slower than rasterizing these scenes.
+fn assert_render_eq(
+    gpu: &gsk::Renderer,
+    actual_node: &gsk::RenderNode,
+    expected_node: &gsk::RenderNode,
+    scene: &Scene<'_>,
+    output: &Path,
+    name: &str,
+) {
+    let actual = render(gpu, actual_node, scene);
+    let actual_pixels = pixels(&actual);
+    let expected = render(gpu, expected_node, scene);
+    let expected_pixels = pixels(&expected);
+    let actual_size = (actual.width(), actual.height());
+    let expected_size = (expected.width(), expected.height());
+    if actual_size == expected_size && actual_pixels == expected_pixels {
+        return;
+    }
+    let nodes_equal = actual_node.serialize() == expected_node.serialize();
+    let width = actual.width() as usize;
+    let mut count = 0;
+    let mut bounds = None;
+    let mut first = Vec::new();
+    let mut max_channel_delta = 0;
+    for (index, (a, b)) in actual_pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected_pixels.as_chunks::<4>().0)
+        .enumerate()
+    {
+        if a == b {
+            continue;
+        }
+        count += 1;
+        let (x, y) = (index % width, index / width);
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((left, top, right, bottom)) => {
+                (x.min(left), y.min(top), x.max(right), y.max(bottom))
+            }
+        });
+        for (&a, &b) in a.iter().zip(b) {
+            max_channel_delta = max_channel_delta.max(a.abs_diff(b));
+        }
+        if first.len() < 8 {
+            first.push(json!({"x": x, "y": y, "actual_bgra": a, "expected_bgra": b}));
+        }
+    }
+    let report = json!({
+        "case": name, "gtk_renderer": gpu.type_().name(),
+        "actual_size": actual_size, "expected_size": expected_size,
+        "scale": scene.scale, "origin": scene.origin, "metrics": scene.metrics,
+        "nodes_equal": nodes_equal, "differing_pixels": count,
+        "bounds": bounds, "max_channel_delta": max_channel_delta, "first": first,
+    });
+    std::fs::write(
+        output.join(format!("{name}-mismatch.json")),
+        serde_json::to_string_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    for (suffix, texture, node) in [
+        ("actual", &actual, actual_node),
+        ("expected", &expected, expected_node),
+    ] {
+        texture
+            .save_to_png(output.join(format!("{name}-{suffix}.png")))
+            .unwrap();
+        node.write_to_file(output.join(format!("{name}-{suffix}.node")))
+            .unwrap();
+    }
+    panic!(
+        "{name}: retained/fresh mismatch on {}: nodes_equal={nodes_equal}, \
+        sizes={actual_size:?}/{expected_size:?}, {count} differing pixels, \
+        bounds={bounds:?}, max channel delta={max_channel_delta}; see {}",
+        gpu.type_().name(),
+        output.join(format!("{name}-mismatch.json")).display()
+    );
+}
+
 fn node(
     renderer: &mut Renderer,
     scene: &Scene<'_>,
@@ -235,7 +336,12 @@ fn validate_overlapping_fallbacks(
     );
 }
 
-fn validate_cache(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
+fn validate_cache(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+    output: &Path,
+) {
     let theme = Theme::adwaita(true);
     let cells = fixture(theme);
     let mut highlights = vec![0; cells.len()];
@@ -299,18 +405,23 @@ fn validate_cache(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &
         let (cached, stats) = node(&mut renderer, &scene, &font, context);
         assert_eq!(stats.rebuilt_rows, rows, "Cache invalidation after {step}");
         let fresh = node(&mut Renderer::new(), &scene, &font, context).0;
-        assert_eq!(
-            pixels(&render(gpu, &cached, &scene)),
-            pixels(&render(gpu, &fresh, &scene)),
-            "Retained rows differ from fresh rendering after {step}"
+        assert_render_eq(
+            gpu,
+            &cached,
+            &fresh,
+            &scene,
+            output,
+            &format!("cache-{step}"),
         );
     }
     // Output changing one row must not discard the other rows.
     let mut changed = cells.clone();
     changed[43] = cell("Z", theme, 0);
     scene.cells = &changed;
-    let (_, stats) = node(&mut renderer, &scene, &font, context);
+    let (cached, stats) = node(&mut renderer, &scene, &font, context);
     assert_eq!(stats.rebuilt_rows, 1);
+    let fresh = node(&mut Renderer::new(), &scene, &font, context).0;
+    assert_render_eq(gpu, &cached, &fresh, &scene, output, "cache-output");
     assert_eq!(
         node(&mut renderer, &scene, &font, context).1.rebuilt_rows,
         0
@@ -342,6 +453,7 @@ fn validate_scroll_cache(
     gpu: &gsk::Renderer,
     font: &pango::FontDescription,
     context: &pango::Context,
+    output: &Path,
 ) {
     let theme = Theme::adwaita(true);
     for scale in [1.0, 1.25, 1.5, 2.0] {
@@ -386,30 +498,14 @@ fn validate_scroll_cache(
                     assert_eq!(stats.rebuilt_rows, 1, "Scrolling should reuse seven rows");
                 }
                 let fresh = node(&mut Renderer::new(), &scene, font, context).0;
-                // Step zero only primes the cache. Both renderers are fresh;
-                // avoid redundant GPU readbacks when their nodes match.
-                if step == 0 && cached.serialize() == fresh.serialize() {
-                    continue;
-                }
-                let actual = render(gpu, &cached, &scene);
-                let expected = render(gpu, &fresh, &scene);
-                if pixels(&actual) != pixels(&expected) {
-                    actual
-                        .save_to_png("artifacts/scroll-cache-actual.png")
-                        .unwrap();
-                    expected
-                        .save_to_png("artifacts/scroll-cache-expected.png")
-                        .unwrap();
-                    cached
-                        .write_to_file("artifacts/scroll-cache-actual.node")
-                        .unwrap();
-                    fresh
-                        .write_to_file("artifacts/scroll-cache-expected.node")
-                        .unwrap();
-                    panic!(
-                        "Scrolled cache differs at step {step}, scale {scale}, origin {origin:?}"
-                    );
-                }
+                assert_render_eq(
+                    gpu,
+                    &cached,
+                    &fresh,
+                    &scene,
+                    output,
+                    &format!("scroll-{step}-{scale}-{}-{}", origin.0, origin.1),
+                );
             }
         }
     }
@@ -428,9 +524,13 @@ fn validate_scroll_cache(
             "An edge edit must preserve other cached rows"
         );
         let fresh = node(&mut Renderer::new(), &scene, font, context).0;
-        assert_eq!(
-            pixels(&render(gpu, &cached, &scene)),
-            pixels(&render(gpu, &fresh, &scene))
+        assert_render_eq(
+            gpu,
+            &cached,
+            &fresh,
+            &scene,
+            output,
+            &format!("edge-{target}"),
         );
     }
 }
@@ -583,6 +683,12 @@ fn main() -> anyhow::Result<()> {
     window.present();
     let gpu = window.renderer().unwrap();
     let context = window.pango_context();
+    let cairo = OffscreenRenderer(gsk::CairoRenderer::new().upcast());
+    cairo.0.realize_for_display(&WidgetExt::display(&window))?;
+    let cache_gpu = match options.cache_renderer {
+        CacheBackend::Cairo => &cairo.0,
+        CacheBackend::Selected => &gpu,
+    };
     let mut cases = Vec::new();
     for dark in [true, false] {
         for font_name in [
@@ -640,22 +746,24 @@ fn main() -> anyhow::Result<()> {
     }
     let font = pango::FontDescription::from_string("Monospace 12");
     validate_overlapping_fallbacks(&gpu, &font, &context);
-    validate_cache(&gpu, &font, &context);
-    validate_scroll_cache(&gpu, &font, &context);
+    validate_cache(cache_gpu, &font, &context, &options.output);
+    validate_scroll_cache(cache_gpu, &font, &context, &options.output);
     validate_geometry(&gpu, &font, &context);
     std::fs::write(
         options.output.join("checks.json"),
         serde_json::to_string_pretty(&json!({
-            "gtk_renderer": gpu.type_().name(), "glyph_cases": cases,
-            "checks": ["independent layout agreement", "row invalidation", "scroll cache reuse", "bounded glyph cache",
+            "gtk_renderer": gpu.type_().name(), "cache_renderer": cache_gpu.type_().name(),
+            "glyph_cases": cases,
+            "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded glyph cache",
                        "font and context changes", "fractional blocks", "selection and search",
                        "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order"]
         }))?,
     )?;
     println!(
-        "PASS: {}: {} glyph cases, cache and geometry checks",
+        "PASS: {}: {} glyph cases and geometry checks; exact cache pixels on {}",
         gpu.type_().name(),
-        cases.len()
+        cases.len(),
+        cache_gpu.type_().name()
     );
     window.close();
     gpu.unrealize();
