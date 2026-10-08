@@ -4,6 +4,12 @@ Run commands from the repository root. [Build prerequisites](../README.md#run)
 apply to all Rust checks. Bootstrap the pinned Ghostty library before the first
 build, or set `GHOSTTY_PREFIX` to a compatible installation.
 
+After changing the Ghostty pin, bootstrap it in that worktree and validate
+against the resulting `.deps/ghostty` installation. An installation built from
+the previous pin cannot validate the upgrade. Update `SOURCE_SHA256` with the
+source archive hash and check `ZIG_VERSION` against upstream's `build.zig.zon`
+and `src/build/zig.zig` requirements.
+
 ## Prerequisites
 
 The headless smoke tests need Python 3.12+, PyGObject, GdkPixbuf 2 introspection
@@ -39,6 +45,13 @@ tests, runs Clippy with warnings denied, and builds both binaries and the
 examples. It then runs the bootstrap, daemon, control, and icon smoke tests.
 `--native` includes the desktop suite in an isolated headless Wayland compositor
 with XWayland disabled.
+
+The engine tests cover wide-character clipping without reflow on active and
+inactive alternate screens and with wraparound disabled, editing the clipped
+column, same-grid resize reports and synchronized output, and palette reset to
+the latest configured theme. After a Ghostty upgrade, run
+`python3 scripts/check.py --native --skip-build --only resize font renderer terminal-renderer`
+after the headless checks to cover sizing and rendering through the frontend.
 
 The renderer examples include source modules whose unit tests already run in
 the application target. The runner skips repeating those unit tests for the
