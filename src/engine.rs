@@ -567,6 +567,67 @@ mod tests {
     }
 
     #[test]
+    fn narrowing_without_reflow_clears_split_wide_characters_before_editing() {
+        // Ghostty #14509: a clipped wide head used to retain a missing tail,
+        // so editing the last column could write past the row's cells.
+        for screen in ["primary-no-wrap", "alternate", "inactive-alternate"] {
+            for edit in [b"\x1b[@".as_slice(), b"\x1b[P", b"\x1b[X", b""] {
+                let mut engine = Engine::new().unwrap();
+                engine.resize(6, 3, 8, 16).unwrap();
+                if screen == "primary-no-wrap" {
+                    engine.write(b"\x1b[?7l");
+                } else {
+                    engine.write(b"\x1b[?47h");
+                }
+                engine.write("界ab一\r\nKEEP".as_bytes());
+                assert_eq!(engine.text().unwrap(), "界ab一\nKEEP");
+                if screen == "inactive-alternate" {
+                    engine.write(b"\x1b[?47l");
+                }
+                engine.resize(5, 3, 8, 16).unwrap();
+                if screen == "inactive-alternate" {
+                    engine.write(b"\x1b[?47h");
+                }
+                assert_eq!(engine.text().unwrap(), "界ab\nKEEP", "{screen}");
+                assert_eq!(engine.cells[4].text(), "", "Clipped head on {screen}");
+                assert_eq!(engine.cells[4].flags & 64, 0);
+                assert_ne!(engine.cells[1].flags & 64, 0, "Intact wide tail");
+                engine.write(b"\x1b[1;5H");
+                engine.write(edit);
+                engine.write(b"X");
+                assert_eq!(engine.text().unwrap(), "界abX\nKEEP", "{screen}: {edit:?}");
+                engine.resize(6, 3, 8, 16).unwrap();
+                assert_eq!(engine.text().unwrap(), "界abX\nKEEP", "{screen}");
+                assert_eq!(engine.cells[5].text(), "", "Clipped tail must stay cleared");
+                assert_eq!(engine.cells[5].flags & 64, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn same_grid_resize_updates_size_reports_and_releases_synchronized_output() {
+        // Ghostty #14482: unchanged rows/columns still have resize effects.
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 3, 8, 16).unwrap();
+        engine.write(b"before\x1b[?2048h");
+        engine.take_events();
+        for (width, height) in [(9, 18), (9, 18), (10, 20)] {
+            engine.write(b"\x1b[?2026h\r\x1b[2Kafter");
+            assert!(engine.mode(2026));
+            engine.resize(12, 3, width, height).unwrap();
+            assert!(!engine.mode(2026));
+            assert_eq!(engine.text().unwrap(), "after");
+            assert_eq!((engine.frame.cols, engine.frame.rows), (12, 3));
+            assert_eq!(
+                engine.take_events().0,
+                format!("\x1b[48;3;12;{};{}t", 3 * height, 12 * width).as_bytes()
+            );
+            engine.write(b"\r\x1b[2Kbefore");
+            assert_eq!(engine.text().unwrap(), "before");
+        }
+    }
+
+    #[test]
     fn synchronized_output_preserves_the_last_complete_frame() {
         let mut engine = Engine::new().unwrap();
         engine.write(b"previous");
@@ -901,5 +962,31 @@ mod tests {
         assert_eq!(e.frame.background, light.background);
         assert_eq!(e.frame.cursor, light.cursor);
         assert_eq!(e.cells[0].fg, light.palette[4]);
+    }
+
+    #[test]
+    fn full_reset_restores_the_latest_configured_palette() {
+        // Ghostty #14480: RIS must discard OSC 4 overrides, including the
+        // extended palette, while retaining the application's defaults.
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"\x1b[38;5;200mE");
+        engine.snapshot().unwrap();
+        let extended_default = engine.cells[0].fg;
+        engine.write(b"\x1b]4;2;#ffff00;200;#112233\x07\r\x1b[32mG\x1b[38;5;200mE");
+        engine.snapshot().unwrap();
+        assert_eq!(engine.cells[0].fg, [0xff, 0xff, 0x00]);
+        assert_eq!(engine.cells[1].fg, [0x11, 0x22, 0x33]);
+        let mut theme = Theme::adwaita(false);
+        theme.palette[2] = [0xa1, 0xb2, 0xc3];
+        engine.set_theme(&theme).unwrap();
+        engine.snapshot().unwrap();
+        assert_eq!(engine.cells[0].fg, [0xff, 0xff, 0x00]);
+        assert_eq!(engine.cells[1].fg, [0x11, 0x22, 0x33]);
+        engine.write(b"\x1bc\x1b[32mG\x1b[38;5;200mE");
+        assert_eq!(engine.text().unwrap(), "GE");
+        assert_eq!(engine.cells[0].fg, theme.palette[2]);
+        assert_eq!(engine.cells[1].fg, extended_default);
+        assert_eq!(engine.frame.foreground, theme.foreground);
+        assert_eq!(engine.frame.background, theme.background);
     }
 }

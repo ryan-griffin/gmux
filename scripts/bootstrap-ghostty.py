@@ -12,8 +12,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DEPS = ROOT / ".deps"
-REVISION = "4da7523faba68ccb4042ea20585817098a51c015"
-SOURCE_SHA256 = "61ea669deb246947d111c36527a87e37ab436cbe0cbe67ca71a970dba40b9b28"
+# Reviewed main on 2026-10-08; includes Ghostty fixes #14509, #14482, #14480.
+REVISION = "8f0dd3709050b1026f6324368805033197d8b4a5"
+SOURCE_SHA256 = "f4869fc667ea0a1c93705e363ceca06d394b67ad1d3dde756a7fa5c15691f9cb"
+# Must match the source's build.zig.zon and src/build/zig.zig requirement.
 ZIG_VERSION = "0.16.0"
 EXTRACTED = ".gmux-extracted"
 
