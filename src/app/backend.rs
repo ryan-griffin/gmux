@@ -219,6 +219,7 @@ impl Ui {
                     directories: w.panes.iter().map(|(&id, p)| (id, p.directory())).collect(),
                 })
                 .collect(),
+            ..Session::default()
         };
         if let Err(e) = self.backend.save(session) {
             eprintln!("Could not save session: {e}");

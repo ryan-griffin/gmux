@@ -55,8 +55,8 @@ their ordering, deferred workspace changes, and failure behavior.
 ## Shared data and protocols
 
 `src/ghostty_bridge.h` is the source of truth for the C/Rust engine boundary.
-It defines `GmuxCell`, `GmuxFrame`, `GmuxScrollback`, the event callback, and all
-exported engine function signatures using C types. `src/ghostty_bridge.c` includes that
+It defines `GmuxCell`, `GmuxFrame`, `GmuxScrollback`, event and writer callbacks,
+and all exported function signatures using C types. `src/ghostty_bridge.c` includes that
 header and keeps upstream Ghostty types private, including the opaque engine.
 The C compiler rejects conflicting definitions and exported functions without
 header prototypes.

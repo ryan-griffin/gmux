@@ -46,6 +46,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
         .allowlist_function("gmux_engine_.*")
+        .allowlist_function("gmux_checkpoint_text")
         .use_core()
         .derive_debug(false)
         .derive_partialeq(true)
@@ -68,6 +69,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ghostty_bridge.h");
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREFIX");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed=scripts/bootstrap-ghostty.py");
+    let bootstrap = std::fs::read_to_string(root.join("scripts/bootstrap-ghostty.py")).unwrap();
+    let revision = bootstrap
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("REVISION = \"")
+                .and_then(|s| s.strip_suffix('"'))
+        })
+        .expect("Ghostty source revision is missing");
+    assert!(revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()));
+    println!("cargo:rustc-env=GMUX_GHOSTTY_REVISION={revision}");
     println!("cargo:rerun-if-changed=data/gmux.gresource.xml");
     println!("cargo:rerun-if-changed=data/dev.gmux.Gmux.svg");
     println!("cargo:rerun-if-changed=data/dev.gmux.Gmux-symbolic.svg");

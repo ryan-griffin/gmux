@@ -36,9 +36,15 @@ typedef struct {
 typedef struct GmuxEngine GmuxEngine;
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
+// Called synchronously; true accepts all borrowed bytes, false aborts formatting.
+typedef bool (*GmuxWriterFn)(void *userdata, const uint8_t *data, size_t len);
 
 GmuxEngine *gmux_engine_new(void *userdata, GmuxEventFn callback);
 void gmux_engine_free(GmuxEngine *engine);
+// Serialized terminal state, distinct from the viewport snapshot below.
+int gmux_engine_checkpoint(GmuxEngine *engine, uint8_t *out, size_t cap, size_t *written);
+int gmux_checkpoint_text(const uint8_t *data, size_t len, GmuxWriterFn write,
+    void *userdata, uint16_t *cols, uint16_t *rows);
 int gmux_engine_history_size(GmuxEngine *engine, uint16_t *cols, size_t *rows);
 int gmux_engine_history_row(GmuxEngine *engine, uint32_t row, GmuxCell *cells,
     size_t cols, bool *wrapped);

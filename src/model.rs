@@ -209,6 +209,9 @@ impl SavedTab {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Session {
+    /// Daemon-owned, opaque filenames. Old layouts have no history checkpoints.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scrollback: HashMap<u64, String>,
     pub tabs: Vec<SavedTab>,
     pub filter: TabFilter,
     pub active: u64,

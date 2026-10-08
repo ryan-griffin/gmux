@@ -77,13 +77,14 @@ impl TerminalSession {
         directory: PathBuf,
         cursor_style: CursorStyle,
         theme: &Theme,
+        history: Option<&[u8]>,
     ) -> anyhow::Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.env("GMUX_TAB", tab.to_string());
         command.env("GMUX_PANE", id.to_string());
-        Self::spawn_command(id, directory, cursor_style, theme, command)
+        Self::spawn_command(id, directory, cursor_style, theme, command, history)
     }
 
     fn spawn_command(
@@ -92,14 +93,24 @@ impl TerminalSession {
         cursor_style: CursorStyle,
         theme: &Theme,
         mut command: CommandBuilder,
+        history: Option<&[u8]>,
     ) -> anyhow::Result<Self> {
         // Complete fallible setup before spawning a process we must clean up.
         let mut engine = Engine::new()?;
+        if let Some(history) = history
+            && let Err(error) = engine.restore_history(history)
+        {
+            eprintln!(
+                "Could not restore scrollback for pane {id}: {error}. Starting with empty history"
+            );
+            engine = Engine::new()?;
+        }
         engine.set_cursor_style(cursor_style)?;
         engine.set_theme(theme)?;
+        let (cols, rows) = engine.dimensions();
         let pair = native_pty_system().openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -144,7 +155,7 @@ impl TerminalSession {
             }),
             pid,
             directory,
-            size: (80, 24),
+            size: (cols, rows),
             exited: false,
             title: PaneTitle::default(),
             title_polled: Instant::now(),
@@ -364,6 +375,10 @@ impl TerminalSession {
         })
     }
 
+    pub(crate) fn checkpoint(&self) -> anyhow::Result<Vec<u8>> {
+        self.engine.checkpoint()
+    }
+
     pub fn text(&mut self) -> anyhow::Result<String> {
         self.engine.text()
     }
@@ -485,6 +500,7 @@ mod tests {
             CursorStyle::default(),
             &Theme::adwaita(true),
             command,
+            None,
         )
         .unwrap()
     }

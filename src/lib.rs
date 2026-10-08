@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod model;
 mod persistence;
 pub mod remote;
+mod scrollback;
 pub mod search;
 pub mod session;
 pub mod storage;

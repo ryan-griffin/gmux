@@ -7,16 +7,16 @@ Closing a pane still terminates that pane, and an exited shell removes its pane.
 
 Use **Quit Gmux** in the main menu, Ctrl+Shift+Q, or `gmux quit` to stop the daemon
 and its terminals. The GUI confirms Quit when a foreground job is running. The
-CLI command is an explicit shutdown and does not show a dialog. A layout save
+CLI command is an explicit shutdown and does not show a dialog. A layout or scrollback save
 failure produces a warning but still closes the terminals and daemon. SIGTERM
 and SIGINT sent to the frontend detach it; sent to the daemon they stop its
 sessions.
 
 A stopped daemon cannot resume arbitrary commands. Daemon restart
 restores the saved layout and working directories with fresh shells when Restore
-tabs is enabled. Output and scrollback survive window closure and frontend
-crashes, but not daemon shutdown or a reboot. Disk terminal checkpoints are not
-implemented. Interrupted commands are never replayed automatically.
+tabs is enabled. Window closure and frontend crashes keep the live scrollback.
+Quit and orderly daemon shutdown checkpoint history for later restoration,
+including after a reboot. Interrupted commands are never replayed automatically.
 
 The daemon starts automatically with the frontend. `scripts/run.sh` builds both
 binaries; `scripts/install.sh` installs both. To start just the backend for shell
@@ -75,6 +75,76 @@ take effect after the catalog save succeeds, then advance to a session save.
 Each pending command tracks its current save stage and replies after the save
 sequence finishes or fails. Preparing a session snapshot is separate from
 submitting it to the worker.
+
+## Scrollback checkpoints
+
+The daemon captures Ghostty terminal snapshots on explicit Quit and orderly
+SIGTERM/SIGINT shutdown. There is no periodic checkpoint. A daemon crash, SIGKILL,
+or power loss can lose output since the last orderly shutdown. Existing layout
+saves retain references to the last checkpoint for surviving panes. Live window
+detach and reattach continue using the same PTYs, processes, and terminal state.
+
+Snapshots serialize terminal state and history through
+[`ghostty_snapshot_encode_buf`](https://github.com/ghostty-org/ghostty/blob/8f0dd3709050b1026f6324368805033197d8b4a5/include/ghostty/vt/snapshot.h).
+They are distinct from `gmux_engine_snapshot`, which extracts viewport cells for
+the frontend. Ghostty's binary format version 1 has no stability guarantee yet.
+Gmux wraps each payload with its own format version, the exact Ghostty source
+revision from the build pin, its pane ID, and its payload length. A different
+source revision is incompatible even when Ghostty's format number matches.
+`GHOSTTY_PREFIX` builds must use a library matching that pin. No snapshot format
+migration is attempted.
+
+Startup decodes and validates the whole payload, including Ghostty's record CRCs
+and FINISH marker. It extracts primary-screen text with soft wraps joined, then
+feeds that text into a fresh terminal at the saved dimensions before spawning
+the new shell. The shell starts on the next line with default input modes and
+parser state, using the current theme and cursor preference. Resizing reflows
+the restored text. History search and copying work across wrapped Unicode lines.
+Colors, hyperlinks, graphics, alternate-screen contents, terminal titles, and
+old process modes are discarded. Trailing whitespace and trailing blank rows
+are trimmed. The new process can still clear its screen or history during its
+own startup.
+
+The checkpoint budget is 8 MiB of serialized state per pane, 64 MiB across the
+layout, and 128 panes, visited in layout order. Gmux skips panes that exceed
+these limits and reports a persistence warning. It tracks at most 64 KiB of
+unfinished parser input. A pane with an unavailable continuation also gets
+skipped. Snapshot decoding uses a 64 MiB allocation budget per pane; formatted
+text has an 8 MiB limit. Restoration validates the file header and remaining
+layout budget before reading its payload, then decodes and formats it once.
+These bounds can omit a large history instead of keeping only its newest lines.
+Capture copies bytes in memory on the PTY owner thread
+at shutdown; file reads at startup finish before processing PTYs. The ordered
+disk worker handles writes, syncing, and cleanup while the owner keeps servicing
+PTYs. Output arriving after the Quit capture is outside that checkpoint.
+
+The daemon owns `scrollback/` under the Gmux configuration directory. It creates
+the directory with mode 0700 and snapshot files with mode 0600. Saved layouts
+reference opaque filenames containing a random generation token and pane ID,
+so reused IDs cannot inherit an unrelated checkpoint. The worker syncs snapshot
+files and their directory before atomically publishing `session.json`. It holds
+the session writer lock throughout publication and cleanup. The layout publication
+commits the new generation. An interrupted publication leaves
+the previous layout and its history usable. The old and new generations can
+temporarily occupy twice the 64 MiB payload budget, plus file headers.
+
+After a successful layout save, the worker deletes checkpoints for removed panes
+and old generations, then syncs the directory. Startup and the next checkpoint
+also reclaim orphaned files and interrupted temporary writes. Startup cleanup
+uses the committed disk layout, so a failed shell spawn or disabling Restore
+tabs cannot discard saved history before a replacement layout is committed.
+Closing a pane, closing its tab, or an exited shell removes its checkpoint reference. Snapshot
+failures do not prevent saving an otherwise valid layout or quitting. Quit waits
+for the save result, returns any warning, and freezes layout mutations while
+shutdown is in progress.
+
+Missing, incompatible, corrupt, truncated, oversized, or unreadable checkpoints
+log a warning and start the affected pane with empty history. They do not block
+restoration of other panes. Gmux validates filenames, rejects symlinks and
+nonregular snapshot files, and ignores files absent from the saved layout.
+Removing `scrollback/` clears the disk history without changing the saved tabs.
+Settings, workspace, and layout recovery still follows the protected-state
+rules below.
 
 Git HEAD watches supply branch updates, and ancestor directory watches discover
 repository creation, removal, and nested repositories. Two workers publish each
@@ -196,7 +266,7 @@ and are limited to 4 MiB.
 ## Validation
 
 Use the [testing guide](testing.md) to run all checks or select the daemon,
-control, recovery, scheduling, and notification tests in the isolated fixture.
+control, scrollback, recovery, scheduling, and notification tests in the isolated fixture.
 
 The daemon test covers actual PTYs without a display, background output, idle CPU
 usage, one-row packets, hidden-pane output without automatic snapshots,
@@ -207,6 +277,28 @@ closing both processes. On the development machine the idle daemon consumed zero
 CPU ticks over a 1.1 second interval. This is an idle check, not a throughput or
 memory benchmark. [Whole-application measurements](performance.md) cover CPU,
 resident memory, and native input-to-render latency with three busy panes.
+
+The scrollback test covers Quit/SIGTERM persistence, fresh shell PIDs and input,
+Unicode and wrapped history, file permissions, PTY progress during a blocked
+checkpoint commit, incompatible versions and source revisions, ownership,
+corruption, truncation, trailing bytes, deleted-pane cleanup, and preserving
+committed history when startup cannot restore the saved panes. Unit tests also
+cover fresh-terminal mode and parser state, reflow and copying, bounded envelopes,
+orphan cleanup, snapshot symlink rejection, and concurrent checkpoint publication.
+
+Validation on 2026-10-08 used main `e7b6d45` and bootstrapped Ghostty revision
+`8f0dd3709050b1026f6324368805033197d8b4a5` in this worktree. The scrollback
+smoke test checks that saved envelopes declare that pin.
+`python3 scripts/check.py` passed formatting, 120 Rust tests, Clippy with warnings
+denied, builds, and the bootstrap, daemon, scrollback, control, and icon suites.
+Selected native Wayland checks passed for daemon reconnect, state recovery,
+window closure, terminal scrolling, terminal input, and fresh mapped and occluded
+screenshots at 100% and 125% monitor scale. Earlier native Find checks timed out
+at the sidebar directory assertion at line 118, both with the scrollback changes
+and an untouched build of baseline `686a272`. Its later history checks remain
+unverified in that suite. Known baseline native Resize and Find failures were
+excluded from this validation. History unit tests and headless checkpoint
+regressions passed. The full native suite was not run.
 
 The notification test covers unread state after delivery and reconnect, GUI
 acknowledgements, stale acknowledgements racing with new alerts, and the latest

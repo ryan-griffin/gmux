@@ -65,6 +65,87 @@ pub struct Engine {
     find_row: Vec<Cell>,
 }
 impl Engine {
+    pub(crate) fn dimensions(&self) -> (u16, u16) {
+        self.size
+    }
+    pub(crate) fn checkpoint(&self) -> anyhow::Result<Vec<u8>> {
+        let mut len = 0;
+        let result =
+            unsafe { gmux_engine_checkpoint(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut len) };
+        anyhow::ensure!(
+            result >= 0,
+            "Ghostty snapshot could not capture terminal state"
+        );
+        anyhow::ensure!(
+            len <= crate::scrollback::MAX_PANE_BYTES,
+            "Terminal snapshot exceeds 8 MiB"
+        );
+        let mut bytes = vec![0; len];
+        let result = unsafe {
+            gmux_engine_checkpoint(self.raw.as_ptr(), bytes.as_mut_ptr(), bytes.len(), &mut len)
+        };
+        anyhow::ensure!(
+            result == 0 && len == bytes.len(),
+            "Ghostty snapshot encoding failed"
+        );
+        Ok(bytes)
+    }
+
+    pub(crate) fn restore_history(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            bytes.len() <= crate::scrollback::MAX_PANE_BYTES,
+            "Snapshot exceeds 8 MiB"
+        );
+        // Stream one decode/format pass into bounded storage. The callback is
+        // synchronous and borrows this Vec only until the C function returns.
+        unsafe extern "C" fn collect(ud: *mut c_void, data: *const u8, len: usize) -> bool {
+            let text = unsafe { &mut *ud.cast::<Vec<u8>>() };
+            if len > crate::scrollback::MAX_PANE_BYTES - text.len()
+                || text.try_reserve(len).is_err()
+            {
+                return false;
+            }
+            text.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+            true
+        }
+        let (mut cols, mut rows) = (0, 0);
+        let mut text = Vec::<u8>::new();
+        let result = unsafe {
+            gmux_checkpoint_text(
+                bytes.as_ptr(),
+                bytes.len(),
+                Some(collect),
+                (&mut text as *mut Vec<u8>).cast(),
+                &mut cols,
+                &mut rows,
+            )
+        };
+        anyhow::ensure!(
+            result == 0,
+            "Invalid Ghostty snapshot or history exceeds restore budget"
+        );
+        anyhow::ensure!(
+            crate::viewport::valid(cols as u64, rows as u64),
+            "Invalid snapshot dimensions"
+        );
+        // Validate before changing the fresh engine. Plain formatter output must
+        // never feed control sequences or an incomplete UTF-8 character to it.
+        let text = std::str::from_utf8(&text)?;
+        anyhow::ensure!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "Invalid history text"
+        );
+        self.resize(cols, rows, 0, 0)?;
+        let text = text.trim_end_matches('\n');
+        if !text.is_empty() {
+            for line in text.split('\n') {
+                self.write(line.as_bytes());
+                self.write(b"\r\n");
+            }
+        }
+        Ok(())
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let mut events = Box::<Events>::default();
         let raw = NonNull::new(unsafe {
@@ -352,6 +433,103 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_restore_unicode_and_reflow_wrapped_history() {
+        let mut old = Engine::new().unwrap();
+        old.resize(12, 3, 0, 0).unwrap();
+        let line = "before 你好 e\u{301} 🦀 after a long wrapped line";
+        old.write(format!("{line}\r\nsecond hard line\r\nthird\r\nfourth\r\n").as_bytes());
+        let snapshot = old.checkpoint().unwrap();
+        let mut fresh = Engine::new().unwrap();
+        fresh.restore_history(&snapshot).unwrap();
+        assert_eq!(fresh.dimensions(), (12, 3));
+        for cols in [12, 19] {
+            fresh.resize(cols, 3, 0, 0).unwrap();
+            fresh.find(line);
+            while fresh.find_pending() {
+                fresh.poll_find();
+            }
+            assert_eq!(fresh.find_state().total, 1);
+            fresh.snapshot().unwrap();
+            let total = fresh.frame.scrollback.total;
+            fresh.select((0, 0), (cols - 1, total as u32 - 1)).unwrap();
+            let text = fresh.copy().unwrap();
+            assert!(text.contains(line), "{text:?}");
+            assert!(text.contains("second hard line\nthird\nfourth"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn restoring_history_discards_alternate_screen_modes_and_unfinished_input() {
+        for unfinished in [
+            b"\x1b[".as_slice(),
+            b"\x1b]2;unfinished",
+            b"\xf0\x9f",
+            b"\x1bPqunfinished",
+            b"\x1b_Ga=T;unfinished",
+        ] {
+            let mut old = Engine::new().unwrap();
+            old.write(b"primary history\r\n\x1b[?1h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1049halternate content\x1b[>31u");
+            old.write(unfinished);
+            let mut fresh = Engine::new().unwrap();
+            fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
+            assert!(!fresh.mode(0));
+            assert!(!fresh.mode(1004));
+            assert_eq!(fresh.key("Up", 0, 0, false, ""), b"\x1b[A");
+            assert_eq!(fresh.paste("input", false).unwrap(), b"input");
+            assert_eq!(fresh.metadata(false), "");
+            fresh.write(b"fresh shell\r\n");
+            let text = fresh.text().unwrap();
+            assert!(
+                text.contains("primary history") && text.contains("fresh shell"),
+                "{text:?}"
+            );
+            assert!(!text.contains("alternate content") && !text.contains("unfinished"));
+        }
+    }
+
+    #[test]
+    fn checkpoint_continuation_budget_recovers_after_the_parser_returns_to_ground() {
+        let mut old = Engine::new().unwrap();
+        old.write(b"primary history\r\n\x1b]2;");
+        old.write(&vec![b'a'; 64 * 1024 + 1]);
+        assert!(
+            old.checkpoint().is_err(),
+            "An untracked continuation must never become a partial snapshot"
+        );
+        old.write(b"\x07");
+        let snapshot = old.checkpoint().unwrap();
+        let mut fresh = Engine::new().unwrap();
+        fresh.restore_history(&snapshot).unwrap();
+        fresh.write(b"fresh shell");
+        assert!(fresh.text().unwrap().contains("fresh shell"));
+    }
+
+    #[test]
+    fn damaged_ghostty_snapshots_never_install_partial_history() {
+        let mut old = Engine::new().unwrap();
+        old.write(b"saved history");
+        let snapshot = old.checkpoint().unwrap();
+        let mut damaged = snapshot.clone();
+        let middle = damaged.len() / 2;
+        damaged[middle] ^= 0xff;
+        let mut trailing = snapshot.clone();
+        trailing.push(0);
+        for bytes in [
+            &snapshot[..0],
+            &snapshot[..32],
+            &snapshot[..snapshot.len() / 2],
+            &snapshot[..snapshot.len() - 1],
+            &damaged,
+            &trailing,
+        ] {
+            let mut fresh = Engine::new().unwrap();
+            assert!(fresh.restore_history(bytes).is_err());
+            fresh.write(b"fresh");
+            assert_eq!(fresh.text().unwrap(), "fresh");
+        }
+    }
     #[test]
     fn history_find_preserves_unicode_matching_and_selection_across_scrolling() {
         let mut engine = Engine::new().unwrap();

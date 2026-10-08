@@ -56,7 +56,7 @@ python3 scripts/check.py --native
 
 The runner checks formatting, runs Rust unit, integration, and documentation
 tests, runs Clippy with warnings denied, and builds both binaries and the
-examples. It then runs the bootstrap, daemon, control, and icon smoke tests.
+examples. It then runs the bootstrap, daemon, scrollback, control, and icon smoke tests.
 `--native` includes the desktop suite in an isolated headless Wayland compositor
 with XWayland disabled.
 
@@ -100,6 +100,7 @@ building or starting services. Unknown names and desktop selections without
 | --- | --- |
 | `bootstrap` | Interrupted downloads and extraction, recovery of older incomplete caches, cache reuse, checksum verification, and temporary-file cleanup. |
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |
+| `scrollback` | Durable history across Quit/SIGTERM, fresh shells, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
 | `workspace`, `sidebar-search`, `branch`, `title`, `scheduling` | Workspace state, sidebar behavior, process metadata, focus, and background work. |
 | `find`, `commands`, `font`, `resize` | Search, palette accessibility, live settings, and sizing. |
 | `main-menu`, `terminal-context-menu` | Menu actions, keyboard navigation, and busy-process confirmation. |

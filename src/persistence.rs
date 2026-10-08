@@ -2,6 +2,7 @@
 use crate::{
     ipc,
     model::{Session, WorkspaceCatalog},
+    scrollback::Checkpoint,
     storage,
 };
 use std::{
@@ -13,12 +14,16 @@ use std::{
 
 pub(crate) enum Save {
     Session(Session),
+    Checkpoint(Checkpoint),
+    Prune,
     Catalog(WorkspaceCatalog),
 }
 impl Save {
     fn write(self) -> anyhow::Result<()> {
         match self {
-            Self::Session(value) => storage::save("session.json", &value),
+            Self::Session(value) => crate::scrollback::save_session(&value),
+            Self::Checkpoint(value) => value.write(),
+            Self::Prune => crate::scrollback::prune_committed(),
             Self::Catalog(value) => storage::save("workspaces.json", &value),
         }
     }
