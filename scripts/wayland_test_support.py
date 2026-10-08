@@ -1,4 +1,5 @@
 """Native input and composited frames in an isolated Mutter Wayland session."""
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import select
@@ -29,6 +30,43 @@ def wait_for(predicate, timeout=12):
             return value
         time.sleep(0.01)
     raise AssertionError("Native Wayland test did not reach the expected state")
+
+
+@contextmanager
+def monitor_scale(scale):
+    # GDK_SCALE does not override Wayland's preferred surface scale. Configure
+    # the private Mutter monitor so this exercises a fractional-scale surface.
+    interface = "org.gnome.Mutter.DisplayConfig"
+    path = "/org/gnome/Mutter/DisplayConfig"
+    assert os.environ.get("GMUX_WAYLAND_TEST") == "1", "Use the isolated Wayland fixture"
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def call(method, signature=None, arguments=()):
+        return bus.call_sync(interface, path, interface, method,
+                             GLib.Variant(signature, arguments) if signature else None,
+                             None, Gio.DBusCallFlags.NONE, 5000, None)
+
+    def state():
+        return call("GetCurrentState").unpack()
+
+    original = state()[2][0][2]
+
+    def apply(value):
+        serial, monitors, logical, properties = state()
+        assert len(monitors) == len(logical) == 1, "Expected the fixture's single virtual monitor"
+        specification, modes, _ = monitors[0]
+        mode = next(mode for mode in modes if mode[6].get("is-current"))
+        assert value in mode[5], (value, mode[5])
+        call("ApplyMonitorsConfig", "(uua(iiduba(ssa{sv}))a{sv})",
+             (serial, 1, [(0, 0, float(value), 0, True, [(specification[0], mode[0], {})])],
+              {"layout-mode": GLib.Variant("u", properties["layout-mode"])}))
+        wait_for(lambda: state()[2][0][2] == value)
+
+    try:
+        apply(scale)
+        yield
+    finally:
+        apply(original)
 
 
 def ensure_wayland_session():

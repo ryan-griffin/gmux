@@ -253,6 +253,7 @@ impl Ui {
                     "window_active": self.window.is_active(),
                     "window_mapped": self.window.is_mapped(),
                     "window_scale": self.window.scale_factor(),
+                    "window_size": [self.window.width(), self.window.height()],
                     "frame_counter": self.window.frame_clock().map(|clock| clock.frame_counter()),
                     "viewport": pane.map(|pane| pane.renderer_geometry()),
                 }))

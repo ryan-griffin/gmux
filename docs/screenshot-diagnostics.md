@@ -127,7 +127,7 @@ libadwaita 1.10.0; the minimum toolkit versions were not separately installed.
 Logs and PNGs live in ignored `artifacts/`, with investigation reports under
 `artifacts/screenshot-investigation/`.
 
-Recorded results:
+Historical screenshot-modernization results:
 
 - The worktree bootstrap completed for Ghostty revision
   `4da7523faba68ccb4042ea20585817098a51c015`. Formatting, all 109 Rust tests,
@@ -198,7 +198,82 @@ Logs include `find-bootstrap.log`, `find-diagnose.log`,
 `find-headless-validation.log` under ignored `artifacts/`; the adjacent Resize
 result is in `find-adjacent-resize.log`.
 
-This follow-up does not establish a passing full native suite or resolve the
-renderer cache issue recorded above. The historical pixel-only Resize failure's
-cause remains with its separate investigation; the passing adjacent check here
-records the behavior of this fix.
+The Find follow-up does not establish a passing full native suite or resolve
+the renderer cache issue recorded above. Its passing adjacent Resize check
+records the behavior of the guard. The separate Resize investigation below
+confirms the cause and adds exact pixel-size and monitor-scale coverage.
+
+## Resize follow-up
+
+The pixel-only timeout also reproduced on baseline `686a272`. It reproduced
+on `4740ff1` with Ghostty `8f0dd3709050b1026f6324368805033197d8b4a5` too.
+It predates the screenshot and Ghostty modernizations.
+
+A Wayland trace on 2026-10-08 identified an app resize RPC bug. Every request
+called `unmaximize()`, even on an unmaximized window. The
+[XDG shell protocol](https://github.com/wayland-mirror/wayland-protocols/blob/main/stable/xdg-shell/xdg-shell.xml#L942)
+requires a configure reply even in that state. Mutter replied with the old
+1040 by 680 geometry after GTK had applied 1041 by 680. GTK then restored the
+old allocation. The canvas and independently probed PTY both remained 783 by
+580 pixels at 27 rows and 87 columns. The grid-overlay cases could observe a
+temporary resize before this reply arrived.
+
+The [Find follow-up](https://github.com/ryan-griffin/gmux/pull/8) adds the
+resize RPC guard so it calls `unmaximize()` only when GTK reports a maximized
+window. With that guard, 1041 by 680 stays allocated, the canvas becomes
+784 by 580, and `TIOCGWINSZ` reports the same pixel size at the unchanged grid.
+The terminal renderer and PTY resize implementation already handled this
+allocation correctly; neither needed changes. This fixes the app's diagnostic
+resize request, rather than changing interactive compositor-driven resizing.
+
+There was also an independent test assumption. The adaptive sidebar can consume
+one window pixel. For example, after the fix, 1040 to 1039 moves the canvas
+origin left by one pixel while its width remains 783. The resize suite now
+waits for the requested actual GTK allocation, then allows a second adjacent
+window pixel if the first did not change the canvas. It still requires exactly
+one canvas pixel, unchanged rows and columns, matching PTY pixel geometry,
+and no overlay. It checks width and height in both directions at monitor scales
+1 and 1.25, and observes each result throughout the overlay dismissal interval
+to catch delayed geometry rollback. Fractional-scale fixtures start with an
+empty saved session sized to fit the logical monitor, avoiding Mutter's
+automatic maximization of the default window.
+Grid and geometry probes clear and home the terminal before running so shell
+output stays above the overlay sample at fractional scale.
+
+Follow-up validation used a fresh worktree-local bootstrap of Ghostty
+`8f0dd3709050b1026f6324368805033197d8b4a5`, with no `GHOSTTY_PREFIX` override:
+
+```sh
+./scripts/bootstrap-ghostty.sh
+python3 scripts/check.py
+python3 scripts/check.py --native --skip-build --only resize font terminal-renderer screenshot
+```
+
+After rebasing onto `aa6644266cbd201690dc70a7ec82be3752bae3ec`, the merged
+Find guard supplies the app fix. This follow-up adds only the actual
+`renderer-info.window_size` diagnostic to app code. The Find checks and their
+historical diagnosis remain in place. The standard headless runner and native
+`resize screenshot` checks were rerun on the rebased tree; the font and
+terminal-renderer results above came from the earlier validation with the same
+guard and unchanged rendering code.
+
+Formatting, all 120 Rust tests, Clippy with warnings denied, binaries/examples,
+and all five headless suites passed. The complete resize suite passed at both
+monitor scales. Font, terminal-renderer, and screenshot checks also passed in
+the isolated native Mutter fixture. These selected results resolve the
+historical Resize failure; they do not establish a passing full native suite.
+The Find follow-up covers its historical timeout; the renderer-check failure
+recorded above remains separate. Toolkit versions remain GTK 4.24.1 and
+libadwaita 1.10.0; minimum versions were not separately tested.
+A negative-control build with the old unconditional `unmaximize()` failed at
+the requested 1000 by 680 GTK allocation. The revised tests reject the old
+behavior; the guard was restored after this check.
+
+The concise allocation and PTY probe results are in
+`artifacts/resize-investigation.log`. Before/after Wayland traces are preserved
+in `resize-before-fix-wayland.log` and `resize-after-fix-wayland.log` under
+`artifacts/`. Final runner logs are `resize-headless-check.log` and
+`resize-native-check.log`, with a JSON PTY report for each pixel-only case.
+The earlier adjacent font and terminal-renderer results are preserved in
+`resize-prebase-native-check.log`.
+The negative-control failure is in `resize-negative-check.log`.

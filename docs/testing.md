@@ -127,6 +127,14 @@ Notification edge cases belong to the notification suites. The `audit` suite
 runs each regression in a separate application fixture. Named scenarios print
 their status so failures identify the behavior being checked.
 
+The `resize` suite checks grid overlays and their dismissal deadlines at 100%
+and 125% monitor scale. It waits for actual GTK window allocations and requires
+one-pixel canvas changes in both width and height while retaining rows and
+columns. Independent `TIOCGWINSZ` probes check PTY pixel sizes. Each pixel-only
+case observes overlay absence and stable geometry throughout the dismissal
+interval, catching delayed compositor replies that undo a resize. Its empty
+saved session starts at a size that fits the logical monitor.
+
 The `screenshot` suite uses a solid fullscreen cover and compositor frames to
 verify that Gmux is fully occluded. It changes only the private fixture monitor's
 scale through Mutter's DisplayConfig interface and restores it after each case.
