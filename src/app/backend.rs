@@ -250,6 +250,9 @@ impl Ui {
                     "gtk": self.window.renderer().map(|renderer| renderer.type_().name().to_string()),
                     "display": gtk::prelude::WidgetExt::display(&self.window).type_().name(),
                     "window_active": self.window.is_active(),
+                    "window_mapped": self.window.is_mapped(),
+                    "window_scale": self.window.scale_factor(),
+                    "frame_counter": self.window.frame_clock().map(|clock| clock.frame_counter()),
                     "viewport": pane.map(|pane| pane.renderer_geometry()),
                 }))
             }
@@ -408,34 +411,43 @@ impl Ui {
 
     // Diagnostic screenshots need a fresh snapshot even when the compositor
     // pauses the window. WidgetPaintable returns its cached render node in that
-    // case. Keep the deprecated CSS background/frame calls confined here until
-    // GTK offers a public replacement that also captures the window decoration.
-    #[allow(deprecated)]
+    // case. See docs/screenshot-diagnostics.md for tested public alternatives.
     pub(super) fn capture_window(&self, path: &str) -> anyhow::Result<()> {
+        let bounds = self
+            .window
+            .compute_bounds(&self.window)
+            .ok_or_else(|| anyhow::anyhow!("Window has not rendered yet"))?;
         anyhow::ensure!(
-            self.window.is_mapped() && self.window.allocated_width() > 0,
+            self.window.is_mapped() && bounds.width() > 0.0 && bounds.height() > 0.0,
             "Window has not rendered yet"
         );
         // A compositor may pause an occluded window's frame clock. Complete
         // pending layout and snapshot its current contents without waiting for
         // an on-screen frame or returning a stale cached paintable.
+        // Unlike width()/height(), bounds include the CSS border and padding.
+        // Gmux's toplevel has no CSS margins, so this retains its allocation.
         self.window.allocate(
-            self.window.allocated_width(),
-            self.window.allocated_height(),
-            self.window.allocated_baseline(),
+            bounds.width() as i32,
+            bounds.height() as i32,
+            self.window.baseline(),
             None,
         );
         let snapshot = gtk::Snapshot::new();
-        let style = self.window.style_context();
-        let width = self.window.width() as f64;
-        let height = self.window.height() as f64;
-        snapshot.render_background(&style, 0.0, 0.0, width, height);
-        let mut child = self.window.first_child();
-        while let Some(widget) = child {
-            self.window.snapshot_child(&widget, &snapshot);
-            child = widget.next_sibling();
+        // GTK has no public fresh root snapshot API that includes its CSS
+        // decoration. Keep this exception confined to CSS snapshot construction.
+        #[allow(deprecated)]
+        {
+            let style = self.window.style_context();
+            let width = self.window.width() as f64;
+            let height = self.window.height() as f64;
+            snapshot.render_background(&style, 0.0, 0.0, width, height);
+            let mut child = self.window.first_child();
+            while let Some(widget) = child {
+                self.window.snapshot_child(&widget, &snapshot);
+                child = widget.next_sibling();
+            }
+            snapshot.render_frame(&style, 0.0, 0.0, width, height);
         }
-        snapshot.render_frame(&style, 0.0, 0.0, width, height);
         let node = snapshot
             .to_node()
             .ok_or_else(|| anyhow::anyhow!("Window has not rendered yet"))?;

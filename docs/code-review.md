@@ -95,11 +95,17 @@ for the diagnostic below. Ghostty's terminal C API is pinned by
 
 ## Limits
 
-The screenshot diagnostic uses deprecated GTK CSS background and frame calls
-inside `capture_window` in [`app/backend.rs`](../src/app/backend.rs).
+The screenshot diagnostic retains a block-scoped exception for deprecated GTK
+CSS background and frame calls inside `capture_window` in
+[`app/backend.rs`](../src/app/backend.rs). Allocation uses the supported
+`compute_bounds()` and `baseline()` APIs.
 `GtkWidgetPaintable` can return a cached render node when the compositor pauses
 an occluded window. The diagnostic builds a fresh snapshot to capture current
 content and window decoration. Normal UI controls do not use that exception.
+The [screenshot investigation](screenshot-diagnostics.md) records tested public
+alternatives and the remaining GTK API requirement. The isolated `screenshot`
+suite checks fresh pixels and decoration while a fully covered window's frame
+clock is paused, including fractional monitor scaling.
 
 AT-SPI tests verify command announcements and search relationships; Orca speech
 output has not been tested. Run the [native regression suite](testing.md) for

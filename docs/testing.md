@@ -92,6 +92,7 @@ building or starting services. Unknown names and desktop selections without
 | `terminal-input`, `terminal-scrollbar`, `terminal-renderer`, `renderer` | Input, clipboard, selection, scrolling, interactive applications, and render-node correctness. |
 | `notifications`, `notification-focus`, `notification-delivery` | Alert queues, unread acknowledgements, reconnects, focus suppression, desktop delivery before pane attachment, and click navigation. |
 | `smoke`, `audit`, `icon` | Application workflows, pane lifecycle cases, and icon decoding. |
+| `screenshot` | Fresh mapped, occluded, and revealed captures, window decoration, paused frame clocks, and logical PNG dimensions at 100% and 125% monitor scale. |
 
 Detailed rendering checks are in [renderer validation](renderer.md#validation).
 Backend cases are in [session validation](terminal-sessions.md#validation).
@@ -102,6 +103,13 @@ The general `smoke` suite covers startup, PTY workflows, and session reconnects.
 Notification edge cases belong to the notification suites. The `audit` suite
 runs each regression in a separate application fixture. Named scenarios print
 their status so failures identify the behavior being checked.
+
+The `screenshot` suite uses a solid fullscreen cover and compositor frames to
+verify that Gmux is fully occluded. It changes only the private fixture monitor's
+scale through Mutter's DisplayConfig interface and restores it after each case.
+It checks GTK's reported surface scale because `GDK_SCALE` does not override
+Wayland's preferred scale in the tested environment. See the
+[screenshot investigation](screenshot-diagnostics.md) for API alternatives.
 
 ## Backends and appearance
 
