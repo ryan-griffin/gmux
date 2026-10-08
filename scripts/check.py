@@ -9,7 +9,8 @@ HEADLESS = ["bootstrap", "daemon", "control", "icon"]
 DESKTOP = ["state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
            "title", "scheduling", "resize", "font", "find", "commands", "main-menu", "window-close",
            "terminal-context-menu", "terminal-scrollbar", "terminal-renderer",
-           "terminal-input", "notifications", "notification-focus", "notification-delivery", "renderer"]
+           "terminal-input", "notifications", "notification-focus", "notification-delivery",
+           "renderer", "screenshot"]
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--native", action="store_true")
