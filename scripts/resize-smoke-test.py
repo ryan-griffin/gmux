@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check the native resize overlay, PTY sizing, and dismissal deadline."""
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import json
 import re
 import shlex
@@ -45,7 +46,7 @@ with (artifacts / "resize-smoke.log").open("w") as log:
                 tabs=[], filter="all", active=0, width=round(1120 / scale),
                 height=round(740 / scale), maximized=False,
             )))
-            fixture.start_app(root / "target/debug/gmux", "--directory", root, stdout=log, stderr=log)
+            fixture.start_app(cargo_binary("gmux"), "--directory", root, stdout=log, stderr=log)
             pane = rpc("list")["tabs"][0]["active_pane"]
             wait_for(lambda: "GMUX_RESIZE>" in rpc("read", pane=pane)["text"])
             geometry_probe = fixture.path / "geometry.py"

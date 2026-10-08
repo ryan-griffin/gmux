@@ -8,6 +8,7 @@ import json
 from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
 import shutil
 import subprocess
@@ -74,7 +75,7 @@ time.sleep(30)
         wait_for(lambda: "GMUX_READY" in rpc("read", pane=pane)["text"].splitlines())
 
     with (artifacts / "title-smoke.log").open("w") as log:
-        app = subprocess.Popen([str(root / "target/debug/gmux"), "--directory", str(root)],
+        app = subprocess.Popen([str(cargo_binary("gmux")), "--directory", str(root)],
                                env=env, cwd=root, stdout=log, stderr=log)
         try:
             tab = wait_for(lambda: rpc("list")["tabs"])[0]
@@ -97,6 +98,8 @@ time.sleep(30)
                 run(pane, "btop")
                 expect(pane, "btop")
                 interrupt(pane)
+            else:
+                print("Optional btop title check omitted: btop is not installed.", flush=True)
             second = rpc("split", pane=pane)["pane"]
             ready(second)
             run(pane, f"python3 {shlex.quote(str(job))} title")

@@ -8,6 +8,7 @@ from functools import partial
 from test_support import AccessibilityFixture, AppFixture, descendants, wait_accessible
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 
 import gi
 
@@ -29,13 +30,12 @@ def focused(obj):
 
 
 appearance = os.environ.get("GMUX_REVIEW_APPEARANCE", "dark")
-with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityFixture(
-    stdout=log, stderr=log,
-), AppFixture(dict(restore=False, appearance=appearance, desktop_notifications=False),
+with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityFixture(), AppFixture(
+    dict(restore=False, appearance=appearance, desktop_notifications=False),
     prefix="gmux-commands-", env={"GTK_A11Y": "atspi"},
 ) as fixture:
     rpc = fixture.rpc
-    app = fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+    app = fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
     listener = None
     try:
         wait_for(lambda: rpc("renderer-info")["window_active"])

@@ -17,13 +17,33 @@ jobs:
   headless:
     name: Headless / ${{ matrix.toolchain }}
     runs-on: ubuntu-24.04
+    # Ubuntu supplies the Docker host; all job steps run inside Fedora.
+    container: registry.fedoraproject.org/fedora:44@sha256:cd3513b19e87220eb6fba1aeb041cf88f9c00c3b1de213c36db7532c383f4a1c
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.ci-cache/cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.ci-cache/rustup
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cache/target
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.ci-cache/zig
+      LANG: C.UTF-8
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         toolchain: [minimum, development]
     steps:
+      - name: Install Git for checkout inside Fedora
+        run: dnf --assumeyes --setopt=install_weak_deps=False install git
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install and verify Fedora dependencies
+        id: environment
+        run: |
+          bash ci/install-deps.sh
+          echo "packages=$(sha256sum artifacts/packages.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Read the Rust requirements
         id: rust
@@ -52,10 +72,10 @@ jobs:
             .ci-cache/cargo/registry
             .ci-cache/cargo/git
             .ci-cache/rustup
-            target
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('ci/Containerfile', 'scripts/bootstrap-ghostty.py') }}-${{ hashFiles('Cargo.lock') }}
+            .ci-cache/target
+          key: rust-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ steps.rust.outputs.version }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('ci/Containerfile', 'scripts/bootstrap-ghostty.py') }}-
+            rust-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ steps.rust.outputs.version }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py') }}-
 
       - name: Cache Ghostty and Zig dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -63,33 +83,12 @@ jobs:
           path: |
             .deps
             .ci-cache/zig
-          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/Containerfile', 'scripts/bootstrap-ghostty.py') }}
-
-      - name: Set up the image builder
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build the Linux validation environment
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: ci
-          file: ci/Containerfile
-          platforms: linux/amd64
-          load: true
-          push: false
-          tags: gmux-ci:local
-          cache-from: type=gha,scope=gmux-ci
-          cache-to: type=gha,mode=max,scope=gmux-ci
+          key: ghostty-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py') }}
 
       - name: Bootstrap Ghostty and run the headless checks
         env:
-          RUST_VERSION: ${{ steps.rust.outputs.version }}
-        run: |
-          docker run --rm --init \
-            --user 0:0 \
-            --env GMUX_CI_UID="$(id -u)" --env GMUX_CI_GID="$(id -g)" \
-            --env RUSTUP_TOOLCHAIN="$RUST_VERSION" \
-            --volume "$GITHUB_WORKSPACE:/workspace" \
-            gmux-ci:local bash ci/run.sh
+          RUSTUP_TOOLCHAIN: ${{ steps.rust.outputs.version }}
+        run: bash ci/check.sh
 
       - name: Preserve check output and reports
         if: always()

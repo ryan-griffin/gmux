@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import platform
 import shlex
 import socket
@@ -23,7 +24,7 @@ from daemon_test_support import stop_daemon
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--binary", type=Path, default=Path("target/release/gmux"))
+parser.add_argument("--binary", type=Path, default=None)
 parser.add_argument("--output", type=Path, default=Path("artifacts/performance.json"))
 parser.add_argument("--seconds", type=float, default=5)
 parser.add_argument("--samples", type=int, default=40)
@@ -31,7 +32,7 @@ parser.add_argument("--renderer", choices=["vulkan", "gl", "cairo"], default="vu
 args = parser.parse_args()
 assert args.seconds >= 1 and args.samples >= 5
 ensure_wayland_session()
-args.binary = args.binary.resolve()
+args.binary = args.binary.resolve() if args.binary else cargo_binary("gmux", profile="release")
 args.output = args.output.resolve()
 args.output.parent.mkdir(parents=True, exist_ok=True)
 clock_ticks = os.sysconf("SC_CLK_TCK")

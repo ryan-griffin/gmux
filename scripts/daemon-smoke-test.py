@@ -10,6 +10,7 @@ from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import select
 import shlex
 import socket
@@ -35,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
     shell.write_text("#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
     shell.chmod(0o700)
     env = dict(os.environ, GMUX_SOCKET=str(temp / "socket"),
-               XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell))
+               XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell), HISTFILE=str(temp / "bash_history"))
     log = (artifacts / "daemon-smoke.log").open("w")
     daemon = None
     app = None
@@ -46,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
 
     def start_daemon():
         # Prove the backend has no display requirement even during native checks.
-        process = subprocess.Popen([str(root / "target/debug/gmux-daemon")],
+        process = subprocess.Popen([str(cargo_binary("gmux-daemon"))],
                                    env=dict(env, DISPLAY="", WAYLAND_DISPLAY=""),
                                    stdout=log, stderr=log)
         wait_for(lambda: (temp / "socket.stream").exists())
@@ -102,7 +103,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
 
     try:
         daemon = start_daemon()
-        duplicate = subprocess.Popen([str(root / "target/debug/gmux-daemon")], env=env, stdout=log, stderr=log)
+        duplicate = subprocess.Popen([str(cargo_binary("gmux-daemon"))], env=env, stdout=log, stderr=log)
         assert duplicate.wait(timeout=5) == 0, "Concurrent launch must leave the existing daemon alive"
         assert rpc("daemon-info")["pid"] == daemon.pid
         first = rpc("new", directory=str(root))
@@ -190,7 +191,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
 
         if args.native:
             def start_app():
-                process = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+                process = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
                 wait_for(lambda: (temp / "socket.ui").exists() and rpc("daemon-info")["attached"])
                 wait_for(lambda: rpc("renderer-info")["gtk"])
                 return process

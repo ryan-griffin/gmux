@@ -8,6 +8,7 @@ import json
 from test_support import rpc as shared_rpc, wait_for
 import os
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
 import subprocess
 import tempfile
@@ -53,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-renderer-") as directory:
 
     with (artifacts / "terminal-renderer-smoke.log").open("w") as log:
         def start():
-            process = subprocess.Popen([str(root / "target/debug/gmux")], env=env, stdout=log, stderr=log)
+            process = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             return process
 

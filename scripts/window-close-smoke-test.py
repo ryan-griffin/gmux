@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check conditional window closure and preservation of background terminals."""
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import shlex
 import time
 
@@ -36,7 +37,7 @@ with (artifacts / "window-close-smoke.log").open("w") as log, WaylandInput() as 
             shell_script="#!/bin/sh\nexport PS1='GMUX_CLOSE> '\nstty -echo\n"
                          "exec /bin/bash --noprofile --norc -i\n",
         ) as fixture:
-            app = fixture.start_app(root / "target/debug/gmux", cwd=root, stdout=log, stderr=log)
+            app = fixture.start_app(cargo_binary("gmux"), cwd=root, stdout=log, stderr=log)
             wait_for(lambda: fixture.rpc("renderer-info")["window_active"])
             daemon_pid = fixture.rpc("daemon-info")["pid"]
             if case != "empty startup":
