@@ -31,6 +31,7 @@ impl CatalogEffect {
 
 pub(super) enum PreparedSave {
     Session(Session),
+    Checkpoint(crate::scrollback::Checkpoint),
     Catalog {
         catalog: WorkspaceCatalog,
         effect: Option<CatalogEffect>,
@@ -44,6 +45,7 @@ impl PreparedSave {
     fn into_job(self) -> (Save, SaveStage) {
         match self {
             Self::Session(session) => (Save::Session(session), SaveStage::Session),
+            Self::Checkpoint(value) => (Save::Checkpoint(value), SaveStage::Session),
             Self::Catalog { catalog, effect } => {
                 (Save::Catalog(catalog), SaveStage::Catalog { effect })
             }
@@ -90,6 +92,12 @@ impl PendingControl {
         daemon: &mut Daemon,
         worker: &Worker,
     ) -> Option<Self> {
+        if daemon.quitting && request.body.mutates_state() {
+            let _ = request
+                .reply
+                .try_send(json!({"error":"Daemon is shutting down"}));
+            return None;
+        }
         let kind = match &request.body {
             Request::Internal(InternalRequest::Command { .. }) => ReplyKind::Command,
             Request::Internal(InternalRequest::Presentation { .. }) => ReplyKind::Presentation,
@@ -156,7 +164,7 @@ impl ControlReply {
             } else {
                 &mut self.value
             };
-            result["warning"] = json!(format!("Could not save layout: {error}"));
+            result["warning"] = json!(format!("Could not save layout or scrollback: {error}"));
         }
         self
     }
@@ -297,6 +305,7 @@ impl Daemon {
                     directory.clone(),
                     settings.cursor_style,
                     &Theme::adwaita(settings.appearance != "light"),
+                    None,
                 )?;
                 self.sessions.insert(pane, session);
                 let name = name.filter(|n| !n.trim().is_empty());
@@ -344,6 +353,7 @@ impl Daemon {
                     directory.clone(),
                     settings.cursor_style,
                     &Theme::adwaita(settings.appearance != "light"),
+                    None,
                 )?;
                 self.sessions.insert(pane, session);
                 let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
@@ -572,9 +582,20 @@ impl Daemon {
                 Ok(self.response_with_session_save(json!({"ok":true})))
             }
             Request::Public(PublicRequest::Quit) => {
-                self.prepare_session_save();
+                let checkpoint = self.prepare_checkpoint();
+                let warning = match checkpoint {
+                    Ok(checkpoint) => {
+                        self.pending_write = Some(PreparedSave::Checkpoint(checkpoint));
+                        None
+                    }
+                    Err(error) => {
+                        self.prepare_session_save();
+                        Some(format!("Could not capture scrollback: {error}"))
+                    }
+                };
+                self.checkpointed = true;
                 self.quitting = true;
-                Ok(json!({"ok":true,"warning":null}))
+                Ok(json!({"ok":true,"warning":warning}))
             }
             Request::Public(PublicRequest::List) => self.list(),
             Request::Public(PublicRequest::Send {

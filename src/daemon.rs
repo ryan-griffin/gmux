@@ -94,6 +94,7 @@ struct Daemon {
     sent_rows: u64,
     started: Instant,
     pending_write: Option<PreparedSave>,
+    checkpointed: bool,
 }
 impl Daemon {
     fn new() -> anyhow::Result<Self> {
@@ -126,6 +127,7 @@ impl Daemon {
             sent_rows: 0,
             started: Instant::now(),
             pending_write: None,
+            checkpointed: false,
         };
         let catalog = storage::load_catalog()?;
         if let TabFilter::Workspace(id) = daemon.state.filter
@@ -137,6 +139,8 @@ impl Daemon {
             daemon.state.filter = TabFilter::All;
         }
         let mut used: HashSet<_> = catalog.workspaces.iter().map(|w| w.id).collect();
+        let mut history_bytes = 0;
+        let mut history_panes = 0;
         for mut tab in saved.tabs {
             if let Err(e) = tab.validate() {
                 eprintln!("Skipping invalid saved tab: {e}");
@@ -165,13 +169,42 @@ impl Daemon {
                         .filter(|p| p.is_dir())
                         .cloned()
                         .unwrap_or_else(model::home);
+                    let history = saved.scrollback.get(id).and_then(|name| {
+                        if history_panes >= crate::scrollback::MAX_PANES {
+                            eprintln!(
+                                "Skipping scrollback for pane {id}: restore pane limit reached"
+                            );
+                            return None;
+                        }
+                        history_panes += 1;
+                        match crate::scrollback::load(
+                            *id,
+                            name,
+                            crate::scrollback::MAX_TOTAL_BYTES - history_bytes,
+                        ) {
+                            Ok(bytes) => {
+                                history_bytes += bytes.len();
+                                Some(bytes)
+                            }
+                            Err(error) => {
+                                eprintln!("{error:#}. Starting with empty history");
+                                None
+                            }
+                        }
+                    });
                     let session = TerminalSession::spawn(
                         *id,
                         tab.id,
                         directory,
                         settings.cursor_style,
                         &Theme::adwaita(settings.appearance != "light"),
+                        history.as_deref(),
                     )?;
+                    if history.is_some()
+                        && let Some(name) = saved.scrollback.get(id)
+                    {
+                        daemon.state.scrollback.insert(*id, name.clone());
+                    }
                     daemon.sessions.insert(*id, session);
                     spawned.push(*id);
                 }
@@ -189,6 +222,10 @@ impl Daemon {
             daemon.state.tabs.push(tab);
         }
         daemon.last_id = used.into_iter().max().unwrap_or(0);
+        daemon
+            .state
+            .scrollback
+            .retain(|id, _| daemon.sessions.contains_key(id));
         daemon.select_visible();
         Ok(daemon)
     }
@@ -274,6 +311,7 @@ impl Daemon {
             .filter(|tab| self.state.filter.matches(tab.workspace))
             .position(|tab| tab.id == self.state.active);
         self.sessions.remove(&id);
+        self.state.scrollback.remove(&id);
         self.unread.remove(&id);
         self.notifications.remove(&id);
         self.clipboard.remove(&id);
@@ -353,6 +391,38 @@ impl Daemon {
     }
     fn prepare_session_save(&mut self) {
         self.pending_write = Some(PreparedSave::Session(self.session_snapshot()));
+    }
+
+    fn prepare_checkpoint(&mut self) -> anyhow::Result<crate::scrollback::Checkpoint> {
+        let mut panes = Vec::new();
+        let mut warnings = Vec::new();
+        let mut bytes = 0;
+        // Layout order makes the aggregate cap deterministic.
+        for (index, id) in self
+            .state
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.ids())
+            .enumerate()
+        {
+            if index == crate::scrollback::MAX_PANES {
+                warnings.push("Further panes omitted: checkpoint pane limit reached".into());
+                break;
+            }
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            session.poll();
+            match session.checkpoint() {
+                Ok(snapshot) if bytes + snapshot.len() <= crate::scrollback::MAX_TOTAL_BYTES => {
+                    bytes += snapshot.len();
+                    panes.push((id, snapshot));
+                }
+                Ok(_) => warnings.push(format!("Pane {id}: checkpoint budget reached")),
+                Err(error) => warnings.push(format!("Pane {id}: {error}")),
+            }
+        }
+        crate::scrollback::Checkpoint::new(self.session_snapshot(), panes, warnings)
     }
 }
 

@@ -121,7 +121,94 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, notify);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
+    // Track only a bounded unfinished sequence for shutdown snapshots.
+    size_t continuation_max = 64 * 1024;
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
+        &continuation_max)) { gmux_engine_free(e); return NULL; }
     return e;
+}
+
+// Serialized terminal state, distinct from gmux_engine_snapshot's viewport.
+int gmux_engine_checkpoint(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
+    GhosttyResult result = ghostty_snapshot_encode_buf(e->terminal, out, cap, written);
+    return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
+}
+
+// A file-size bound alone cannot bound allocations declared by a damaged file.
+// This allocator lives until the temporary decoded terminal and formatter die.
+typedef struct { size_t used, limit; } SnapshotBudget;
+static void *snapshot_alloc(void *ctx, size_t len, uint8_t alignment, uintptr_t ra) {
+    (void)ra;
+    SnapshotBudget *budget = ctx;
+    if (len > budget->limit - budget->used) return NULL;
+    // The pinned Zig adapter passes log2 alignment, including aligned pages.
+    if (alignment >= sizeof(size_t) * 8) return NULL;
+    size_t bytes_alignment = (size_t)1 << alignment;
+    if (bytes_alignment < sizeof(void *)) bytes_alignment = sizeof(void *);
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, bytes_alignment, len)) return NULL;
+    if (ptr) budget->used += len;
+    return ptr;
+}
+static bool snapshot_resize(void *ctx, void *ptr, size_t len, uint8_t alignment,
+    size_t new_len, uintptr_t ra) {
+    (void)ctx; (void)ptr; (void)len; (void)alignment; (void)new_len; (void)ra;
+    return false;
+}
+static void *snapshot_remap(void *ctx, void *ptr, size_t len, uint8_t alignment,
+    size_t new_len, uintptr_t ra) {
+    (void)ctx; (void)ptr; (void)len; (void)alignment; (void)new_len; (void)ra;
+    return NULL;
+}
+static void snapshot_free(void *ctx, void *ptr, size_t len, uint8_t alignment, uintptr_t ra) {
+    (void)alignment; (void)ra;
+    ((SnapshotBudget *)ctx)->used -= len;
+    free(ptr);
+}
+static const GhosttyAllocatorVtable snapshot_vtable = {
+    .alloc = snapshot_alloc, .resize = snapshot_resize,
+    .remap = snapshot_remap, .free = snapshot_free,
+};
+
+// Decode into a temporary terminal. Export only primary-screen text so the
+// new engine never inherits modes, metadata, graphics, or parser continuation.
+int gmux_checkpoint_text(const uint8_t *data, size_t len, GmuxWriterFn write,
+    void *userdata, uint16_t *cols, uint16_t *rows) {
+    SnapshotBudget budget = {.limit = 64 * 1024 * 1024};
+    GhosttyAllocator allocator = {.ctx = &budget, .vtable = &snapshot_vtable};
+    GhosttySnapshotDecoder decoder = NULL;
+    GhosttyTerminal terminal = NULL;
+    GhosttyFormatter formatter = NULL;
+    size_t continuation_max = 64 * 1024, consumed = 0;
+    int result = -1;
+    if (ghostty_snapshot_decoder_new_buf(&allocator, &decoder, data, len) ||
+        ghostty_snapshot_decoder_set(decoder, GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES,
+            &continuation_max) ||
+        ghostty_snapshot_decoder_decode(decoder, &terminal) ||
+        ghostty_snapshot_decoder_get(decoder, GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET, &consumed) ||
+        consumed != len ||
+        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLS, cols) ||
+        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ROWS, rows)) goto done;
+    // Never replay a full-screen program into the new shell's primary screen.
+    // terminal_set(MODE) changes flags without running screen-switch effects.
+    // Cancel continuation on this disposable terminal before sending DECRST.
+    const uint8_t cancel[] = {0x18, 0x1b, '\\'};
+    size_t cancelled = 0;
+    if (ghostty_terminal_vt_write_until_ground(terminal, cancel, sizeof(cancel), &cancelled)) goto done;
+    const char primary[] = "\x1b[?1049l\x1b[?1047l\x1b[?47l";
+    ghostty_terminal_vt_write(terminal, (const uint8_t *)primary, sizeof(primary) - 1);
+    GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+    options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+    options.unwrap = true;
+    options.trim = true;
+    if (ghostty_formatter_terminal_new(&allocator, &formatter, terminal, options)) goto done;
+    GhosttyWriter writer = {.write = write, .userdata = userdata};
+    result = ghostty_formatter_format(formatter, writer) == GHOSTTY_SUCCESS ? 0 : -1;
+done:
+    ghostty_formatter_free(formatter);
+    ghostty_snapshot_decoder_free(decoder);
+    ghostty_terminal_free(terminal);
+    return result;
 }
 int gmux_engine_theme(GmuxEngine *e, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *ansi, bool dark) {

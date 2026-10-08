@@ -12,7 +12,7 @@ pub fn config_dir() -> PathBuf {
 pub fn load<T: serde::de::DeserializeOwned + Default>(name: &str) -> anyhow::Result<T> {
     load_at(&config_dir().join(name))
 }
-fn load_at<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
+pub(crate) fn load_at<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
     use anyhow::Context;
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -26,19 +26,33 @@ pub fn save<T: Serialize + serde::de::DeserializeOwned + Default>(
     name: &str,
     value: &T,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(config_dir())?;
-    let path = config_dir().join(name);
-    save_at(&path, value)
+    with_state_lock(name, |path| save_locked_at(path, value))
 }
+pub(crate) fn with_state_lock<T>(
+    name: &str,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let directory = config_dir();
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(name);
+    with_lock_at(&path, || operation(&path))
+}
+#[cfg(test)]
 fn save_at<T: Serialize + serde::de::DeserializeOwned + Default>(
     path: &Path,
     value: &T,
 ) -> anyhow::Result<()> {
+    with_lock_at(path, || save_locked_at(path, value))
+}
+
+/// Hold the state writer lock through publication and any dependent cleanup.
+pub(crate) fn with_lock_at<T>(
+    path: &Path,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     use std::{
-        fs::{File, OpenOptions},
-        io::Write,
+        fs::OpenOptions,
         os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-        sync::atomic::{AtomicU64, Ordering},
     };
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
@@ -62,9 +76,46 @@ fn save_at<T: Serialize + serde::de::DeserializeOwned + Default>(
             return Err(error.into());
         }
     }
+    operation()
+}
+
+/// The caller must hold this path's state writer lock.
+pub(crate) fn save_locked_at<T: Serialize + serde::de::DeserializeOwned + Default>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
     // An autosave must not replace a file that became unreadable or invalid
     // after startup. Missing files are the only case that starts from defaults.
     let _: T = load_at(path)?;
+    atomic_write_at(
+        path,
+        |writer| {
+            serde_json::to_writer_pretty(writer, value)?;
+            Ok(())
+        },
+        || {
+            let _: T = load_at(path)?;
+            Ok(())
+        },
+    )
+}
+
+/// Publish bytes durably. Callers serialize ownership and validate as needed.
+pub(crate) fn atomic_write_at(
+    path: &Path,
+    write: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
+    validate: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::{
+        fs::{File, OpenOptions},
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid state path"))?;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let (temp, mut file) = loop {
         let mut temp_name = std::ffi::OsString::from(".");
@@ -94,12 +145,12 @@ fn save_at<T: Serialize + serde::de::DeserializeOwned + Default>(
     }
     let temp = Temporary(temp);
     let mut writer = std::io::BufWriter::new(&mut file);
-    serde_json::to_writer_pretty(&mut writer, value)?;
+    write(&mut writer)?;
     writer.flush()?;
     drop(writer);
     file.sync_all()?;
     // Recheck after writing, too, in case an external editor damaged the file.
-    let _: T = load_at(path)?;
+    validate()?;
     std::fs::rename(&temp.0, path)?;
     File::open(parent)?.sync_all()?;
     Ok(())

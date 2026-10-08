@@ -59,6 +59,8 @@ pub fn run() -> anyhow::Result<()> {
     let _cleanup = SocketCleanup(stream_path);
     let mut daemon = Daemon::new()?;
     let mut persistence = Worker::new(wake.clone());
+    // Optional cache cleanup must not rewrite session.json during startup.
+    persistence.submit(Save::Prune, false)?;
     let mut saving: Option<PendingControl> = None;
     let mut controls = VecDeque::new();
     let mut next_metadata = Instant::now();
@@ -341,9 +343,12 @@ pub fn run() -> anyhow::Result<()> {
         }
         let layout_changed = !exited.is_empty();
         for id in exited.drain(..) {
-            daemon.close(id);
+            if !daemon.quitting {
+                daemon.close(id);
+            }
         }
         if layout_changed
+            && !daemon.quitting
             && let Err(error) = persistence.submit(Save::Session(daemon.session_snapshot()), true)
         {
             eprintln!("Could not save layout after process exit: {error}");
@@ -353,8 +358,22 @@ pub fn run() -> anyhow::Result<()> {
             daemon.errors.clear();
         }
     }
-    if let Err(error) = persistence.submit(Save::Session(daemon.session_snapshot()), false) {
-        eprintln!("Could not save layout during shutdown: {error}");
+    if !daemon.checkpointed {
+        match daemon.prepare_checkpoint() {
+            Ok(checkpoint) => {
+                if let Err(error) = persistence.submit(Save::Checkpoint(checkpoint), false) {
+                    eprintln!("Could not save scrollback during shutdown: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("Could not capture scrollback during shutdown: {error}");
+                if let Err(error) =
+                    persistence.submit(Save::Session(daemon.session_snapshot()), false)
+                {
+                    eprintln!("Could not save layout during shutdown: {error}");
+                }
+            }
+        }
     }
     persistence.finish();
     for (_, result) in persistence.results() {

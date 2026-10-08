@@ -236,7 +236,20 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         assert restored["tabs"][0]["workspace"] == workspace, "Keep membership in an existing workspace"
         assert next(tab for tab in restored["tabs"] if tab["id"] == 999997)["workspace"] is None, "Move a restored tab from a deleted workspace to Unassigned"
         assert session_path.read_bytes() == saved_bytes, "Loading must not rewrite the saved session"
-        assert "HEADLESS_READY" not in rpc("read", pane=pane)["text"]
+        stream = socket.socket(socket.AF_UNIX)
+        stream.settimeout(5)
+        stream.connect(str(temp / "socket.stream"))
+        command("attach", version=6)
+        command("subscribe", panes=[hidden])
+        screen(hidden)
+        command("scroll-to", pane=hidden, row=0, serial=99)
+        header, cells = screen(hidden, lambda header, cells: header["scroll_serial"] == 99)
+        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 71))
+        assert b"hidden 1" in text, "Daemon restart must restore primary-screen history"
+        command("scroll", pane=hidden, delta=0, bottom=True)
+        screen(hidden, lambda header, cells: header["frame"]["scrollback"]["offset"] > 0)
+        stream.close()
+        stream = None
         restored_split = rpc("split", pane=pane)["pane"]
         assert restored_split > 999998, "New pane IDs must exceed every restored tab and pane ID"
         rpc("close", pane=restored_split)
