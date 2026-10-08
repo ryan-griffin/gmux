@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Check fresh diagnostic screenshots with a paused, occluded Wayland window."""
-from contextlib import contextmanager
 import json
 import math
 import os
@@ -10,10 +9,10 @@ import time
 
 import gi
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import GdkPixbuf, Gio, GLib
+from gi.repository import GdkPixbuf
 
 from test_support import AppFixture, assert_stays, scenario, stop_process, wait_for
-from wayland_test_support import WaylandInput
+from wayland_test_support import WaylandInput, monitor_scale
 
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
@@ -74,43 +73,6 @@ def body_dimensions(pixbuf):
     assert channels == 4, "Screenshot lost its alpha channel"
     return (sum(pixels[(height // 2) * stride + x * channels + 3] == 255 for x in range(width)),
             sum(pixels[y * stride + (width // 2) * channels + 3] == 255 for y in range(height)))
-
-
-@contextmanager
-def monitor_scale(scale):
-    # GDK_SCALE does not override Wayland's preferred surface scale. Configure
-    # the private Mutter monitor so this exercises a fractional-scale surface.
-    interface = "org.gnome.Mutter.DisplayConfig"
-    path = "/org/gnome/Mutter/DisplayConfig"
-    assert os.environ.get("GMUX_WAYLAND_TEST") == "1", "Use the isolated Wayland fixture"
-    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-
-    def call(method, signature=None, arguments=()):
-        return bus.call_sync(interface, path, interface, method,
-                             GLib.Variant(signature, arguments) if signature else None,
-                             None, Gio.DBusCallFlags.NONE, 5000, None)
-
-    def state():
-        return call("GetCurrentState").unpack()
-
-    original = state()[2][0][2]
-
-    def apply(value):
-        serial, monitors, logical, properties = state()
-        assert len(monitors) == len(logical) == 1, "Expected the fixture's single virtual monitor"
-        specification, modes, _ = monitors[0]
-        mode = next(mode for mode in modes if mode[6].get("is-current"))
-        assert value in mode[5], (value, mode[5])
-        call("ApplyMonitorsConfig", "(uua(iiduba(ssa{sv}))a{sv})",
-             (serial, 1, [(0, 0, float(value), 0, True, [(specification[0], mode[0], {})])],
-              {"layout-mode": GLib.Variant("u", properties["layout-mode"])}))
-        wait_for(lambda: state()[2][0][2] == value)
-
-    try:
-        apply(scale)
-        yield
-    finally:
-        apply(original)
 
 
 with (artifacts / f"screenshot-{appearance}-smoke.log").open("w") as log:
