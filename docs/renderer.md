@@ -99,8 +99,11 @@ background batching, and block seams at 100%, 125%,
 150%, and 200% scale with fractional pane positions.
 
 Retained output must match a freshly built scene after changes to cursor, focus,
-selection, search, font, context, theme, scale, and viewport size. Unicode churn
-must keep the glyph cache within its limit. The smoke script checks node types
+selection, search, font, context, theme, scale, and viewport size. Each cache case
+requires exact pixels from a separate Cairo renderer. This includes initial
+scenes, scrolling at all tested scales and pane positions, edge edits, and a
+single-row output change. Unicode churn must keep
+the glyph cache within its limit. The smoke script checks node types
 and row rebuild counts for unchanged, single-row, and scrolling workloads.
 Terminal scenes contain text nodes and no Cairo image nodes even when GTK uses
 its software backend.
@@ -150,6 +153,84 @@ It verifies primary-screen restoration and 3000 lines of colored output. Other
 native regressions cover system fonts, Find, resize overlays, notifications,
 and daemon reconnect. Tests currently cover this Intel Iris Xe/Mesa machine;
 other GPU vendors have not been tested here.
+
+## Cache comparison investigation
+
+On 2026-10-08, the unchanged checker failed once in ten focused Vulkan runs
+against main `5d20a97`, using the worktree's bootstrapped Ghostty revision
+`8f0dd3709050b1026f6324368805033197d8b4a5`. Its archive matched the bootstrap's
+SHA-256. `GHOSTTY_PREFIX` was unset; builds used `.deps/ghostty` and the installed
+libclang 23.1.1. The native fixture used Mutter 51.0, GTK 4.24.1, libadwaita
+1.10.0, Mesa 26.2.4, and Intel Iris Xe graphics.
+
+The historical edited-row failure changed three channels of one pixel at
+`(69, 78)` in a 400 by 192 image. Bounded diagnostics reproduced one- and
+two-pixel outliers in other cache cases, including an initial scene where both
+application renderers were fresh. In every captured mismatch, the cached and
+fresh nodes serialized identically. Repeated downloads of each failed texture
+returned unchanged bytes. Re-rendering the same nodes removed the outliers.
+The fixture supplies a native display, but these checks render directly to
+textures without compositor capture or frame callbacks. GTK's
+[GPU texture renderer](https://github.com/GNOME/gtk/blob/4.24.1/gsk/gpu/gskgpurenderer.c)
+waits for the submitted frame before returning the texture.
+
+The evidence identifies unstable Vulkan rendering as the cache comparison's
+unsuitable pixel reference. It does not establish whether GTK or Mesa causes
+the transient output. Disabling GPU merging, all GPU optimizations, dmabuf,
+worker threads, or dual-source blending did not eliminate failures. A separate renderer
+realized for offscreen drawing also failed. Simple solid-color, Pango-layout,
+and saved-node probes each passed 1000 repeated renders; none reproduces the
+checker's complete sequence of font, context, and glyph-cache changes.
+
+The checker now uses exact Cairo pixels for cache invariants. Cairo consumes
+the actual retained and independently rebuilt GSK scenes. It adds no pixel
+tolerance or retry. The selected GTK backend still runs all sixteen independent Pango-layout cases, the overlapping fallback
+paint-order comparison, and the geometry, selection, decoration, and cursor
+pixel checks. `checks.json` and smoke output report both the selected backend
+and the cache oracle. No application cache or drawing behavior changed.
+
+To run the original GPU cache comparison explicitly:
+
+```sh
+GSK_RENDERER=vulkan target/debug/examples/renderer-check \
+  --cache-renderer selected --output artifacts/renderer-gpu-cache
+```
+
+A mismatch remains a failure. Node serialization runs on failure, so font
+serialization does not add work to every passing comparison. It writes the
+actual and expected PNGs and node files under `--output`, plus a JSON report
+with image dimensions, node equality, changed-pixel count, inclusive bounds, maximum channel difference, and at most
+eight pixel samples. The panic reports only that summary and the report path.
+The default oracle also writes these diagnostics if a cache regression occurs.
+
+Focused validation used main `aa6644266cbd201690dc70a7ec82be3752bae3ec`.
+The final rebase onto `d8daabcc12b4cb9405d96186a4652edb8ade6fce` preserved
+the Find and Resize changes. The checker binary's SHA-256 remained identical,
+so the focused repeat evidence applies to that final binary too.
+
+- Thirty fresh-process Vulkan runs passed with the default Cairo cache oracle.
+  Each checked all sixteen independent GPU layout cases and the selected GPU's
+  geometry and paint order, plus exact cache pixels. These runs shared one
+  isolated fixture and did not retry failed checks.
+- The explicit Vulkan GPU cache comparison failed three of ten runs, each
+  with one changed pixel and equal node serialization. This mode exposes the
+  remaining graphics-stack instability.
+- Five OpenGL runs and three Cairo runs passed with `--cache-renderer selected`,
+  so both also checked exact cached/fresh pixels on their selected backend.
+- After the final rebase, native `renderer` and `terminal-renderer` passed on
+  Vulkan, including row
+  reuse and bounded cache counts, Vim editing, live `top`, scrolling, resize,
+  reattachment, and 3000 colored output lines.
+- After the final rebase, `python3 scripts/check.py` passed formatting, all 120 Rust tests, Clippy with
+  warnings denied, binary/example builds, and the five headless suites.
+- A temporary one-pixel red overlay caused an exact cache comparison failure.
+  Its report identified one changed pixel at `(0, 0)` and saved both images and
+  node files; the panic log stayed below 2 KiB. The injection was removed before
+  the final build.
+
+Investigation logs and probes live in ignored `artifacts/renderer-investigation/`.
+Repeat-run results above describe the checker and this graphics stack; they do
+not prove Vulkan output is deterministic or validate other GPU vendors.
 
 ## Benchmarks
 

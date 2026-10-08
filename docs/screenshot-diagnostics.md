@@ -277,3 +277,16 @@ in `resize-before-fix-wayland.log` and `resize-after-fix-wayland.log` under
 The earlier adjacent font and terminal-renderer results are preserved in
 `resize-prebase-native-check.log`.
 The negative-control failure is in `resize-negative-check.log`.
+
+## Renderer cache follow-up
+
+The renderer follow-up reproduced this historical failure on the current
+Ghostty pin and found transient Vulkan pixels for identically serialized cache
+scenes. A separate Cairo pixel oracle now checks exact cache output. The
+selected GPU still runs the independent layout and geometry checks. The
+original GPU cache comparison remains available as a diagnostic.
+See the [cache comparison investigation](renderer.md#cache-comparison-investigation)
+for verified results and limits. This checker fix does not resolve the graphics
+stack's intermittent output or change `capture_window`. It makes no new claim
+about the full native suite. The verified Find and Resize results above remain
+separate from this renderer investigation.

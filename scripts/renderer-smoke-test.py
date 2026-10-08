@@ -31,6 +31,7 @@ with (output / "benchmark.log").open("w") as log:
 checks = json.loads((output / "checks/checks.json").read_text())
 report = json.loads((output / "results.json").read_text())
 assert checks["gtk_renderer"] == report["gtk_renderer"]
+assert checks["cache_renderer"] == "GskCairoRenderer", checks
 assert len(checks["glyph_cases"]) == 16
 for result in report["results"]:
     assert result["terminal_renderer"] == "gsk"
@@ -44,4 +45,5 @@ for result in report["results"]:
     assert result["cached_glyphs"] <= 4096, result
 
 print(f"PASS: {report['gtk_renderer']}, {len(checks['glyph_cases'])} independent glyph comparisons, "
-      + ", ".join(checks["checks"]) + ", direct text nodes without Cairo nodes")
+      + ", ".join(checks["checks"]) + f", cache oracle {checks['cache_renderer']}"
+      + ", direct text nodes without Cairo nodes")
