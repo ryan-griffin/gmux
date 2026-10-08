@@ -148,7 +148,57 @@ Recorded results:
   initially failed a pointer-input assertion, then passed with both the
   original backend and the final implementation on rerun.
 
-These failures prevent a claim that the full native suite passes in this
-environment. The Find suite stopped before its light-appearance case, although
-its earlier dark screenshots succeeded. The investigation leaves these broader
-regressions outside the screenshot change.
+These historical results did not establish a passing full native suite. At the
+time of the screenshot investigation, Find stopped before its light-appearance
+case, although its earlier dark screenshots succeeded. Those failures were
+outside the screenshot change.
+
+## Native Find follow-up
+
+The Find timeout at the focused sidebar-directory assertion also reproduced
+on untouched baseline `686a272`. A follow-up on main `5d20a97` traced the
+failure through pane metadata, focus, the AT-SPI tree, and Wayland messages.
+The first pane stayed active and both panes reported the expected directories.
+Accessibility traversal cleared its caches, but the sidebar had collapsed and
+hidden, so its rows were absent from the tree.
+
+The `resize` diagnostic unconditionally called `unmaximize()` on an already
+normal window. After GTK requested the wide 1120 by 740 geometry, Mutter's
+reply to that unnecessary request configured the old 540 by 480 geometry.
+The window returned to its narrow layout. Find's terminal-width wait could
+mistake the space gained by hiding the sidebar for a completed wide resize.
+The Wayland trace recorded the wide geometry followed by the old-size configure;
+waiting for native window dimensions alone reproduced the failed wide resize.
+
+The diagnostic now calls `unmaximize()` only for a maximized window. The
+unchanged Find suite passed after that fix. Its regression checks now wait for
+native window dimensions and the expanded sidebar before switching tabs. The
+directory assertion checks the visible, selected `Find Test` row and still
+requires its label to follow each focused pane's directory. No timeout was
+extended and no assertion was skipped.
+
+Validation on 2026-10-08 bootstrapped Ghostty revision
+`8f0dd3709050b1026f6324368805033197d8b4a5` in the follow-up worktree, with the
+verified source archive SHA256
+`f4869fc667ea0a1c93705e363ceca06d394b67ad1d3dde756a7fa5c15691f9cb`.
+The full native Find suite passed in dark and light appearance, including
+retained-history Unicode matches, offscreen navigation, wrapping, live output,
+tab and pane switching, clearing and reopening. Added cases also passed for
+Unicode and wrapped history after a checkpoint-saving Quit and daemon restart,
+then search after grid reflow. Native sidebar-search, branch, and terminal-input
+checks passed, including scrollback selection and clipboard copying.
+`python3 scripts/check.py` passed formatting, all 120 Rust tests, Clippy with
+warnings denied, binary and example builds, and all five headless suites. The
+engine tests include copying checkpoint-restored history across reflow.
+The adjacent native `resize` suite also passed, including its pixel-only case.
+These native checks used the repository's isolated Mutter Wayland fixture with
+GTK 4.24.1, libadwaita 1.10.0, and Mutter 51.0.
+Logs include `find-bootstrap.log`, `find-diagnose.log`,
+`find-diagnose-protocol-app.log`, `find-native-validation.log`, and
+`find-headless-validation.log` under ignored `artifacts/`; the adjacent Resize
+result is in `find-adjacent-resize.log`.
+
+This follow-up does not establish a passing full native suite or resolve the
+renderer cache issue recorded above. The historical pixel-only Resize failure's
+cause remains with its separate investigation; the passing adjacent check here
+records the behavior of this fix.
