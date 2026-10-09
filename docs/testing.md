@@ -270,6 +270,8 @@ It checks exact restored background pixels in a composited Wayland frame and
 copies a restored line across reflow using native pointer selection and the
 Wayland clipboard. A new clipboard owner and the exact text must arrive within
 the existing deadline, even when a previous test has left clipboard contents.
+Before dragging after Find closes, the suite waits for its observed closed
+vertical allocation, frontend and daemon grid agreement, and a new compositor frame.
 The `terminal-copy` suite holds daemon updates at a barrier while row growth or
 shrink invalidates the displayed selection. Copy must still publish the exact
 tracked Unicode text with a new Wayland clipboard owner. Copy with no backend
