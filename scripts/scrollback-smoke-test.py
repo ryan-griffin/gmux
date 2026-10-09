@@ -15,11 +15,15 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 ghostty_revision = runpy.run_path(str(root / "scripts/bootstrap-ghostty.py"))["REVISION"]
 unicode_line = "你好 e\u0301 🦀 wrapped history " * 6
+colored_output = ("\\033[31;44mINDEX\\033[38;5;201;48;5;22mEXTENDED\\033[0m\\n"
+                  "\\033[1;3;4;9;38;2;12;34;56;48;2;78;90;123m" + unicode_line + "\\033[0m\\n"
+                  "\\033[0mPLAIN_OUTPUT\\n")
 
 
 class History:
     def __init__(self, fixture, pane):
         self.fixture, self.pane = fixture, pane
+        self.frame, self.cells = None, {}
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(8)
         self.socket.connect(str(fixture.path / "socket.stream"))
@@ -44,8 +48,36 @@ class History:
             body = self.exact(size)
             header_size, = struct.unpack("<I", body[:4])
             header = json.loads(body[4:4 + header_size])
+            if header["meta"]["id"] == self.pane and header["frame"] is not None:
+                frame = header["frame"]
+                cells = body[4 + header_size:]
+                assert len(cells) == len(header["rows"]) * frame["cols"] * 71
+                if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
+                    self.cells = {}
+                self.frame = frame
+                for index, row in enumerate(header["rows"]):
+                    for col in range(frame["cols"]):
+                        start = (index * frame["cols"] + col) * 71
+                        cell = cells[start:start + 71]
+                        text = cell[:64].split(b"\0", 1)[0].decode()
+                        fg, bg, flags = bytes(cell[64:67]), bytes(cell[67:70]), cell[70]
+                        # The formatter emits background-only blanks as spaces.
+                        if not text and bg != bytes(frame["background"]) and flags & 64 == 0:
+                            text = " "
+                        self.cells[row, col] = (text, fg, bg, flags)
             if header["meta"]["id"] == self.pane and predicate(header):
                 return header
+
+    def rendition(self):
+        self.packet(lambda header: header["frame"] is not None)
+        result = {}
+        for serial, row in enumerate(range(0, self.frame["scrollback"]["total"], self.frame["rows"]), 1):
+            self.send("scroll-to", row=row, serial=serial)
+            self.packet(lambda header: header["scroll_serial"] == serial)
+            for (y, x), cell in self.cells.items():
+                if cell[0] and cell[3] & 64 == 0:
+                    result[self.frame["scrollback"]["offset"] + y, x] = cell
+        return [result[position] for position in sorted(result)]
 
     def text(self):
         frame = self.packet(lambda header: header["frame"] is not None)["frame"]
@@ -57,7 +89,7 @@ class History:
         self.socket.close()
 
 
-with AppFixture({"restore": True}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
+with AppFixture({"restore": True, "appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
     fixture.env.update(DISPLAY="", WAYLAND_DISPLAY="", GMUX_TEST_DIR=str(fixture.path))
     (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY\\n'\nexec /bin/bash --noprofile --norc -i\n")
 
@@ -85,13 +117,37 @@ with AppFixture({"restore": True}, prefix="gmux-scrollback-") as fixture, (artif
     def ready(pane):
         wait_for(lambda: "SHELL_READY" in fixture.rpc("read", pane=pane)["text"])
 
-    with scenario("Quit restores Unicode and wrapped history into new shells"):
+    def rendition(pane):
+        probe = History(fixture, pane)
+        try:
+            return probe.rendition()
+        finally:
+            probe.close()
+
+    def assert_colors(cells):
+        text = [cell[0] for cell in cells]
+        for marker, fg, bg, flags in [
+            ("INDEX", bytes([192, 28, 40]), bytes([30, 120, 228]), 0),
+            ("EXTENDED", bytes([255, 0, 255]), bytes([0, 95, 0]), 0),
+            ("你好", bytes([12, 34, 56]), bytes([78, 90, 123]), 27),
+            ("PLAIN_OUTPUT", bytes([255, 255, 255]), bytes([28, 28, 31]), 0),
+            ("SHELL_READY", bytes([255, 255, 255]), bytes([28, 28, 31]), 0),
+        ]:
+            starts = [index for index in range(len(cells) - len(marker) + 1)
+                      if text[index:index + len(marker)] == list(marker)]
+            assert starts, marker
+            for start in starts:
+                assert all(cell[1:] == (fg, bg, flags) for cell in cells[start:start + len(marker)]), marker
+
+    with scenario("Quit restores colored Unicode and wrapped history into new shells"):
         daemon = start()
         pane = fixture.rpc("new", directory=str(root))["pane"]
         ready(pane)
         first_pid = (fixture.path / f"{pane}.pid").read_text()
-        send(pane, "printf 'SNAPSHOT_BEGIN\\n%s\\n' '" + unicode_line + "'; for i in $(seq 1 80); do printf 'history %s\\n' \"$i\"; done; printf 'CHECKPOINT_READY\\n'")
+        send(pane, "printf 'SNAPSHOT_BEGIN\\n" + colored_output + "'; for i in $(seq 1 80); do printf 'history %s\\n' \"$i\"; done; printf 'CHECKPOINT_READY\\n\\033[38;2;111;112;113;48;2;21;22;23mUNRESET'")
         wait_for(lambda: "CHECKPOINT_READY" in fixture.rpc("read", pane=pane)["text"])
+        before = rendition(pane)
+        assert_colors(before)
         survivor = fixture.rpc("new", directory=str(root))["pane"]
         ready(survivor)
         send(survivor, "printf 'SURVIVING_HISTORY\\n'")
@@ -107,6 +163,11 @@ with AppFixture({"restore": True}, prefix="gmux-scrollback-") as fixture, (artif
         assert (fixture.path / f"{pane}.pid").read_text() != first_pid
         text = history(pane)
         assert "SNAPSHOT_BEGIN" in text and unicode_line.rstrip() in text and "history 80" in text, text
+        after = rendition(pane)
+        assert after[:len(before)] == before, "Restored cell rendition differs from captured history"
+        assert_colors(after)
+        for cell in after[len(before):]:
+            assert cell[1:] == (bytes([255, 255, 255]), bytes([28, 28, 31]), 0), "Saved rendition bled into the fresh shell"
         send(pane, "printf 'NEW_PROCESS_INPUT\\n'")
         wait_for(lambda: "NEW_PROCESS_INPUT" in fixture.rpc("read", pane=pane)["text"])
         stop(daemon)
@@ -183,6 +244,7 @@ with AppFixture({"restore": True}, prefix="gmux-scrollback-") as fixture, (artif
         ("file truncation", valid[:-1]),
         ("missing FINISH", truncated_payload()),
         ("trailing bytes", valid + b"garbage"),
+        ("oversized payload", valid[:60] + struct.pack("<Q", 8 * 1024 * 1024 + 1) + valid[68:]),
         ("missing snapshot", None),
     ]:
         with scenario(f"recover from incompatible or damaged {name}"):
@@ -204,13 +266,19 @@ with AppFixture({"restore": True}, prefix="gmux-scrollback-") as fixture, (artif
     with scenario("SIGTERM saves history and deleted panes release their snapshots"):
         daemon = start()
         ready(pane)
-        send(pane, "printf 'SIGTERM_HISTORY\\n'")
+        send(pane, "printf 'SIGTERM_HISTORY\\n" + colored_output + "\\033[38;2;111;112;113;48;2;21;22;23mUNRESET'")
         wait_for(lambda: "SIGTERM_HISTORY" in fixture.rpc("read", pane=pane)["text"])
+        before = rendition(pane)
+        assert_colors(before)
         daemon.terminate()
         assert daemon.wait(timeout=8) == 0
         daemon = start()
         ready(pane)
         assert "SIGTERM_HISTORY" in history(pane)
+        after = rendition(pane)
+        assert after[:len(before)] == before
+        assert_colors(after)
+        assert all(cell[1:] == (bytes([255, 255, 255]), bytes([28, 28, 31]), 0) for cell in after[len(before):])
         saved = json.loads(session_path.read_text())
         path = fixture.config / "scrollback" / saved["scrollback"][str(pane)]
         assert path.exists()
@@ -246,4 +314,4 @@ with AppFixture({"restore": True}, prefix="gmux-scrollback-") as fixture, (artif
         ready(new_pane)
         stop(daemon)
 
-print("PASS: durable Quit/SIGTERM history, new shell PIDs and input, Unicode wraps, snapshot permissions, disk backpressure, version/CRC/truncation recovery, startup recovery, and deleted-pane cleanup")
+print("PASS: durable Quit/SIGTERM colored history, exact indexed/RGB cells and attributes, resets without prompt bleed, new shell PIDs and input, Unicode wraps, snapshot permissions, disk backpressure, version/CRC/truncation/oversize recovery, startup recovery, and deleted-pane cleanup")

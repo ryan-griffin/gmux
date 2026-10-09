@@ -43,7 +43,9 @@ GmuxEngine *gmux_engine_new(void *userdata, GmuxEventFn callback);
 void gmux_engine_free(GmuxEngine *engine);
 // Serialized terminal state, distinct from the viewport snapshot below.
 int gmux_engine_checkpoint(GmuxEngine *engine, uint8_t *out, size_t cap, size_t *written);
-int gmux_checkpoint_text(const uint8_t *data, size_t len, GmuxWriterFn write,
+// Format primary text/rendition without terminal extras. Before replay, the
+// caller must validate the complete output, including untrusted cell text.
+int gmux_checkpoint_history(const uint8_t *data, size_t len, GmuxWriterFn write,
     void *userdata, uint16_t *cols, uint16_t *rows);
 int gmux_engine_history_size(GmuxEngine *engine, uint16_t *cols, size_t *rows);
 int gmux_engine_history_row(GmuxEngine *engine, uint32_t row, GmuxCell *cells,
