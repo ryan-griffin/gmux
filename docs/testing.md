@@ -38,14 +38,18 @@ The native suite and application benchmark also need:
   GStreamer 1.0, GstVideo 1.0, GDK 4, GdkPixbuf 2, and AT-SPI 2.
 - The AT-SPI accessibility bus and registry D-Bus service files, and GNOME
   desktop settings schemas for the font tests. The fixture activates the registry
-  by its bus name, using the distribution's service file to locate the executable.
+  by its bus name. If activation returns `ServiceUnknown`, it reports the failure
+  and launches the installed accessibility service file's `Exec` command from
+  `XDG_DATA_DIRS`. This supports private `dbus-broker` sessions without a systemd
+  user manager, without assuming a distribution's executable location.
 - `gtk4-rendernode-tool` for renderer checks, Git for branch checks, and Vim
   and `top` for interactive terminal checks.
 
 The native fixture uses Mutter's private RemoteDesktop and ScreenCast D-Bus
-interfaces. The recorded environment used Mutter 50.5, PipeWire 1.6.9,
+interfaces. The host-native validation used Mutter 51.0, PipeWire 1.6.9,
 WirePlumber 0.5.18, and GStreamer 1.28.7. These are tested versions, not minimum
-requirements beyond those stated above.
+requirements beyond those stated above. This was separate from Fedora headless
+CI and does not establish Fedora native coverage.
 
 ## Rust requirements
 
@@ -364,8 +368,9 @@ capture helpers live in
 and a shell, and shuts down the daemon even if the frontend has already exited.
 Shell fixtures write history within their temporary directories.
 `AccessibilityFixture` activates and waits for the registry's D-Bus name.
-The registry belongs to the private accessibility bus and ends with that bus;
-closing a fixture does not kill a service shared by later suites. Readiness
-checks wait for observable state. Timed
+An activated registry belongs to the private accessibility bus and ends with
+that bus. If activation is unavailable, the fixture owns and stops only the
+fallback process it launched. An existing registry is reused without killing it.
+Readiness checks wait for observable state. Timed
 observations remain where a check needs to verify dismissal deadlines or the
 absence of delayed updates.
