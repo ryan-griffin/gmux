@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Run Rust checks and smoke tests. Add --native for the isolated Wayland suite."""
 import argparse
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-HEADLESS = ["bootstrap", "daemon", "scrollback", "control", "icon"]
+HEADLESS = ["bootstrap", "cargo-output", "daemon", "scrollback", "control", "icon"]
 DESKTOP = ["state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
            "title", "scheduling", "resize", "split-resize", "font", "find", "commands", "main-menu", "window-close",
            "terminal-context-menu", "terminal-scrollbar", "terminal-renderer",
@@ -45,9 +47,23 @@ if missing:
     parser.error("Missing smoke tests: " + ", ".join(missing))
 
 
-def run(command, timeout):
+def run(command, timeout, *, artifacts=False):
     print("Running " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=root, check=True, timeout=timeout)
+    result = subprocess.run(command, cwd=root, timeout=timeout,
+                            stdout=subprocess.PIPE if artifacts else None, text=artifacts)
+    if artifacts:
+        output = root / "artifacts/cargo-build.jsonl"
+        output.parent.mkdir(exist_ok=True)
+        output.write_text(result.stdout)
+    result.check_returncode()
+    return result.stdout
+
+
+from cargo_test_support import ARTIFACT_ENV, compiler_artifacts, native_output_dir
+# Never import an artifact selection from a previous invocation.
+os.environ.pop(ARTIFACT_ENV, None)
+if not args.skip_build or any(name not in ("bootstrap", "cargo-output", "icon") for name in names):
+    native_output_dir()
 
 
 if args.native:
@@ -58,7 +74,9 @@ if not args.skip_build:
     run(["cargo", "fmt", "--check"], args.build_timeout)
     run(["cargo", "test", "--locked"], args.build_timeout)
     run(["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"], args.build_timeout)
-    run(["cargo", "build", "--locked", "--bins", "--examples"], args.build_timeout)
+    output = run(["cargo", "build", "--locked", "--bins", "--examples",
+                  "--message-format=json-render-diagnostics"], args.build_timeout, artifacts=True)
+    os.environ[ARTIFACT_ENV] = json.dumps(compiler_artifacts(output))
 for name, file in zip(names, files):
     command = [sys.executable, str(file)]
     if args.native and name in ("smoke", "daemon"):

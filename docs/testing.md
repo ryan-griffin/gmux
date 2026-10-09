@@ -171,7 +171,7 @@ python3 scripts/check.py --native
 
 The runner checks formatting, runs Rust unit, integration, and documentation
 tests, runs Clippy with warnings denied, and builds both binaries and the
-examples. It then runs the bootstrap, daemon, scrollback, control, and icon smoke tests.
+examples. It then runs the bootstrap, Cargo output, daemon, scrollback, control, and icon smoke tests.
 `--native` includes the desktop suite in an isolated headless Wayland compositor
 with XWayland disabled.
 
@@ -210,10 +210,31 @@ python3 scripts/check.py --skip-build --only control icon
 Use `smoke` for `smoke-test.py`. Rust checks still run unless `--skip-build` is
 set; that option skips all formatting, Rust tests, Clippy, and build steps.
 Use it after a successful build while checking an unchanged binary.
-All smoke and benchmark defaults resolve Cargo's output directory with locked
-`cargo metadata`, including `CARGO_TARGET_DIR` and Cargo config `build.target-dir`.
-Explicit `--binary` and `--check-binary` options still select the supplied paths.
-This avoids testing old binaries under `target/debug` after a redirected build.
+Fresh runner builds select executable paths from Cargo's `compiler-artifact`
+JSON messages and save that output to `artifacts/cargo-build.jsonl`. The runner
+passes those paths to smoke tests for this invocation. It clears any inherited
+artifact selection before setup, so an earlier build cannot supply it.
+
+Direct smoke/benchmark defaults and `--skip-build` do not rebuild the application.
+They resolve Cargo's output directory with locked `cargo metadata` and read the
+current environment and Cargo config hierarchy to select either the ordinary
+output or a single explicit native host target's subdirectory. This includes
+`CARGO_TARGET_DIR`, config `build.target-dir`, `CARGO_BUILD_TARGET`, and config
+`build.target`, with parent/home configs and legacy `config` precedence.
+They do not fall back to `target/debug` if the selected binary is missing.
+
+Defaults execute native host binaries only. Multiple-target arrays, custom and
+cross targets, and config includes are rejected with an actionable error.
+For a separate manual build using command-line-only `--target` or `--config`,
+pass its actual executable paths through `--binary` and `--check-binary` where
+available. Those explicit overrides remain unchanged and bypass default path
+selection; they do not provide cross-execution or emulator support.
+The `cargo-output` smoke suite builds isolated tiny Cargo packages and verifies
+application, daemon and example selection with stale default binaries present.
+It tests environment/config host targets, ordinary and redirected outputs,
+config precedence, release output, and rejection of unsupported targets.
+`--skip-build` still skips the repository's Rust/build checks; this explicitly
+selected smoke suite compiles only its temporary fixtures.
 Include `--native` for desktop tests so the runner provides their isolated
 display and services.
 
@@ -223,6 +244,7 @@ building or starting services. Unknown names and desktop selections without
 
 | Smoke tests | What they cover |
 | --- | --- |
+| `cargo-output` | Real Cargo executable artifacts and native host target/config selection, redirected output, stale-binary rejection, and unsupported-target errors. |
 | `bootstrap` | Interrupted downloads and extraction, recovery of older incomplete caches, cache reuse, checksum verification, and temporary-file cleanup. |
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |
 | `scrollback` | Durable colored history across Quit/SIGTERM, exact indexed/RGB foreground/background and attribute cells, resets and fresh shell output, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
@@ -343,6 +365,7 @@ and a shell, and shuts down the daemon even if the frontend has already exited.
 Shell fixtures write history within their temporary directories.
 `AccessibilityFixture` activates and waits for the registry's D-Bus name.
 The registry belongs to the private accessibility bus and ends with that bus;
-closing a fixture does not kill a service shared by later suites. Readiness checks wait for observable state. Timed
+closing a fixture does not kill a service shared by later suites. Readiness
+checks wait for observable state. Timed
 observations remain where a check needs to verify dismissal deadlines or the
 absence of delayed updates.
