@@ -627,8 +627,12 @@ fn layout_widget(
             second,
             ratio,
         } => {
+            let mut first_path = path.clone();
+            first_path.push(false);
+            let mut second_path = path.clone();
+            second_path.push(true);
             let changed_layout = saved.clone();
-            let changed_path = path.clone();
+            let changed_path = path;
             let changed_ui = ui.clone();
             let split = super::split::SplitPane::new(
                 if *vertical {
@@ -654,21 +658,6 @@ fn layout_widget(
                 },
             );
             let paned = split.paned();
-            paned.add_css_class("tab-split");
-            // GtkPaned clips overflow by default, including the card shadows
-            // on its outer edges. Each terminal already clips its own contents.
-            paned.set_overflow(gtk::Overflow::Visible);
-            paned.set_hexpand(true);
-            paned.set_vexpand(true);
-            // Narrow handles extend their hit area into adjacent scrollbars.
-            // Keep input within the existing 6px separator styled in CSS.
-            paned.set_wide_handle(true);
-            paned.set_shrink_start_child(false);
-            paned.set_shrink_end_child(false);
-            let mut first_path = path.clone();
-            first_path.push(false);
-            let mut second_path = path.clone();
-            second_path.push(true);
             paned.set_start_child(Some(&layout_widget(
                 first,
                 panes,
@@ -676,13 +665,7 @@ fn layout_widget(
                 first_path,
                 ui.clone(),
             )));
-            paned.set_end_child(Some(&layout_widget(
-                second,
-                panes,
-                saved.clone(),
-                second_path,
-                ui.clone(),
-            )));
+            paned.set_end_child(Some(&layout_widget(second, panes, saved, second_path, ui)));
             split.upcast()
         }
     }
