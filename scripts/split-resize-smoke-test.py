@@ -39,12 +39,15 @@ with (artifacts / "split-resize-smoke.log").open("w") as log:
             def layout():
                 return rpc("list")["tabs"][0]["layout"]
 
+            def capture(name):
+                rpc("screenshot", path=str(artifacts / f"split-resize-{name}-scale-{scale}.png"))
+
             def resize(w, h):
                 rpc("resize", width=w, height=h)
+                # Window allocation includes its children. Observe native GTK
+                # resizing without forcing another layout and PNG on every step.
                 wait_for(lambda: rpc("renderer-info", pane=pane)["window_size"] == [w, h],
                          message=f"GTK did not allocate the requested {w} by {h} window")
-                # A fresh snapshot waits for GTK's layout and terminal geometry.
-                rpc("screenshot", path=str(artifacts / f"split-resize-scale-{scale}.png"))
 
             def drag_divider(down):
                 rpc("focus", pane=pane)
@@ -80,6 +83,7 @@ with (artifacts / "split-resize-smoke.log").open("w") as log:
                     other = rpc("split", pane=pane, down=down)["pane"]
                     wait_for(lambda: geometry(pane)[axis] < geometry(other)[axis] + 20)
                     resize(width, height)
+                    capture(f"{axis}-initial")
                     samples = []
                     for delta in (*range(81), *range(79, -1, -1)):
                         resize(width + (delta if not down else 0), height + (delta if down else 0))
@@ -94,10 +98,12 @@ with (artifacts / "split-resize-smoke.log").open("w") as log:
                     for sample in samples:
                         assert abs(sample["first"] - sample["second"]) <= 1, sample
                         assert sample["ratio"] == 0.5, sample
+                    capture(f"{axis}-equal")
 
                 with scenario(f"scale {scale}: dragged {axis} proportions survive resizing"):
                     drag_divider(down)
                     resize(width, height)
+                    capture(f"{axis}-dragged")
                     ratio = layout()["Split"]["ratio"]
                     first, second = geometry(pane), geometry(other)
                     for delta in (*range(41), *range(39, -1, -1)):
@@ -120,6 +126,7 @@ with (artifacts / "split-resize-smoke.log").open("w") as log:
                 session_path.write_text(json.dumps(saved))
                 fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
                 resize(width, height)
+                capture("nested-restored")
                 first, top, lower = geometry(pane), geometry(right), geometry(bottom)
                 assert abs(first["width"] / (first["width"] + top["width"]) - 0.9) < 0.02
                 assert abs(top["height"] / (top["height"] + lower["height"]) - 0.35) < 0.05

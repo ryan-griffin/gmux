@@ -158,6 +158,8 @@ saved session starts at a size that fits the logical monitor.
 The `split-resize` suite checks horizontal and vertical proportions during
 one-pixel window growth and shrinkage at 100% and 125% monitor scale. Equal
 splits must stay within one pixel, and resizing must preserve saved proportions.
+It waits for native allocations on each step and captures diagnostic screenshots
+at scenario checkpoints.
 It also checks native divider dragging, nested unequal splits, session restore,
 and recovery of the requested proportions after minimum sizes constrain a pane.
 

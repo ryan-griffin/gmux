@@ -78,7 +78,17 @@ impl SplitPane {
         // We set the start size before allocation; GTK must not scale it again.
         paned.set_resize_start_child(false);
         paned.set_resize_end_child(true);
-        imp.separator.set(paned.first_child().unwrap()).unwrap();
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+        paned.add_css_class("tab-split");
+        // Preserve the terminal cards' shadows on the split's outer edges.
+        paned.set_overflow(gtk::Overflow::Visible);
+        // Narrow handles extend their hit area into adjacent scrollbars.
+        // Keep input within the 6px separator styled in CSS.
+        paned.set_wide_handle(true);
+        imp.separator
+            .set(paned.first_child().expect("GtkPaned has a separator"))
+            .unwrap();
         paned.set_parent(&split);
         let weak = split.downgrade();
         paned.connect_position_notify(move |paned| {
@@ -91,8 +101,9 @@ impl SplitPane {
                 return;
             }
             let ratio = (paned.position() as f64 / imp.available.get() as f64).clamp(0.1, 0.9);
-            imp.ratio.set(ratio);
-            on_change(ratio);
+            if imp.ratio.replace(ratio) != ratio {
+                on_change(ratio);
+            }
         });
         imp.paned.set(paned).unwrap();
         split.set_hexpand(true);
