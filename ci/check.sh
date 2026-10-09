@@ -31,10 +31,13 @@ sha256sum .deps/ghostty.tar.gz
 python3 scripts/check.py
 python3 - <<'PY'
 from pathlib import Path
+import json
+import os
 import subprocess
 import sys
 sys.path.insert(0, "scripts")
-from cargo_test_support import cargo_binary
+from cargo_test_support import ARTIFACT_ENV, cargo_binary, compiler_artifacts
+os.environ[ARTIFACT_ENV] = json.dumps(compiler_artifacts(Path("artifacts/cargo-build.jsonl").read_text()))
 for name in ("gmux", "gmux-daemon"):
     binary = cargo_binary(name)
     print(f"Built binary: {binary}", flush=True)
