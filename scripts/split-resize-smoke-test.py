@@ -2,6 +2,7 @@
 """Check split proportions during incremental native window resizing."""
 import json
 from pathlib import Path
+from cargo_test_support import cargo_binary
 import time
 
 import gi
@@ -29,7 +30,7 @@ with (artifacts / "split-resize-smoke.log").open("w") as log:
                 tabs=[], filter="all", active=0, width=width,
                 height=height, maximized=False,
             )))
-            fixture.start_app(root / "target/debug/gmux", "--directory", root,
+            fixture.start_app(cargo_binary("gmux"), "--directory", root,
                               stdout=log, stderr=log)
             pane = rpc("list")["tabs"][0]["active_pane"]
 
@@ -124,7 +125,7 @@ with (artifacts / "split-resize-smoke.log").open("w") as log:
                 restored_layout["Split"]["ratio"] = 0.9
                 restored_layout["Split"]["second"]["Split"]["ratio"] = 0.35
                 session_path.write_text(json.dumps(saved))
-                fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+                fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
                 resize(width, height)
                 capture("nested-restored")
                 first, top, lower = geometry(pane), geometry(right), geometry(bottom)
