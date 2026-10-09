@@ -95,24 +95,49 @@ source revision is incompatible even when Ghostty's format number matches.
 migration is attempted.
 
 Startup decodes and validates the whole payload, including Ghostty's record CRCs
-and FINISH marker. It extracts primary-screen text with soft wraps joined, then
-feeds that text into a fresh terminal at the saved dimensions before spawning
+and FINISH marker. It extracts primary-screen text and cell rendition with soft
+wraps joined, then feeds them into a fresh terminal at the saved dimensions before spawning
 the new shell. The shell starts on the next line with default input modes and
 parser state, using the current theme and cursor preference. Resizing reflows
 the restored text. History search and copying work across wrapped Unicode lines.
-Colors, hyperlinks, graphics, alternate-screen contents, terminal titles, and
-old process modes are discarded. Trailing whitespace and trailing blank rows
-are trimmed. The new process can still clear its screen or history during its
-own startup.
+Historical foreground/background colors and text attributes survive. Indexed
+colors retain their indices and use the current theme's ANSI palette or the
+standard extended palette. Default colors follow the current theme; explicit
+RGB colors keep their values across theme changes. Saved OSC palette and default
+color overrides are discarded. Gmux does not install the saved palette into the
+new shell. The existing snapshot format and source pin remain unchanged, so
+compatible checkpoints saved by earlier builds also restore with color.
+
+The pinned VT formatter runs with every terminal/screen extra disabled. Before
+replay, Gmux validates the complete output as UTF-8 text, CRLF line breaks, and
+only the formatter's SGR rendition operations. It rejects other controls and
+incomplete sequences before changing the fresh engine. Replay ends with an SGR
+reset before moving to the new shell's row, so historical rendition cannot
+bleed into its prompt. Hyperlinks, graphics, alternate-screen contents, titles,
+old process modes, and parser continuations are discarded.
+
+The pinned formatter defers unwritten blank cells until later text, which can
+give gaps after colored text the preceding rendition. Gmux formats disjoint
+selection ranges at those gaps so they start with default rendition. Ghostty
+still formats Unicode clusters, soft wraps and hard line breaks. Invalid page
+coordinates fail restoration before replay.
+
+Trailing unstyled whitespace and trailing blank rows are trimmed. Interior
+blank lines survive. On rows with text, styled spaces and background-only cells
+keep their rendition; background-only cells replay as spaces. Blank rows without
+text carry no saved rendition. Copying still trims trailing spaces. The new
+process can clear its screen or history during its own startup.
 
 The checkpoint budget is 8 MiB of serialized state per pane, 64 MiB across the
 layout, and 128 panes, visited in layout order. Gmux skips panes that exceed
 these limits and reports a persistence warning. It tracks at most 64 KiB of
 unfinished parser input. A pane with an unavailable continuation also gets
 skipped. Snapshot decoding uses a 64 MiB allocation budget per pane; formatted
-text has an 8 MiB limit. Restoration validates the file header and remaining
-layout budget before reading its payload, then decodes and formats it once.
-These bounds can omit a large history instead of keeping only its newest lines.
+UTF-8/SGR replay, including its clean ending, has an 8 MiB limit. Alternating
+styles can exceed that limit even when the binary snapshot fits. Restoration
+validates the file header and remaining layout budget before reading its payload,
+then decodes once and formats disjoint history ranges. These bounds can omit a
+large history instead of keeping only its newest lines.
 Capture copies bytes in memory on the PTY owner thread
 at shutdown; file reads at startup finish before processing PTYs. The ordered
 disk worker handles writes, syncing, and cleanup while the owner keeps servicing
@@ -279,6 +304,7 @@ memory benchmark. [Whole-application measurements](performance.md) cover CPU,
 resident memory, and native input-to-render latency with three busy panes.
 
 The scrollback test covers Quit/SIGTERM persistence, fresh shell PIDs and input,
+exact indexed/RGB colors and text attributes, resets without prompt bleed,
 Unicode and wrapped history, file permissions, PTY progress during a blocked
 checkpoint commit, incompatible versions and source revisions, ownership,
 corruption, truncation, trailing bytes, deleted-pane cleanup, and preserving
@@ -308,6 +334,21 @@ history after Quit and daemon restart, offscreen match navigation, and search
 after grid reflow. The selected sidebar row still follows the focused pane's
 directory. See the [Find diagnosis](screenshot-diagnostics.md#native-find-follow-up)
 for the original failure and the follow-up evidence.
+
+Color restoration validation on 2026-10-08 started from main `164d9bc` on
+x86_64 Arch Linux with Rust 1.99.0 and Python 3.14.7. The pinned Ghostty source
+archive matched its SHA256, Zig 0.16.0 built it in this worktree, and a live
+daemon's `/proc/<pid>/maps` confirmed linkage to that local library. The standard
+headless runner passed formatting, 126 Rust tests, Clippy with warnings denied,
+binary/example builds, and all five headless suites, including colored Quit and
+SIGTERM restart regressions.
+
+Selected native `find` and `terminal-input` suites passed with `GSK_RENDERER=cairo`
+in the isolated Wayland fixture. Find checked restored color pixels and native
+clipboard copying after reflow in dark and light appearance. The environment
+used GTK 4.24.1, libadwaita 1.10.0, Mutter 51.0, PipeWire 1.6.9, WirePlumber
+0.5.18, and GStreamer 1.28.7. This color validation did not run the full native
+suite or the OpenGL/Vulkan renderer checks.
 
 The notification test covers unread state after delivery and reconnect, GUI
 acknowledgements, stale acknowledgements racing with new alerts, and the latest

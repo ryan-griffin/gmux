@@ -170,15 +170,77 @@ static const GhosttyAllocatorVtable snapshot_vtable = {
     .remap = snapshot_remap, .free = snapshot_free,
 };
 
-// Decode into a temporary terminal. Export only primary-screen text so the
+static int format_history_range(const GhosttyAllocator *allocator, GhosttyTerminal terminal,
+    GhosttyFormatterTerminalOptions options, const GhosttySelection *selection, GhosttyWriter writer) {
+    GhosttyFormatter formatter = NULL;
+    options.selection = selection;
+    if (ghostty_formatter_terminal_new(allocator, &formatter, terminal, options)) return -1;
+    int result = ghostty_formatter_format(formatter, writer) == GHOSTTY_SUCCESS ? 0 : -1;
+    ghostty_formatter_free(formatter);
+    return result;
+}
+
+static int format_history(const GhosttyAllocator *allocator, GhosttyTerminal terminal,
+    GhosttyFormatterTerminalOptions options, uint16_t cols, GhosttyWriter writer) {
+    // The pinned formatter flushes deferred empty cells before switching style,
+    // so unwritten gaps after styled text can inherit its rendition. End a
+    // selection before each such gap. The next selection starts with default
+    // rendition and still lets Ghostty handle graphemes, wraps and blank rows.
+    // Each range resets its final style; all refs borrow this disposable terminal.
+    size_t rows = 0;
+    if (!cols || ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_TOTAL_ROWS, &rows) ||
+        !rows || rows > UINT32_MAX) return -1;
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    GhosttyGridRef previous = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    bool styled = false;
+    for (size_t y = 0; y < rows; y++) {
+        GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN,
+            .value.coordinate = {.x = 0, .y = (uint32_t)y}};
+        GhosttyRow row;
+        bool wrapped = false;
+        if (ghostty_terminal_grid_ref(terminal, point, &ref) ||
+            ghostty_grid_ref_row(&ref, &row) || ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, &wrapped)) return -1;
+        // The pinned raw ref accessor assumes valid coordinates. A damaged or
+        // incompletely reflowed page can be narrower than terminal.cols.
+        GhosttyGridRef end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        point.value.coordinate.x = cols - 1;
+        if (ghostty_terminal_grid_ref(terminal, point, &end) ||
+            end.node != ref.node || end.y != ref.y) return -1;
+        if (y == 0) selection.start = ref;
+        for (uint16_t x = 0; x < cols; x++) {
+            ref.x = x;
+            GhosttyCell cell;
+            GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+            bool text = false, styling = false;
+            if (ghostty_grid_ref_cell(&ref, &cell) ||
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide) ||
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_HAS_TEXT, &text) ||
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_HAS_STYLING, &styling)) return -1;
+            if (wide == GHOSTTY_CELL_WIDE_NARROW || wide == GHOSTTY_CELL_WIDE_WIDE) {
+                if (!text && !styling && styled) {
+                    selection.end = previous;
+                    if (format_history_range(allocator, terminal, options, &selection, writer)) return -1;
+                    selection.start = ref;
+                }
+                styled = styling;
+            }
+            previous = ref;
+        }
+        if (!wrapped) styled = false;
+    }
+    selection.end = previous;
+    return format_history_range(allocator, terminal, options, &selection, writer);
+}
+
+// Decode into a temporary terminal. Export only primary-screen rendition so the
 // new engine never inherits modes, metadata, graphics, or parser continuation.
-int gmux_checkpoint_text(const uint8_t *data, size_t len, GmuxWriterFn write,
+int gmux_checkpoint_history(const uint8_t *data, size_t len, GmuxWriterFn write,
     void *userdata, uint16_t *cols, uint16_t *rows) {
     SnapshotBudget budget = {.limit = 64 * 1024 * 1024};
     GhosttyAllocator allocator = {.ctx = &budget, .vtable = &snapshot_vtable};
     GhosttySnapshotDecoder decoder = NULL;
     GhosttyTerminal terminal = NULL;
-    GhosttyFormatter formatter = NULL;
     size_t continuation_max = 64 * 1024, consumed = 0;
     int result = -1;
     if (ghostty_snapshot_decoder_new_buf(&allocator, &decoder, data, len) ||
@@ -198,14 +260,17 @@ int gmux_checkpoint_text(const uint8_t *data, size_t len, GmuxWriterFn write,
     const char primary[] = "\x1b[?1049l\x1b[?1047l\x1b[?47l";
     ghostty_terminal_vt_write(terminal, (const uint8_t *)primary, sizeof(primary) - 1);
     GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
-    options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+    options.emit = GHOSTTY_FORMATTER_FORMAT_VT;
     options.unwrap = true;
     options.trim = true;
-    if (ghostty_formatter_terminal_new(&allocator, &formatter, terminal, options)) goto done;
+    // Keep every extra disabled, including palette and cursor style. The pinned
+    // formatter emits indexed SGR references and RGB, with no per-cell OSC 8.
+    // Indexed/default colors therefore use the new terminal's current theme.
+    options.extra = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalExtra);
+    options.extra.screen = GHOSTTY_INIT_SIZED(GhosttyFormatterScreenExtra);
     GhosttyWriter writer = {.write = write, .userdata = userdata};
-    result = ghostty_formatter_format(formatter, writer) == GHOSTTY_SUCCESS ? 0 : -1;
+    result = format_history(&allocator, terminal, options, *cols, writer);
 done:
-    ghostty_formatter_free(formatter);
     ghostty_snapshot_decoder_free(decoder);
     ghostty_terminal_free(terminal);
     return result;

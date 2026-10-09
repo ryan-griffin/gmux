@@ -13,6 +13,7 @@ import gi
 
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi
+from wayland_test_support import WaylandInput
 
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
@@ -50,7 +51,7 @@ def window_size():
         return bounds.width, bounds.height
 
 
-with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdout=log, stderr=log):
+with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdout=log, stderr=log), WaylandInput() as native:
     for appearance in ("dark", "light"):
         with AppFixture(dict(restore=True, desktop_notifications=False, appearance=appearance),
             prefix="gmux-find-", env={"GTK_A11Y": "atspi", "GDK_DEBUG": os.environ.get("GDK_DEBUG", "") + ":no-vsync"},
@@ -174,7 +175,7 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             # Quit checkpoints history; reopening starts fresh shells. Find must
             # still reveal Unicode and wrapped text, including after grid reflow.
             restored_line = "RESTORED_FIND_界 e\u0301 " + wrapped
-            rpc("send", pane=first["pane"], text="printf '\\033[3J\\033[2J\\033[H" + restored_line + "\\n'; seq 1 200",
+            rpc("send", pane=first["pane"], text="printf '\\033[3J\\033[2J\\033[H\\033[38;2;12;34;56m\\033[48;2;78;90;123m" + restored_line + "\\033[0m\\n'; seq 1 200",
                 paste=True, enter=True)
             wait_for(lambda: "200" in rpc("read", pane=first["pane"])["text"])
             assert "RESTORED_FIND_界" not in rpc("read", pane=first["pane"])["text"]
@@ -201,6 +202,29 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             wait_for(lambda: find("1 of 1", "label"))
             assert following.get_action_iface().do_action(0)
             wait_for(lambda: restored_line in rpc("read", pane=first["pane"])["text"].replace("\n", ""))
-            print(f"PASS: {appearance} Find, focused sidebar directories, retained and checkpoint-restored Unicode/wrapped history, reflow", flush=True)
+            # Remove search highlights to inspect exact restored background
+            # pixels in a composited frame, then copy the reflowed Unicode line
+            # with native pointer selection and the Wayland clipboard.
+            assert entry.get_editable_text_iface().set_text_contents("")
+            rpc("action", name="find")
+            left, top, right, bottom = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((78, 90, 123)))
+            state = rpc("renderer-info", pane=first["pane"])["viewport"]
+            cols, cw, ch = state["cols"], state["cell_width"], state["cell_height"]
+            # The wide CJK character and combining mark cancel in len().
+            end_row, end_col = divmod(len(restored_line) - 1, cols)
+            native.move(left + cw / 2, top + ch / 2)
+            native.button(True)
+            native.move(left + (end_col + .5) * cw, top + (end_row + .5) * ch)
+            native.button(False)
+            wait_for(lambda: rpc("_copy", pane=first["pane"])["text"] == restored_line)
+            wait_for(lambda: rpc("renderer-info", pane=first["pane"])["viewport"]["selection"] is not None)
+            rpc("action", name="copy")
+            def copied():
+                text = native.clipboard_text()
+                assert text == restored_line, (text, restored_line)
+                return True
+            wait_for(copied)
+            rpc("screenshot", path=str(artifacts / f"find-{appearance}-restored-colors.png"))
+            print(f"PASS: {appearance} Find, focused sidebar directories, retained and checkpoint-restored Unicode/wrapped history, reflow, restored color pixels and native clipboard copy", flush=True)
 
 print("PASS: dark/light find bars, Unicode history search, offscreen navigation, match counts, wrapping, live output, tab/pane switching, focused sidebar directories, clearing and reopening, checkpoint restore and reflow")

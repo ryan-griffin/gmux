@@ -100,7 +100,7 @@ building or starting services. Unknown names and desktop selections without
 | --- | --- |
 | `bootstrap` | Interrupted downloads and extraction, recovery of older incomplete caches, cache reuse, checksum verification, and temporary-file cleanup. |
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |
-| `scrollback` | Durable history across Quit/SIGTERM, fresh shells, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
+| `scrollback` | Durable colored history across Quit/SIGTERM, exact indexed/RGB foreground/background and attribute cells, resets and fresh shell output, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
 | `workspace`, `sidebar-search`, `branch`, `title`, `scheduling` | Workspace state, sidebar behavior, process metadata, focus, and background work. |
 | `find`, `commands`, `font`, `resize` | Search, palette accessibility, live settings, and sizing. |
 | `main-menu`, `terminal-context-menu` | Menu actions, keyboard navigation, and busy-process confirmation. |
@@ -110,12 +110,23 @@ building or starting services. Unknown names and desktop selections without
 | `screenshot` | Fresh mapped, occluded, and revealed captures, window decoration, paused frame clocks, and logical PNG dimensions at 100% and 125% monitor scale. |
 
 The `find` suite runs both dark and light appearance, including retained and
-checkpoint-restored Unicode and wrapped history, offscreen navigation, grid
-reflow, and the selected sidebar row's directory after pane focus changes.
+checkpoint-restored colored Unicode and wrapped history, offscreen navigation,
+grid reflow, and the selected sidebar row's directory after pane focus changes.
+It checks exact restored background pixels in a composited Wayland frame and
+copies a restored line across reflow using native pointer selection and the
+Wayland clipboard.
 It waits for native window dimensions and the expanded sidebar after widening;
 terminal width alone can change when a collapsed sidebar hides. Engine unit
 tests also check copying restored history across reflow, and `terminal-input`
 checks native selection and clipboard copying across scrollback.
+
+Engine checkpoint tests compare historical cells across several widths,
+including indexed and RGB colors, text attributes, wide/combining characters,
+styled spaces, unwritten gaps, internal blank lines, and search/copy results.
+They verify current theme behavior and discarded saved palette overrides, a clean new output row,
+restricted rendition controls, and rejection before installation when styles
+expand a valid snapshot beyond the replay budget. CRC-valid payloads containing
+control characters or excessive page dimensions also fail before installation.
 
 Detailed rendering checks are in [renderer validation](renderer.md#validation).
 Backend cases are in [session validation](terminal-sessions.md#validation).

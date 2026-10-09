@@ -11,6 +11,49 @@ mod ffi {
 use ffi::*;
 pub use ffi::{Cell, Frame, Scrollback};
 
+// Accept only the pinned cell formatter's rendition operations. Validate the
+// whole UTF-8 stream before touching the fresh terminal, including controls in
+// damaged cell/grapheme data. Never accept OSC, modes, cursor movement or an
+// unfinished parser sequence just because it came from a validated checkpoint.
+fn validate_history_replay(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut text = std::str::from_utf8(bytes)?;
+    while !text.is_empty() {
+        if let Some(parameters) = text.strip_prefix("\x1b[") {
+            let end = parameters.find('m').filter(|&end| end <= 18);
+            let end = end.ok_or_else(|| anyhow::anyhow!("Invalid history rendition"))?;
+            let parameters = &parameters[..end];
+            let valid = match parameters {
+                "0" | "1" | "2" | "3" | "4" | "5" | "7" | "8" | "9" | "53" | "4:2" | "4:3"
+                | "4:4" | "4:5" => true,
+                _ => {
+                    let mut parts = parameters.split(';');
+                    let color_value = |s: &str| {
+                        !s.is_empty()
+                            && s.bytes().all(|byte| byte.is_ascii_digit())
+                            && s.parse::<u8>().is_ok()
+                    };
+                    matches!(parts.next(), Some("38" | "48" | "58"))
+                        && match parts.next() {
+                            Some("5") => parts.next().is_some_and(color_value),
+                            Some("2") => (0..3).all(|_| parts.next().is_some_and(color_value)),
+                            _ => false,
+                        }
+                        && parts.next().is_none()
+                }
+            };
+            anyhow::ensure!(valid, "Invalid history rendition");
+            text = &text[end + 3..];
+        } else if let Some(rest) = text.strip_prefix("\r\n") {
+            text = rest;
+        } else {
+            let character = text.chars().next().unwrap();
+            anyhow::ensure!(!character.is_control(), "Invalid history text");
+            text = &text[character.len_utf8()..];
+        }
+    }
+    Ok(())
+}
+
 impl Default for Cell {
     fn default() -> Self {
         Self {
@@ -111,7 +154,7 @@ impl Engine {
         let (mut cols, mut rows) = (0, 0);
         let mut text = Vec::<u8>::new();
         let result = unsafe {
-            gmux_checkpoint_text(
+            gmux_checkpoint_history(
                 bytes.as_ptr(),
                 bytes.len(),
                 Some(collect),
@@ -128,21 +171,20 @@ impl Engine {
             crate::viewport::valid(cols as u64, rows as u64),
             "Invalid snapshot dimensions"
         );
-        // Validate before changing the fresh engine. Plain formatter output must
-        // never feed control sequences or an incomplete UTF-8 character to it.
-        let text = std::str::from_utf8(&text)?;
-        anyhow::ensure!(
-            !text.chars().any(|c| c.is_control() && c != '\n'),
-            "Invalid history text"
-        );
-        self.resize(cols, rows, 0, 0)?;
-        let text = text.trim_end_matches('\n');
+        validate_history_replay(&text)?;
+        // Include the clean ending in the replay budget. Reset before CRLF so
+        // a saved background cannot fill the new prompt's row during scrolling.
         if !text.is_empty() {
-            for line in text.split('\n') {
-                self.write(line.as_bytes());
-                self.write(b"\r\n");
-            }
+            let ending = b"\x1b[0m\r\n";
+            anyhow::ensure!(
+                text.len() <= crate::scrollback::MAX_PANE_BYTES - ending.len(),
+                "History exceeds restore budget"
+            );
+            text.try_reserve(ending.len())?;
+            text.extend_from_slice(ending);
         }
+        self.resize(cols, rows, 0, 0)?;
+        self.write(&text);
         Ok(())
     }
 
@@ -434,6 +476,251 @@ impl Drop for Engine {
 mod tests {
     use super::*;
 
+    fn rendered_history(engine: &mut Engine) -> Vec<(String, [u8; 3], [u8; 3], u8)> {
+        engine.snapshot().unwrap();
+        let total = engine.frame.scrollback.total;
+        let mut result = Vec::new();
+        for row in 0..total {
+            engine.scroll_to(row);
+            engine.snapshot().unwrap();
+            let local = row - engine.frame.scrollback.offset;
+            let start = local as usize * engine.frame.cols as usize;
+            for cell in &engine.cells[start..start + engine.frame.cols as usize] {
+                // VT represents a background-only blank as a literal space.
+                // Include those cells in the exact rendition comparison too.
+                if cell.flags & 64 == 0 {
+                    let text = if cell.text().is_empty() && cell.bg != engine.frame.background {
+                        " "
+                    } else {
+                        cell.text()
+                    };
+                    if !text.is_empty() {
+                        result.push((text.to_owned(), cell.fg, cell.bg, cell.flags));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn checkpoints_restore_cell_colors_attributes_and_unicode_across_reflow() {
+        let mut old = Engine::new().unwrap();
+        old.resize(12, 3, 0, 0).unwrap();
+        old.set_theme(&Theme::adwaita(true)).unwrap();
+        old.write(
+            concat!(
+                "\x1b[31;44mINDEX\x1b[38;5;201;48;5;22mEXTENDED\x1b[0m\r\n",
+                "\x1b[38;2;12;34;56;48;2;78;90;123;1;3;4;9m你好 e\u{301} 🦀 wrapped",
+                "\x1b[0m plain\r\n\r\n",
+                "\x1b[7;2;8mATTR\x1b[0m\r\n",
+                // No SGR reset before capture, with a background on the last row.
+                "\x1b[38;2;111;112;113;48;2;21;22;23mFINAL"
+            )
+            .as_bytes(),
+        );
+        let snapshot = old.checkpoint().unwrap();
+        let expected = rendered_history(&mut old);
+        let mut fresh = Engine::new().unwrap();
+        fresh.restore_history(&snapshot).unwrap();
+        fresh.set_theme(&Theme::adwaita(true)).unwrap();
+        for cols in [12, 19, 9] {
+            fresh.resize(cols, 3, 0, 0).unwrap();
+            assert_eq!(rendered_history(&mut fresh), expected, "{cols} columns");
+            fresh
+                .select((0, 0), (cols - 1, fresh.frame.scrollback.total as u32 - 1))
+                .unwrap();
+            assert!(
+                fresh
+                    .copy()
+                    .unwrap()
+                    .contains("你好 e\u{301} 🦀 wrapped plain\n\nATTR\nFINAL")
+            );
+            fresh.find("你好 e\u{301} 🦀 wrapped");
+            while fresh.find_pending() {
+                fresh.poll_find();
+            }
+            assert_eq!(fresh.find_state().total, 1);
+        }
+        fresh.scroll(0, true);
+        fresh.write(b"Z");
+        fresh.snapshot().unwrap();
+        let new = fresh.cells.iter().find(|cell| cell.text() == "Z").unwrap();
+        assert_eq!(
+            (new.fg, new.bg, new.flags),
+            (
+                Theme::adwaita(true).foreground,
+                Theme::adwaita(true).background,
+                0
+            )
+        );
+        assert!(fresh.events.replies.is_empty());
+        assert!(fresh.events.notifications.is_empty());
+    }
+
+    #[test]
+    fn restored_indices_and_defaults_follow_current_theme_and_discard_saved_palette() {
+        let mut old = Engine::new().unwrap();
+        old.set_theme(&Theme::adwaita(true)).unwrap();
+        old.write(b"\x1b]4;1;rgb:01/02/03\x1b\\\x1b]10;rgb:04/05/06\x1b\\\x1b[31mI\x1b[0mD\x1b[38;2;7;8;9mR");
+        let mut fresh = Engine::new().unwrap();
+        fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
+        for dark in [false, true] {
+            let theme = Theme::adwaita(dark);
+            fresh.set_theme(&theme).unwrap();
+            fresh.snapshot().unwrap();
+            assert_eq!(fresh.cells[0].fg, theme.palette[1]);
+            assert_eq!(fresh.cells[1].fg, theme.foreground);
+            assert_eq!(fresh.cells[2].fg, [7, 8, 9]);
+            assert_eq!(fresh.cells[0].bg, theme.background);
+        }
+    }
+
+    #[test]
+    fn restored_unwritten_gaps_have_default_rendition() {
+        let mut old = Engine::new().unwrap();
+        old.resize(12, 3, 0, 0).unwrap();
+        old.set_theme(&Theme::adwaita(true)).unwrap();
+        old.write("\x1b[31;44mA\x1b[0m\x1b[4CB\x1b[32;45mC\x1b[0m\x1b[2CD\r\n\r\n\x1b[31;44m你好 e\u{301} 🦀\x1b[0m\x1b[2CZ wrapped\r\n".as_bytes());
+        let mut fresh = Engine::new().unwrap();
+        fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
+        fresh.set_theme(&Theme::adwaita(true)).unwrap();
+        old.scroll_to(0);
+        fresh.scroll_to(0);
+        old.snapshot().unwrap();
+        fresh.snapshot().unwrap();
+        for x in 0..10 {
+            assert_eq!(
+                (fresh.cells[x].fg, fresh.cells[x].bg, fresh.cells[x].flags),
+                (old.cells[x].fg, old.cells[x].bg, old.cells[x].flags),
+                "column {x}"
+            );
+        }
+        for cols in [12, 19] {
+            fresh.resize(cols, 3, 0, 0).unwrap();
+            fresh.snapshot().unwrap();
+            fresh
+                .select((0, 0), (cols - 1, fresh.frame.scrollback.total as u32 - 1))
+                .unwrap();
+            assert_eq!(
+                fresh.copy().unwrap(),
+                "A    BC  D\n\n你好 e\u{301} 🦀  Z wrapped"
+            );
+        }
+    }
+
+    #[test]
+    fn history_replay_accepts_only_complete_utf8_crlf_and_cell_rendition() {
+        for valid in [
+            "你好 e\u{301} 🦀\r\n",
+            "\x1b[0m\x1b[4:3m\x1b[58;2;255;255;255m",
+            "\x1b[38;5;201m\x1b[48;2;1;2;3m",
+        ] {
+            validate_history_replay(valid.as_bytes()).unwrap();
+        }
+        for invalid in [
+            b"\x1b]4;1;rgb:01/02/03\x1b\\".as_slice(),
+            b"\x1b[?1049h",
+            b"\x1b[2J",
+            b"\x1b[1;2H",
+            b"\x1b[",
+            b"\x1b[0m\xf0\x9f",
+            b"\x1b[38;2;256;0;0m",
+            b"\x1b[38;2;1;2m",
+            b"\x1b[38;5;1;2m",
+            b"\x1b[9999999999999999999m",
+            b"\x1b[0\x07m",
+            b"\x1b[+1m",
+            b"\x1b[38;5;+1m",
+            b"\n",
+            b"\r",
+            b"\t",
+            b"\x07",
+            b"\xc2\x9b31m",
+        ] {
+            assert!(validate_history_replay(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn styled_history_expansion_is_bounded_before_installation() {
+        let mut old = Engine::new().unwrap();
+        old.resize(1000, 131, 0, 0).unwrap();
+        let line = concat!(
+            "\x1b[1;2;3;5;7;8;9;53m\x1b[4:3m\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m\x1b[58;2;13;14;15mA",
+            "\x1b[4:5m\x1b[38;2;7;8;9m\x1b[48;2;10;11;12m\x1b[58;2;16;17;18mB"
+        )
+        .repeat(500);
+        for _ in 0..131 {
+            old.write(line.as_bytes());
+            old.write(b"\r\n");
+        }
+        // A compact style table and cell grid can expand beyond the replay
+        // budget when every cell switches styles. The valid file stays small.
+        let snapshot = old.checkpoint().unwrap();
+        let mut fresh = Engine::new().unwrap();
+        assert!(fresh.restore_history(&snapshot).is_err());
+        assert_eq!(fresh.dimensions(), (80, 24));
+        fresh.write(b"fresh");
+        assert_eq!(fresh.text().unwrap(), "fresh");
+        assert!(
+            fresh
+                .restore_history(&vec![0; crate::scrollback::MAX_PANE_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn crc_valid_snapshots_with_control_cells_or_excessive_page_dimensions_are_rejected() {
+        let mut old = Engine::new().unwrap();
+        old.resize(2, 1, 0, 0).unwrap();
+        old.write(b"X");
+        let snapshot = old.checkpoint().unwrap();
+        // Pinned v1 envelope is 10 bytes; records have tag/length/CRC32C.
+        // Locate the first PAGE, whose 20-byte header precedes this fixture's
+        // empty style/hyperlink tables and one row of bare one-byte cells.
+        let mut record = 10;
+        while u16::from_le_bytes(snapshot[record..record + 2].try_into().unwrap()) != 3 {
+            let len = u32::from_le_bytes(snapshot[record + 2..record + 6].try_into().unwrap());
+            record += 10 + len as usize;
+        }
+        let len = u32::from_le_bytes(snapshot[record + 2..record + 6].try_into().unwrap()) as usize;
+        let page = record + 10;
+        assert_eq!(&snapshot[page + 4..page + 8], &[0; 4]);
+        assert_eq!((snapshot[page + 20] >> 4) & 3, 0);
+        assert_eq!(snapshot[page + 23], b'X');
+        for (offset, replacement) in [
+            (page + 23, vec![0x07]),
+            (page + 23, vec![0x1b]),
+            (page + 23, vec![0x9b]),
+            (page, vec![0xff; 4]),
+        ] {
+            let mut damaged = snapshot.clone();
+            damaged[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            let mut crc = !0u32;
+            for byte in damaged[record..record + 6]
+                .iter()
+                .chain(&damaged[page..page + len])
+            {
+                crc ^= *byte as u32;
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0x82f63b78 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            damaged[record + 6..record + 10].copy_from_slice(&(!crc).to_le_bytes());
+            let mut fresh = Engine::new().unwrap();
+            assert!(
+                fresh.restore_history(&damaged).is_err(),
+                "offset {offset}, {replacement:?}"
+            );
+            assert_eq!(fresh.dimensions(), (80, 24));
+            fresh.write(b"fresh");
+            assert_eq!(fresh.text().unwrap(), "fresh");
+            assert!(fresh.events.replies.is_empty());
+            assert!(fresh.events.notifications.is_empty());
+        }
+    }
+
     #[test]
     fn checkpoints_restore_unicode_and_reflow_wrapped_history() {
         let mut old = Engine::new().unwrap();
@@ -470,7 +757,7 @@ mod tests {
             b"\x1b_Ga=T;unfinished",
         ] {
             let mut old = Engine::new().unwrap();
-            old.write(b"primary history\r\n\x1b[?1h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1049halternate content\x1b[>31u");
+            old.write(b"\x1b]2;old title\x07\x1b]8;;https://example.com\x07primary history\x1b]8;;\x07\r\n\x1b[?1h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1049halternate content\x1b[>31u");
             old.write(unfinished);
             let mut fresh = Engine::new().unwrap();
             fresh.restore_history(&old.checkpoint().unwrap()).unwrap();

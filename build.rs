@@ -46,7 +46,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
         .allowlist_function("gmux_engine_.*")
-        .allowlist_function("gmux_checkpoint_text")
+        .allowlist_function("gmux_checkpoint_history")
         .use_core()
         .derive_debug(false)
         .derive_partialeq(true)
