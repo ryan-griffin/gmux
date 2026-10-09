@@ -627,11 +627,33 @@ fn layout_widget(
             second,
             ratio,
         } => {
-            let paned = gtk::Paned::new(if *vertical {
-                gtk::Orientation::Vertical
-            } else {
-                gtk::Orientation::Horizontal
-            });
+            let changed_layout = saved.clone();
+            let changed_path = path.clone();
+            let changed_ui = ui.clone();
+            let split = super::split::SplitPane::new(
+                if *vertical {
+                    gtk::Orientation::Vertical
+                } else {
+                    gtk::Orientation::Horizontal
+                },
+                *ratio,
+                move |value| {
+                    let mut layout = changed_layout.borrow_mut();
+                    let mut node = &mut *layout;
+                    for end in &changed_path {
+                        if let Layout::Split { first, second, .. } = node {
+                            node = if *end { second } else { first };
+                        }
+                    }
+                    if let Layout::Split { ratio, .. } = node {
+                        *ratio = value;
+                    }
+                    if let Some(ui) = changed_ui.upgrade() {
+                        ui.mark_dirty();
+                    }
+                },
+            );
+            let paned = split.paned();
             paned.add_css_class("tab-split");
             // GtkPaned clips overflow by default, including the card shadows
             // on its outer edges. Each terminal already clips its own contents.
@@ -661,53 +683,7 @@ fn layout_widget(
                 second_path,
                 ui.clone(),
             )));
-            let ratio = ratio.clamp(0.1, 0.9);
-            let vertical = *vertical;
-            let initialized = Rc::new(Cell::new(false));
-            let applied = initialized.clone();
-            paned.add_tick_callback(move |paned, _| {
-                let dimension = if vertical {
-                    paned.height()
-                } else {
-                    paned.width()
-                };
-                if dimension > 0 {
-                    paned.set_position((dimension as f64 * ratio) as i32);
-                    applied.set(true);
-                    glib::ControlFlow::Break
-                } else {
-                    glib::ControlFlow::Continue
-                }
-            });
-            paned.connect_position_notify(move |paned| {
-                // Initial allocation can notify before the saved proportion is
-                // applied. Do not persist that temporary divider position.
-                if !initialized.get() {
-                    return;
-                }
-                let dimension = if vertical {
-                    paned.height()
-                } else {
-                    paned.width()
-                };
-                if dimension <= 0 {
-                    return;
-                }
-                let mut layout = saved.borrow_mut();
-                let mut node = &mut *layout;
-                for end in &path {
-                    if let Layout::Split { first, second, .. } = node {
-                        node = if *end { second } else { first };
-                    }
-                }
-                if let Layout::Split { ratio, .. } = node {
-                    *ratio = (paned.position() as f64 / dimension as f64).clamp(0.1, 0.9);
-                }
-                if let Some(ui) = ui.upgrade() {
-                    ui.mark_dirty();
-                }
-            });
-            paned.upcast()
+            split.upcast()
         }
     }
 }

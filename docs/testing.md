@@ -102,7 +102,7 @@ building or starting services. Unknown names and desktop selections without
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |
 | `scrollback` | Durable colored history across Quit/SIGTERM, exact indexed/RGB foreground/background and attribute cells, resets and fresh shell output, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
 | `workspace`, `sidebar-search`, `branch`, `title`, `scheduling` | Workspace state, sidebar behavior, process metadata, focus, and background work. |
-| `find`, `commands`, `font`, `resize` | Search, palette accessibility, live settings, and sizing. |
+| `find`, `commands`, `font`, `resize`, `split-resize` | Search, palette accessibility, live settings, and sizing. |
 | `terminal-copy` | Clipboard publication during row resize with daemon replies held, and clipboard preservation when no selection exists. |
 | `main-menu`, `terminal-context-menu` | Menu actions, keyboard navigation, and busy-process confirmation. |
 | `terminal-input`, `terminal-scrollbar`, `terminal-renderer`, `renderer` | Input, clipboard, selection, scrolling, interactive applications, and render-node correctness. |
@@ -154,6 +154,12 @@ columns. Independent `TIOCGWINSZ` probes check PTY pixel sizes. Each pixel-only
 case observes overlay absence and stable geometry throughout the dismissal
 interval, catching delayed compositor replies that undo a resize. Its empty
 saved session starts at a size that fits the logical monitor.
+
+The `split-resize` suite checks horizontal and vertical proportions during
+one-pixel window growth and shrinkage at 100% and 125% monitor scale. Equal
+splits must stay within one pixel, and resizing must preserve saved proportions.
+It also checks native divider dragging, nested unequal splits, session restore,
+and recovery of the requested proportions after minimum sizes constrain a pane.
 
 The `screenshot` suite uses a solid fullscreen cover and compositor frames to
 verify that Gmux is fully occluded. It changes only the private fixture monitor's
