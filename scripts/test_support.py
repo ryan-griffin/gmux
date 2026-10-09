@@ -167,6 +167,26 @@ class AccessibilityFixture:
     """Activate the registry through the private accessibility bus's service file."""
     def __init__(self):
         self.connection = None
+        self.process = None
+
+    def start_service_command(self, address, error):
+        from gi.repository import GLib
+        # dbus-broker requires systemd even for Exec-only service files. An
+        # isolated session has no user manager; use the installed service's
+        # command rather than guessing a distribution's lib/libexec location.
+        for directory in GLib.get_system_data_dirs():
+            service = Path(directory, "dbus-1/accessibility-services/org.a11y.atspi.Registry.service")
+            if not service.is_file():
+                continue
+            settings = GLib.KeyFile()
+            settings.load_from_file(str(service), GLib.KeyFileFlags.NONE)
+            assert settings.get_string("D-BUS Service", "Name") == "org.a11y.atspi.Registry", service
+            _, command = GLib.shell_parse_argv(settings.get_string("D-BUS Service", "Exec"))
+            print(f"AT-SPI activation unavailable ({error}); launching {command} from {service}", flush=True)
+            self.process = subprocess.Popen(command, env=dict(os.environ, AT_SPI_BUS_ADDRESS=address))
+            return
+        raise RuntimeError("AT-SPI registry activation failed and its service file was not found in "
+                           "XDG_DATA_DIRS. Install the AT-SPI registry service; see docs/testing.md.") from error
 
     def __enter__(self):
         from gi.repository import Gio, GLib
@@ -178,16 +198,24 @@ class AccessibilityFixture:
             None, None)
 
         def ready():
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(f"AT-SPI registry exited with status {self.process.returncode}")
             return self.connection.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
                 "org.freedesktop.DBus", "NameHasOwner", GLib.Variant("(s)", ("org.a11y.atspi.Registry",)),
                 GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
 
         try:
             if not ready():
-                self.connection.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
-                    "org.freedesktop.DBus", "StartServiceByName",
-                    GLib.Variant("(su)", ("org.a11y.atspi.Registry", 0)),
-                    GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 5000, None)
+                try:
+                    self.connection.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus", "StartServiceByName",
+                        GLib.Variant("(su)", ("org.a11y.atspi.Registry", 0)),
+                        GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 5000, None)
+                except GLib.Error as error:
+                    if not error.matches(Gio.dbus_error_quark(), Gio.DBusError.SERVICE_UNKNOWN):
+                        raise
+                    if not ready():
+                        self.start_service_command(address, error)
             wait_accessible(ready, message="Accessibility registry did not acquire its bus name")
         except Exception:
             self.__exit__(None, None, None)
@@ -195,6 +223,7 @@ class AccessibilityFixture:
         return self
 
     def __exit__(self, *_):
+        stop_process(self.process)
         if self.connection is not None:
             self.connection.close_sync(None)
 
