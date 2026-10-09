@@ -2,6 +2,8 @@
 """Copy a tracked selection while row-resize replies are held, using Wayland."""
 from pathlib import Path
 
+from cargo_test_support import cargo_binary
+
 from test_support import AppFixture, DelayedViewport, wait_accessible as wait_for
 from wayland_test_support import ClipboardObserver, WaylandInput, ensure_wayland_session
 
@@ -18,13 +20,13 @@ with (artifacts / "terminal-copy-smoke.log").open("w") as log, WaylandInput() as
         with AppFixture(dict(restore=False, desktop_notifications=False), prefix="gmux-copy-",
                 shell_script="#!/bin/sh\nexport PS1='COPY_READY> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n") as fixture:
             rpc = fixture.rpc
-            fixture.start(root / "target/debug/gmux-daemon", stdout=log, stderr=log)
+            fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info"))
             original = fixture.env["GMUX_SOCKET"]
             replies = []
             with DelayedViewport(original, fixture.path / "frontend", observe_header=replies.append) as proxy:
                 fixture.env["GMUX_SOCKET"] = proxy.proxy_path
-                fixture.start_app(root / "target/debug/gmux", stdout=log, stderr=log)
+                fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
                 pane = rpc("new", name="Copy row resize")["pane"]
                 wait_for(lambda: "COPY_READY>" in rpc("read", pane=pane)["text"])
                 text = "ROW_COPY_界 e\u0301 exact Unicode " + ("grow" if direction == 1 else "shrink")
