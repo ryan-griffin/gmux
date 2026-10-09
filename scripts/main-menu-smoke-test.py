@@ -170,6 +170,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
         else:
             # This part runs fullscreen in the private compositor, so window
             # coordinates are monitor coordinates without window shadows.
+            # A directory tooltip can cover this row while keyboard actions
+            # run. Moving onto that popup and pressing in the same event batch
+            # delivers the button to the disappearing tooltip instead of the
+            # row. Park away from controls and observe tooltip dismissal first.
+            tooltip = row.get_name()
+            print(f"Tab menu tooltip before pointer preparation: {bool(find(tooltip, 'label'))}", flush=True)
+            native.move(native.latest_frame.width - 1, native.latest_frame.height - 1)
+            wait_for(lambda: find(tooltip, "label") is None)
             bounds = row.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
             native.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
             for pressed in (True, False):
