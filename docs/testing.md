@@ -103,6 +103,7 @@ building or starting services. Unknown names and desktop selections without
 | `scrollback` | Durable colored history across Quit/SIGTERM, exact indexed/RGB foreground/background and attribute cells, resets and fresh shell output, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
 | `workspace`, `sidebar-search`, `branch`, `title`, `scheduling` | Workspace state, sidebar behavior, process metadata, focus, and background work. |
 | `find`, `commands`, `font`, `resize` | Search, palette accessibility, live settings, and sizing. |
+| `terminal-copy` | Clipboard publication during row resize with daemon replies held, and clipboard preservation when no selection exists. |
 | `main-menu`, `terminal-context-menu` | Menu actions, keyboard navigation, and busy-process confirmation. |
 | `terminal-input`, `terminal-scrollbar`, `terminal-renderer`, `renderer` | Input, clipboard, selection, scrolling, interactive applications, and render-node correctness. |
 | `notifications`, `notification-focus`, `notification-delivery` | Alert queues, unread acknowledgements, reconnects, focus suppression, desktop delivery before pane attachment, and click navigation. |
@@ -114,7 +115,15 @@ checkpoint-restored colored Unicode and wrapped history, offscreen navigation,
 grid reflow, and the selected sidebar row's directory after pane focus changes.
 It checks exact restored background pixels in a composited Wayland frame and
 copies a restored line across reflow using native pointer selection and the
-Wayland clipboard.
+Wayland clipboard. A new clipboard owner and the exact text must arrive within
+the existing deadline, even when a previous test has left clipboard contents.
+The `terminal-copy` suite holds daemon updates at a barrier while row growth or
+shrink invalidates the displayed selection. Copy must still publish the exact
+tracked Unicode text with a new Wayland clipboard owner. Copy with no backend
+selection must return the daemon's rejection and preserve the existing text
+and owner. The headless `daemon`
+suite checks ordered selection and copy requests, including selected whitespace
+that legitimately formats to an empty string.
 It waits for native window dimensions and the expanded sidebar after widening;
 terminal width alone can change when a collapsed sidebar hides. Engine unit
 tests also check copying restored history across reflow, and `terminal-input`

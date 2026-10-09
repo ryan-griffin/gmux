@@ -206,6 +206,10 @@ impl Daemon {
         let session = self.sessions.get_mut(&id).unwrap();
         match command {
             StreamCommand::Copy => {
+                anyhow::ensure!(
+                    session.selection().is_some(),
+                    "Select terminal text to copy it"
+                );
                 self.clipboard.insert(id, session.copy()?);
             }
             StreamCommand::Find { query } => session.find(&query),
