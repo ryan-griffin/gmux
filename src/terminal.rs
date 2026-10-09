@@ -599,9 +599,8 @@ impl Terminal {
         })
     }
     pub fn copy(&self) -> bool {
-        if self.selection.borrow().is_none() {
-            return false;
-        }
+        // Paint can invalidate the displayed range before a resize reply arrives.
+        // The daemon validates its tracked selection in command order.
         if let Err(error) = self.session.borrow().copy() {
             self.show_status(&error.to_string());
             return false;

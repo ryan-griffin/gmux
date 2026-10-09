@@ -205,13 +205,18 @@ class AccessibilityFixture:
 
 class DelayedViewport:
     """Relay a private daemon stream, with controllable reply latency."""
-    def __init__(self, socket_path, proxy_path):
+    def __init__(self, socket_path, proxy_path, *, observe_header=None):
         self.socket_path = str(socket_path)
         self.proxy_path = str(proxy_path)
         self.delay = 0
         self.closed = threading.Event()
+        self.reply_hold = threading.Event()
+        self.reply_held = threading.Event()
+        self.reply_release = threading.Event()
+        self.reply_release.set()
         self.sockets = []
         self.threads = []
+        self.observe_header = observe_header
 
     def __enter__(self):
         import socket
@@ -223,11 +228,26 @@ class DelayedViewport:
         self.sockets.append(listener)
 
         def relay(source, destination, delayed=False):
+            pending = b""
             try:
                 while data := source.recv(65536):
+                    if delayed and self.reply_hold.is_set():
+                        self.reply_held.set()
+                        assert self.reply_release.wait(12), "Viewport reply barrier was not released"
                     if self.closed.wait(self.delay if delayed else 0):
                         return
                     destination.sendall(data)
+                    if delayed and self.observe_header is not None:
+                        pending += data
+                        while len(pending) >= 4:
+                            size = int.from_bytes(pending[:4], "little")
+                            assert 4 <= size <= 16 * 1024 * 1024, "Invalid viewport packet size"
+                            if len(pending) < 4 + size:
+                                break
+                            header_size = int.from_bytes(pending[4:8], "little")
+                            assert header_size <= size - 4, "Invalid viewport header size"
+                            self.observe_header(json.loads(pending[8:8 + header_size]))
+                            pending = pending[4 + size:]
             except OSError:
                 pass  # Closing the fixture interrupts blocked stream operations.
 
@@ -249,9 +269,22 @@ class DelayedViewport:
         worker.start()
         return self
 
+    @contextmanager
+    def hold_replies(self):
+        """Keep frontend commands live while daemon updates wait at a barrier."""
+        self.reply_held.clear()
+        self.reply_release.clear()
+        self.reply_hold.set()
+        try:
+            yield self.reply_held
+        finally:
+            self.reply_hold.clear()
+            self.reply_release.set()
+
     def __exit__(self, *_):
         import socket
         self.closed.set()
+        self.reply_release.set()
         for connection in self.sockets:
             try:
                 connection.shutdown(socket.SHUT_RDWR)

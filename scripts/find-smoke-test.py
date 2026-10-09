@@ -13,7 +13,7 @@ import gi
 
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi
-from wayland_test_support import WaylandInput
+from wayland_test_support import ClipboardObserver, WaylandInput
 
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
@@ -52,6 +52,7 @@ def window_size():
 
 
 with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdout=log, stderr=log), WaylandInput() as native:
+    clipboard = ClipboardObserver(native)
     for appearance in ("dark", "light"):
         with AppFixture(dict(restore=True, desktop_notifications=False, appearance=appearance),
             prefix="gmux-find-", env={"GTK_A11Y": "atspi", "GDK_DEBUG": os.environ.get("GDK_DEBUG", "") + ":no-vsync"},
@@ -218,12 +219,11 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(stdou
             native.button(False)
             wait_for(lambda: rpc("_copy", pane=first["pane"])["text"] == restored_line)
             wait_for(lambda: rpc("renderer-info", pane=first["pane"])["viewport"]["selection"] is not None)
+            owner_count = clipboard.checkpoint()
             rpc("action", name="copy")
-            def copied():
-                text = native.clipboard_text()
-                assert text == restored_line, (text, restored_line)
-                return True
-            wait_for(copied)
+            clipboard.wait_for_text(restored_line, owner_count)
+            text = clipboard.read()
+            assert text == restored_line, (text, restored_line)
             rpc("screenshot", path=str(artifacts / f"find-{appearance}-restored-colors.png"))
             print(f"PASS: {appearance} Find, focused sidebar directories, retained and checkpoint-restored Unicode/wrapped history, reflow, restored color pixels and native clipboard copy", flush=True)
 

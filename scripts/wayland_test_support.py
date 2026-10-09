@@ -152,6 +152,64 @@ def _run(script, arguments):
                     process.wait(timeout=5)
 
 
+class ClipboardObserver:
+    """Require a new text owner and retain exact clipboard failure details."""
+    def __init__(self, native):
+        self.native = native
+        self.owners = []
+        self.last_text = None
+        self.last_error = None
+        native.bus.signal_subscribe(REMOTE, REMOTE + ".Session", "SelectionOwnerChanged", native.remote,
+            None, Gio.DBusSignalFlags.NONE, self.owner_changed)
+
+    def owner_changed(self, connection, sender, path, interface, signal, parameters):
+        self.owners.append(parameters.unpack()[0])
+
+    def checkpoint(self):
+        context = GLib.MainContext.default()
+        while context.pending():
+            context.iteration(False)
+        return len(self.owners)
+
+    @staticmethod
+    def text_owner(owner):
+        formats = owner.get("mime-types", [])
+        # Unpack the tuple containing Mutter's string array when present.
+        if len(formats) == 1 and isinstance(formats[0], (tuple, list)):
+            formats = formats[0]
+        return owner.get("session-is-owner") is False and any(
+            isinstance(mime, str) and mime.split(";", 1)[0] == "text/plain" for mime in formats)
+
+    def read(self):
+        try:
+            self.last_text = self.native.clipboard_text()
+            return self.last_text
+        except (OSError, GLib.Error) as error:
+            self.last_error = dict(type=type(error).__name__, message=str(error))
+            for name in ("domain", "code", "message", "errno"):
+                if hasattr(error, name):
+                    self.last_error[name] = getattr(error, name)
+            raise
+
+    def wait_for_text(self, text, checkpoint):
+        from test_support import wait_accessible
+
+        def published():
+            exact = self.read() == text
+            return exact and bool(self.owners[checkpoint:]) and self.text_owner(self.owners[-1])
+
+        try:
+            wait_accessible(published, message="Copy did not publish exact text with a new text clipboard owner")
+        except AssertionError as error:
+            raise AssertionError(f"{error}; last owner={self.owners[-1:]!r}; "
+                f"last text={self.last_text!r}; last error={self.last_error!r}") from error
+        assert self.read() == text, (self.last_text, text)
+
+    def assert_preserved(self, text, checkpoint):
+        assert self.checkpoint() == checkpoint, ("Clipboard owner changed", self.owners[checkpoint:])
+        assert self.read() == text, ("Clipboard text changed", self.last_text, text)
+
+
 class Frame:
     def __init__(self, sample):
         buffer = sample.get_buffer()

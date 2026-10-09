@@ -92,6 +92,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
                 return header, cells
         raise AssertionError("No matching viewport packet")
 
+    def copy_reply(predicate):
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            header, _ = packet()
+            if header["meta"]["id"] == pane and predicate(header):
+                return header
+        raise AssertionError("No matching copy reply")
+
     try:
         daemon = start_daemon()
         duplicate = subprocess.Popen([str(root / "target/debug/gmux-daemon")], env=env, stdout=log, stderr=log)
@@ -125,6 +133,25 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header
         assert b"H" in cells
+        # Selection commands and Copy share the frontend's ordered stream.
+        # A missing selection must produce an error, never an empty copy packet.
+        for selected in (False, True, False):
+            if selected:
+                command("select", pane=pane, start=[0, 0], end=[4, 0])
+            else:
+                command("clear-selection", pane=pane)
+            command("copy", pane=pane)
+            reply = copy_reply(lambda header: header["copy"] is not None or header["error"] is not None)
+            if selected:
+                assert reply["copy"] == "HEADL" and reply["error"] is None, reply
+            else:
+                assert reply["error"] == "Select terminal text to copy it" and reply["copy"] is None, reply
+        # Selected whitespace is still a selection and may copy an empty string.
+        command("select", pane=pane, start=[0, 1], end=[0, 1])
+        command("copy", pane=pane)
+        reply = copy_reply(lambda header: header["copy"] is not None or header["error"] is not None)
+        assert reply["copy"] == "" and reply["error"] is None, reply
+        command("clear-selection", pane=pane)
         while select.select([stream], [], [], 0.1)[0]:
             packet()
         command("input", pane=pane, bytes=list(b"printf '\\033[3;1HROW_DELTA'\r"))
@@ -274,7 +301,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         daemon.terminate()
         assert daemon.wait(timeout=8) == 0
         daemon = None
-        print(f"PASS: headless PTYs, background workspaces and focus, {idle_ticks} idle CPU ticks, one-row packets, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Quit/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and daemon Quit closing the frontend" if args.native else ""))
+        print(f"PASS: headless PTYs, background workspaces and focus, {idle_ticks} idle CPU ticks, one-row packets, ordered copy with absent and blank selections, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Quit/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and daemon Quit closing the frontend" if args.native else ""))
     finally:
         if stream:
             stream.close()
