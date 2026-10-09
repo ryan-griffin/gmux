@@ -49,14 +49,16 @@ if missing:
 
 def run(command, timeout, *, artifacts=False):
     print("Running " + " ".join(command), flush=True)
-    result = subprocess.run(command, cwd=root, timeout=timeout,
-                            stdout=subprocess.PIPE if artifacts else None, text=artifacts)
     if artifacts:
         output = root / "artifacts/cargo-build.jsonl"
         output.parent.mkdir(exist_ok=True)
-        output.write_text(result.stdout)
+        # Write while Cargo runs so partial diagnostics survive failure/timeout.
+        with output.open("w") as log:
+            result = subprocess.run(command, cwd=root, timeout=timeout, stdout=log)
+    else:
+        result = subprocess.run(command, cwd=root, timeout=timeout)
     result.check_returncode()
-    return result.stdout
+    return output.read_text() if artifacts else None
 
 
 from cargo_test_support import ARTIFACT_ENV, compiler_artifacts, native_output_dir

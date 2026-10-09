@@ -218,6 +218,8 @@ Fresh runner builds select executable paths from Cargo's `compiler-artifact`
 JSON messages and save that output to `artifacts/cargo-build.jsonl`. The runner
 passes those paths to smoke tests for this invocation. It clears any inherited
 artifact selection before setup, so an earlier build cannot supply it.
+Cargo writes directly to that artifact during the build, preserving partial
+diagnostics if the command fails or reaches its deadline.
 
 Direct smoke/benchmark defaults and `--skip-build` do not rebuild the application.
 They resolve Cargo's output directory with locked `cargo metadata` and read the
