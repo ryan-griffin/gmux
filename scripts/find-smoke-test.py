@@ -189,6 +189,9 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(), Wa
             rpc("focus", pane=first["pane"])
             wait_for(lambda: sidebar_directory(first_directory))
             assert "RESTORED_FIND_界" not in rpc("read", pane=first["pane"])["text"]
+            closed = rpc("renderer-info", pane=first["pane"])
+            closed_top = closed["viewport"]["origin"][1]
+            closed_bottom = closed["window_size"][1] - closed_top - closed["viewport"]["height"]
             rpc("action", name="find")
             entry = wait_for(lambda: (find("Find...", "entry") or find("Find...", "text")))
             following = wait_for(lambda: find("Next match (Ctrl+G)", "button"))
@@ -209,7 +212,26 @@ with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(), Wa
             # with native pointer selection and the Wayland clipboard.
             assert entry.get_editable_text_iface().set_text_contents("")
             rpc("action", name="find")
-            left, top, right, bottom = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((78, 90, 123)))
+            def search_hidden():
+                state = rpc("renderer-info", pane=first["pane"])
+                viewport = state["viewport"]
+                return (viewport["origin"][1] == closed_top and
+                    viewport["height"] == state["window_size"][1] - closed_top - closed_bottom)
+            wait_for(search_hidden, message="Find did not return to its closed vertical allocation")
+
+            def grid_current():
+                viewport = rpc("renderer-info", pane=first["pane"])["viewport"]
+                return (not viewport["scroll_pending"] and
+                    rpc("_metadata", pane=first["pane"])["meta"]["size"] == [viewport["cols"], viewport["rows"]])
+            wait_for(grid_current, message="Hidden Find layout did not reach the daemon grid")
+            # Hiding Find animates the terminal's origin and grid. Old capture
+            # coordinates can select a different history row during that motion.
+            native.drain_frames()
+            previous_frame = native.latest_frame
+            def restored_bounds():
+                frame = native.frame(timeout=.1, fresh=False)
+                return frame.color_bounds((78, 90, 123)) if frame is not previous_frame else None
+            left, top, right, bottom = wait_for(restored_bounds)
             state = rpc("renderer-info", pane=first["pane"])["viewport"]
             cols, cw, ch = state["cols"], state["cell_width"], state["cell_height"]
             # The wide CJK character and combining mark cancel in len().
