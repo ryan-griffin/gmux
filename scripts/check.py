@@ -7,7 +7,7 @@ import sys
 
 HEADLESS = ["bootstrap", "daemon", "scrollback", "control", "icon"]
 DESKTOP = ["state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
-           "title", "scheduling", "resize", "font", "find", "commands", "main-menu", "window-close",
+           "title", "scheduling", "resize", "split-resize", "font", "find", "commands", "main-menu", "window-close",
            "terminal-context-menu", "terminal-scrollbar", "terminal-renderer",
            "terminal-input", "terminal-copy", "notifications", "notification-focus", "notification-delivery",
            "renderer", "screenshot"]

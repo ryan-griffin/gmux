@@ -30,6 +30,7 @@ mod backend;
 mod branches;
 mod dialogs;
 mod preferences;
+mod split;
 mod tabs;
 mod window;
 mod workspaces;

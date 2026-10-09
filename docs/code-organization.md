@@ -14,6 +14,7 @@ and notification handling. Its child modules group the larger workflows.
 | --- | --- |
 | `app/window.rs` | Construct the window, widgets, menus, and update callbacks. |
 | `app/tabs.rs` | Create and restore tabs, manage pane layouts, and synchronize focus. |
+| `app/split.rs` | Allocate split panes from saved proportions without cumulative rounding. |
 | `app/actions.rs` | Register window actions and keyboard accelerators. |
 | `app/dialogs.rs` | Close and Quit confirmation, folder selection, tab naming, and the command palette. |
 | `app/preferences.rs` | Preferences, settings persistence, and terminal settings updates. |
