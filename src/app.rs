@@ -36,7 +36,7 @@ mod window;
 mod workspaces;
 
 use actions::{TAB_ACTIONS, ZOOM_IN_SHORTCUTS};
-use preferences::apply_appearance;
+use preferences::{AppPreferences, PreferenceControls, apply_appearance};
 struct Tab {
     id: u64,
     name: String,
@@ -78,7 +78,7 @@ pub struct Ui {
     heading: adw::WindowTitle,
     toast: adw::ToastOverlay,
     settings: Rc<RefCell<Settings>>,
-    desktop_settings: Option<gio::Settings>,
+    preferences_dialog: RefCell<Option<Rc<PreferenceControls>>>,
     tabs: RefCell<Vec<Tab>>,
     sessions: RefCell<SessionManager>,
     catalog: RefCell<WorkspaceCatalog>,
@@ -145,6 +145,7 @@ impl Drop for Ui {
 struct Windows {
     app: adw::Application,
     endpoint: ipc::Endpoint,
+    preferences: RefCell<Option<Rc<AppPreferences>>>,
     windows: RefCell<Vec<Rc<Ui>>>,
     next_id: Cell<u64>,
     server: RefCell<Option<ipc::Server>>,
@@ -160,6 +161,10 @@ impl Windows {
             .cloned()
     }
     fn create(self: &Rc<Self>, directory: Option<PathBuf>) -> anyhow::Result<Rc<Ui>> {
+        if self.preferences.borrow().is_none() {
+            let preferences = AppPreferences::new(self)?;
+            *self.preferences.borrow_mut() = Some(preferences);
+        }
         if self.server.borrow().is_none() {
             let wake = ipc::Wake::new()?;
             *self.server.borrow_mut() = Some(ipc::Server::start_at(
@@ -192,6 +197,7 @@ impl Windows {
         gmux::remote::ensure_daemon()?;
         let ui = Ui::new(
             &self.app,
+            self.preferences.borrow().as_ref().unwrap().settings.clone(),
             directory,
             Rc::downgrade(self),
             id,
@@ -259,6 +265,7 @@ pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
     let owner = Rc::new(Windows {
         app: application.clone(),
         endpoint: ipc::Endpoint::local(),
+        preferences: RefCell::new(None),
         windows: RefCell::new(Vec::new()),
         next_id: Cell::new(0),
         server: RefCell::new(None),

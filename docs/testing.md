@@ -40,6 +40,12 @@ file's New Window action through GIO, checking its label and reuse of the same
 daemon and terminals. GNOME uses this action for the app icon's context menu and
 middle-click.
 
+`preferences` changes settings through native GTK controls in multiple windows.
+It checks shared fonts, cursor style, pane title bars, appearance, and open
+Preferences dialogs while sidebar visibility, navigation, and zoom stay local.
+It holds the settings-file lock to check ordered saves, new windows opened before
+a save finishes, and pending writes when the application closes.
+
 The `main-menu` suite activates New Window through the visible menu item, its
 W mnemonic, Ctrl+Shift+N from a focused terminal, and Enter in the command palette.
 It checks availability in an empty window and the collapsed sidebar overlay,

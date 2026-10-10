@@ -245,7 +245,6 @@ enum Job {
     Request(u64, Value),
     Focus(u64, Option<u64>),
     Save(crate::model::Session),
-    Persist(crate::model::Settings),
 }
 #[derive(Default)]
 struct Jobs {
@@ -291,10 +290,6 @@ impl Client {
                             crate::control::InternalRequest::Presentation { session },
                         ),
                     ),
-                    Job::Persist(settings) => (
-                        0,
-                        crate::storage::save("settings.json", &settings).map(|()| Value::Null),
-                    ),
                 };
                 if sender.send((id, result)).is_err() {
                     break;
@@ -323,9 +318,6 @@ impl Client {
     pub fn focus(&self, tab: u64, pane: Option<u64>) -> anyhow::Result<()> {
         self.enqueue(Job::Focus(tab, pane))
     }
-    pub fn persist(&self, settings: crate::model::Settings) -> anyhow::Result<()> {
-        self.enqueue(Job::Persist(settings))
-    }
     fn enqueue(&self, job: Job) -> anyhow::Result<()> {
         let (lock, ready) = &*self.jobs;
         let mut jobs = lock.lock().unwrap();
@@ -336,7 +328,6 @@ impl Client {
                 *last_pane = pane;
             }
             (Job::Save(value), Some(Job::Save(last))) => *last = value,
-            (Job::Persist(settings), Some(Job::Persist(last))) => *last = settings,
             (job, _) => {
                 anyhow::ensure!(jobs.queue.len() < 128, "Daemon request queue is full");
                 jobs.queue.push_back(job);

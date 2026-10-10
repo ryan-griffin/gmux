@@ -256,6 +256,9 @@ impl Terminal {
             &terminal.chrome_css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // The daemon may still have the previous on-disk cursor default while
+        // a preference save is pending. New views use the application snapshot.
+        terminal.refresh_settings();
         terminal.refresh_theme();
         terminal.install_clipboard_actions();
         terminal.install_focus(&canvas, on_focus);
@@ -585,6 +588,7 @@ impl Terminal {
         serde_json::json!({
             "width": self.area.width(), "height": self.area.height(),
             "cols": cols, "rows": rows, "cell_width": cw, "cell_height": ch,
+            "title_bar_visible": self.title_bar.is_visible(), "cursor_style": frame.cursor_style,
             "scale": scale, "origin": [origin.0, origin.1], "focused": self.area.has_focus(),
             "scrollback": session.snapshot().frame.scrollback,
             "scroll_pending": session.scroll_pending(),
