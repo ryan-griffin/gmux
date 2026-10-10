@@ -22,7 +22,10 @@ Startup failures use `AdwAlertDialog` with a heading, plain-text error details,
 and one neutral Close response. Close receives initial focus and is both the
 default response for Enter and the close response for Escape and window-manager
 dismissal. Default activation does not imply suggested-action styling.
-Repeated activation or directory opening raises the existing failure alert.
+Repeated activation, directory opening, or New Window requests during failed
+startup raise the existing failure alert without retrying initialization.
+The alert uses the saved appearance even when the daemon check fails before
+window setup.
 
 The startup alert is a necessary exception to the HIG's parent-window rule:
 initialization can fail before a main window exists. Libadwaita's supported
