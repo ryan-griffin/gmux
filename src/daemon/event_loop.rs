@@ -216,7 +216,7 @@ pub fn run() -> anyhow::Result<()> {
                     for request in requests {
                         let pane = daemon.resolve_pane(request.pane).ok();
                         let attach = request.is_attach();
-                        if let Err(error) = daemon.input(&mut frontend, request) {
+                        if let Err(error) = daemon.input(id, &mut frontend, request) {
                             if attach {
                                 connected = false;
                                 break;
@@ -234,6 +234,8 @@ pub fn run() -> anyhow::Result<()> {
             }
             if connected {
                 daemon.frontends.insert(id, frontend);
+            } else {
+                daemon.resize_sessions(None);
             }
         }
         for _ in 0..32 {
@@ -326,9 +328,7 @@ pub fn run() -> anyhow::Result<()> {
             daemon.updates(metadata_due);
             next_frame = Instant::now() + Duration::from_millis(16);
         } else {
-            daemon
-                .frontends
-                .retain(|_, frontend| frontend.flush().is_ok());
+            daemon.flush_frontends();
         }
         let layout_changed = !exited.is_empty();
         for id in exited.drain(..) {

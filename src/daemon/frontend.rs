@@ -2,6 +2,8 @@
 use super::*;
 use crate::transport::{PasteOptions, StreamCommand, StreamRequest};
 
+type TerminalSize = (u16, u16, u32, u32, u16, u16);
+
 #[derive(Default)]
 pub(super) struct SentScreen {
     pub(super) frame: Frame,
@@ -26,7 +28,7 @@ pub(super) struct Frontend {
     pub(super) clipboard: HashMap<u64, String>,
     pub(super) errors: HashMap<u64, String>,
     pub(super) state_revision: Option<u64>,
-    pub(super) sizes: HashMap<u64, (u16, u16, u32, u32, u16, u16)>,
+    pub(super) sizes: HashMap<u64, TerminalSize>,
     pub(super) focused: bool,
     pub(super) changed: HashSet<u64>,
 }
@@ -140,9 +142,60 @@ impl Frontend {
         Ok(requests)
     }
 }
+
+fn requested_size<'a>(
+    pane: u64,
+    frontends: impl Iterator<Item = (u64, &'a Frontend)>,
+) -> Option<TerminalSize> {
+    frontends
+        .filter(|(_, frontend)| {
+            frontend.attached
+                && frontend.visible.contains(&pane)
+                && frontend.sizes.contains_key(&pane)
+        })
+        // Without a focused subscriber, keep a stable owner to avoid contention.
+        .min_by_key(|(id, frontend)| (!frontend.focused, *id))
+        .map(|(_, frontend)| frontend.sizes[&pane])
+}
+
 impl Daemon {
+    pub(super) fn resize_sessions(&mut self, current: Option<(u64, &Frontend)>) {
+        // Input processing temporarily removes its frontend from the map.
+        for (&pane, session) in &mut self.sessions {
+            let Some((cols, rows, cw, ch, width, height)) = requested_size(
+                pane,
+                self.frontends
+                    .iter()
+                    .map(|(&id, frontend)| (id, frontend))
+                    .chain(current),
+            ) else {
+                continue;
+            };
+            match session.resize(cols, rows, cw, ch, width, height) {
+                Ok(true) => {
+                    self.changed.insert(pane);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.errors.insert(pane, error.to_string());
+                    self.changed.insert(pane);
+                }
+            }
+        }
+    }
+
+    pub(super) fn flush_frontends(&mut self) {
+        let before = self.frontends.len();
+        self.frontends
+            .retain(|_, frontend| frontend.flush().is_ok());
+        if self.frontends.len() != before {
+            self.resize_sessions(None);
+        }
+    }
+
     pub(super) fn input(
         &mut self,
+        frontend_id: u64,
         frontend: &mut Frontend,
         request: StreamRequest,
     ) -> anyhow::Result<()> {
@@ -170,14 +223,7 @@ impl Daemon {
                 for other in self.frontends.values_mut() {
                     other.focused = false;
                 }
-                for (&id, &(cols, rows, cw, ch, width, height)) in &frontend.sizes {
-                    if frontend.visible.contains(&id)
-                        && let Some(session) = self.sessions.get_mut(&id)
-                        && session.resize(cols, rows, cw, ch, width, height)?
-                    {
-                        self.changed.insert(id);
-                    }
-                }
+                self.resize_sessions(Some((frontend_id, frontend)));
             }
             return Ok(());
         }
@@ -186,17 +232,11 @@ impl Daemon {
                 if !frontend.visible.contains(id) {
                     frontend.screens.remove(id);
                     frontend.changed.insert(*id);
-                    if frontend.focused
-                        && let Some(&(cols, rows, cw, ch, width, height)) = frontend.sizes.get(id)
-                        && let Some(session) = self.sessions.get_mut(id)
-                        && session.resize(cols, rows, cw, ch, width, height)?
-                    {
-                        self.changed.insert(*id);
-                    }
                 }
             }
             frontend.screens.retain(|id, _| panes.contains(id));
             frontend.visible = panes;
+            self.resize_sessions(Some((frontend_id, frontend)));
             return Ok(());
         }
         let id = match self.resolve_pane(pane) {
@@ -206,6 +246,25 @@ impl Daemon {
                 return Err(error);
             }
         };
+        if let StreamCommand::Resize {
+            cols,
+            rows,
+            cw,
+            ch,
+            width,
+            height,
+        } = command
+        {
+            anyhow::ensure!(
+                crate::viewport::valid(cols.into(), rows.into()),
+                "Invalid terminal size"
+            );
+            frontend
+                .sizes
+                .insert(id, (cols, rows, cw, ch, width, height));
+            self.resize_sessions(Some((frontend_id, frontend)));
+            return Ok(());
+        }
         match command {
             StreamCommand::PasteBegin { size, options } => {
                 frontend.paste = None;
@@ -246,6 +305,7 @@ impl Daemon {
                     "Incomplete paste"
                 );
                 return self.input(
+                    frontend_id,
                     frontend,
                     StreamRequest::pane(
                         id,
@@ -275,31 +335,6 @@ impl Daemon {
         }
         let view = frontend.views.get_mut(&id).unwrap();
         match command {
-            StreamCommand::Resize {
-                cols,
-                rows,
-                cw,
-                ch,
-                width,
-                height,
-            } => {
-                anyhow::ensure!(
-                    crate::viewport::valid(cols.into(), rows.into()),
-                    "Invalid terminal size"
-                );
-                frontend
-                    .sizes
-                    .insert(id, (cols, rows, cw, ch, width, height));
-                let owns_size = frontend.focused
-                    || !self
-                        .frontends
-                        .values()
-                        .any(|f| f.focused && f.visible.contains(&id));
-                if owns_size && session.resize(cols, rows, cw, ch, width, height)? {
-                    self.changed.insert(id);
-                }
-                return Ok(());
-            }
             StreamCommand::Input { bytes } => session.send(&bytes)?,
             StreamCommand::Paste { text, options } => {
                 anyhow::ensure!(
@@ -394,6 +429,7 @@ impl Daemon {
         })
     }
     pub(super) fn updates(&mut self, metadata_due: bool) {
+        let before = self.frontends.len();
         let mut ids: Vec<_> = self.frontends.keys().copied().collect();
         ids.sort_by_key(|id| (!self.frontends[id].focused, *id));
         // Every window receives the same revision. Read the catalog, capture
@@ -429,6 +465,10 @@ impl Daemon {
         }
         self.changed.clear();
         self.errors.clear();
+        if self.frontends.len() != before {
+            // Keep handoff changes pending even if survivors were already sent a frame.
+            self.resize_sessions(None);
+        }
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -611,5 +651,82 @@ impl Daemon {
         frontend.changed.clear();
         frontend.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(size: TerminalSize) -> (Frontend, UnixStream) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let mut frontend = Frontend::new(socket);
+        frontend.attached = true;
+        frontend.visible.insert(1);
+        frontend.sizes.insert(1, size);
+        (frontend, peer)
+    }
+
+    #[test]
+    fn size_selection_prefers_focus_then_connection_order_including_the_current_client() {
+        let first_size = (50, 12, 8, 16, 400, 192);
+        let second_size = (70, 20, 10, 20, 700, 400);
+        let (first, _first_peer) = client(first_size);
+        let (mut second, _second_peer) = client(second_size);
+        assert_eq!(
+            requested_size(1, [(2, &second), (1, &first)].into_iter()),
+            Some(first_size)
+        );
+        second.focused = true;
+        let stored = HashMap::from([(1, first)]);
+        assert_eq!(
+            requested_size(
+                1,
+                stored
+                    .iter()
+                    .map(|(&id, client)| (id, client))
+                    .chain(Some((2, &second)))
+            ),
+            Some(second_size)
+        );
+        second.visible.clear();
+        assert_eq!(
+            requested_size(
+                1,
+                stored
+                    .iter()
+                    .map(|(&id, client)| (id, client))
+                    .chain(Some((2, &second)))
+            ),
+            Some(first_size)
+        );
+    }
+
+    #[test]
+    fn size_selection_skips_unsized_hidden_and_unattached_clients() {
+        let size = (70, 20, 10, 20, 700, 400);
+        let (mut focused, _focused_peer) = client(size);
+        focused.focused = true;
+        focused.sizes.clear();
+        let (mut fallback, _fallback_peer) = client(size);
+        assert_eq!(
+            requested_size(1, [(1, &focused), (2, &fallback)].into_iter()),
+            Some(size)
+        );
+        fallback.visible.clear();
+        assert_eq!(
+            requested_size(1, [(1, &focused), (2, &fallback)].into_iter()),
+            None
+        );
+        fallback.visible.insert(1);
+        fallback.attached = false;
+        assert_eq!(
+            requested_size(1, [(1, &focused), (2, &fallback)].into_iter()),
+            None
+        );
+        assert_eq!(
+            requested_size(2, [(1, &focused), (2, &fallback)].into_iter()),
+            None
+        );
     }
 }
