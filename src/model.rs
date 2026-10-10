@@ -160,7 +160,7 @@ impl Default for Settings {
             font_size: 11.0,
             appearance: "system".into(),
             show_sidebar: true,
-            show_pane_titles: true,
+            show_pane_titles: false,
             cursor_style: CursorStyle::default(),
             restore: true,
             desktop_notifications: true,
