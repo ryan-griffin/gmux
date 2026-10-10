@@ -65,86 +65,6 @@ impl Matcher {
     }
 }
 
-#[derive(Default)]
-pub struct Search {
-    query: String,
-    matches: Vec<Range<usize>>,
-    current: usize,
-    highlights: Vec<u8>,
-    highlights_dirty: bool,
-}
-
-impl Search {
-    pub fn ranges(&self) -> &[Range<usize>] {
-        &self.matches
-    }
-    pub fn set_query(&mut self, query: &str) {
-        let query = query.to_lowercase();
-        if self.query != query {
-            self.query = query;
-            self.matches.clear();
-            self.current = 0;
-            self.highlights_dirty = true;
-        }
-    }
-
-    pub fn refresh(&mut self, cells: &[Cell], cols: usize) {
-        self.highlights_dirty = true;
-        if self.query.is_empty() || cols == 0 {
-            self.matches.clear();
-            self.current = 0;
-            return;
-        }
-        let selected = self.matches.get(self.current).cloned();
-        self.matches.clear();
-        let mut matcher = Matcher::default();
-        for (y, row) in cells.chunks(cols).enumerate() {
-            matcher.feed(row, y * cols, &self.query, false, &mut self.matches);
-        }
-        self.current = selected
-            .and_then(|selected| self.matches.iter().position(|range| *range == selected))
-            .unwrap_or_else(|| self.current.min(self.matches.len().saturating_sub(1)));
-    }
-
-    pub fn advance(&mut self, previous: bool) {
-        let total = self.matches.len();
-        if total > 0 {
-            self.current = if previous {
-                (self.current + total - 1) % total
-            } else {
-                (self.current + 1) % total
-            };
-            self.highlights_dirty = true;
-        }
-    }
-
-    pub fn status(&self) -> (usize, usize) {
-        let total = self.matches.len();
-        (if total == 0 { 0 } else { self.current + 1 }, total)
-    }
-
-    // 0: no match, 1: another match, 2: the current match.
-    pub fn highlights(&mut self, len: usize) -> &[u8] {
-        if self.matches.is_empty() {
-            return &[];
-        }
-        if !self.highlights_dirty && self.highlights.len() == len {
-            return &self.highlights;
-        }
-        self.highlights.resize(len, 0);
-        self.highlights.fill(0);
-        for (index, range) in self.matches.iter().enumerate() {
-            for cell in range.clone() {
-                if let Some(highlight) = self.highlights.get_mut(cell) {
-                    *highlight = if index == self.current { 2 } else { 1 };
-                }
-            }
-        }
-        self.highlights_dirty = false;
-        &self.highlights
-    }
-}
-
 #[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FindState {
     pub current: usize,
@@ -277,6 +197,10 @@ mod tests {
         }
         panic!("Find did not finish");
     }
+    fn status(engine: &Engine) -> (usize, usize) {
+        let state = engine.find_state();
+        (state.current, state.total)
+    }
     #[test]
     fn history_find_joins_soft_wraps_but_preserves_hard_line_breaks_and_wide_spacers() {
         let mut engine = screen("123456needle\r\nneed\r\nle", 8, 5);
@@ -303,98 +227,58 @@ mod tests {
 
     #[test]
     fn counts_case_insensitive_matches_and_wraps_in_both_directions() {
-        let engine = screen("one ONE one", 20, 2);
-        let mut search = Search::default();
-        search.set_query("One");
-        search.refresh(&engine.cells, 20);
-        assert_eq!(search.status(), (1, 3));
-        search.advance(true);
-        assert_eq!(search.status(), (3, 3));
-        search.advance(false);
-        assert_eq!(search.status(), (1, 3));
-        search.advance(false);
-        search.refresh(&engine.cells, 20);
-        assert_eq!(search.status(), (2, 3));
-        search.set_query("missing");
-        search.refresh(&engine.cells, 20);
-        search.advance(true);
-        assert_eq!(search.status(), (0, 0));
+        let mut engine = screen("one ONE one", 20, 2);
+        history_find(&mut engine, "One");
+        assert_eq!(status(&engine), (1, 3));
+        engine.find_advance(true);
+        assert_eq!(status(&engine), (3, 3));
+        engine.find_advance(false);
+        assert_eq!(status(&engine), (1, 3));
+        engine.find_advance(false);
+        history_find(&mut engine, "one");
+        assert_eq!(status(&engine), (2, 3));
+        history_find(&mut engine, "missing");
+        engine.find_advance(true);
+        assert_eq!(status(&engine), (0, 0));
     }
 
     #[test]
     fn handles_unicode_and_highlights_the_whole_wide_character() {
-        let engine = screen("界 É e\u{301} İ", 20, 2);
-        let mut search = Search::default();
-        search.set_query("界");
-        search.refresh(&engine.cells, 20);
-        assert_eq!(search.status(), (1, 1));
-        assert_eq!(&search.highlights(engine.cells.len())[..3], &[2, 2, 0]);
+        let mut engine = screen("界 É e\u{301} İ", 20, 2);
+        let state = history_find(&mut engine, "界");
+        assert_eq!(status(&engine), (1, 1));
+        assert_eq!(state.highlights, vec![(0, 2, 2)]);
         for query in ["é", "e\u{301}", "i\u{307}"] {
-            search.set_query(query);
-            search.refresh(&engine.cells, 20);
-            assert_eq!(search.status(), (1, 1), "{query}");
+            history_find(&mut engine, query);
+            assert_eq!(status(&engine), (1, 1), "{query}");
         }
     }
 
     #[test]
     fn updates_when_output_changes_and_does_not_join_separate_rows() {
         let mut engine = screen("one one\r\none", 12, 3);
-        let mut search = Search::default();
-        search.set_query("one");
-        search.refresh(&engine.cells, 12);
-        search.advance(false);
+        history_find(&mut engine, "one");
+        engine.find_advance(false);
         engine.write(b"\x1b[1;1Hxxx");
-        engine.snapshot().unwrap();
-        search.refresh(&engine.cells, 12);
-        assert_eq!(search.status(), (1, 2));
-        assert_eq!(search.matches[search.current], 4..7);
-        search.set_query("one one");
-        search.refresh(&engine.cells, 12);
-        assert_eq!(search.status(), (0, 0));
-        search.set_query("");
-        search.refresh(&engine.cells, 12);
-        assert!(
-            search
-                .highlights(engine.cells.len())
-                .iter()
-                .all(|&x| x == 0)
-        );
+        let state = history_find(&mut engine, "one");
+        assert_eq!(status(&engine), (1, 2));
+        assert_eq!(state.highlights, vec![(4, 7, 2), (12, 15, 1)]);
+        history_find(&mut engine, "one one");
+        assert_eq!(status(&engine), (0, 0));
+        assert!(history_find(&mut engine, "").highlights.is_empty());
     }
     #[test]
     fn highlights_follow_navigation_query_changes_and_viewport_updates() {
         let mut engine = screen("one one", 12, 2);
-        let mut search = Search::default();
-        search.set_query("one");
-        search.refresh(&engine.cells, 12);
         assert_eq!(
-            &search.highlights(engine.cells.len())[..7],
-            &[2, 2, 2, 0, 1, 1, 1]
+            history_find(&mut engine, "one").highlights,
+            vec![(0, 3, 2), (4, 7, 1)]
         );
-        search.advance(false);
-        assert_eq!(
-            &search.highlights(engine.cells.len())[..7],
-            &[1, 1, 1, 0, 2, 2, 2]
-        );
+        engine.find_advance(false);
+        assert_eq!(engine.find_state().highlights, vec![(0, 3, 1), (4, 7, 2)]);
         engine.write(b"\x1b[1;1Hxxx");
-        engine.snapshot().unwrap();
-        search.refresh(&engine.cells, 12);
-        assert_eq!(
-            &search.highlights(engine.cells.len())[..7],
-            &[0, 0, 0, 0, 2, 2, 2]
-        );
-        search.set_query("");
-        search.refresh(&engine.cells, 12);
-        assert!(
-            search
-                .highlights(engine.cells.len())
-                .iter()
-                .all(|&value| value == 0)
-        );
-        search.set_query("xxx");
-        search.refresh(&engine.cells, 12);
-        assert_eq!(
-            &search.highlights(engine.cells.len())[..7],
-            &[2, 2, 2, 0, 0, 0, 0]
-        );
+        assert_eq!(history_find(&mut engine, "one").highlights, vec![(4, 7, 2)]);
+        assert!(history_find(&mut engine, "").highlights.is_empty());
+        assert_eq!(history_find(&mut engine, "xxx").highlights, vec![(0, 3, 2)]);
     }
 }

@@ -49,13 +49,6 @@ impl Ui {
             })
             .build();
         window.set_size_request(360, 280);
-        let css = gtk::CssProvider::new();
-        css.load_from_string(include_str!("../../data/style.css"));
-        gtk::style_context_add_provider_for_display(
-            &gdk::Display::default().unwrap(),
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
         let split = adw::OverlaySplitView::builder()
             .min_sidebar_width(220.0)
             .max_sidebar_width(280.0)

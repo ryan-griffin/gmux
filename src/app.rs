@@ -243,8 +243,15 @@ pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
         .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
     application.connect_startup(|_| {
-        gtk::IconTheme::for_display(&gdk::Display::default().unwrap())
-            .add_resource_path("/dev/gmux/Gmux/icons");
+        let display = gdk::Display::default().unwrap();
+        gtk::IconTheme::for_display(&display).add_resource_path("/dev/gmux/Gmux/icons");
+        let css = gtk::CssProvider::new();
+        css.load_from_string(include_str!("../data/style.css"));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     });
     application.add_main_option(
         "new-window",
