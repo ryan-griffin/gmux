@@ -339,6 +339,8 @@ It waits for native allocations on each step and captures diagnostic screenshots
 at scenario checkpoints.
 It also checks native divider dragging, nested unequal splits, session restore,
 and recovery of the requested proportions after minimum sizes constrain a pane.
+The fixture enables pane title bars so their controls impose the minimum width
+used by the clamping scenario, independently of the application's default.
 
 The `screenshot` suite uses a solid fullscreen cover and compositor frames to
 verify that Gmux is fully occluded. It changes only the private fixture monitor's

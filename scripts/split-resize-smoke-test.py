@@ -19,8 +19,11 @@ artifacts.mkdir(exist_ok=True)
 
 with (artifacts / "split-resize-smoke.log").open("w") as log:
     for scale in (1, 1.25):
+        # Header controls impose the minimum width exercised by the clamping
+        # scenario, independently of the application's pane-title default.
         with monitor_scale(scale), WaylandInput() as native, AppFixture(
             dict(appearance="dark", restore=True, show_sidebar=False,
+                 show_pane_titles=True,
                  use_system_font=False, font="Monospace", font_size=12),
             prefix="gmux-split-resize-", env={"GTK_A11Y": "none"},
         ) as fixture:
