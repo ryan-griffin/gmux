@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-scrollbar-") as directory:
     config = temp / "config/gmux"
     config.mkdir(parents=True)
     settings = dict(use_system_font=False, font="Monospace", font_size=12,
-                    appearance="dark", restore=False, show_sidebar=False,
+                    appearance="dark", show_sidebar=False,
                     desktop_notifications=False)
     (config / "settings.json").write_text(json.dumps(settings))
     env = dict(os.environ, GTK_A11Y="none", SHELL=str(shell),

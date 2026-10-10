@@ -90,7 +90,8 @@ class History:
         self.socket.close()
 
 
-with AppFixture({"restore": True, "appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
+# Older settings with restore disabled must still restore tabs and history.
+with AppFixture({"restore": False, "appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
     fixture.env.update(DISPLAY="", WAYLAND_DISPLAY="", GMUX_TEST_DIR=str(fixture.path))
     (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY\\n'\nexec /bin/bash --noprofile --norc -i\n")
 
@@ -140,7 +141,7 @@ with AppFixture({"restore": True, "appearance": "dark"}, prefix="gmux-scrollback
             for start in starts:
                 assert all(cell[1:] == (fg, bg, flags) for cell in cells[start:start + len(marker)]), marker
 
-    with scenario("Quit restores colored Unicode and wrapped history into new shells"):
+    with scenario("Quit restores tabs and history into new shells despite the removed setting"):
         daemon = start()
         pane = fixture.rpc("new", directory=str(root))["pane"]
         ready(pane)
@@ -200,31 +201,26 @@ with AppFixture({"restore": True, "appearance": "dark"}, prefix="gmux-scrollback
     survivor_path = fixture.config / "scrollback" / saved["scrollback"][str(survivor)]
     survivor_bytes = survivor_path.read_bytes()
 
-    for reason in ["shell spawn failure", "Restore tabs disabled"]:
-        with scenario(f"startup cleanup preserves committed history after {reason}"):
-            session_path.write_bytes(baseline)
-            snapshot_path.write_bytes(valid)
-            survivor_path.write_bytes(survivor_bytes)
-            orphan = snapshot_path.parent / ("99-" + "f" * 32 + ".snapshot")
-            orphan.write_bytes(b"interrupted publication")
-            shell = fixture.env["SHELL"]
-            if reason == "shell spawn failure":
-                fixture.env["SHELL"] = str(fixture.path / "missing-shell")
-            else:
-                fixture.set_settings({"restore": False})
-            daemon = start()
-            assert not fixture.rpc("list")["tabs"]
-            wait_for(lambda: not orphan.exists())
-            assert session_path.read_bytes() == baseline
-            assert snapshot_path.read_bytes() == valid
-            daemon.kill()  # Do not commit an empty layout over the saved one.
-            assert daemon.wait(timeout=8) != 0
-            fixture.env["SHELL"] = shell
-            fixture.set_settings({"restore": True})
-            daemon = start()
-            ready(pane)
-            assert "SNAPSHOT_BEGIN" in history(pane)
-            stop(daemon)
+    with scenario("startup cleanup preserves committed history after shell spawn failure"):
+        session_path.write_bytes(baseline)
+        snapshot_path.write_bytes(valid)
+        survivor_path.write_bytes(survivor_bytes)
+        orphan = snapshot_path.parent / ("99-" + "f" * 32 + ".snapshot")
+        orphan.write_bytes(b"interrupted publication")
+        shell = fixture.env["SHELL"]
+        fixture.env["SHELL"] = str(fixture.path / "missing-shell")
+        daemon = start()
+        assert not fixture.rpc("list")["tabs"]
+        wait_for(lambda: not orphan.exists())
+        assert session_path.read_bytes() == baseline
+        assert snapshot_path.read_bytes() == valid
+        daemon.kill()  # Do not commit an empty layout over the saved one.
+        assert daemon.wait(timeout=8) != 0
+        fixture.env["SHELL"] = shell
+        daemon = start()
+        ready(pane)
+        assert "SNAPSHOT_BEGIN" in history(pane)
+        stop(daemon)
 
     def flip(offset):
         changed = bytearray(valid)

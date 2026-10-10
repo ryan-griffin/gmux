@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
     temp = Path(directory)
     config = temp / "config/gmux"
     config.mkdir(parents=True)
-    (config / "settings.json").write_text(json.dumps(dict(restore=True, desktop_notifications=False)))
+    (config / "settings.json").write_text(json.dumps(dict(desktop_notifications=False)))
     shell = temp / "shell"
     shell.write_text("#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
     shell.chmod(0o700)

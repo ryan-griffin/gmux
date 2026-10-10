@@ -32,7 +32,7 @@ def close_shortcut(native):
 with (artifacts / "window-close-smoke.log").open("w") as log, WaylandInput() as native:
     for case in ("empty startup", "last pane", "empty workspace", "Close Window command"):
         with scenario(case), AppFixture(
-            dict(restore=False, desktop_notifications=False), env={"GTK_A11Y": "none"},
+            dict(desktop_notifications=False), env={"GTK_A11Y": "none"},
             prefix="gmux-window-close-",
             shell_script="#!/bin/sh\nexport PS1='GMUX_CLOSE> '\nstty -echo\n"
                          "exec /bin/bash --noprofile --norc -i\n",

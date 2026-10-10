@@ -48,7 +48,7 @@ def alive(pid):
         return False
 
 
-with AppFixture(dict(restore=False, show_sidebar=False, desktop_notifications=False)) as fixture:
+with AppFixture(dict(show_sidebar=False, desktop_notifications=False)) as fixture:
     fixture.env["GTK_A11Y"] = "none"
     real_git = shutil.which("git")
     repository = fixture.path / "repo"

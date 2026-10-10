@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-renderer-") as directory:
     config = temp / "config/gmux"
     config.mkdir(parents=True)
     (config / "settings.json").write_text(json.dumps(dict(
-        appearance="dark", restore=False, desktop_notifications=False,
+        appearance="dark", desktop_notifications=False,
         use_system_font=False, font="Monospace", font_size=12,
     )))
     shell = temp / "shell"

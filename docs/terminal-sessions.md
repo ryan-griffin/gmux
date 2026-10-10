@@ -41,8 +41,8 @@ and SIGINT sent to the frontend detach it; sent to the daemon they stop its
 sessions.
 
 A stopped daemon cannot resume arbitrary commands. Daemon restart
-restores the saved layout and working directories with fresh shells when Restore
-tabs is enabled. Window closure and frontend crashes keep the live scrollback.
+restores the saved tabs, layout, and working directories with fresh shells.
+Window closure and frontend crashes keep the live scrollback.
 Quit and orderly daemon shutdown checkpoint history for later restoration,
 including after a reboot. Interrupted commands are never replayed automatically.
 

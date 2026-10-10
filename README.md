@@ -69,7 +69,7 @@ Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close
 
 The app's Keyboard Shortcuts dialog lists the remaining shortcuts. Settings and saved layouts live in `~/.config/gmux/`, or `$XDG_CONFIG_HOME/gmux/`.
 
-Explicit Quit and orderly daemon shutdown save bounded scrollback checkpoints there. With Restore tabs enabled, reopening restores the primary-screen text history and starts fresh shells in the saved directories. Commands and jobs do not resume. Unicode, wrapped lines, colors, and text attributes survive; hyperlinks and full-screen application contents do not. A Ghostty source upgrade or damaged checkpoint starts that pane with empty history. A crash or power loss can lose output since the last orderly shutdown. See [scrollback checkpoints](docs/terminal-sessions.md#scrollback-checkpoints) for limits and recovery.
+Explicit Quit and orderly daemon shutdown save bounded scrollback checkpoints there. Reopening after the daemon stops restores tabs, split layouts, and primary-screen text history, and starts fresh shells in the saved directories. Commands and jobs do not resume. Unicode, wrapped lines, colors, and text attributes survive; hyperlinks and full-screen application contents do not. A Ghostty source upgrade or damaged checkpoint starts that pane with empty history. A crash or power loss can lose output since the last orderly shutdown. See [scrollback checkpoints](docs/terminal-sessions.md#scrollback-checkpoints) for limits and recovery.
 
 ## Shell automation
 

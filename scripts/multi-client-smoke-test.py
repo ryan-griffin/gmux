@@ -77,7 +77,7 @@ class Client:
 
 
 root = Path(__file__).resolve().parent.parent
-with AppFixture(dict(restore=False), prefix="gmux-multi-client-") as fixture:
+with AppFixture(prefix="gmux-multi-client-") as fixture:
     fixture.start(cargo_binary("gmux-daemon"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_for(lambda: fixture.rpc("daemon-info"))
     created = fixture.rpc("_command", command=dict(method="new", directory=str(root)))
@@ -184,7 +184,7 @@ with AppFixture(dict(restore=False), prefix="gmux-multi-client-") as fixture:
 
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-with AppFixture(dict(restore=False), prefix="gmux-size-owner-") as fixture, (artifacts / "multi-client-ownership.log").open("w") as log:
+with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-client-ownership.log").open("w") as log:
     fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)
     wait_for(lambda: fixture.rpc("daemon-info"))
     pane = fixture.rpc("_command", command=dict(method="new", directory=str(root)))["result"]["pane"]

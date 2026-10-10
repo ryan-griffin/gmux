@@ -83,7 +83,7 @@ with (artifacts / f"screenshot-{appearance}-smoke.log").open("w") as log:
             monitor_scale(scale),
             WaylandInput() as desktop,
             AppFixture(
-                dict(appearance=appearance, restore=True, desktop_notifications=False, show_sidebar=False,
+                dict(appearance=appearance, desktop_notifications=False, show_sidebar=False,
                      use_system_font=False, font="Monospace", font_size=12),
                 prefix="gmux-screenshot-", env={"GTK_A11Y": "none"},
             ) as fixture,

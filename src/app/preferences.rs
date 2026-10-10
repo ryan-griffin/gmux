@@ -161,7 +161,6 @@ pub(super) struct PreferenceControls {
     cursor: adw::ComboRow,
     custom_font: adw::ExpanderRow,
     font: adw::ActionRow,
-    restore: adw::SwitchRow,
     desktop: adw::SwitchRow,
 }
 
@@ -176,7 +175,6 @@ impl PreferenceControls {
             .set_enable_expansion(!settings.use_system_font);
         self.font
             .set_title(&font::custom_description(settings).to_string());
-        self.restore.set_active(settings.restore);
         self.desktop.set_active(settings.desktop_notifications);
         self.updating.set(false);
     }
@@ -314,25 +312,9 @@ impl Ui {
         });
         font_group.add(&custom_font);
         page.add(&font_group);
-        let behavior = adw::PreferencesGroup::builder()
-            .title("Tabs")
-            .description("Reopening the window reconnects to running terminals. Restore tabs and directories with fresh shells after the background daemon stops.")
+        let notifications = adw::PreferencesGroup::builder()
+            .title("Notifications")
             .build();
-        let restore = adw::SwitchRow::builder()
-            .title("Restore tabs")
-            .active(self.settings.borrow().restore)
-            .build();
-        let weak = Rc::downgrade(self);
-        let syncing = updating.clone();
-        restore.connect_active_notify(move |row| {
-            if !syncing.get()
-                && let Some(ui) = weak.upgrade()
-            {
-                ui.settings.borrow_mut().restore = row.is_active();
-                ui.save_settings();
-            }
-        });
-        behavior.add(&restore);
         let desktop = adw::SwitchRow::builder()
             .title("Desktop notifications")
             .subtitle("Send alerts from unattended terminals to the desktop")
@@ -348,8 +330,8 @@ impl Ui {
                 ui.save_settings();
             }
         });
-        behavior.add(&desktop);
-        page.add(&behavior);
+        notifications.add(&desktop);
+        page.add(&notifications);
         dialog.add(&page);
         *self.preferences_dialog.borrow_mut() = Some(Rc::new(PreferenceControls {
             dialog: dialog.clone(),
@@ -359,7 +341,6 @@ impl Ui {
             cursor,
             custom_font,
             font: font_row,
-            restore,
             desktop,
         }));
         let weak = Rc::downgrade(self);

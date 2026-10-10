@@ -55,7 +55,7 @@ def window_size():
 with (artifacts / "find-smoke.log").open("w") as log, AccessibilityFixture(), WaylandInput() as native:
     clipboard = ClipboardObserver(native)
     for appearance in ("dark", "light"):
-        with AppFixture(dict(restore=True, desktop_notifications=False, appearance=appearance),
+        with AppFixture(dict(desktop_notifications=False, appearance=appearance),
             prefix="gmux-find-", env={"GTK_A11Y": "atspi", "GDK_DEBUG": os.environ.get("GDK_DEBUG", "") + ":no-vsync"},
             shell_script="#!/bin/sh\nexport PS1='GMUX_FIND> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n",
         ) as fixture:
