@@ -266,6 +266,10 @@ The `cargo-output` smoke suite builds isolated tiny Cargo packages and verifies
 application, daemon and example selection with stale default binaries present.
 It tests environment/config host targets, ordinary and redirected outputs,
 config precedence, release output, and rejection of unsupported targets.
+It also runs `run.sh` and `install.sh` against those fixtures, checking argument
+forwarding, release installation, and rejection of failed builds or missing and
+ambiguous artifacts. The scripts share the runner's artifact parser and select
+both binaries from one successful Cargo build in the requested profile.
 `--skip-build` still skips the repository's Rust/build checks; this explicitly
 selected smoke suite compiles only its temporary fixtures.
 Include `--native` for desktop tests so the runner provides their isolated
@@ -277,7 +281,7 @@ building or starting services. Unknown names and desktop selections without
 
 | Smoke tests | What they cover |
 | --- | --- |
-| `cargo-output` | Real Cargo executable artifacts and native host target/config selection, redirected output, stale-binary rejection, and unsupported-target errors. |
+| `cargo-output` | Real Cargo executable artifacts and native host target/config selection, redirected output, launch argument forwarding, release installation, stale-binary rejection, build failures, and missing or ambiguous artifacts. |
 | `bootstrap` | Interrupted downloads and extraction, recovery of older incomplete caches, cache reuse, checksum verification, and temporary-file cleanup. |
 | `startup-error` | A private incompatible-daemon handshake, content-sized standalone alerts, repeated CLI and desktop activation/open including `--new-window` during startup failure, initial focus, keyboard/pointer/system dismissal, keyboard scrolling of long plain-text error details with a fixed Close response, AT-SPI error descriptions, saved light/dark appearance, screenshots with and without high contrast, and neutral button fill. |
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |

@@ -49,28 +49,6 @@ def native_output_dir():
     return cargo_target_dir()
 
 
-def compiler_artifacts(output, *, profile="debug"):
-    """Read executable paths from cargo build --message-format=json output."""
-    artifacts = {}
-    for line in output.splitlines():
-        message = json.loads(line)
-        if message.get("reason") != "compiler-artifact" or not message.get("executable"):
-            continue
-        if message["profile"]["test"]:
-            continue
-        target = message["target"]
-        for kind in ("bin", "example"):
-            if kind not in target["kind"]:
-                continue
-            key = f"{profile}/{kind}/{target['name']}"
-            executable = message["executable"]
-            if key in artifacts and artifacts[key] != executable:
-                raise SystemExit(f"Cargo reported multiple executables for {key}; "
-                                 "select a single native target or explicit binary paths.")
-            artifacts[key] = executable
-    return artifacts
-
-
 def cargo_binary(name, *, example=False, profile="debug"):
     directory = native_output_dir() / profile
     if recorded := os.environ.get(ARTIFACT_ENV):
