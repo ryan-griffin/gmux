@@ -174,11 +174,9 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
         } else if child.is_none() {
             // Surface recovery errors to the launcher before a failing daemon
             // can hide their details in its log.
-            let settings = crate::storage::load::<crate::model::Settings>("settings.json")?;
+            let _: crate::model::Settings = crate::storage::load("settings.json")?;
             let _: crate::model::WorkspaceCatalog = crate::storage::load("workspaces.json")?;
-            if settings.restore {
-                let _: Session = crate::storage::load("session.json")?;
-            }
+            let _: Session = crate::storage::load("session.json")?;
             let exe = std::env::current_exe()?.with_file_name("gmux-daemon");
             anyhow::ensure!(
                 exe.is_file(),

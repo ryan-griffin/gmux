@@ -25,6 +25,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 with (artifacts / "preferences-smoke.log").open("w") as log, AccessibilityFixture(), WaylandInput() as native, AppFixture(
+    # The removed preference in an older settings file must be ignored.
     dict(restore=False, desktop_notifications=False, appearance="dark",
          use_system_font=True, font="Monospace", font_size=16, show_sidebar=True),
     prefix="gmux-preferences-", env={"GTK_A11Y": "atspi", "GSETTINGS_BACKEND": "keyfile"},
@@ -135,8 +136,11 @@ with (artifacts / "preferences-smoke.log").open("w") as log, AccessibilityFixtur
     with scenario("a sidebar toggle in another window preserves global preferences"):
         rpc("action", window=first, name="preferences")
         switch = wait_for(lambda: control("Window A", "Pane Title Bars", "switch"))
+        assert control("Window A", "Restore tabs", "switch") is None
+        assert control("Window B", "Restore tabs", "switch") is None
         assert switch.get_action_iface().do_action(0)
         wait_for(lambda: json.loads(fixture.settings_path.read_text()).get("show_pane_titles") is True)
+        assert "restore" not in saved(), "Saving preferences kept the removed setting"
         rpc("action", window=second, name="sidebar")
         wait_for(lambda: json.loads(fixture.settings_path.read_text()).get("show_sidebar") is False)
         assert json.loads(fixture.settings_path.read_text())["show_pane_titles"], "Sidebar restored stale global preferences"
@@ -188,8 +192,6 @@ with (artifacts / "preferences-smoke.log").open("w") as log, AccessibilityFixtur
                 wait_for(lambda: viewport(window, pane)["cursor_style"] == 2)
             rpc("action", window=second, name="sidebar")
             rpc("action", window=first, name="sidebar")
-            set_switch("Window B", "Restore tabs", True)
-            wait_for(lambda: checked("Window A", "Restore tabs"))
             assert saved() == on_disk
             assert not rpc("list", window=first)["sidebar_visible"]
             assert rpc("list", window=second)["sidebar_visible"]
@@ -215,7 +217,7 @@ with (artifacts / "preferences-smoke.log").open("w") as log, AccessibilityFixtur
             fcntl.flock(lock, fcntl.LOCK_UN)
         expected = dict(appearance="light", cursor_style="underline", use_system_font=False,
                         font="Monospace", font_size=16, show_pane_titles=True,
-                        desktop_notifications=True, restore=True, show_sidebar=False)
+                        desktop_notifications=True, show_sidebar=False)
         wait_for(lambda: all(saved()[key] == value for key, value in expected.items()),
                  message="Ordered persistence lost a preference changed in another window")
 

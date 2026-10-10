@@ -17,7 +17,7 @@ artifacts.mkdir(exist_ok=True)
 with (artifacts / "terminal-copy-smoke.log").open("w") as log, WaylandInput() as native:
     clipboard = ClipboardObserver(native)
     for direction in (1, -1):
-        with AppFixture(dict(restore=False, desktop_notifications=False), prefix="gmux-copy-",
+        with AppFixture(dict(desktop_notifications=False), prefix="gmux-copy-",
                 shell_script="#!/bin/sh\nexport PS1='COPY_READY> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n") as fixture:
             rpc = fixture.rpc
             fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)

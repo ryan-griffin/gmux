@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     config.mkdir(parents=True)
     (config / "settings.json").write_text(json.dumps(dict(
         use_system_font=False, font="Monospace", font_size=12, appearance="dark",
-        restore=False, show_sidebar=False, desktop_notifications=False)))
+        show_sidebar=False, desktop_notifications=False)))
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
     app = daemon = None

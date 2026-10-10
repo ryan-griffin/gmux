@@ -100,11 +100,7 @@ struct Daemon {
 impl Daemon {
     fn new() -> anyhow::Result<Self> {
         let settings = storage::load::<Settings>("settings.json")?;
-        let saved = if settings.restore {
-            storage::load::<Session>("session.json")?
-        } else {
-            Session::default()
-        };
+        let saved = storage::load::<Session>("session.json")?;
         let mut daemon = Self {
             sessions: HashMap::new(),
             state: Session {

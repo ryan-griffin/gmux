@@ -90,7 +90,7 @@ try:
         temp = Path(directory)
         config = temp / "config/gmux"
         config.mkdir(parents=True)
-        (config / "settings.json").write_text(json.dumps(dict(restore=False, appearance="dark",
+        (config / "settings.json").write_text(json.dumps(dict(appearance="dark",
             desktop_notifications=False, use_system_font=False, font="Monospace", font_size=12)))
         rcfile = temp / "bashrc"
         rcfile.write_text("PS1='GMUX_BENCH> '\nPROMPT_COMMAND=''\nstty -echo\n")

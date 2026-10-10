@@ -31,7 +31,7 @@ def focused(obj):
 
 appearance = os.environ.get("GMUX_REVIEW_APPEARANCE", "dark")
 with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityFixture(), AppFixture(
-    dict(restore=False, appearance=appearance, desktop_notifications=False),
+    dict(appearance=appearance, desktop_notifications=False),
     prefix="gmux-commands-", env={"GTK_A11Y": "atspi"},
 ) as fixture:
     rpc = fixture.rpc

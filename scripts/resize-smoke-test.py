@@ -35,7 +35,7 @@ def central_text(image):
 with (artifacts / "resize-smoke.log").open("w") as log:
     for scale in (1, 1.25):
         with monitor_scale(scale), AppFixture(
-            dict(appearance="dark", restore=True), prefix="gmux-resize-",
+            dict(appearance="dark"), prefix="gmux-resize-",
             env={"GTK_A11Y": "none", "GDK_DEBUG": "no-portals,no-vsync"},
             shell_script="#!/bin/sh\nexport PS1='GMUX_RESIZE> '\nstty -echo\nexec /bin/bash --noprofile --norc -i\n",
         ) as fixture:

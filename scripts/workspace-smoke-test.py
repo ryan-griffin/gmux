@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-workspaces-") as directory:
     temp = Path(directory)
     config = temp / "config/gmux"
     config.mkdir(parents=True)
-    settings = dict(appearance="dark", restore=True, desktop_notifications=False)
+    settings = dict(appearance="dark", desktop_notifications=False)
     (config / "settings.json").write_text(json.dumps(settings))
     shell = temp / "shell"
     shell.write_text("#!/bin/sh\nexport PS1='GMUX_READY> '\nexec /bin/bash --noprofile --norc -i\n")
@@ -148,8 +148,6 @@ with tempfile.TemporaryDirectory(prefix="gmux-workspaces-") as directory:
         finally:
             stop(app)
 
-        settings["restore"] = False
-        (config / "settings.json").write_text(json.dumps(settings))
         app = start(log)
         try:
             assert state()["tabs"] == []
@@ -167,8 +165,6 @@ with tempfile.TemporaryDirectory(prefix="gmux-workspaces-") as directory:
         finally:
             stop(app)
 
-        settings["restore"] = True
-        (config / "settings.json").write_text(json.dumps(settings))
         app = start(log)
         try:
             assert [t["id"] for t in state()["tabs"]] == saved_order
@@ -191,4 +187,4 @@ with tempfile.TemporaryDirectory(prefix="gmux-workspaces-") as directory:
             assert state()["active_tab"] == following["tab"]
         finally:
             stop(app)
-        print("PASS: persistent workspace catalog, flat All/No Workspace/workspace filters, saved default directories, stable membership across cd, moves without changing splits/unread state, revealing hidden panes, deletion without stopping processes, empty workspaces, disabled tab restore, and filtered session restore")
+        print("PASS: persistent workspace catalog, flat All/No Workspace/workspace filters, saved default directories, stable membership across cd, moves without changing splits/unread state, revealing hidden panes, deletion without stopping processes, empty session restart, and filtered session restore")

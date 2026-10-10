@@ -106,7 +106,7 @@ binary = args.binary or cargo_binary("gmux-daemon")
 results = []
 
 for kind in ("valid-input-scroll", "empty-lines-input"):
-    with scenario(kind), AppFixture(dict(restore=False), prefix="gmux-frontend-input-") as fixture:
+    with scenario(kind), AppFixture(prefix="gmux-frontend-input-") as fixture:
         daemon = fixture.start(binary, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         wait_for(lambda: fixture.rpc("daemon-info"))
         pane = fixture.rpc("new")["pane"]
@@ -150,7 +150,7 @@ for kind in ("valid-input-scroll", "empty-lines-input"):
             noisy.close()
             observer.close()
 
-with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture(dict(restore=False)) as fixture:
+with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture() as fixture:
     fixture.start(binary, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_for(lambda: fixture.rpc("daemon-info"))
     pane = fixture.rpc("new")["pane"]

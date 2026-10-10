@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-sidebar-search-") as directory:
     config = temp / "config/gmux"
     config.mkdir(parents=True)
     (config / "settings.json").write_text(json.dumps({
-        "appearance": "dark", "restore": True, "desktop_notifications": False,
+        "appearance": "dark", "desktop_notifications": False,
     }))
     shell = temp / "shell"
     shell.write_text("#!/bin/sh\nexec /bin/bash --noprofile --norc -i\n")

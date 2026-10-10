@@ -14,7 +14,8 @@ root = Path(__file__).resolve().parent.parent
 with AccessibilityFixture():
     for name in ("settings.json", "workspaces.json", "session.json"):
         with scenario(f"startup recovery preserves damaged {name}"), AppFixture(
-            {"restore": True}, env={"GTK_A11Y": "atspi"},
+            # A legacy opt-out must no longer bypass saved-session validation.
+            {"restore": False}, env={"GTK_A11Y": "atspi"},
         ) as fixture:
             path = fixture.config / name
             damaged = b'{"broken":'

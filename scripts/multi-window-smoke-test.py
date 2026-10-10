@@ -18,7 +18,7 @@ root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
-with AppFixture(dict(restore=False, desktop_notifications=False), prefix="gmux-multi-window-", env={"GTK_A11Y": "none"}) as fixture, (artifacts / "multi-window-smoke.log").open("w") as log:
+with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", env={"GTK_A11Y": "none"}) as fixture, (artifacts / "multi-window-smoke.log").open("w") as log:
     app = fixture.start_app(cargo_binary("gmux"), stdout=log, stderr=log)
     first = fixture.rpc("windows")["windows"][0]["id"]
     created = fixture.rpc("new", window=first, name="Original", directory=str(root))

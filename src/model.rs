@@ -148,7 +148,6 @@ pub struct Settings {
     pub show_sidebar: bool,
     pub show_pane_titles: bool,
     pub cursor_style: CursorStyle,
-    pub restore: bool,
     pub desktop_notifications: bool,
 }
 impl Default for Settings {
@@ -162,7 +161,6 @@ impl Default for Settings {
             show_sidebar: true,
             show_pane_titles: false,
             cursor_style: CursorStyle::default(),
-            restore: true,
             desktop_notifications: true,
         }
     }
