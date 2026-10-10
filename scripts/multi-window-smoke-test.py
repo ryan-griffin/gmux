@@ -88,6 +88,8 @@ with AppFixture(dict(restore=False, desktop_notifications=False), prefix="gmux-m
         wait_for(lambda: len(next(t for t in state(second)["tabs"] if t["id"] == tab)["panes"]) == 2)
         assert next(t for t in state(first)["tabs"] if t["id"] == tab)["active_pane"] == split["pane"]
         assert next(t for t in state(second)["tabs"] if t["id"] == tab)["active_pane"] == pane
+        wait_for(lambda: fixture.rpc("renderer-info", window=first, pane=split["pane"])["viewport"]["focused"],
+                 message="The newly created split did not receive keyboard focus")
         before = fixture.rpc("renderer-info", window=second, pane=pane)["viewport"]["cell_height"]
         fixture.rpc("action", window=first, name="zoom-in")
         assert fixture.rpc("renderer-info", window=second, pane=pane)["viewport"]["cell_height"] == before

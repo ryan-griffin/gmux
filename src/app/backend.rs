@@ -279,9 +279,10 @@ impl Ui {
             _ => None,
         };
         if let Some(pane) = pane
-            && self.pane(Some(pane)).is_ok()
+            && let Ok(terminal) = self.pane(Some(pane))
         {
             self.focus_pane(pane);
+            terminal.area.grab_focus();
         }
     }
     pub(super) fn mark_dirty(self: &Rc<Self>) {
