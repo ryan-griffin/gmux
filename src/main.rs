@@ -25,6 +25,9 @@ struct Cli {
     /// Open the first tab in this directory.
     #[arg(long)]
     directory: Option<PathBuf>,
+    /// Open another window connected to the same daemon.
+    #[arg(long)]
+    new_window: bool,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -173,5 +176,5 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    app::run(cli.directory)
+    app::run(cli.directory, cli.new_window)
 }

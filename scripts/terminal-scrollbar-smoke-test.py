@@ -251,7 +251,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-scrollbar-") as directory:
             finished.touch()
             state = wait_for(lambda: settled(lambda state: state["scrollbar"]["visible"]))
 
-            # A fresh frontend must receive the daemon's retained scroll position.
+            # A new window keeps the history but starts with its own scroll position.
             saved = state["scrollback"]["offset"]
             rpc("detach")
             assert app.wait(timeout=8) == 0
@@ -262,7 +262,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-scrollbar-") as directory:
             state = wait_for(lambda: settled(lambda state: state["scrollbar"]["visible"]))
             # Zoom is frontend state, so reopening also reflows the viewport.
             assert_adjustment(state)
-            assert saved > 0 and state["scrollback"]["offset"] > 0
+            assert saved > 0
+            assert state["scrollback"]["offset"] + state["scrollback"]["len"] == state["scrollback"]["total"]
             wait_for(lambda: native.frame(timeout=0.1, fresh=False).data.count(b"\xff\xff\xff\xff") > 100_000)
             bounds = native.click_color((230, 30, 45))
             wait_for(lambda: rpc("renderer-info")["window_active"])

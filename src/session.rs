@@ -64,13 +64,24 @@ pub struct TerminalSession {
     pty: Option<Pty>,
     pid: Option<u32>,
     directory: PathBuf,
-    size: (u16, u16),
+    size: PtySize,
+    cell_size: (u32, u32),
     exited: bool,
     title: PaneTitle,
     title_polled: Instant,
 }
 
 impl TerminalSession {
+    pub(crate) fn new_view(&self) -> anyhow::Result<crate::engine::EngineView> {
+        self.engine.new_view()
+    }
+    pub(crate) fn with_view<T>(
+        &mut self,
+        view: &mut crate::engine::EngineView,
+        f: impl FnOnce(&mut Engine) -> T,
+    ) -> T {
+        self.engine.with_view(view, f)
+    }
     pub(crate) fn spawn(
         id: u64,
         tab: u64,
@@ -155,7 +166,13 @@ impl TerminalSession {
             }),
             pid,
             directory,
-            size: (cols, rows),
+            size: PtySize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            cell_size: (0, 0),
             exited: false,
             title: PaneTitle::default(),
             title_polled: Instant::now(),
@@ -171,7 +188,7 @@ impl TerminalSession {
     }
 
     pub fn size(&self) -> (u16, u16) {
-        self.size
+        (self.size.cols, self.size.rows)
     }
 
     pub fn exited(&self) -> bool {
@@ -340,6 +357,7 @@ impl TerminalSession {
         self.engine.set_theme(theme)
     }
 
+    /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.
     pub fn resize(
         &mut self,
         cols: u16,
@@ -348,22 +366,27 @@ impl TerminalSession {
         ch: u32,
         width: u16,
         height: u16,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             crate::viewport::valid(cols as u64, rows as u64),
             "Invalid terminal size"
         );
-        self.engine.resize(cols, rows, cw, ch)?;
-        self.size = (cols, rows);
-        if let Some(pty) = &self.pty {
-            pty.master.resize(PtySize {
-                cols,
-                rows,
-                pixel_width: width,
-                pixel_height: height,
-            })?;
+        let size = PtySize {
+            cols,
+            rows,
+            pixel_width: width,
+            pixel_height: height,
+        };
+        if self.size == size && self.cell_size == (cw, ch) {
+            return Ok(false);
         }
-        Ok(())
+        self.engine.resize(cols, rows, cw, ch)?;
+        if let Some(pty) = &self.pty {
+            pty.master.resize(size)?;
+        }
+        self.size = size;
+        self.cell_size = (cw, ch);
+        Ok(true)
     }
 
     pub fn snapshot(&mut self) -> anyhow::Result<ScreenSnapshot<'_>> {
@@ -388,9 +411,6 @@ impl TerminalSession {
     }
     pub fn find_advance(&mut self, previous: bool) {
         self.engine.find_advance(previous);
-    }
-    pub(crate) fn find_pending(&self) -> bool {
-        self.engine.find_pending()
     }
     pub fn find_state(&self) -> crate::search::FindState {
         self.engine.find_state()
@@ -676,7 +696,13 @@ mod tests {
         ",
         );
         wait_for(|| notification(&mut session, "ready"));
-        session.resize(91, 37, 8, 16, 728, 592).unwrap();
+        assert!(session.resize(91, 37, 8, 16, 728, 592).unwrap());
+        assert!(!session.resize(91, 37, 8, 16, 728, 592).unwrap());
+        // Pixel and cell dimensions still reach the terminal when the grid
+        // has not changed, as happens with zoom or fractional scaling.
+        assert!(session.resize(91, 37, 9, 18, 819, 666).unwrap());
+        let size = session.pty.as_ref().unwrap().master.get_size().unwrap();
+        assert_eq!((size.pixel_width, size.pixel_height), (819, 666));
         session.send_text("go", true).unwrap();
         wait_for(|| notification(&mut session, "changed-directory"));
         assert_eq!(

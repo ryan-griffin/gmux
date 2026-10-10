@@ -5,10 +5,10 @@ impl Ui {
     pub(super) fn new(
         app: &adw::Application,
         directory: Option<PathBuf>,
+        owner: std::rc::Weak<Windows>,
+        id: u64,
+        endpoint: ipc::Endpoint,
     ) -> anyhow::Result<Rc<Self>> {
-        gio::resources_register_include!("gmux.gresource")?;
-        gtk::IconTheme::for_display(&gdk::Display::default().unwrap())
-            .add_resource_path("/dev/gmux/Gmux/icons");
         let settings = Rc::new(RefCell::new(storage::load::<Settings>("settings.json")?));
         let desktop_settings = font::desktop_settings();
         if let Some(desktop) = &desktop_settings {
@@ -16,25 +16,24 @@ impl Ui {
         }
         apply_appearance(&settings.borrow());
         let wake = ipc::Wake::new()?;
-        let server = ipc::Server::start_at(ipc::companion_path(".ui"), wake.clone())?;
-        let mut sessions = SessionManager::connect(wake.clone())?;
-        let saved_session = if let Some(directory) = directory {
+        let mut sessions = SessionManager::connect_at(endpoint.clone(), wake.clone())?;
+        let initial: CommandReply = if let Some(directory) = directory {
             // Initial setup completes before presenting a window. Runtime commands use the worker.
             let reply: CommandReply =
-                serde_json::from_value(ipc::call(InternalRequest::Command {
+                serde_json::from_value(endpoint.call(InternalRequest::Command {
                     command: Command::New {
                         directory: Some(directory),
                         name: None,
                         workspace: None,
                     },
                 })?)?;
-            sessions.install_metadata(reply.metadata);
-            reply.session
+            reply
         } else {
-            sessions.saved_session()?
+            serde_json::from_value(endpoint.call(InternalRequest::State)?)?
         };
-        let catalog = storage::load_catalog()?;
-        let session = saved_session;
+        sessions.install_metadata(initial.metadata);
+        let catalog = initial.catalog;
+        let session = initial.session;
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Gmux")
@@ -244,18 +243,37 @@ impl Ui {
             changing: Cell::new(false),
             dirty: Cell::new(false),
             save_source: RefCell::new(None),
-            server,
-            backend: ipc::Client::new(wake.clone()),
+            owner,
+            id,
+            revision: Cell::new(initial.revision),
+            detaching: Cell::new(false),
+            backend: endpoint.client(wake.clone()),
             pending: RefCell::new(HashMap::new()),
             command_count: Cell::new(0),
             command_exits: RefCell::new(HashSet::new()),
             keyboard,
-            wake: wake.clone(),
             update_source: RefCell::new(None),
+            branch_source: RefCell::new(None),
+            theme_handler: RefCell::new(None),
             branches: BranchWorker::new(wake.clone()),
             branch_cache: RefCell::new(BranchCache::default()),
             branch_monitors: RefCell::new(HashMap::new()),
             repository_monitors: RefCell::new(HashMap::new()),
+        });
+        let weak = Rc::downgrade(&ui);
+        ui.window.connect_is_active_notify(move |window| {
+            if let Some(ui) = weak.upgrade() {
+                if let Err(error) = ui.sessions.borrow().set_focused(window.is_active()) {
+                    ui.message(&error.to_string());
+                }
+                if window.is_active() {
+                    ui.synced_focus.set((u64::MAX, None));
+                    ui.sync_focus();
+                    if let Some(pane) = ui.active_pane() {
+                        ui.mark_read(pane.id);
+                    }
+                }
+            }
         });
         ui.install_actions();
         ui.refresh_workspace_ui();
@@ -281,7 +299,7 @@ impl Ui {
             });
         }
         let weak = Rc::downgrade(&ui);
-        adw::StyleManager::default().connect_dark_notify(move |_| {
+        let handler = adw::StyleManager::default().connect_dark_notify(move |_| {
             if let Some(ui) = weak.upgrade() {
                 for tab in ui.tabs.borrow().iter() {
                     for pane in tab.panes.values() {
@@ -290,6 +308,7 @@ impl Ui {
                 }
             }
         });
+        *ui.theme_handler.borrow_mut() = Some(handler);
         let weak = Rc::downgrade(&ui);
         ui.sidebar.connect_row_selected(move |_, row| {
             if let (Some(ui), Some(row)) = (weak.upgrade(), row)
@@ -415,15 +434,6 @@ impl Ui {
             }
             glib::Propagation::Stop
         });
-        for signal in [libc::SIGTERM, libc::SIGINT] {
-            let weak = Rc::downgrade(&ui);
-            glib_unix::unix_signal_add_local(signal, move || {
-                if let Some(ui) = weak.upgrade() {
-                    ui.detach_frontend();
-                }
-                glib::ControlFlow::Break
-            });
-        }
         for saved in session.tabs {
             if let Err(error) = ui.restore_tab(saved, false) {
                 ui.message(&format!("Could not restore a tab: {error}"));
@@ -469,8 +479,8 @@ impl Ui {
                 let updates = ui.sessions.borrow_mut().poll();
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 if ui.sessions.borrow().disconnected() {
-                    ui.app.quit();
-                    return glib::ControlFlow::Continue;
+                    ui.close_window();
+                    return glib::ControlFlow::Break;
                 }
                 for (id, update) in updates {
                     if update.exited && ui.command_count.get() > 0 {
@@ -508,102 +518,20 @@ impl Ui {
                     ui.refresh_metadata();
                 }
                 ui.update_branches();
-                for _ in 0..16 {
-                    let Ok(request) = ui.server.receiver.try_recv() else {
-                        if ui.search.is_search_mode() {
-                            ui.update_search_count();
-                        }
-                        return glib::ControlFlow::Continue;
-                    };
-                    let method = request.body["method"].as_str().unwrap_or("");
-                    let action_command = if method == "action" {
-                        let name = request.body["name"].as_str().unwrap_or("");
-                        if ui
-                            .window
-                            .lookup_action(name)
-                            .is_some_and(|a| a.is_enabled())
-                        {
-                            match name {
-                                "new" => Some(Command::New {
-                                    directory: Some(ui.default_directory()),
-                                    name: None,
-                                    workspace: Some(ui.selected_workspace()),
-                                }),
-                                "split-right" | "split-down" => {
-                                    ui.active_pane().map(|pane| Command::Split {
-                                        pane: Some(pane.id),
-                                        down: name == "split-down",
-                                    })
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(command) = action_command {
-                        let reply = request.reply;
-                        ui.command(command, move |_, result| {
-                            let response = result
-                                .map(|_| json!({"ok":true}))
-                                .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                            let _ = reply.try_send(response);
-                        });
-                        continue;
-                    }
-                    if gmux::control::Command::supports(method) {
-                        let reply = request.reply;
-                        let command = match serde_json::from_value(request.body) {
-                            Ok(command) => command,
-                            Err(error) => {
-                                let _ = reply.try_send(json!({"error":error.to_string()}));
-                                continue;
-                            }
-                        };
-                        ui.command(command, move |_, result| {
-                            let response = result
-                                .and_then(|result| Ok(serde_json::to_value(result)?))
-                                .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                            let _ = reply.try_send(response);
-                        });
-                        continue;
-                    }
-                    if method == "read" {
-                        let pane = match backend::RequestTargets::decode(&request.body)
-                            .and_then(|targets| ui.pane(targets.pane))
-                        {
-                            Ok(pane) => pane.id,
-                            Err(error) => {
-                                let _ = request.reply.try_send(json!({"error":error.to_string()}));
-                                continue;
-                            }
-                        };
-                        let body = InternalRequest::Read { pane: Some(pane) };
-                        let reply = request.reply;
-                        ui.request(body, move |_, result| {
-                            let _ = reply.try_send(
-                                result.unwrap_or_else(|e| json!({"error":e.to_string()})),
-                            );
-                        });
-                        continue;
-                    }
-                    let response = ui
-                        .handle_request(request.body)
-                        .unwrap_or_else(|error| json!({"error":error.to_string()}));
-                    if ui.dirty.replace(false) {
-                        ui.save_session();
-                    }
-                    let _ = request.reply.try_send(response);
+                let state = ui.sessions.borrow_mut().take_state();
+                if let Some(state) = state
+                    && let Err(error) = ui.apply_shared(state)
+                {
+                    ui.message(&error.to_string());
                 }
-                // Requests already queued when the fd was drained need another turn.
-                ui.wake.notify();
+                if ui.search.is_search_mode() {
+                    ui.update_search_count();
+                }
                 glib::ControlFlow::Continue
             });
         *ui.update_source.borrow_mut() = Some(source);
         let weak = Rc::downgrade(&ui);
-        glib::timeout_add_local(Duration::from_secs(30), move || {
+        let source = glib::timeout_add_local(Duration::from_secs(30), move || {
             let Some(ui) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
@@ -611,7 +539,94 @@ impl Ui {
             ui.refresh_unwatched_branches();
             glib::ControlFlow::Continue
         });
+        *ui.branch_source.borrow_mut() = Some(source);
         Ok(ui)
+    }
+    pub(super) fn handle_control(self: &Rc<Self>, request: ipc::Request) {
+        let ui = self;
+        let method = request.body["method"].as_str().unwrap_or("");
+        let action_command = if method == "action" {
+            let name = request.body["name"].as_str().unwrap_or("");
+            if ui
+                .window
+                .lookup_action(name)
+                .is_some_and(|a| a.is_enabled())
+            {
+                match name {
+                    "new" => Some(Command::New {
+                        directory: Some(ui.default_directory()),
+                        name: None,
+                        workspace: Some(ui.selected_workspace()),
+                    }),
+                    "split-right" | "split-down" => ui.active_pane().map(|pane| Command::Split {
+                        pane: Some(pane.id),
+                        down: name == "split-down",
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(command) = action_command {
+            let reply = request.reply;
+            ui.command(command, move |_, result| {
+                let response = result
+                    .map(|_| json!({"ok":true}))
+                    .unwrap_or_else(|e| json!({"error":e.to_string()}));
+                let _ = reply.try_send(response);
+            });
+            return;
+        }
+        if gmux::control::Command::supports(method) {
+            let reply = request.reply;
+            let command = match serde_json::from_value(request.body) {
+                Ok(command) => command,
+                Err(error) => {
+                    let _ = reply.try_send(json!({"error":error.to_string()}));
+                    return;
+                }
+            };
+            ui.command(command, move |_, result| {
+                let response = result
+                    .and_then(|result| Ok(serde_json::to_value(result)?))
+                    .unwrap_or_else(|e| json!({"error":e.to_string()}));
+                let _ = reply.try_send(response);
+            });
+            return;
+        }
+        if method == "read" {
+            let pane = match backend::RequestTargets::decode(&request.body)
+                .and_then(|targets| ui.pane(targets.pane))
+            {
+                Ok(pane) => pane,
+                Err(error) => {
+                    let _ = request.reply.try_send(json!({"error":error.to_string()}));
+                    return;
+                }
+            };
+            if ui.sessions.borrow().is_visible(pane.id) {
+                let _ = request.reply.try_send(json!({"text":pane.text()}));
+                return;
+            }
+            let body = InternalRequest::Read {
+                pane: Some(pane.id),
+            };
+            let reply = request.reply;
+            ui.request(body, move |_, result| {
+                let _ = reply.try_send(result.unwrap_or_else(|e| json!({"error":e.to_string()})));
+            });
+            return;
+        }
+        let response = ui
+            .handle_request(request.body)
+            .unwrap_or_else(|error| json!({"error":error.to_string()}));
+        if ui.dirty.replace(false) {
+            ui.save_session();
+        }
+        let _ = request.reply.try_send(response);
     }
 }
 
@@ -627,7 +642,23 @@ fn main_menu_button(tabs: &gio::Menu) -> gtk::MenuButton {
     let fullscreen = gio::Menu::new();
     fullscreen.append(Some("_Fullscreen"), Some("win.fullscreen"));
     menu.append_section(None, &fullscreen);
-    menu.append_section(None, tabs);
+    // Mirror tab choices into the creation group, keeping New Window out of
+    // the specialized New Tab dropdowns and retaining live workspace updates.
+    let creation = gio::Menu::new();
+    for index in 0..tabs.n_items() {
+        creation.append_item(&gio::MenuItem::from_model(tabs, index));
+    }
+    creation.append(Some("New _Window"), Some("win.new-window"));
+    let updated = creation.clone();
+    tabs.connect_items_changed(move |tabs, position, removed, added| {
+        for _ in 0..removed {
+            updated.remove(position);
+        }
+        for index in position..position + added {
+            updated.insert_item(index, &gio::MenuItem::from_model(tabs, index));
+        }
+    });
+    menu.append_section(None, &creation);
     let tools = gio::Menu::new();
     tools.append(Some("_Manage Workspaces…"), Some("win.manage-workspaces"));
     tools.append(Some("_Commands…"), Some("win.palette"));

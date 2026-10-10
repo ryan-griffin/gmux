@@ -5,6 +5,34 @@ shells, commands, terminal modes, scrollback, and pane IDs running. Opening Gmux
 again reconnects to those sessions. A frontend crash also leaves them running.
 Closing a pane still terminates that pane, and an exited shell removes its pane.
 
+Each window has a separate frontend connection. Tab creation, closure, names,
+split topology, workspace catalog and membership, unread state, and PTY output
+are shared. The daemon broadcasts versioned layout snapshots after mutations
+and process exits, encoding each broadcast once for all connections.
+A window ignores snapshots older than the latest revision it has applied,
+including delayed command replies. Commands that create tabs or
+panes reveal their results in the requesting window.
+
+Active tabs and panes, workspace filters, sidebar controls, split ratios, zoom,
+terminal search and selection, scroll position, fullscreen, and window dimensions
+belong to each window. Each connection has its own viewport subscriptions,
+search worker state, tracked scroll anchor and selection, paste assembly, and
+clipboard replies. One terminal engine and PTY serve every view of a pane.
+Ghostty render dirtiness has one consumer, so views share its normal render cache
+and compare output against their own last sent cells. Synchronized output holds
+a separate frozen viewport for each existing view.
+
+The most recently focused client viewing a pane supplies its PTY dimensions.
+Other clients remember their requested dimensions and apply them when focused.
+Repeated requests with unchanged grid, cell, and pixel dimensions skip terminal
+and PTY resizing.
+Input from every client reaches the same PTY. Terminal applications still have
+one grid size; a differently sized window renders that shared grid in its own
+allocation. A detached window releases only its connection and views.
+Presentation saves retain defaults for the next window and never replace shared
+tab topology or another live window's choices. A new window starts at the bottom
+of terminal history with fresh search and selection state.
+
 Use **Quit Gmux** in the main menu, Ctrl+Shift+Q, or `gmux quit` to stop the daemon
 and its terminals. The GUI confirms Quit when a foreground job is running. The
 CLI command is an explicit shutdown and does not show a dialog. A layout or scrollback save
@@ -186,8 +214,8 @@ tests. Explicitly closing a session or dropping its owner terminates the process
 ## Frontend transport
 
 The daemon owns `$GMUX_SOCKET`, normally `$XDG_RUNTIME_DIR/gmux.sock`. Its
-`.stream` companion carries one persistent frontend connection; `.ui` routes
-GUI socket methods to the attached frontend. A `.lock` file serializes daemon
+`.stream` companion accepts independent persistent frontend connections; `.ui`
+routes GUI socket methods through the application's window registry. A `.lock` file serializes daemon
 startup, and sockets have owner-only permissions. The frontend and daemon use
 one protocol version and reject mismatched binaries. Build and install both
 binaries from the same revision. Gmux does not maintain older protocol versions
@@ -195,6 +223,21 @@ or migrate older saved formats during pre-release development.
 The protocol version is defined in [`src/transport.rs`](../src/transport.rs).
 When an upgrade changes it, quit the existing daemon before launching the
 matching rebuilt binaries.
+
+`gmux rpc '{"method":"windows"}'` lists window IDs. GUI requests can include a
+`window` ID, for example `{"method":"list","window":2}`. Requests without it
+target the active window, falling back to the newest remaining window.
+`{"method":"new-window"}` creates a window. Unknown window IDs return an error.
+Reading a visible pane returns that window's viewport, including its scroll
+position. Hidden panes and headless reads use the daemon's live bottom viewport.
+
+`ipc::Endpoint` keeps a daemon's control and stream paths together.
+`SessionManager::connect_at` attaches to an existing endpoint without launching
+a daemon or loading its layout and workspace files locally. Windows obtain
+those objects from daemon snapshots and resolve implicit command targets locally
+before sending requests. This supports future forwarded or remote transports
+without coupling live window choices to the daemon transport. Saved presentation
+fields supply startup defaults. The current launcher still connects to the local daemon; remote connection configuration is not implemented.
 
 Clipboard and text pastes use messages of at most 16 KiB of UTF-8 text. The
 daemon assembles a complete paste of up to 4 MiB before asking Ghostty to encode
@@ -269,8 +312,9 @@ file in the same directory. Saves flush and sync the temporary file, rename it
 over the destination, then sync the directory. Failed writes remove their
 temporary files. Published files have owner-only read and write permissions.
 
-Find scans all retained rows in batches of 64 and yields between batches. It
-joins soft-wrapped rows and preserves hard line breaks. A bounded unmatched
+Find scans all retained rows in batches of 64 on the viewport update schedule
+and yields between batches. It joins soft-wrapped rows and preserves hard line
+breaks. A bounded unmatched
 suffix carries queries across rows and scan batches, including wide characters.
 Output and resize invalidate results for a fresh scan. Navigation sends the
 viewport to an offscreen match. Selection endpoints use Ghostty tracked references and survive

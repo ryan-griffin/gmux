@@ -9,3 +9,8 @@ Categories=GNOME;GTK;System;TerminalEmulator;
 Keywords=terminal;shell;workspace;agent;ghostty;
 StartupNotify=true
 StartupWMClass=dev.gmux.Gmux
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=gmux --new-window

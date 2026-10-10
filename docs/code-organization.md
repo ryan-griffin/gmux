@@ -7,18 +7,22 @@ pattern and keeps UI types out of the daemon.
 
 ## GTK application
 
-`src/app.rs` contains `Ui`, `Tab`, startup and shutdown cleanup, search feedback,
-and notification handling. Its child modules group the larger workflows.
+`src/app.rs` contains the `Windows` registry, per-window `Ui` and `Tab` objects,
+startup and shutdown cleanup, search feedback, and notification handling. The
+registry owns the UI socket and routes requests to a selected window. Its child modules group the larger workflows.
+Application callbacks hold weak references to the registry. Resources and icon
+paths register once at startup; each window removes its update and branch timers
+and disconnects its global theme callback when dropped.
 
 | Module | Responsibility |
 | --- | --- |
 | `app/window.rs` | Construct the window, widgets, menus, and update callbacks. |
-| `app/tabs.rs` | Create and restore tabs, manage pane layouts, and synchronize focus. |
+| `app/tabs.rs` | Create and restore tabs, manage pane layouts, and report the active window's focus. |
 | `app/split.rs` | Allocate split panes from saved proportions without cumulative rounding. |
 | `app/actions.rs` | Register window actions and keyboard accelerators. |
 | `app/dialogs.rs` | Close and Quit confirmation, folder selection, tab naming, and the command palette. |
 | `app/preferences.rs` | Preferences, settings persistence, and terminal settings updates. |
-| `app/backend.rs` | Queue backend requests, reconcile returned state, save presentation, and handle UI socket methods. |
+| `app/backend.rs` | Queue backend requests, reconcile versioned shared state while preserving window choices, save presentation, and handle UI socket methods. |
 | `app/branches.rs` | Repository watches, branch lookup scheduling, and branch labels. |
 | `app/workspaces.rs` | Workspace dialogs, filters, menus, and sidebar search. |
 

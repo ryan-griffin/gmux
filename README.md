@@ -34,9 +34,20 @@ Pass another installation prefix as the script's first argument.
 
 Closing the window keeps panes and commands running in a headless daemon. Reopen Gmux to reconnect to the same terminals. Use **Quit Gmux**, Ctrl+Shift+Q, or `gmux quit` to stop them.
 
+Open another window with **New Window**, Ctrl+Shift+N, or `gmux --new-window`.
+After installation, GNOME also offers New Window in the app icon's context menu
+and opens another window when you middle-click the icon.
+Windows share tabs, split topology, tab names, workspace membership, unread alerts,
+and live terminals. You can type into the same pane from either window.
+Each window keeps its own active tab and pane, workspace filter, sidebar search
+and visibility, split proportions, zoom, terminal search, selection, scroll
+position, and window size. The most recently focused window viewing a pane
+controls its PTY size. Closing a window detaches that window; Quit stops all
+windows and terminals. Saved presentation supplies defaults for the next window.
+
 Create tabs with the plus button. Manage Workspaces in the main menu lets you add, edit, or remove saved workspaces. The sidebar filter also offers workspace management. Sidebar visibility is remembered when you reopen Gmux. Right-click a tab to rename it, move it to an existing or new workspace, or remove its workspace membership; middle-click to close it. Deleting a workspace keeps its tabs open and unassigned. Exiting a shell closes its pane.
 
-The main menu stays above the sidebar and creates tabs, including in a chosen directory or workspace. F10 reveals the sidebar and opens the menu. New Tab in Workspace lists saved workspaces and is disabled when none exist. Fullscreen is a checked item. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
+The main menu stays above the sidebar and groups New Window with tab creation, including tabs in a chosen directory or workspace. F10 reveals the sidebar and opens the menu. New Tab in Workspace lists saved workspaces and is disabled when none exist. The New Tab dropdowns contain only tab creation actions. Fullscreen is a checked item. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
 
 The three-dot Terminal Actions menu in the content header contains Rename Tab, Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Rename Tab changes the active tab's name. To remove a custom name, choose Remove Tab Name beside Rename Tab in the Terminal Actions menu or the tab's context menu. The tab then follows the active pane's title again. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both close actions ask for confirmation when processes are running. This menu is available with the sidebar hidden.
 
@@ -44,6 +55,7 @@ Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close
 
 | Action | Shortcut |
 | --- | --- |
+| New window | Ctrl+Shift+N |
 | New tab | Ctrl+Shift+T |
 | New tab in directory | Ctrl+Shift+O |
 | Split right / down | Ctrl+Shift+D / Ctrl+Shift+E |

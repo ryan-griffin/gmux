@@ -30,6 +30,25 @@ The headless smoke tests need Python 3.12+, PyGObject, GdkPixbuf 2 introspection
 data, and its SVG loader. They use real PTYs and private settings and sockets.
 They require no display or running Gmux instance.
 
+`multi-client` checks two connections sharing input, output, layouts, and
+workspaces while keeping scrolling, search, selection, and clipboard replies
+independent. It also checks PTY sizing and disconnect isolation. `multi-window`
+uses the native Wayland fixture to check CLI/action window creation, shared tab
+and split changes, independent navigation and zoom, and closing individual
+windows without stopping their shells. It also launches the checked-in desktop
+file's New Window action through GIO, checking its label and reuse of the same
+daemon and terminals. GNOME uses this action for the app icon's context menu and
+middle-click.
+
+The `main-menu` suite activates New Window through the visible menu item, its
+W mnemonic, Ctrl+Shift+N from a focused terminal, and Enter in the command palette.
+It checks availability in an empty window and the collapsed sidebar overlay,
+preservation of the source window's navigation, and reuse of existing terminals.
+New Window must stay out of the New Tab dropdowns. The `commands` suite checks
+its search terms, enabled state, accelerator label, and matching help in the
+Application shortcut section. Run the menu suite in light, dark, and high-contrast
+appearances using the options below.
+
 The native suite and application benchmark also need:
 
 - `dbus-run-session`, Mutter with `--headless`, `--no-x11`, and

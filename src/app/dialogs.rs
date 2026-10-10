@@ -85,13 +85,23 @@ impl Ui {
         });
     }
     pub(super) fn detach_frontend(self: &Rc<Self>) {
+        if self.detaching.replace(true) {
+            return;
+        }
         self.save_session();
         self.request(InternalRequest::Hello, |ui, result| {
             if let Err(error) = result {
                 eprintln!("Could not finish saving layout: {error}");
             }
-            ui.app.quit();
+            ui.close_window();
         });
+    }
+    pub(super) fn close_window(&self) {
+        self.sessions.borrow_mut().clear();
+        self.window.destroy();
+        if let Some(owner) = self.owner.upgrade() {
+            owner.windows.borrow_mut().retain(|ui| ui.id != self.id);
+        }
     }
     pub(super) fn open_folder(self: &Rc<Self>) {
         let dialog = gtk::FileDialog::builder()
@@ -456,6 +466,7 @@ impl Ui {
             (
                 "Application",
                 &[
+                    ("New Window", "new-window"),
                     ("Main Menu", "main-menu"),
                     ("Commands…", "palette"),
                     ("Preferences", "preferences"),

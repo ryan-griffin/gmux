@@ -16,6 +16,11 @@ pub const COMMANDS: &[Command] = &[
         keywords: "open folder path project",
     },
     Command {
+        title: "New Window",
+        action: "new-window",
+        keywords: "open another window same terminals",
+    },
+    Command {
         title: "Add Workspace…",
         action: "new-workspace",
         keywords: "create new group project",

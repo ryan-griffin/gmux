@@ -24,8 +24,15 @@ its focus ring and error state.
 
 ## Menus and focus
 
-The main menu and both New Tab dropdowns share a menu model with live workspace
-choices. Fullscreen uses a stateful action whose checkmark follows the window.
+The main menu and both New Tab dropdowns share tab creation choices with live
+workspace updates. New Window belongs to the main menu's creation group; the
+specialized New Tab dropdowns contain only tab actions. Its label has no ellipsis
+because it opens a window immediately, and its W mnemonic is distinct from the
+other primary-menu access keys. Fullscreen uses a stateful action whose checkmark
+follows the window.
+The desktop launcher advertises the standard `new-window` action with the label
+New Window and runs `gmux --new-window`. GNOME uses it for the app icon's context
+menu and middle-click, keeping window creation on the same CLI path.
 The main menu stays above the sidebar, including in the narrow sidebar overlay.
 The separate Terminal Actions menu includes Rename Tab and
 Close Tab for the active tab, and split, Find, zoom, and Close Pane for its active
@@ -87,6 +94,11 @@ explains that Ctrl+Shift+W closes the window when the empty state is shown.
 Action labels use the same wording and capitalization in the command palette
 and shortcut dialog. Copy Selection clarifies the terminal's Copy action, and
 the checked Fullscreen menu item names the setting rather than its toggle action.
+New Window appears in the Application shortcut section and uses Ctrl+Shift+N,
+following the terminal's existing Shift-modified creation shortcuts. Its menu,
+palette, and help labels use the registered action and accelerator. Native checks
+exercise the menu item, W mnemonic, terminal shortcut, and palette activation,
+including an empty window and the collapsed sidebar overlay.
 
 GTK 4.22 and libadwaita 1.9 feature levels are declared in
 [`Cargo.toml`](../Cargo.toml). The binaries deny deprecated Rust API use except
@@ -115,6 +127,7 @@ menu, focus, preferences, and accessibility checks.
 
 - [GNOME HIG: UI styling](https://developer.gnome.org/hig/guidelines/ui-styling.html)
 - [GNOME HIG: menus](https://developer.gnome.org/hig/patterns/controls/menus.html)
+- [GNOME HIG: keyboard interaction](https://developer.gnome.org/hig/guidelines/keyboard.html)
 - [GNOME HIG: dialogs](https://developer.gnome.org/hig/patterns/feedback/dialogs.html)
 - [GNOME HIG: text fields](https://developer.gnome.org/hig/patterns/controls/text-fields.html)
 - [GNOME HIG: writing style](https://developer.gnome.org/hig/guidelines/writing-style.html)

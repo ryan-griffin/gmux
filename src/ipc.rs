@@ -78,6 +78,28 @@ pub fn socket_path() -> PathBuf {
                 .join("gmux.sock")
         })
 }
+
+/// Control and streaming addresses for one daemon. A forwarded daemon can use
+/// different socket paths without changing the session or window model.
+#[derive(Clone)]
+pub struct Endpoint {
+    pub control: PathBuf,
+    pub stream: PathBuf,
+}
+impl Endpoint {
+    pub fn local() -> Self {
+        Self {
+            control: socket_path(),
+            stream: companion_path(".stream"),
+        }
+    }
+    pub fn call(&self, request: impl serde::Serialize) -> anyhow::Result<Value> {
+        call_at(&self.control, request)
+    }
+    pub fn client(&self, wake: Wake) -> Client {
+        Client::at(self.control.clone(), wake)
+    }
+}
 impl Server {
     pub fn start_at(path: PathBuf, wake: Wake) -> anyhow::Result<Self> {
         if UnixStream::connect(&path).is_ok() {

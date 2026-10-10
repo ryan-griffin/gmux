@@ -34,6 +34,12 @@ typedef struct {
 } GmuxFrame;
 
 typedef struct GmuxEngine GmuxEngine;
+typedef struct GmuxView GmuxView;
+// Per-frontend rendering, scroll anchors, and selections over one terminal.
+GmuxView *gmux_engine_view_new(GmuxEngine *engine);
+void gmux_engine_view_free(GmuxView *view);
+void gmux_engine_view_enter(GmuxEngine *engine, GmuxView *view);
+void gmux_engine_view_leave(GmuxEngine *engine, GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
 // Called synchronously; true accepts all borrowed bytes, false aborts formatting.

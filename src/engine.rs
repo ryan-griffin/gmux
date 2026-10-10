@@ -107,7 +107,85 @@ pub struct Engine {
     find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
 }
+
+/// Presentation state for one client, independent of the PTY and terminal modes.
+pub(crate) struct EngineView {
+    raw: NonNull<GmuxView>,
+    held_frame: Frame,
+    held_cells: Vec<Cell>,
+    find: crate::search::HistorySearch,
+    find_row: Vec<Cell>,
+}
+impl EngineView {
+    pub(crate) fn find_pending(&self) -> bool {
+        self.find.pending || self.find.dirty
+    }
+    pub(crate) fn invalidate(&mut self) {
+        self.find.invalidate();
+    }
+}
+/// Plain text for the displayed grid, with wide-cell continuations omitted.
+pub(crate) fn viewport_text(frame: Frame, cells: &[Cell]) -> String {
+    let mut text = String::with_capacity(cells.len());
+    for (index, row) in cells.chunks(frame.cols as usize).enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        let start = text.len();
+        for cell in row {
+            if cell.flags & 64 != 0 {
+                continue;
+            }
+            let glyph = cell.text();
+            text.push_str(if glyph.is_empty() { " " } else { glyph });
+        }
+        text.truncate(start + text[start..].trim_end().len());
+    }
+    text.truncate(text.trim_end().len());
+    text
+}
+impl Drop for EngineView {
+    fn drop(&mut self) {
+        unsafe { gmux_engine_view_free(self.raw.as_ptr()) }
+    }
+}
 impl Engine {
+    pub(crate) fn new_view(&self) -> anyhow::Result<EngineView> {
+        Ok(EngineView {
+            raw: NonNull::new(unsafe { gmux_engine_view_new(self.raw.as_ptr()) })
+                .ok_or_else(|| anyhow::anyhow!("Could not create terminal view"))?,
+            find: crate::search::HistorySearch::default(),
+            find_row: Vec::new(),
+            held_frame: Frame::default(),
+            held_cells: Vec::new(),
+        })
+    }
+    pub(crate) fn with_view<T>(
+        &mut self,
+        view: &mut EngineView,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        unsafe { gmux_engine_view_enter(self.raw.as_ptr(), view.raw.as_ptr()) }
+        self.swap_view(view);
+        let held = self.mode(2026);
+        if held {
+            view.held_cells.resize(self.cells.len(), Cell::default());
+            std::mem::swap(&mut self.cells, &mut view.held_cells);
+            std::mem::swap(&mut self.frame, &mut view.held_frame);
+        }
+        let result = f(self);
+        if held {
+            std::mem::swap(&mut self.cells, &mut view.held_cells);
+            std::mem::swap(&mut self.frame, &mut view.held_frame);
+        }
+        self.swap_view(view);
+        unsafe { gmux_engine_view_leave(self.raw.as_ptr(), view.raw.as_ptr()) }
+        result
+    }
+    fn swap_view(&mut self, view: &mut EngineView) {
+        std::mem::swap(&mut self.find, &mut view.find);
+        std::mem::swap(&mut self.find_row, &mut view.find_row);
+    }
     pub(crate) fn dimensions(&self) -> (u16, u16) {
         self.size
     }
@@ -420,23 +498,7 @@ impl Engine {
     }
     pub fn text(&mut self) -> anyhow::Result<String> {
         self.snapshot()?;
-        let mut text = String::with_capacity(self.cells.len());
-        for (index, row) in self.cells.chunks(self.frame.cols as usize).enumerate() {
-            if index > 0 {
-                text.push('\n');
-            }
-            let start = text.len();
-            for cell in row {
-                if cell.flags & 64 != 0 {
-                    continue;
-                }
-                let glyph = cell.text();
-                text.push_str(if glyph.is_empty() { " " } else { glyph });
-            }
-            text.truncate(start + text[start..].trim_end().len());
-        }
-        text.truncate(text.trim_end().len());
-        Ok(text)
+        Ok(viewport_text(self.frame, &self.cells))
     }
     pub fn mouse(
         &mut self,
@@ -475,6 +537,88 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_views_share_output_but_keep_scroll_selection_and_search() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(30, 3, 8, 16).unwrap();
+        engine.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut first = engine.new_view().unwrap();
+        let mut second = engine.new_view().unwrap();
+        engine.with_view(&mut first, |engine| {
+            engine.scroll_to(0);
+            engine.select((0, 0), (2, 0)).unwrap();
+            engine.find("one");
+            while engine.find_pending() {
+                engine.poll_find();
+            }
+            assert!(engine.text().unwrap().starts_with("one"));
+            assert_eq!(engine.copy().unwrap(), "one");
+        });
+        engine.with_view(&mut second, |engine| {
+            assert!(engine.text().unwrap().contains("five"));
+            assert!(engine.selection().is_none());
+            assert_eq!(engine.find_state().total, 0);
+        });
+        engine.write(b"\r\nsix");
+        first.invalidate();
+        second.invalidate();
+        // A normal snapshot can consume Ghostty's dirty flags before either client.
+        assert!(engine.text().unwrap().contains("six"));
+        engine.with_view(&mut second, |engine| {
+            assert!(engine.text().unwrap().contains("six"));
+        });
+        engine.with_view(&mut first, |engine| {
+            assert!(engine.text().unwrap().starts_with("one"));
+            assert_eq!(engine.copy().unwrap(), "one");
+            while engine.find_pending() {
+                engine.poll_find();
+            }
+            assert_eq!(engine.find_state().total, 1);
+        });
+        engine.resize(20, 4, 8, 16).unwrap();
+        engine.with_view(&mut first, |engine| {
+            assert_eq!(engine.copy().unwrap(), "one")
+        });
+        // Tracked view references can be freed after their terminal disappears.
+        drop(engine);
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn synchronized_output_holds_each_clients_own_viewport() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(20, 3, 8, 16).unwrap();
+        engine.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut first = engine.new_view().unwrap();
+        let mut second = engine.new_view().unwrap();
+        let earlier = engine.with_view(&mut first, |engine| {
+            engine.scroll_to(0);
+            engine.text().unwrap()
+        });
+        let later = engine.with_view(&mut second, |engine| engine.text().unwrap());
+        engine.write(b"\x1b[?2026h\r\x1b[2Kchanged");
+        let mut attached_during_hold = engine.new_view().unwrap();
+        engine.with_view(&mut attached_during_hold, |engine| {
+            assert_eq!(engine.text().unwrap(), later)
+        });
+        for _ in 0..2 {
+            engine.with_view(&mut first, |engine| {
+                assert_eq!(engine.text().unwrap(), earlier)
+            });
+            engine.with_view(&mut second, |engine| {
+                assert_eq!(engine.text().unwrap(), later)
+            });
+        }
+        engine.write(b"\x1b[?2026l");
+        engine.with_view(&mut second, |engine| {
+            assert!(engine.text().unwrap().contains("changed"))
+        });
+        engine.with_view(&mut first, |engine| {
+            assert_eq!(engine.text().unwrap(), earlier)
+        });
+    }
 
     fn rendered_history(engine: &mut Engine) -> Vec<(String, [u8; 3], [u8; 3], u8)> {
         engine.snapshot().unwrap();

@@ -30,7 +30,7 @@ assert appearance in ("light", "dark"), appearance
 variant = appearance + ("-hc" if os.environ.get("ADW_DEBUG_HIGH_CONTRAST") == "1" else "")
 tab_items = ("New Tab", "New Tab in Directory…", "New Tab in Workspace")
 main_items = ("Fullscreen", *tab_items,
-              "Manage Workspaces…", "Commands…", "Quit Gmux", "Preferences",
+              "New Window", "Manage Workspaces…", "Commands…", "Quit Gmux", "Preferences",
               "Keyboard Shortcuts", "About Gmux")
 terminal_items = ("Rename Tab…", "Remove Tab Name", "Split Right", "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out",
                   "Reset Zoom", "Close Pane", "Close Tab")
@@ -130,6 +130,39 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             or find("Workspace Filter", "button"))
         assert button.get_action_iface().do_action(0)
         wait_for(lambda: item("All Tabs"))
+
+    def check_new_window(trigger):
+        original = rpc("windows")["windows"]
+        assert len(original) == 1, original
+        source = original[0]["id"]
+        before = rpc("list", window=source)
+        panes = [pane["id"] for tab in before["tabs"] for pane in tab["panes"]]
+        trigger()
+        windows = wait_for(lambda: (windows if len(windows := rpc("windows")["windows"]) == 2 else None))
+        created = next(window["id"] for window in windows if window["id"] != source)
+        wait_for(lambda: rpc("daemon-info")["frontends"] == 2)
+        wait_for(lambda: rpc("renderer-info", window=created)["window_active"])
+        assert [pane["id"] for tab in rpc("list", window=created)["tabs"]
+                for pane in tab["panes"]] == panes, "New Window must reuse the existing terminals"
+        after = rpc("list", window=source)
+        for field in ("active_tab", "filter", "tab_search", "sidebar_visible"):
+            assert after[field] == before[field], (field, before[field], after[field])
+        rpc("detach", window=created)
+        wait_for(lambda: len(rpc("windows")["windows"]) == 1)
+        wait_for(lambda: rpc("daemon-info")["frontends"] == 1)
+        wait_for(lambda: rpc("renderer-info", window=source)["window_active"])
+        assert app.poll() is None
+
+    def palette_new_window():
+        chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_p)
+        entry = wait_for(lambda: find("Search commands", "entry") or find("Search commands", "text"))
+        assert entry.get_editable_text_iface().set_text_contents("new window")
+        row = wait_for(lambda: find("New Window", "list item"))
+        selection = row.get_parent().get_selection_iface()
+        wait_for(lambda: selection.get_n_selected_children() == 1
+                 and selection.get_selected_child(0).get_name() == "New Window")
+        wait_for(lambda: entry.get_state_set().contains(Atspi.StateType.FOCUSED))
+        key(Gdk.KEY_Return)
 
     def tab_row(name):
         for row in descendants(Atspi.get_desktop(0)):
@@ -239,11 +272,16 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             assert find("Terminal Actions", "toggle button") is None
             assert find("Terminal Actions", "button") is None
 
+            assert item("New Window").get_state_set().contains(Atspi.StateType.SENSITIVE)
+            check_new_window(lambda: activate("New Window"))
+            wait_for(lambda: not menu_visible())
+
             # The empty-window SplitButton has the same accessible menu model.
             open_options()
             for name in tab_items:
                 wait_for(lambda: item(name))
             assert not item("New Tab in Workspace").get_state_set().contains(Atspi.StateType.SENSITIVE)
+            assert item("New Window") is None, "New Tab options must contain only tab creation actions"
 
             # Tab creation remains available with the sidebar hidden.
             dismiss()
@@ -256,6 +294,22 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             pane = tabs[0]["panes"][0]["id"]
             wait_for(lambda: viewport()["focused"] and viewport()["cell_height"] > 0)
             base = viewport()["cell_height"]
+            check_new_window(lambda: chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_n))
+            assert not rpc("list")["sidebar_visible"], "New Window must preserve a hidden sidebar"
+            open_menu()
+            check_new_window(lambda: key(Gdk.KEY_w))
+            check_new_window(palette_new_window)
+
+            # The primary menu remains usable in the collapsed sidebar overlay.
+            rpc("resize", width=540, height=700)
+            wait_for(lambda: rpc("list")["sidebar_collapsed"])
+            open_menu()
+            for name in main_items:
+                wait_for(lambda: item(name))
+            capture(variant + "-narrow")
+            check_new_window(lambda: activate("New Window"))
+            rpc("resize", width=1120, height=740)
+            wait_for(lambda: not rpc("list")["sidebar_collapsed"])
             workspaces = []
             for name in ("Project", "Product", "My_Project"):
                 folder = temp / name
@@ -652,6 +706,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             wait_for(lambda: find("Quit Gmux?") is None)
             assert rpc("daemon-info")["attached"] and len(rpc("list")["tabs"]) == 2
             print(f"PASS ({variant}): accessible main menu, empty-window sensitivity, "
+                  "New Window menu activation, mnemonic, terminal shortcut and palette activation, "
+                  "collapsed-sidebar menu access, "
                   "tab and workspace creation, dynamic workspace choices and mnemonics, "
                   "directory dialog, separate terminal menu, active-tab rename, active-pane splits and zoom, "
                   "Find focus, pane and whole-tab closure with busy confirmations, synchronized "

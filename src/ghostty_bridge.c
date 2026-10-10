@@ -22,7 +22,79 @@ struct GmuxEngine {
     bool held;
     GhosttyTrackedGridRef selection_start, selection_end;
     uint64_t hold_started_ms;
+    GmuxView *views;
+    bool view_held;
 };
+
+struct GmuxView {
+    GmuxEngine *owner;
+    GmuxView *next;
+    GhosttyRenderState render;
+    GhosttyTerminalScrollbar scrollbar;
+    GhosttyTrackedGridRef viewport, selection_start, selection_end;
+    bool held_used;
+    bool captured;
+};
+
+static void swap_view(GmuxEngine *e, GmuxView *v) {
+#define SWAP(field, type) do { type tmp=e->field; e->field=v->field; v->field=tmp; } while (0)
+    SWAP(selection_start, GhosttyTrackedGridRef);
+    SWAP(selection_end, GhosttyTrackedGridRef);
+#undef SWAP
+}
+
+GmuxView *gmux_engine_view_new(GmuxEngine *e) {
+    GmuxView *v = calloc(1, sizeof(*v));
+    if (!v) return NULL;
+    v->owner=e; v->next=e->views; e->views=v;
+    return v;
+}
+void gmux_engine_view_free(GmuxView *v) {
+    if (!v) return;
+    if (v->owner) {
+        GmuxView **link=&v->owner->views;
+        while (*link && *link != v) link=&(*link)->next;
+        if (*link) *link=v->next;
+    }
+    ghostty_tracked_grid_ref_free(v->viewport);
+    ghostty_tracked_grid_ref_free(v->selection_start);
+    ghostty_tracked_grid_ref_free(v->selection_end);
+    ghostty_render_state_free(v->render);
+    free(v);
+}
+void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
+    gmux_engine_expire_render_hold(e);
+    swap_view(e, v);
+    v->held_used=e->held && v->captured; e->view_held=e->held;
+    if (v->held_used) {
+        GhosttyRenderState render=e->render; e->render=v->render; v->render=render;
+        GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
+    }
+    GhosttyPointCoordinate point;
+    if (v->viewport && !ghostty_tracked_grid_ref_point(v->viewport, GHOSTTY_POINT_TAG_SCREEN, &point))
+        gmux_engine_scroll_to(e, point.y);
+    else
+        gmux_engine_scroll(e, 0, true);
+}
+void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
+    GhosttyTerminalScrollbar bar;
+    if (!ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &bar)) {
+        if (bar.offset + bar.len >= bar.total) {
+            ghostty_tracked_grid_ref_free(v->viewport); v->viewport=NULL;
+        } else {
+            GhosttyPoint point={.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={0,bar.offset}};
+            if (v->viewport) ghostty_tracked_grid_ref_set(v->viewport, e->terminal, point);
+            else ghostty_terminal_grid_ref_track(e->terminal, point, &v->viewport);
+        }
+    }
+    if (v->held_used) {
+        GhosttyRenderState render=e->render; e->render=v->render; v->render=render;
+        GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
+    }
+    e->view_held=false;
+    swap_view(e, v);
+    gmux_engine_scroll(e, 0, true);
+}
 
 static uint64_t now_ms(void) {
     struct timespec now;
@@ -37,6 +109,21 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         // contains the next frame. Keep it visible until that frame is complete.
         if (ghostty_render_state_update(e->render, terminal)) return;
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
+        for (GmuxView *v=e->views; v; v=v->next) {
+            gmux_engine_view_enter(e, v);
+            // A fresh held cache must read all rows, independently of the
+            // dirty flags already consumed by the normal render state.
+            GhosttyRenderState frozen=NULL;
+            v->captured=false;
+            if (!ghostty_render_state_new(NULL, &frozen)) {
+                if (!ghostty_render_state_update(frozen, terminal)) {
+                    ghostty_render_state_free(v->render); v->render=frozen;
+                    v->captured=true;
+                } else ghostty_render_state_free(frozen);
+            }
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &v->scrollbar);
+            gmux_engine_view_leave(e, v);
+        }
         e->hold_started_ms = now_ms();
     }
     e->held = held;
@@ -86,6 +173,7 @@ static bool color_scheme(GhosttyTerminal t, void *ud, GhosttyColorScheme *out) {
 }
 void gmux_engine_free(GmuxEngine *e) {
     if (!e) return;
+    for (GmuxView *v=e->views; v; v=v->next) v->owner=NULL;
     ghostty_tracked_grid_ref_free(e->selection_start);
     ghostty_tracked_grid_ref_free(e->selection_end);
     ghostty_key_event_free(e->key);
@@ -365,7 +453,11 @@ int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len, bool clipb
     return ghostty_terminal_paste(e->terminal, &paste, NULL);
 }
 int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap) {
-    gmux_engine_expire_render_hold(e);
+    if (!e->view_held) gmux_engine_expire_render_hold(e);
+    if (e->held) {
+        GhosttyRenderStateDirty dirty=GHOSTTY_RENDER_STATE_DIRTY_FULL;
+        ghostty_render_state_set(e->render, GHOSTTY_RENDER_STATE_OPTION_DIRTY, &dirty);
+    }
     if (!e->held && ghostty_render_state_update(e->render, e->terminal)) return -1;
     if (!e->held && ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar)) return -1;
     frame->scrollback = (GmuxScrollback){e->scrollbar.total, e->scrollbar.offset, e->scrollbar.len};

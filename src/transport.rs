@@ -9,7 +9,7 @@ use std::{
 mod requests;
 pub(crate) use requests::{PasteOptions, StreamCommand, StreamRequest};
 
-pub(crate) const VERSION: u32 = 6;
+pub(crate) const VERSION: u32 = 7;
 pub(crate) const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub(crate) const PASTE_CHUNK: usize = 16 * 1024;
 pub(crate) const MAX_PACKET: usize = 16 * 1024 * 1024;
@@ -30,6 +30,8 @@ pub struct Metadata {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Header {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<crate::control::CommandReply>,
     pub meta: Metadata,
     pub frame: Option<Frame>,
     pub scroll_serial: u64,
@@ -53,6 +55,9 @@ impl Packet {
     pub(crate) fn memory_size(&self) -> usize {
         let header = &self.header;
         std::mem::size_of::<Self>()
+            + header.state.as_ref().map_or(0, |state| {
+                serde_json::to_vec(state).map_or(MAX_PACKET, |bytes| bytes.len())
+            })
             + self.cells.capacity() * std::mem::size_of::<Cell>()
             + header.meta.directory.capacity()
             + header.meta.title.capacity()
@@ -170,6 +175,7 @@ mod tests {
         cell.flags = 65;
         Packet {
             header: Header {
+                state: None,
                 meta: Metadata {
                     id: 1,
                     directory: PathBuf::from("/tmp"),

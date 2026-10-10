@@ -4,6 +4,7 @@ use super::*;
 impl Ui {
     pub(super) fn install_actions(self: &Rc<Self>) {
         for (name, shortcuts) in [
+            ("new-window", &["<Control><Shift>n"][..]),
             ("new", &["<Control><Shift>t"][..]),
             ("open-folder", &["<Control><Shift>o"]),
             ("split-right", &["<Control><Shift>d"]),
@@ -93,15 +94,6 @@ impl Ui {
             Some(gtk::NamedAction::new("win.close-empty-window")),
         ));
         self.empty.add_controller(empty_shortcuts);
-        let action =
-            gio::SimpleAction::new("focus-notification", Some(&u64::static_variant_type()));
-        let weak = Rc::downgrade(self);
-        action.connect_activate(move |_, value| {
-            if let (Some(ui), Some(id)) = (weak.upgrade(), value.and_then(|v| v.get::<u64>())) {
-                ui.jump_to_pane(id);
-            }
-        });
-        self.app.add_action(&action);
         let action = gio::SimpleAction::new_stateful(
             "workspace-filter",
             Some(glib::VariantTy::STRING),
@@ -191,6 +183,13 @@ impl Ui {
             return;
         }
         match name {
+            "new-window" => {
+                if let Some(owner) = self.owner.upgrade()
+                    && let Err(error) = owner.create(None)
+                {
+                    self.message(&error.to_string());
+                }
+            }
             "new" => {
                 self.new_tab(self.default_directory(), None);
             }

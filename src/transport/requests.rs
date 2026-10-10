@@ -71,6 +71,9 @@ pub(crate) enum StreamCommand {
     Attach {
         version: u32,
     },
+    Focused {
+        active: bool,
+    },
     Subscribe {
         panes: HashSet<u64>,
     },

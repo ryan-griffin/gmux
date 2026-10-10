@@ -338,7 +338,9 @@ impl Ui {
                 .set_subtitle(&model::display_path(&p.directory()));
             p.search(&self.search_entry.text());
             p.area.grab_focus();
-            self.mark_read(p.id);
+            if self.window.is_active() {
+                self.mark_read(p.id);
+            }
         }
         self.changing.set(false);
         self.sync_focus();
@@ -346,7 +348,7 @@ impl Ui {
     }
     pub(super) fn sync_focus(&self) {
         let focus = (self.active.get(), self.active_pane().map(|pane| pane.id));
-        if focus != self.synced_focus.get() {
+        if self.window.is_active() && focus != self.synced_focus.get() {
             match self.backend.focus(focus.0, focus.1) {
                 Ok(()) => self.synced_focus.set(focus),
                 Err(error) => eprintln!("Could not sync terminal focus: {error}"),
