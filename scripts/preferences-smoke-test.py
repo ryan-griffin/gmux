@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Check application preferences and local sidebar state across native windows."""
 import fcntl
+import ctypes
 import json
+import os
 from pathlib import Path
+import struct
 import subprocess
 import time
 
@@ -218,17 +221,49 @@ with (artifacts / "preferences-smoke.log").open("w") as log, AccessibilityFixtur
 
     with scenario("pending preference writes finish when all windows close"):
         rpc("action", window=first, name="preferences")
-        with (fixture.config / ".settings.json.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            set_switch("Window A", "Pane Title Bars", False)
-            set_switch("Window A", "Desktop notifications", False)
-            close_preferences("Window A")
-            for window in (third, second, first):
-                rpc("detach", window=window)
-            wait_for(lambda: not rpc("daemon-info")["attached"])
-            assert app.poll() is None, "Application exited before pending preferences could be written"
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        assert app.wait(timeout=8) == 0
+        rpc("action", window=second, name="preferences")
+        # Atomic publication renames settings.json into its directory. Count
+        # those actual writes, rather than exposing worker internals to tests.
+        libc = ctypes.CDLL(None, use_errno=True)
+        events = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        assert events >= 0, ctypes.get_errno()
+        try:
+            assert libc.inotify_add_watch(events, os.fsencode(fixture.config), 0x80) >= 0, ctypes.get_errno()
+            with (fixture.config / ".settings.json.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                set_switch("Window A", "Pane Title Bars", False)
+                set_switch("Window A", "Desktop notifications", False)
+                # Many alternating edits would accumulate full snapshots in an
+                # unbounded queue. Only the in-flight and final saves may run.
+                for edit in range(40):
+                    window = "Window A" if edit % 2 == 0 else "Window B"
+                    set_switch(window, "Pane Title Bars", edit % 2 == 0)
+                    set_switch(window, "Desktop notifications", edit % 2 == 0)
+                assert saved()["show_pane_titles"] and saved()["desktop_notifications"]
+                close_preferences("Window A")
+                close_preferences("Window B")
+                for window in (third, second, first):
+                    rpc("detach", window=window)
+                wait_for(lambda: not rpc("daemon-info")["attached"])
+                assert app.poll() is None, "Application exited before pending preferences could be written"
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            assert app.wait(timeout=8) == 0
+            publications = 0
+            while True:
+                try:
+                    data = os.read(events, 65536)
+                except BlockingIOError:
+                    break
+                offset = 0
+                while offset < len(data):
+                    _, mask, _, length = struct.unpack_from("iIII", data, offset)
+                    assert not mask & 0x4000, "File-event queue overflowed"
+                    name = data[offset + 16:offset + 16 + length].rstrip(b"\0")
+                    publications += bool(mask & 0x80 and name == b"settings.json")
+                    offset += 16 + length
+            assert 1 <= publications <= 2, f"Pending edits did not coalesce: {publications} settings writes"
+        finally:
+            os.close(events)
         expected.update(show_pane_titles=False, desktop_notifications=False)
         assert all(saved()[key] == value for key, value in expected.items()), saved()
 
