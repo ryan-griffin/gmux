@@ -333,8 +333,10 @@ impl TerminalCanvas {
             self.update_contents(gtk::AccessibleTextContentChange::Remove, 0, old_len);
             imp.text_buffer.borrow_mut().take();
         }
+        let used_bytes = next.used_bytes();
         let old = imp.text.replace(next);
-        imp.spare_text.replace(Some(old));
+        let spare = (!old.has_excess_capacity(used_bytes)).then_some(old);
+        imp.spare_text.replace(spare);
         imp.text_revision.set(Some(key));
         if content_changed {
             self.update_contents(gtk::AccessibleTextContentChange::Insert, 0, new_len);

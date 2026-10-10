@@ -80,6 +80,10 @@ comparing glyph bytes and wide-cell continuation flags. Color and style changes
 still repaint but reuse the accessible text and its mappings. Actual text or
 layout changes rebuild the full viewport with a spare set of text buffers;
 the old contents remain readable until the removal notification completes.
+After shrinking, buffers with capacity above four times the current live text
+storage release their excess capacity, and the canvas discards an oversized
+spare. The [performance notes](performance.md#buffer-retention-after-resizing)
+record the retained memory and reuse timings.
 Cached and rebuilt selections share the same cell-end mapping,
 including wide glyphs and row boundaries. Boundary queries reuse a lazily created
 GTK text buffer until the text changes. Changes to colors alone do not emit text
