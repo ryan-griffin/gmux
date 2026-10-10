@@ -36,7 +36,8 @@ import os
 import subprocess
 import sys
 sys.path.insert(0, "scripts")
-from cargo_test_support import ARTIFACT_ENV, cargo_binary, compiler_artifacts
+from cargo_build import compiler_artifacts
+from cargo_test_support import ARTIFACT_ENV, cargo_binary
 os.environ[ARTIFACT_ENV] = json.dumps(compiler_artifacts(Path("artifacts/cargo-build.jsonl").read_text()))
 for name in ("gmux", "gmux-daemon"):
     binary = cargo_binary(name)
