@@ -634,6 +634,9 @@ impl RemoteSession {
     pub fn clear_selection(&self) -> anyhow::Result<()> {
         self.command(StreamCommand::ClearSelection)
     }
+    pub fn clear_screen(&self) -> anyhow::Result<()> {
+        self.command(StreamCommand::ClearScreen)
+    }
     pub fn selection(&self) -> Option<(u64, u64)> {
         self.selection
     }

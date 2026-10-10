@@ -136,6 +136,22 @@ with AppFixture(dict(restore=False), prefix="gmux-multi-client-") as fixture:
             first.until(lambda h: h["meta"]["id"] == pane and h["find"] and not h["find"]["pending"])
             assert first.frame["scrollback"]["offset"] == 0 and "SHARED_WHILE_SCROLLED" not in first.text()
 
+        with scenario("clear screen removes shared history and stale client presentation"):
+            first.send("clear-screen")
+            for client in (first, second):
+                cleared = client.until(lambda h: h["meta"]["id"] == pane and h["frame"]
+                    and h["frame"]["scrollback"]["total"] == h["frame"]["rows"]
+                    and h["find"] and h["find"]["total"] == 0 and not h["find"]["pending"])
+                assert client.text().strip() == "", client.text()
+                assert cleared["selection"] is None
+                assert client.frame["scrollback"]["offset"] == 0
+            first.send("input", bytes=list(b"printf 'line AFTER_CLEAR\\n'\n"))
+            first.until(lambda h: h["meta"]["id"] == pane and h["find"]
+                        and h["find"]["total"] == 1 and not h["find"]["pending"]
+                        and "AFTER_CLEAR" in first.text())
+            second.output("AFTER_CLEAR")
+            assert not fixture.rpc("_metadata", pane=pane)["meta"]["exited"]
+
         with scenario("focused client supplies the PTY size without resize contention"):
             first.send("focused", active=True)
             first.send("resize", cols=50, rows=12)

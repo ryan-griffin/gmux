@@ -67,6 +67,23 @@ The separate Terminal Actions menu includes Rename Tab and
 Close Tab for the active tab, and split, Find, zoom, and Close Pane for its active
 pane. Its button is hidden when there is no active terminal.
 
+Clear Screen sits beside Find in Terminal Actions and the terminal context menu,
+and is available through the command palette. The
+[GNOME HIG](https://developer.gnome.org/hig/patterns/controls/menus.html) assigns
+content-specific actions to secondary menus and app-wide actions to the main
+menu. Clearing targets one pane, so it stays out of the main menu, New Tab
+dropdowns, and tab context menu. Each terminal menu has a distinct mnemonic for
+the action. It has no default keyboard shortcut and is disabled in an empty window.
+
+The daemon erases the primary screen and history through the existing typed
+frontend command path, then updates all clients viewing that pane. It releases
+their scroll anchors and selections and restarts history searches with their
+existing queries. It avoids allocating a view or taking a snapshot to dispatch
+the clear. VT erasure waits for a parser ground boundary and ends synchronized
+output so the result can display immediately. Following Ghostty's Clear Screen
+behavior, clearing is rejected on the alternate screen to preserve full-screen
+applications' display and cursor state.
+
 Remove Tab Name sits beside Rename Tab in both tab menus and is hidden for
 automatic names. It restores automatic title updates immediately and targets
 the clicked tab in the context menu.

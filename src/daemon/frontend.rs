@@ -367,6 +367,16 @@ impl Daemon {
                 }
                 return Ok(());
             }
+            StreamCommand::ClearScreen => {
+                self.sessions.get_mut(&id).unwrap().clear_screen()?;
+                for client in std::iter::once(&mut *frontend).chain(self.frontends.values_mut()) {
+                    if let Some(view) = client.views.get_mut(&id) {
+                        view.restart_find();
+                    }
+                }
+                self.changed.insert(id);
+                return Ok(());
+            }
             _ => {}
         }
         let session = self.sessions.get_mut(&id).unwrap();

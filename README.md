@@ -49,9 +49,16 @@ Create tabs with the plus button. Manage Workspaces in the main menu lets you ad
 
 The main menu stays above the sidebar and groups New Window with tab creation, including tabs in a chosen directory or workspace. F10 reveals the sidebar and opens the menu. New Tab in Workspace lists saved workspaces and is disabled when none exist. The New Tab dropdowns contain only tab creation actions. Fullscreen is a checked item. Preferences, Keyboard Shortcuts, and About Gmux are grouped at the bottom.
 
-The three-dot Terminal Actions menu in the content header contains Rename Tab, Split Right, Split Down, Find, zoom controls, Close Pane, and Close Tab. Rename Tab changes the active tab's name. To remove a custom name, choose Remove Tab Name beside Rename Tab in the Terminal Actions menu or the tab's context menu. The tab then follows the active pane's title again. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both close actions ask for confirmation when processes are running. This menu is available with the sidebar hidden.
+The three-dot Terminal Actions menu in the content header contains Rename Tab, Split Right, Split Down, Find, Clear Screen, zoom controls, Close Pane, and Close Tab. Rename Tab changes the active tab's name. To remove a custom name, choose Remove Tab Name beside Rename Tab in the Terminal Actions menu or the tab's context menu. The tab then follows the active pane's title again. Close Pane affects the active pane; Close Tab closes every pane in the active tab. Both close actions ask for confirmation when processes are running. This menu is available with the sidebar hidden.
 
-Right-click a terminal for Copy, Paste, Find, Split Right, Split Down, and Close Pane. In apps that capture mouse input, use Shift+right-click to open the menu. The Menu key and Shift+F10 also open it.
+Right-click a terminal for Copy, Paste, Find, Clear Screen, Split Right, Split Down, and Close Pane. In apps that capture mouse input, use Shift+right-click to open the menu. The Menu key and Shift+F10 also open it.
+
+Clear Screen erases the active pane's screen and all scrollback, including history
+visible in other windows, without restarting its shell. It also appears in the
+command palette. Existing selections and search matches are cleared, and an open
+Find query continues matching new output. Clearing is unavailable while a
+full-screen app uses the alternate screen. A partial terminal sequence finishes
+before the clear runs.
 
 | Action | Shortcut |
 | --- | --- |

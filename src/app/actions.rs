@@ -16,6 +16,7 @@ impl Ui {
             ("copy", &["<Control><Shift>c"]),
             ("paste", &["<Control><Shift>v"]),
             ("find", &["<Control><Shift>f"]),
+            ("clear-screen", &[]),
             ("sidebar", &["<Control><Shift>b"]),
             ("search-tabs", &[]),
             ("palette", &["<Control><Shift>p"]),
@@ -228,6 +229,11 @@ impl Ui {
                     self.search_entry.grab_focus();
                 }
             }
+            "clear-screen" => {
+                if let Some(p) = self.active_pane() {
+                    p.clear_screen();
+                }
+            }
             "sidebar" => self.split.set_show_sidebar(!self.split.shows_sidebar()),
             "search-tabs" => {
                 self.split.set_show_sidebar(true);
@@ -327,6 +333,7 @@ pub(super) const TAB_ACTIONS: &[&str] = &[
     "copy",
     "paste",
     "find",
+    "clear-screen",
     "rename",
     "remove-active-tab-name",
     "next-tab",

@@ -19,6 +19,7 @@ const CONTEXT_MENU_SECTIONS: &[&[(&str, &str)]] = &[
         ("_Copy", "terminal.copy"),
         ("_Paste", "terminal.paste"),
         ("_Find…", "win.find"),
+        ("Clear _Screen", "win.clear-screen"),
     ],
     &[
         ("Split _Right", "win.split-right"),
@@ -616,6 +617,13 @@ impl Terminal {
     }
     pub fn paste(self: &Rc<Self>) {
         self.paste_from(&self.area.clipboard());
+    }
+    pub fn clear_screen(&self) {
+        if let Err(error) = self.session.borrow().clear_screen() {
+            self.show_status(&error.to_string());
+            return;
+        }
+        self.stop_selection_drag();
     }
     fn paste_from(self: &Rc<Self>, clipboard: &gdk::Clipboard) {
         let weak = Rc::downgrade(self);

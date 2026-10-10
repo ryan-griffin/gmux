@@ -32,7 +32,7 @@ tab_items = ("New Tab", "New Tab in Directory…", "New Tab in Workspace")
 main_items = ("Fullscreen", *tab_items,
               "New Window", "Manage Workspaces…", "Commands…", "Quit Gmux", "Preferences",
               "Keyboard Shortcuts", "About Gmux")
-terminal_items = ("Rename Tab…", "Remove Tab Name", "Split Right", "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out",
+terminal_items = ("Rename Tab…", "Remove Tab Name", "Split Right", "Split Down", "Find in Terminal…", "Clear Screen", "Zoom In", "Zoom Out",
                   "Reset Zoom", "Close Pane", "Close Tab")
 
 
@@ -385,6 +385,30 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
             native.frame(timeout=2)
             original_tab = rpc("list")["active_tab"]
 
+            rpc("send", pane=pane, text="for i in $(seq 1 80); do printf 'clear-history-%s\\n' \"$i\"; done",
+                paste=True, enter=True)
+            wait_for(lambda: "clear-history-80" in rpc("read", pane=pane)["text"])
+            wait_for(lambda: viewport()["scrollback"]["total"] > viewport()["rows"])
+            open_menu(terminal=True)
+            key(Gdk.KEY_c)
+            wait_for(lambda: not menu_visible())
+            wait_for(lambda: rpc("read", pane=pane)["text"] == "")
+            wait_for(lambda: viewport()["scrollback"]["total"] == viewport()["rows"])
+
+            rpc("send", pane=pane, text="printf 'PALETTE_CLEAR_HISTORY\\n'", paste=True, enter=True)
+            wait_for(lambda: "PALETTE_CLEAR_HISTORY" in rpc("read", pane=pane)["text"])
+            chord(Gdk.KEY_Control_L, Gdk.KEY_Shift_L, Gdk.KEY_p)
+            entry = wait_for(lambda: find("Search commands", "entry") or find("Search commands", "text"))
+            assert entry.get_editable_text_iface().set_text_contents("clear scrollback")
+            row = wait_for(lambda: find("Clear Screen", "list item"))
+            selection = row.get_parent().get_selection_iface()
+            wait_for(lambda: selection.get_n_selected_children() == 1
+                     and selection.get_selected_child(0).get_name() == "Clear Screen")
+            key(Gdk.KEY_Return)
+            wait_for(lambda: find("Search commands", "entry") is None
+                     and find("Search commands", "text") is None)
+            wait_for(lambda: rpc("read", pane=pane)["text"] == "")
+
             def tab(tab_id):
                 return next(tab for tab in rpc("list")["tabs"] if tab["id"] == tab_id)
 
@@ -710,7 +734,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-main-menu-") as directory:
                   "collapsed-sidebar menu access, "
                   "tab and workspace creation, dynamic workspace choices and mnemonics, "
                   "directory dialog, separate terminal menu, active-tab rename, active-pane splits and zoom, "
-                  "Find focus, pane and whole-tab closure with busy confirmations, synchronized "
+                  "Find focus, Clear Screen mnemonic and palette activation, "
+                  "pane and whole-tab closure with busy confirmations, synchronized "
                   "sidebar visibility and fullscreen checkmark, workspace filter and creation dropdowns, "
                   "clicked-tab workspace moves and creation, keyboard invocation and navigation, "
                   "workspace management, standard dialogs, and Quit confirmation")
