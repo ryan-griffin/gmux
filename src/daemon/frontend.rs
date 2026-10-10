@@ -3,6 +3,10 @@ use super::*;
 use crate::transport::{PasteOptions, StreamCommand, StreamRequest};
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
+const READ_CHUNK: usize = 16 * 1024;
+const MAX_INPUT_PER_TURN: usize = 512 * 1024;
+const MAX_REQUESTS_PER_TURN: usize = 64;
+const MAX_COMMAND: usize = 1_048_577;
 
 #[derive(Default)]
 pub(super) struct SentScreen {
@@ -12,6 +16,8 @@ pub(super) struct SentScreen {
 pub(super) struct Frontend {
     pub(super) socket: UnixStream,
     pub(super) input: Vec<u8>,
+    read_buffer: Vec<u8>,
+    read_offset: usize,
     pub(super) output: Vec<u8>,
     pub(super) offset: usize,
     pub(super) attached: bool,
@@ -43,6 +49,8 @@ impl Frontend {
         Self {
             socket,
             input: Vec::new(),
+            read_buffer: Vec::new(),
+            read_offset: 0,
             output: Vec::new(),
             offset: 0,
             attached: false,
@@ -109,24 +117,48 @@ impl Frontend {
         }
         Ok(())
     }
+    pub(super) fn input_pending(&self) -> bool {
+        self.read_offset < self.read_buffer.len()
+    }
     pub(super) fn requests(&mut self) -> anyhow::Result<Vec<StreamRequest>> {
-        let mut buffer = [0; 16384];
+        // Keep the decoded batch small even for empty or invalid JSON lines.
+        // The unread suffix survives the request limit and schedules another turn.
         let mut requests = Vec::new();
-        for _ in 0..32 {
-            let n = match self.socket.read(&mut buffer) {
-                Ok(0) => anyhow::bail!("Frontend disconnected"),
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            };
-            for part in buffer[..n].split_inclusive(|c| *c == b'\n') {
+        let mut budget = MAX_INPUT_PER_TURN;
+        let mut reads = 0;
+        while budget > 0 && requests.len() < MAX_REQUESTS_PER_TURN {
+            if !self.input_pending() {
+                if reads == 32 {
+                    break;
+                }
+                reads += 1;
+                self.read_offset = 0;
+                self.read_buffer.resize(READ_CHUNK.min(budget), 0);
+                let result = self.socket.read(&mut self.read_buffer);
+                if result.is_err() {
+                    self.read_buffer.clear();
+                }
+                match result {
+                    Ok(0) => anyhow::bail!("Frontend disconnected"),
+                    Ok(n) => self.read_buffer.truncate(n),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let end = self.read_buffer.len().min(self.read_offset + budget);
+            for part in self.read_buffer[self.read_offset..end].split_inclusive(|c| *c == b'\n') {
+                if requests.len() == MAX_REQUESTS_PER_TURN {
+                    break;
+                }
+                self.read_offset += part.len();
+                budget -= part.len();
                 let complete = part.ends_with(b"\n");
                 if self.discarding {
                     self.discarding = !complete;
                     continue;
                 }
-                if self.input.len() + part.len() > 1_048_577 {
+                if self.input.len() + part.len() > MAX_COMMAND {
                     self.input.clear();
                     self.discarding = !complete;
                     requests.push(StreamRequest::invalid("Frontend command is too large"));
@@ -736,5 +768,170 @@ mod tests {
             requested_size(2, [(1, &focused), (2, &fallback)].into_iter()),
             None
         );
+    }
+
+    fn connection() -> (Frontend, UnixStream) {
+        let (socket, writer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        (Frontend::new(socket), writer)
+    }
+
+    #[test]
+    fn request_limit_preserves_order_and_buffered_work_without_socket_readiness() {
+        let (mut frontend, mut writer) = connection();
+        let count = MAX_REQUESTS_PER_TURN * 3 + 1;
+        let mut wire = Vec::new();
+        for serial in 0..count {
+            writeln!(
+                wire,
+                r#"{{"method":"scroll-to","row":0,"serial":{serial}}}"#
+            )
+            .unwrap();
+        }
+        writer.write_all(&wire).unwrap();
+        let first = frontend.requests().unwrap();
+        assert_eq!(first.len(), MAX_REQUESTS_PER_TURN);
+        assert!(frontend.input_pending());
+        let mut fd = libc::pollfd {
+            fd: frontend.socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 0) }, 0);
+        let mut received = first;
+        while frontend.input_pending() {
+            let batch = frontend.requests().unwrap();
+            assert!(batch.len() <= MAX_REQUESTS_PER_TURN);
+            received.extend(batch);
+        }
+        assert_eq!(received.len(), count);
+        for (serial, request) in received.into_iter().enumerate() {
+            assert!(
+                matches!(request.command, StreamCommand::ScrollTo { serial: n, .. } if n == serial as u64)
+            );
+        }
+        assert!(frontend.requests().unwrap().is_empty());
+        assert!(!frontend.input_pending());
+    }
+
+    #[test]
+    fn byte_limit_preserves_partial_lines_without_scheduling_an_idle_spin() {
+        let (mut frontend, mut writer) = connection();
+        writer.write_all(&vec![b' '; READ_CHUNK + 1]).unwrap();
+        assert!(frontend.requests().unwrap().is_empty());
+        assert_eq!(frontend.input.len(), READ_CHUNK + 1);
+        assert!(!frontend.input_pending());
+        let sender = std::thread::spawn(move || {
+            writer
+                .write_all(&vec![b' '; MAX_INPUT_PER_TURN + 1])
+                .unwrap();
+            writer
+                .write_all(b"{\"method\":\"attach\",\"version\":7}\n")
+                .unwrap();
+            writer
+        });
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.is_empty() {
+            assert!(Instant::now() < deadline, "Partial line did not complete");
+            let before = frontend.input.len();
+            requests = frontend.requests().unwrap();
+            if requests.is_empty() {
+                assert!(frontend.input.len() - before <= MAX_INPUT_PER_TURN);
+                assert!(!frontend.input_pending());
+            }
+            std::thread::yield_now();
+        }
+        let _writer = sender.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            requests[0].command,
+            StreamCommand::Attach { version: 7 }
+        ));
+        assert!(frontend.input.is_empty());
+    }
+
+    #[test]
+    fn invalid_lines_also_count_toward_the_request_limit() {
+        let (mut frontend, mut writer) = connection();
+        writer
+            .write_all(&[b'\n'; MAX_REQUESTS_PER_TURN + 1])
+            .unwrap();
+        let batch = frontend.requests().unwrap();
+        assert_eq!(batch.len(), MAX_REQUESTS_PER_TURN);
+        assert!(
+            batch
+                .iter()
+                .all(|r| matches!(r.command, StreamCommand::Invalid { .. }))
+        );
+        assert!(frontend.input_pending());
+        assert_eq!(frontend.requests().unwrap().len(), 1);
+        assert!(!frontend.input_pending());
+    }
+
+    #[test]
+    fn fragmented_utf8_and_paste_commands_survive_request_and_byte_limits() {
+        let (mut frontend, mut writer) = connection();
+        writer.write_all(&[b'\n'; MAX_REQUESTS_PER_TURN]).unwrap();
+        writer.write_all(b"{\"method\":\"attach\",\"version\":7}\n{\"method\":\"paste-begin\",\"size\":6}\n{\"method\":\"paste-data\",\"text\":\"").unwrap();
+        writer.write_all(&[0xc3]).unwrap();
+        assert_eq!(frontend.requests().unwrap().len(), MAX_REQUESTS_PER_TURN);
+        let batch = frontend.requests().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(
+            batch[0].command,
+            StreamCommand::Attach { version: 7 }
+        ));
+        assert!(matches!(
+            batch[1].command,
+            StreamCommand::PasteBegin { size: 6, .. }
+        ));
+        writer.write_all(&[0xa9]).unwrap();
+        writer
+            .write_all("🙂\"}\n{\"method\":\"paste-end\"}\n".as_bytes())
+            .unwrap();
+        let batch = frontend.requests().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(&batch[0].command, StreamCommand::PasteData { text } if text == "é🙂"));
+        assert!(matches!(batch[1].command, StreamCommand::PasteEnd));
+        assert!(frontend.input.is_empty());
+        assert!(!frontend.input_pending());
+    }
+
+    #[test]
+    fn oversized_lines_report_once_and_discard_across_turns_before_recovering() {
+        let (mut frontend, mut writer) = connection();
+        let sender = std::thread::spawn(move || {
+            writer
+                .write_all(&vec![b'x'; MAX_COMMAND + MAX_INPUT_PER_TURN * 2])
+                .unwrap();
+            writer
+                .write_all(b"\n{\"method\":\"attach\",\"version\":7}\n")
+                .unwrap();
+            writer
+        });
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received.len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "Oversized command did not recover"
+            );
+            received.extend(frontend.requests().unwrap());
+            assert!(frontend.input.len() <= MAX_COMMAND);
+            std::thread::yield_now();
+        }
+        let _writer = sender.join().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(
+            matches!(&received[0].command, StreamCommand::Invalid { message, .. } if message == "Frontend command is too large")
+        );
+        assert!(matches!(
+            received[1].command,
+            StreamCommand::Attach { version: 7 }
+        ));
+        assert!(!frontend.discarding);
+        assert!(frontend.input.is_empty());
+        assert!(!frontend.input_pending());
     }
 }
