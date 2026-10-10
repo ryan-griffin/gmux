@@ -78,15 +78,11 @@ impl Ui {
         }
         // Resolve implicit targets in this window before crossing the daemon boundary.
         match &mut command {
-            Command::New { workspace, .. } => {
-                if workspace.is_none() {
-                    *workspace = Some(self.selected_workspace());
-                }
+            Command::New { workspace, .. } if workspace.is_none() => {
+                *workspace = Some(self.selected_workspace());
             }
-            Command::Split { pane, .. } | Command::Close { pane } => {
-                if pane.is_none() {
-                    *pane = self.active_pane().map(|pane| pane.id);
-                }
+            Command::Split { pane, .. } | Command::Close { pane } if pane.is_none() => {
+                *pane = self.active_pane().map(|pane| pane.id);
             }
             Command::Move { tab, .. } if tab.is_none() => {
                 *tab = Some(self.active.get());
