@@ -2,6 +2,7 @@
 """Check native window creation, shared layouts, local navigation, and detach."""
 import os
 from pathlib import Path
+import sys
 from unittest.mock import patch
 
 import gi
@@ -9,7 +10,7 @@ gi.require_version("GioUnix", "2.0")
 from gi.repository import Gio, GioUnix
 
 from cargo_test_support import cargo_binary
-from test_support import AppFixture, scenario, wait_for
+from test_support import AppFixture, scenario, stop_process, wait_for
 from wayland_test_support import ensure_wayland_session
 
 ensure_wayland_session()
@@ -112,7 +113,42 @@ with AppFixture(dict(restore=False, desktop_notifications=False), prefix="gmux-m
 
     with scenario("closing one window leaves the other window and all shells alive"):
         daemon_pid = fixture.rpc("daemon-info")["pid"]
-        fixture.rpc("detach", window=first)
+        fixture.rpc("focus", window=first, pane=pane)
+        wait_for(lambda: fixture.rpc("renderer-info", window=first, pane=pane)["window_active"])
+        for window, dimensions in ((first, [1000, 740]), (second, [760, 540])):
+            fixture.rpc("resize", window=window, width=dimensions[0], height=dimensions[1])
+            wait_for(lambda: fixture.rpc("renderer-info", window=window, pane=pane)["window_size"] == dimensions)
+
+        def requested_grid(window):
+            view = fixture.rpc("renderer-info", window=window, pane=pane)["viewport"]
+            return [int(view["width"] // view["cell_width"]), int(view["height"] // view["cell_height"])]
+
+        owner_grid, survivor_grid = requested_grid(first), requested_grid(second)
+        assert owner_grid != survivor_grid, "Window fixtures must request different grids"
+        wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == owner_grid)
+        # Cover the app before closing the owner so the survivor cannot repair
+        # its size through a new focus event or a resize request.
+        cover = fixture.start(sys.executable, "-c", """
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk
+app = Gtk.Application()
+def activate(app):
+    window = Gtk.ApplicationWindow(application=app)
+    window.fullscreen()
+    window.present()
+app.connect("activate", activate)
+app.run()
+""", stdout=log, stderr=log)
+        try:
+            wait_for(lambda: not any(w["active"] for w in fixture.rpc("windows")["windows"]))
+            assert cover.poll() is None, "The focus cover exited"
+            fixture.rpc("detach", window=first)
+            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
+            wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == survivor_grid,
+                     message="Closing the size owner did not apply the unfocused survivor's cached grid")
+        finally:
+            stop_process(cover)
         wait_for(lambda: len(fixture.rpc("windows")["windows"]) == 1)
         wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
         assert app.poll() is None and fixture.rpc("daemon-info")["pid"] == daemon_pid
