@@ -160,26 +160,34 @@ fn requested_size<'a>(
 
 impl Daemon {
     pub(super) fn resize_sessions(&mut self, current: Option<(u64, &Frontend)>) {
+        let panes: Vec<_> = self.sessions.keys().copied().collect();
+        for pane in panes {
+            self.resize_session(pane, current);
+        }
+    }
+
+    fn resize_session(&mut self, pane: u64, current: Option<(u64, &Frontend)>) {
         // Input processing temporarily removes its frontend from the map.
-        for (&pane, session) in &mut self.sessions {
-            let Some((cols, rows, cw, ch, width, height)) = requested_size(
-                pane,
-                self.frontends
-                    .iter()
-                    .map(|(&id, frontend)| (id, frontend))
-                    .chain(current),
-            ) else {
-                continue;
-            };
-            match session.resize(cols, rows, cw, ch, width, height) {
-                Ok(true) => {
-                    self.changed.insert(pane);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    self.errors.insert(pane, error.to_string());
-                    self.changed.insert(pane);
-                }
+        let Some((cols, rows, cw, ch, width, height)) = requested_size(
+            pane,
+            self.frontends
+                .iter()
+                .map(|(&id, frontend)| (id, frontend))
+                .chain(current),
+        ) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&pane) else {
+            return;
+        };
+        match session.resize(cols, rows, cw, ch, width, height) {
+            Ok(true) => {
+                self.changed.insert(pane);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.errors.insert(pane, error.to_string());
+                self.changed.insert(pane);
             }
         }
     }
@@ -262,7 +270,7 @@ impl Daemon {
             frontend
                 .sizes
                 .insert(id, (cols, rows, cw, ch, width, height));
-            self.resize_sessions(Some((frontend_id, frontend)));
+            self.resize_session(id, Some((frontend_id, frontend)));
             return Ok(());
         }
         match command {
