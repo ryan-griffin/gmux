@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise startup alerts before a main window exists, using private fixtures."""
-from contextlib import contextmanager
 from collections import Counter
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import socket
@@ -13,7 +13,7 @@ import gi
 gi.require_version("Atspi", "2.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Atspi, Gdk, GdkPixbuf, GLib
+from gi.repository import Atspi, Gdk, GdkPixbuf, Gio, GLib
 
 from cargo_test_support import cargo_binary
 from test_support import AccessibilityFixture, AppFixture, descendants, scenario, wait_accessible
@@ -25,6 +25,14 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 heading = "Could Not Start Gmux"
 incompatible = "Incompatible gmux daemon. Stop it with gmux quit before upgrading."
+incompatible_cases = (
+    ("light", False, (Gdk.KEY_Return,)),
+    ("dark", False, (Gdk.KEY_Escape,)),
+    ("light", True, (Gdk.KEY_space,)),
+    ("dark", True, (Gdk.KEY_Alt_L, Gdk.KEY_c)),
+    ("light", False, None),
+)
+long_cases = (("long", (Gdk.KEY_Return,)), ("long-system-close", (Gdk.KEY_Alt_L, Gdk.KEY_F4)))
 
 
 @contextmanager
@@ -56,7 +64,7 @@ def incompatible_daemon(fixture):
         worker = threading.Thread(target=serve, daemon=True)
         worker.start()
         try:
-            yield requests
+            yield
         finally:
             stopped.set()
             worker.join(timeout=3)
@@ -67,6 +75,8 @@ def incompatible_daemon(fixture):
 
 
 def elements(app):
+    assert app.poll() is None, ("Application exited before startup alert checks", app.returncode,
+                                artifacts / "startup-error-smoke.log")
     return [obj for obj in descendants(Atspi.get_desktop(0))
             if obj.get_process_id() == app.pid]
 
@@ -125,6 +135,8 @@ def capture(native, alert, close, name):
     bx, by, bw, bh = bounds(close)
     rgb = frame.pixel(x + bx + bw // 4, y + by + bh // 2)
     assert max(rgb) - min(rgb) < 20, (name, "Close has an accent-colored fill", rgb)
+    assert (sum(rgb) < 3 * 128) == name.startswith(("dark", "long")), \
+        (name, "The startup alert did not use the saved appearance", rgb)
     return x, y
 
 
@@ -132,10 +144,11 @@ def inspect(app, *, long=False):
     alert = wait_accessible(lambda: find(app, heading, Atspi.Role.ALERT))
     close = wait_accessible(lambda: find(app, "Close", Atspi.Role.PUSH_BUTTON))
     wait_accessible(lambda: focused(close), message="Close did not receive initial keyboard focus")
-    buttons = [obj for obj in elements(app) if showing(obj) and obj.get_role() == Atspi.Role.PUSH_BUTTON]
+    visible = [obj for obj in elements(app) if showing(obj)]
+    buttons = [obj for obj in visible if obj.get_role() == Atspi.Role.PUSH_BUTTON]
     assert len(buttons) == 1, [(obj.get_name(), obj.get_role_name()) for obj in buttons]
-    assert not any(showing(obj) and obj.get_role() == Atspi.Role.ICON for obj in elements(app))
-    scrollbars = [obj for obj in elements(app) if showing(obj) and obj.get_role() == Atspi.Role.SCROLL_BAR]
+    assert not any(obj.get_role() == Atspi.Role.ICON for obj in visible)
+    scrollbars = [obj for obj in visible if obj.get_role() == Atspi.Role.SCROLL_BAR]
     x, y, width, height = bounds(alert)
     bx, by, bw, bh = bounds(close)
     assert x <= bx < bx + bw <= x + width and y <= by < by + bh <= y + height
@@ -156,13 +169,7 @@ def inspect(app, *, long=False):
 
 with (artifacts / "startup-error-smoke.log").open("w") as log, \
         WaylandInput() as native, AccessibilityFixture():
-    for appearance, high_contrast, dismissal in (
-        ("light", False, (Gdk.KEY_Return,)),
-        ("dark", False, (Gdk.KEY_Escape,)),
-        ("light", True, (Gdk.KEY_space,)),
-        ("dark", True, (Gdk.KEY_Alt_L, Gdk.KEY_c)),
-        ("light", False, None),
-    ):
+    for appearance, high_contrast, dismissal in incompatible_cases:
         name = appearance + ("-hc" if high_contrast else "")
         if dismissal is None:
             name += "-pointer"
@@ -173,12 +180,18 @@ with (artifacts / "startup-error-smoke.log").open("w") as log, \
             app = fixture.start(cargo_binary("gmux"), cwd=root, stdout=log, stderr=log)
             alert, close, body = inspect(app)
             assert body.get_name() == incompatible, body.get_name()
-            assert app.poll() is None, "The application did not retain its standalone alert"
-            # Both activation and directory opening must raise this same alert.
-            for args in ((), ("--directory", str(root))):
+            # Every CLI route must raise the existing startup alert, including
+            # the new-window request rather than retrying initialization.
+            for args in ((), ("--directory", str(root)), ("--new-window",)):
                 subprocess.run([str(cargo_binary("gmux")), *args], env=fixture.env,
                                cwd=root, stdout=log, stderr=log, timeout=8, check=True)
                 assert len([obj for obj in elements(app) if obj.get_role() == Atspi.Role.ALERT]) == 1
+            # Desktop activation and file opening use distinct GApplication signals.
+            remote = Gio.Application(application_id="dev.gmux.Gmux", flags=Gio.ApplicationFlags.HANDLES_OPEN)
+            assert remote.register(None) and remote.get_is_remote()
+            remote.activate()
+            remote.open([Gio.File.new_for_path(str(root))], "")
+            remote.get_dbus_connection().flush_sync(None)
             origin_x, origin_y = capture(native, alert, close, name)
             if dismissal is not None:
                 chord(native, Gdk.KEY_Tab)
@@ -196,7 +209,7 @@ with (artifacts / "startup-error-smoke.log").open("w") as log, \
             assert app.wait(timeout=8) == 1, "Dismissal lost the startup failure exit status"
             assert not Path(fixture.env["GMUX_SOCKET"] + ".ui").exists()
 
-    for name, dismissal in (("long", (Gdk.KEY_Return,)), ("long-system-close", (Gdk.KEY_Alt_L, Gdk.KEY_F4))):
+    for name, dismissal in long_cases:
         with scenario(name), AppFixture(dict(appearance="dark"), prefix="gmux-startup-long-",
                                        env={"GTK_A11Y": "atspi"}) as fixture:
             # Real storage failures include paths and chained parse errors. Use a
@@ -236,7 +249,7 @@ with (artifacts / "startup-error-smoke.log").open("w") as log, \
 
     log.flush()
     output = (artifacts / "startup-error-smoke.log").read_text()
-    assert output.count("Could not start Gmux:") == 7, output
+    assert output.count("Could not start Gmux:") == len(incompatible_cases) + len(long_cases), output
     assert not any(message in output for message in ("CRITICAL", "WARNING", "Gtk-WARNING", "Adwaita-CRITICAL")), output
 print("PASS: startup alerts fit their content, keep Close visible and focused, expose error details, "
       "and dismiss through the keyboard without touching a running daemon")
