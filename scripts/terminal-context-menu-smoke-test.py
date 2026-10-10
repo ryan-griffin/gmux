@@ -26,7 +26,7 @@ ensure_wayland_session()
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
-menu_names = ("Copy", "Paste", "Find…", "Split Right", "Split Down", "Close Pane")
+menu_names = ("Copy", "Paste", "Find…", "Clear Screen", "Split Right", "Split Down", "Close Pane")
 appearance = os.environ.get("GMUX_REVIEW_APPEARANCE", "dark")
 assert appearance in ("light", "dark"), appearance
 variant = appearance + ("-hc" if os.environ.get("ADW_DEBUG_HIGH_CONTRAST") == "1" else "")
@@ -138,10 +138,10 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
             key(Gdk.KEY_Menu)
             wait_for(menu_visible)
             wait_for(lambda: focused_item("Find…"))
-            for name in ("Split Right", "Split Down", "Close Pane"):
+            for name in ("Clear Screen", "Split Right", "Split Down", "Close Pane"):
                 key(Gdk.KEY_Down)
                 wait_for(lambda: focused_item(name))
-            for name in ("Split Down", "Split Right", "Find…"):
+            for name in ("Split Down", "Split Right", "Clear Screen", "Find…"):
                 key(Gdk.KEY_Up)
                 wait_for(lambda: focused_item(name))
             key(Gdk.KEY_Return)
@@ -225,6 +225,27 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
             wait_for(menu_visible)
             activate("Close Pane")
             wait_for(lambda: len(tab()["panes"]) == 2)
+
+            # Clear the clicked pane while another pane is active.
+            rpc("focus", pane=pane)
+            wait_for(lambda: tab()["active_pane"] == pane)
+            bounds = wait_for(lambda: native.frame(timeout=0.1, fresh=False).color_bounds((230, 30, 45)))
+            rpc("focus", pane=other)
+            wait_for(lambda: tab()["active_pane"] == other)
+            other_text = rpc("read", pane=other)["text"]
+            left, top, right, bottom = bounds
+            native.move(left + cw * 2, (top + bottom) / 2)
+            right_click()
+            wait_for(menu_visible)
+            assert tab()["active_pane"] == pane
+            activate("Clear Screen")
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["scrollback"]["total"]
+                     == rpc("renderer-info", pane=pane)["viewport"]["rows"])
+            wait_for(lambda: rpc("read", pane=pane)["text"] == "")
+            assert len(tab()["panes"]) == 2
+            assert rpc("read", pane=other)["text"] == other_text
+            rpc("send", pane=pane, text="printf 'AFTER_CLEAR\\n'", paste=True, enter=True)
+            wait_for(lambda: "AFTER_CLEAR" in rpc("read", pane=pane)["text"])
 
             # Terminal mouse reporting keeps normal right-click; Shift overrides it.
             ready, finished, mouse = (temp / name for name in ("ready", "finished", "mouse"))
@@ -322,6 +343,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-context-menu-") as directory:
             wait_for(lambda: "MOUSE_READY" not in rpc("read", pane=pane)["text"])
             print(f"PASS ({variant}): native terminal context menu, accessible names, action sensitivity, "
                   "selection and clipboard, Find focus, keyboard navigation and activation, mnemonics, "
+                  "Clear Screen clicked-pane targeting and continued shell input, "
                   "pane-specific splitting and closing, busy-process confirmation, mouse reporting, and Shift override")
         except Exception:
             if "mouse" in locals() and mouse.exists():

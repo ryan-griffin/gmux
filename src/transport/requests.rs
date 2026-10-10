@@ -94,6 +94,7 @@ pub(crate) enum StreamCommand {
         end: (u16, u32),
     },
     ClearSelection,
+    ClearScreen,
     Input {
         bytes: Vec<u8>,
     },

@@ -425,6 +425,9 @@ impl TerminalSession {
     pub fn clear_selection(&mut self) {
         self.engine.clear_selection();
     }
+    pub fn clear_screen(&mut self) -> anyhow::Result<()> {
+        self.engine.clear_screen()
+    }
     pub fn selection(&self) -> Option<(u64, u64)> {
         self.engine.selection()
     }

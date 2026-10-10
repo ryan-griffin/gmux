@@ -24,6 +24,7 @@ struct GmuxEngine {
     uint64_t hold_started_ms;
     GmuxView *views;
     bool view_held;
+    bool clear_pending;
 };
 
 struct GmuxView {
@@ -392,7 +393,41 @@ int gmux_engine_theme(GmuxEngine *e, const uint8_t *background,
     return 0;
 }
 void gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
+    if (e->clear_pending) {
+        size_t consumed = 0;
+        if (ghostty_terminal_vt_write_until_ground(e->terminal, data, len, &consumed)) return;
+        gmux_engine_clear_screen(e);
+        data += consumed;
+        len -= consumed;
+    }
     ghostty_terminal_vt_write(e->terminal, data, len);
+}
+int gmux_engine_clear_screen(GmuxEngine *e) {
+    e->clear_pending = false;
+    GhosttyTerminalScreen screen;
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
+        || screen != GHOSTTY_TERMINAL_SCREEN_PRIMARY) return -1;
+    bool ground = false;
+    ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground);
+    if (!ground) {
+        // Never splice host commands into a partial OSC, CSI, or UTF-8 character.
+        e->clear_pending = true;
+        return 0;
+    }
+    GhosttyTerminalModeConfig hold = {.mode = GHOSTTY_MODE_SYNC_OUTPUT, .value = false};
+    ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_MODE, &hold);
+    e->held = false;
+    // ED2 can move prompt rows into history, so erase history afterwards.
+    const char clear[] = "\x1b[2J\x1b[3J\x1b[H";
+    ghostty_terminal_vt_write(e->terminal, (const uint8_t *)clear, sizeof(clear) - 1);
+    gmux_engine_clear_selection(e);
+    for (GmuxView *v = e->views; v; v = v->next) {
+        ghostty_tracked_grid_ref_free(v->viewport); v->viewport = NULL;
+        ghostty_tracked_grid_ref_free(v->selection_start); v->selection_start = NULL;
+        ghostty_tracked_grid_ref_free(v->selection_end); v->selection_end = NULL;
+    }
+    gmux_engine_scroll(e, 0, true);
+    return 0;
 }
 int gmux_engine_cursor_style(GmuxEngine *e, uint8_t style) {
     if (style > GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW) return GHOSTTY_INVALID_VALUE;

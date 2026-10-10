@@ -56,6 +56,11 @@ pub const COMMANDS: &[Command] = &[
         keywords: "search text match locate",
     },
     Command {
+        title: "Clear Screen",
+        action: "clear-screen",
+        keywords: "erase scrollback history output terminal",
+    },
+    Command {
         title: "Rename Tab…",
         action: "rename",
         keywords: "edit name title",

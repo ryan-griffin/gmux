@@ -93,16 +93,19 @@ impl HistorySearch {
         if self.query == query {
             return;
         }
-        self.dirty = !query.is_empty();
         self.query = query;
+        self.restart();
+    }
+    pub fn invalidate(&mut self) {
+        self.dirty |= !self.query.is_empty();
+    }
+    pub fn restart(&mut self) {
+        self.dirty = !self.query.is_empty();
         self.matcher.clear();
         self.matches.clear();
         self.scanning.clear();
         self.current = 0;
         self.pending = false;
-    }
-    pub fn invalidate(&mut self) {
-        self.dirty |= !self.query.is_empty();
     }
     pub fn begin(&mut self, rows: u64, cols: usize) {
         self.rows = rows;

@@ -32,7 +32,9 @@ They require no display or running Gmux instance.
 
 `multi-client` checks two connections sharing input, output, layouts, and
 workspaces while keeping scrolling, search, selection, and clipboard replies
-independent. It also checks PTY sizing and disconnect isolation. `multi-window`
+independent. Clear Screen must erase shared history, release client selections
+and scroll anchors, and restart each client's Find query while the shell keeps
+accepting input. It also checks PTY sizing and disconnect isolation. `multi-window`
 uses the native Wayland fixture to check CLI/action window creation, shared tab
 and split changes, independent navigation and zoom, and closing individual
 windows without stopping their shells. It also launches the checked-in desktop
@@ -56,6 +58,12 @@ New Window must stay out of the New Tab dropdowns. The `commands` suite checks
 its search terms, enabled state, accelerator label, and matching help in the
 Application shortcut section. Run the menu suite in light, dark, and high-contrast
 appearances using the options below.
+
+Clear Screen coverage also checks its secondary-menu placement and mnemonic,
+context-menu navigation and clicked-pane targeting, and command-palette search
+and empty-window sensitivity. Engine tests cover erasure in checkpoints,
+Unicode, parser boundaries, synchronized output, retained terminal modes and
+metadata, and rejection on the alternate screen.
 
 The native suite and application benchmark also need:
 

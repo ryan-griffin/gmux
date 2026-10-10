@@ -127,6 +127,9 @@ impl EngineView {
     pub(crate) fn invalidate(&mut self) {
         self.find.invalidate();
     }
+    pub(crate) fn restart_find(&mut self) {
+        self.find.restart();
+    }
 }
 /// Plain text for the displayed grid, with wide-cell continuations omitted.
 pub(crate) fn viewport_text(frame: Frame, cells: &[Cell]) -> String {
@@ -408,6 +411,14 @@ impl Engine {
     pub fn clear_selection(&mut self) {
         unsafe { gmux_engine_clear_selection(self.raw.as_ptr()) }
     }
+    pub fn clear_screen(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            unsafe { gmux_engine_clear_screen(self.raw.as_ptr()) } == 0,
+            "Clear Screen is unavailable while a full-screen application is using the terminal"
+        );
+        self.find.restart();
+        Ok(())
+    }
     pub fn selection(&self) -> Option<(u64, u64)> {
         let (mut start, mut end) = (0, 0);
         (unsafe { gmux_engine_selection(self.raw.as_ptr(), &mut start, &mut end) } == 0)
@@ -541,6 +552,109 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_screen_erases_history_selection_and_search_without_resetting_session_state() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(20, 3, 0, 0).unwrap();
+        for _ in 0..12 {
+            engine.write("old 你好 e\u{301}\r\n".as_bytes());
+        }
+        engine.write(b"\x1b]2;Keep title\x07\x1b]7;file:///tmp\x07\x1b[?2004h\x1b[31m");
+        engine.scroll_to(0);
+        engine.snapshot().unwrap();
+        assert!(engine.frame.scrollback.total > 3);
+        engine.select((0, 0), (2, 0)).unwrap();
+        engine.find("old");
+        while engine.find_pending() {
+            engine.poll_find();
+        }
+        assert_eq!(engine.find_state().total, 12);
+
+        engine.clear_screen().unwrap();
+        engine.snapshot().unwrap();
+        assert_eq!(engine.frame.scrollback.total, 3);
+        assert_eq!(engine.frame.scrollback.offset, 0);
+        assert_eq!((engine.frame.cursor_x, engine.frame.cursor_y), (0, 0));
+        assert_eq!(engine.text().unwrap(), "");
+        assert!(engine.selection().is_none());
+        while engine.find_pending() {
+            engine.poll_find();
+        }
+        assert_eq!(engine.find_state().total, 0);
+        assert!(engine.mode(2004));
+        assert_eq!(engine.metadata(false), "Keep title");
+        assert_eq!(engine.metadata(true), "file:///tmp");
+        let mut restored = Engine::new().unwrap();
+        restored
+            .restore_history(&engine.checkpoint().unwrap())
+            .unwrap();
+        assert_eq!(restored.text().unwrap(), "");
+
+        engine.write(b"old\x1b[6n");
+        engine.snapshot().unwrap();
+        assert_eq!(engine.text().unwrap(), "old");
+        assert_eq!(engine.cells[0].fg, Theme::adwaita(true).palette[1]);
+        assert_eq!(engine.take_events().0, b"\x1b[1;4R");
+        while engine.find_pending() {
+            engine.poll_find();
+        }
+        assert_eq!(engine.find_state().total, 1);
+    }
+
+    #[test]
+    fn clear_screen_waits_for_partial_vt_and_utf8_before_erasing() {
+        for (prefix, suffix) in [
+            (b"\x1b]2;Partial title".as_slice(), b"\x07NEW".as_slice()),
+            (b"\x1b[38;2;1;2;".as_slice(), b"3mNEW".as_slice()),
+            (b"\xf0\x9f".as_slice(), b"\xa6\x80NEW".as_slice()),
+        ] {
+            let mut engine = Engine::new().unwrap();
+            engine.write(b"OLD\r\n");
+            engine.write(prefix);
+            engine.clear_screen().unwrap();
+            engine.write(suffix);
+            assert_eq!(engine.text().unwrap(), "NEW");
+            assert_eq!(engine.take_events().0, b"");
+        }
+    }
+
+    #[test]
+    fn clear_screen_ends_render_hold_and_clears_every_client_selection_and_scroll_anchor() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(20, 3, 0, 0).unwrap();
+        engine.write(b"old\r\nold\r\nold\r\nold\r\nold");
+        let mut first = engine.new_view().unwrap();
+        let mut second = engine.new_view().unwrap();
+        for view in [&mut first, &mut second] {
+            engine.with_view(view, |engine| {
+                engine.scroll_to(0);
+                engine.select((0, 0), (2, 0)).unwrap();
+                engine.snapshot().unwrap();
+            });
+        }
+        engine.write(b"\x1b[?2026hHELD");
+        engine.clear_screen().unwrap();
+        assert!(!engine.mode(2026));
+        for view in [&mut first, &mut second] {
+            engine.with_view(view, |engine| {
+                assert_eq!(engine.text().unwrap(), "");
+                assert!(engine.selection().is_none());
+                assert_eq!(engine.frame.scrollback.total, 3);
+                assert_eq!(engine.frame.scrollback.offset, 0);
+            });
+        }
+    }
+
+    #[test]
+    fn clear_screen_preserves_alternate_screen_applications() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"PRIMARY\x1b[?1049h\x1b[HALTERNATE");
+        assert!(engine.clear_screen().is_err());
+        assert_eq!(engine.text().unwrap(), "ALTERNATE");
+        engine.write(b"\x1b[?1049l");
+        assert_eq!(engine.text().unwrap(), "PRIMARY");
+    }
 
     #[test]
     fn client_views_share_output_but_keep_scroll_selection_and_search() {

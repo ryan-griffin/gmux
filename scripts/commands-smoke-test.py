@@ -73,12 +73,14 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
 
         close_pane = wait_for(lambda: find("Close Pane", "list item"))
         close_window = wait_for(lambda: find("Close Window", "list item"))
+        clear_screen = wait_for(lambda: find("Clear Screen", "list item"))
         new_window = wait_for(lambda: find("New Window", "list item"))
         new_window_shortcut = wait_for(lambda: shortcut_labels(new_window))
         assert new_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
         pane_shortcut = wait_for(lambda: shortcut_labels(close_pane))
         wait_for(lambda: shortcut_labels(close_window) == pane_shortcut)
         assert not close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE)
+        assert not clear_screen.get_state_set().contains(Atspi.StateType.SENSITIVE)
         assert close_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
 
         def selected(name):
@@ -104,6 +106,7 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         wait_for(lambda: close_window.get_state_set().contains(Atspi.StateType.SHOWING))
         wait_for(lambda: not shortcut_labels(close_window))
         wait_for(lambda: close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        wait_for(lambda: clear_screen.get_state_set().contains(Atspi.StateType.SENSITIVE))
         assert shortcut_labels(close_pane) == pane_shortcut
         assert close_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
         for query, name in [
@@ -112,6 +115,7 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
             ("new directory", "New Tab in Directory…"),
             ("new window", "New Window"), ("another window", "New Window"),
             ("splti riht", "Split Right"), ("name", "Rename Tab…"),
+            ("clear screen", "Clear Screen"), ("scrollback", "Clear Screen"),
             ("toggle sidebar", "Show or Hide Tabs"), ("manage", "Manage Workspaces…"),
         ]:
             search(query, name)
@@ -145,6 +149,7 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         rpc("close", pane=created["pane"])
         wait_for(lambda: shortcut_labels(close_window) == pane_shortcut)
         wait_for(lambda: not close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        wait_for(lambda: not clear_screen.get_state_set().contains(Atspi.StateType.SENSITIVE))
         assert close_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
         rpc("action", name="shortcuts")
         wait_for(lambda: find("Closes the window when the empty state is shown", "label"))
@@ -170,6 +175,7 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         print("PASS: command labels, related terms, typo matching, ranking, disabled matches, "
               "uniform rows, retained search focus, selection and no-result announcements, "
               "search-to-list accessibility relation, conditional Close Window shortcut labels, "
+              "Clear Screen search terms and empty-window sensitivity, "
               "New Window shortcut help in the Application section, and the Close Pane shortcut explanation")
     finally:
         if listener:

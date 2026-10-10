@@ -665,6 +665,7 @@ fn terminal_menu_button() -> gtk::MenuButton {
     terminal.append(Some("Split _Right"), Some("win.split-right"));
     terminal.append(Some("Split _Down"), Some("win.split-down"));
     terminal.append(Some("_Find in Terminal…"), Some("win.find"));
+    terminal.append(Some("_Clear Screen"), Some("win.clear-screen"));
     menu.append_section(None, &terminal);
     let zoom = gio::Menu::new();
     let zoom_in = gio::MenuItem::new(Some("_Zoom In"), Some("win.zoom-in"));
