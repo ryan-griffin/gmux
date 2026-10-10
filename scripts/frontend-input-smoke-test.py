@@ -116,6 +116,7 @@ for kind in ("valid-input-scroll", "empty-lines-input"):
             observer.send("subscribe", panes=[other])
             observer.until(lambda h, text: h["meta"]["id"] == other and h["frame"])
             # A larger, supported viewport makes repeated snapshot work visible.
+            noisy.send("subscribe", panes=[pane])
             noisy.send("resize", cols=160, rows=50)
             wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [160, 50])
             command = wire("input", pane=pane, bytes=[0])
