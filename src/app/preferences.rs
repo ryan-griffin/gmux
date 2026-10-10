@@ -1,6 +1,9 @@
 //! Preferences and terminal settings.
 use super::*;
-use std::{sync::mpsc, thread};
+use std::{
+    sync::{Arc, Condvar, Mutex, mpsc},
+    thread,
+};
 
 /// One settings snapshot and ordered writer for the entire application.
 pub(super) struct AppPreferences {
@@ -82,18 +85,36 @@ impl Drop for AppPreferences {
     }
 }
 
+#[derive(Default)]
+struct PendingSettings {
+    snapshot: Option<Settings>,
+    closed: bool,
+}
+
 struct SettingsWriter {
-    sender: Option<mpsc::Sender<Settings>>,
+    pending: Arc<(Mutex<PendingSettings>, Condvar)>,
     errors: mpsc::Receiver<String>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl SettingsWriter {
     fn new(wake: ipc::Wake) -> Self {
-        let (sender, settings) = mpsc::channel::<Settings>();
+        let pending = Arc::new((Mutex::new(PendingSettings::default()), Condvar::new()));
+        let writing = pending.clone();
         let (errors, receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
-            for settings in settings {
+            loop {
+                let settings = {
+                    let (lock, ready) = &*writing;
+                    let mut pending = lock.lock().unwrap();
+                    while pending.snapshot.is_none() && !pending.closed {
+                        pending = ready.wait(pending).unwrap();
+                    }
+                    let Some(settings) = pending.snapshot.take() else {
+                        break;
+                    };
+                    settings
+                };
                 if let Err(error) = storage::save("settings.json", &settings) {
                     let _ = errors.send(error.to_string());
                     wake.notify();
@@ -101,13 +122,18 @@ impl SettingsWriter {
             }
         });
         Self {
-            sender: Some(sender),
+            pending,
             errors: receiver,
             worker: Some(worker),
         }
     }
     fn persist(&self, settings: Settings) -> anyhow::Result<()> {
-        self.sender.as_ref().unwrap().send(settings)?;
+        let (lock, ready) = &*self.pending;
+        let mut pending = lock.lock().unwrap();
+        anyhow::ensure!(!pending.closed, "Preferences writer is closed");
+        // Keep the in-flight save and only the latest pending snapshot.
+        pending.snapshot = Some(settings);
+        ready.notify_one();
         Ok(())
     }
 }
@@ -115,7 +141,9 @@ impl SettingsWriter {
 impl Drop for SettingsWriter {
     fn drop(&mut self) {
         // Finish queued saves before exiting, including after the last window closes.
-        self.sender.take();
+        let (lock, ready) = &*self.pending;
+        lock.lock().unwrap().closed = true;
+        ready.notify_one();
         if self.worker.take().unwrap().join().is_err() {
             eprintln!("Preferences writer stopped unexpectedly");
         }

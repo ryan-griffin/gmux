@@ -271,8 +271,10 @@ impl Ui {
                 let visible = split.shows_sidebar();
                 // Existing windows keep their own visibility. Save only the
                 // default for future windows in the shared preferences.
-                ui.settings.borrow_mut().show_sidebar = visible;
-                ui.persist_settings();
+                if ui.settings.borrow().show_sidebar != visible {
+                    ui.settings.borrow_mut().show_sidebar = visible;
+                    ui.persist_settings();
+                }
             }
         });
         let weak = Rc::downgrade(&ui);
