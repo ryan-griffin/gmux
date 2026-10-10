@@ -21,6 +21,9 @@ pub struct ScreenSnapshot<'a> {
     pub frame: Frame,
     pub cells: &'a [Cell],
     pub revision: u64,
+    /// Changes when text or wide-cell layout may differ. Local engine snapshots
+    /// conservatively use the cell revision; remote snapshots inspect row deltas.
+    pub text_revision: u64,
 }
 
 #[derive(Default)]
@@ -395,6 +398,7 @@ impl TerminalSession {
             frame: self.engine.frame,
             cells: &self.engine.cells,
             revision: self.engine.revision(),
+            text_revision: self.engine.revision(),
         })
     }
 

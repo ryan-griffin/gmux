@@ -68,6 +68,65 @@ a binary hash identifies a build but does not recover its source.
 local files from recorded runs and are absent from a fresh checkout. Preserve
 those files separately when sharing measurements.
 
+## Accessible terminal text comparison
+
+The isolated accessibility benchmark measures text construction without GTK,
+transport, rendering, AT-SPI queries or notification delivery. Run it with:
+
+```sh
+cargo build --locked --release --example accessible-terminal-benchmark
+taskset -c 2 target/release/examples/accessible-terminal-benchmark \
+  > artifacts/accessibility-benchmark.json
+```
+
+Set `GHOSTTY_PREFIX` to the pinned library installation when building. Both the
+benchmark and the linked Gmux library use Cargo's release profile with thin LTO.
+This avoids measuring optimized benchmark code linked to a debug library.
+
+The ASCII fixture fills every cell with `X`. The Unicode fixture repeats CJK,
+combining characters, an emoji ZWJ sequence, wide-cell continuations and spaces.
+Inputs and outputs pass through `black_box`. Each case has 20 warmup/calibration
+iterations and 21 timed batches, with the batch size calibrated for about 10 ms
+of work. Reported times are per-operation batch means, not individual latency
+percentiles. `fresh` constructs and drops a new `Text`; `reused` rebuilds and
+swaps two retained buffers. `color_row` compares one recolored row using the
+same `Cell::text_eq` predicate as the frontend, then updates caret and selection.
+It excludes the row copy common to both versions and the rest of packet handling.
+
+On 2026-10-10, three alternating before/after runs used an Intel Core i7-13700H,
+Linux 7.2.9 and Rust 1.99.0, pinned to logical CPU 2. The baseline compiled the
+unchanged production `Text::from_frame` at `492b344` with the fresh-only version
+of this benchmark. The table reports the median of the three batch medians,
+in microseconds.
+
+| Grid | Fixture | Baseline fresh rebuild | Reused rebuild | Color-only row |
+| --- | --- | ---: | ---: | ---: |
+| 80 × 24 | ASCII | 33.02 | 31.55 | 0.346 |
+| 80 × 24 | Unicode | 35.59 | 33.41 | 0.345 |
+| 240 × 80 | ASCII | 319.57 | 314.01 | 1.007 |
+| 240 × 80 | Unicode | 366.81 | 328.20 | 1.007 |
+| 512 × 256 | ASCII | 2358.29 | 2129.08 | 2.129 |
+| 512 × 256 | Unicode | 2537.73 | 2255.10 | 2.128 |
+
+The dominant saving is skipping text reconstruction for color and style changes.
+Buffer reuse provides a smaller improvement and removes repeated allocation
+when the new contents fit the retained capacities. Text changes still scan the
+full viewport, including a single changed row. These results support the small
+invalidation/reuse change; they do not establish an application CPU or latency
+improvement or justify the complexity of updating global Unicode mappings by row.
+
+The canvas retains two sets of buffers at their largest capacities until it is
+destroyed. The old implementation also held old and new text during each
+rebuild, but freed the old allocations afterward. The retained memory is the
+tradeoff for reuse. Removal notifications still read the old text before the
+canvas swaps buffers; insertion notifications read the new text afterward.
+
+Local reports are `artifacts/accessibility-benchmark/before-{1,2,3}.json`,
+`after-{1,2,3}.json` and `summary.json`. The preserved baseline executable's
+SHA-256 is `6ff8e3278411e03e0f5fb7c0df9a93fee2acf7e8e92f8ce6c41d653f48af3806`;
+the updated executable's is
+`0a0c9e0da0baaf73c014908029d313db198199aa9512537674725f68fcd8bbe9`.
+
 ## Fallback-font batching comparison
 
 This is the latest recorded application comparison, measured on 2026-10-04

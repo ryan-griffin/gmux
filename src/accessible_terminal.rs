@@ -14,43 +14,48 @@ pub struct Text {
 }
 impl Text {
     pub fn from_frame(frame: Frame, cells: &[Cell], selection: Option<(usize, usize)>) -> Self {
+        let mut text = Self::default();
+        text.rebuild(frame, cells, selection);
+        text
+    }
+    pub fn rebuild(&mut self, frame: Frame, cells: &[Cell], selection: Option<(usize, usize)>) {
         let cols = frame.cols as usize;
-        let mut text = Self {
-            cols,
-            value: String::with_capacity(cells.len()),
-            offsets: Vec::with_capacity(cells.len() + 1),
-            cell_ends: Vec::with_capacity(cells.len()),
-            spans: Vec::with_capacity(cells.len()),
-            ..Self::default()
-        };
+        self.cols = cols;
+        self.value.clear();
+        self.offsets.clear();
+        self.cell_ends.clear();
+        self.spans.clear();
+        self.value.reserve(cells.len());
+        self.offsets.reserve(cells.len() + 1);
+        self.cell_ends.reserve(cells.len());
+        self.spans.reserve(cells.len());
         let mut offset = 0;
         for (i, cell) in cells.iter().enumerate() {
             if i > 0 && cols > 0 && i % cols == 0 {
-                text.value.push('\n');
-                text.spans.push(i - 1..i);
+                self.value.push('\n');
+                self.spans.push(i - 1..i);
                 offset += 1;
             }
             if cell.flags & 64 != 0 && i > 0 && cols > 0 && i % cols != 0 {
-                text.offsets.push(text.offsets[i - 1]);
-                text.cell_ends.push(offset);
+                self.offsets.push(self.offsets[i - 1]);
+                self.cell_ends.push(offset);
             } else {
-                text.offsets.push(offset);
+                self.offsets.push(offset);
                 let glyph = cell.text();
                 let glyph = if glyph.is_empty() { " " } else { glyph };
-                text.value.push_str(glyph);
+                self.value.push_str(glyph);
                 let len = glyph.chars().count();
                 let wide = cols > 0
                     && (i + 1) % cols != 0
                     && cells.get(i + 1).is_some_and(|cell| cell.flags & 64 != 0);
-                text.spans
+                self.spans
                     .extend(std::iter::repeat_n(i..i + if wide { 2 } else { 1 }, len));
                 offset += len as u32;
-                text.cell_ends.push(offset);
+                self.cell_ends.push(offset);
             }
         }
-        text.offsets.push(offset);
-        text.update_positions(frame, selection);
-        text
+        self.offsets.push(offset);
+        self.update_positions(frame, selection);
     }
     pub fn char_count(&self) -> u32 {
         self.offsets.last().copied().unwrap_or(0)
@@ -142,6 +147,106 @@ impl Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn allocations(text: &Text) -> (*const u8, *const u32, *const u32, *const Range<usize>) {
+        (
+            text.value.as_ptr(),
+            text.offsets.as_ptr(),
+            text.cell_ends.as_ptr(),
+            text.spans.as_ptr(),
+        )
+    }
+
+    #[test]
+    fn identical_text_with_different_cell_layout_updates_positions_and_geometry() {
+        let frame = Frame {
+            cols: 2,
+            rows: 1,
+            cursor_x: 1,
+            ..Frame::default()
+        };
+        let mut cells = vec![Cell::default(); 2];
+        cells[0].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        cells[1].text[0] = b'X';
+        let mut text = Text::from_frame(frame, &cells, Some((0, 0)));
+        assert_eq!(text.value, "e\u{301}X");
+        assert_eq!(text.caret, 2);
+        assert_eq!(text.selection, Some((0, 2)));
+        assert_eq!(text.extents(1, 2, 8.0, 16.0), Some((0.0, 0.0, 8.0, 16.0)));
+        cells[0].text = [0; 64];
+        cells[0].text[0] = b'e';
+        cells[1].text[..3].copy_from_slice("\u{301}X".as_bytes());
+        text.rebuild(frame, &cells, Some((0, 0)));
+        assert_eq!(text.value, "e\u{301}X");
+        assert_eq!(text.caret, 1);
+        assert_eq!(text.selection, Some((0, 1)));
+        assert_eq!(text.extents(1, 2, 8.0, 16.0), Some((8.0, 0.0, 8.0, 16.0)));
+        assert_eq!(text.offset_at(12.0, 8.0, 8.0, 16.0), Some(1));
+    }
+
+    #[test]
+    fn rebuild_reuses_storage_and_updates_unicode_row_mappings() {
+        let frame = Frame {
+            cols: 4,
+            rows: 2,
+            ..Frame::default()
+        };
+        let mut cells = vec![Cell::default(); 8];
+        for (cell, glyph) in cells
+            .iter_mut()
+            .zip(["界", "", "e\u{301}", "X", "👩‍💻", "", "b", ""])
+        {
+            cell.text[..glyph.len()].copy_from_slice(glyph.as_bytes());
+        }
+        cells[1].flags = 64;
+        cells[5].flags = 64;
+        let mut text = Text::from_frame(frame, &cells, Some((0, 5)));
+        assert_eq!(text.value, "界e\u{301}X\n👩‍💻b ");
+        let storage = allocations(&text);
+        // A one-row update leaves the first row's offsets and geometry intact.
+        cells[6].text[0] = b'c';
+        text.rebuild(
+            Frame {
+                cursor_x: 2,
+                cursor_y: 1,
+                ..frame
+            },
+            &cells,
+            Some((5, 6)),
+        );
+        assert_eq!(allocations(&text), storage);
+        assert_eq!(text.value, "界e\u{301}X\n👩‍💻c ");
+        assert_eq!(text.offsets, [0, 0, 1, 3, 5, 5, 8, 9, 10]);
+        assert_eq!(text.caret, 8);
+        assert_eq!(text.selection, Some((5, 9)));
+        assert_eq!(text.bytes(5, 8), "👩‍💻\0".as_bytes());
+        assert_eq!(text.extents(5, 8, 8.0, 16.0), Some((0.0, 16.0, 16.0, 16.0)));
+        assert_eq!(text.offset_at(12.0, 24.0, 8.0, 16.0), Some(5));
+        // Smaller and empty grids must not retain old offsets or selections.
+        text.rebuild(
+            Frame {
+                cols: 2,
+                rows: 1,
+                ..Frame::default()
+            },
+            &cells[..2],
+            None,
+        );
+        assert_eq!(allocations(&text), storage);
+        assert_eq!(text.value, "界");
+        assert_eq!(text.offsets, [0, 0, 1]);
+        assert_eq!(text.selection, None);
+        assert_eq!(text.extents(0, 1, 8.0, 16.0), Some((0.0, 0.0, 16.0, 16.0)));
+        text.rebuild(Frame::default(), &[], Some((0, 0)));
+        assert_eq!(allocations(&text), storage);
+        assert!(text.value.is_empty());
+        assert_eq!(text.offsets, [0]);
+        assert_eq!(text.char_count(), 0);
+        assert_eq!(text.caret, 0);
+        assert_eq!(text.selection, None);
+        assert!(text.spans.is_empty());
+        assert!(text.cell_ends.is_empty());
+    }
     #[test]
     fn text_offsets_count_characters_and_preserve_wide_clusters() {
         let mut cells = vec![Cell::default(); 4];

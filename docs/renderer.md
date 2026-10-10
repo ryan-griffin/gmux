@@ -75,8 +75,12 @@ output without automatic viewport extraction or terminal painting.
 
 The canvas implements `GtkAccessibleText` alongside `GtkScrollable`. It exposes
 Unicode viewport text, character offsets, caret, selection, text boundaries, and
-cell extents. Text updates use the viewport revision to avoid rebuilding it for
-unchanged cells. Cached and rebuilt selections share the same cell-end mapping,
+cell extents. The frontend tracks a text revision while applying row deltas,
+comparing glyph bytes and wide-cell continuation flags. Color and style changes
+still repaint but reuse the accessible text and its mappings. Actual text or
+layout changes rebuild the full viewport with a spare set of text buffers;
+the old contents remain readable until the removal notification completes.
+Cached and rebuilt selections share the same cell-end mapping,
 including wide glyphs and row boundaries. Boundary queries reuse a lazily created
 GTK text buffer until the text changes. Changes to colors alone do not emit text
 replacement notifications. The interface is read-only; keyboard input still

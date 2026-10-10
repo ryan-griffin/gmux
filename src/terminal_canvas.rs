@@ -13,6 +13,7 @@ mod imp {
 
     pub struct TerminalCanvas {
         pub text: RefCell<crate::accessible_terminal::Text>,
+        pub spare_text: RefCell<Option<crate::accessible_terminal::Text>>,
         pub text_buffer: RefCell<Option<gtk::TextBuffer>>,
         pub text_revision: Cell<Option<(u64, u16, u16, u64)>>,
         pub metrics: Cell<(f32, f32)>,
@@ -34,6 +35,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 text: RefCell::default(),
+                spare_text: RefCell::default(),
                 text_buffer: RefCell::default(),
                 text_revision: Cell::new(None),
                 metrics: Cell::new((9.6, 22.0)),
@@ -288,13 +290,20 @@ impl TerminalCanvas {
     ) {
         let imp = self.imp();
         let key = (
-            screen.revision,
+            screen.text_revision,
             screen.frame.cols,
             screen.frame.rows,
             screen.frame.scrollback.offset,
         );
         let next = if imp.text_revision.get() != Some(key) {
-            crate::accessible_terminal::Text::from_frame(screen.frame, screen.cells, selection)
+            // Keep the old text readable until GTK's removal notification has
+            // completed, then reuse its allocations for the next rebuild.
+            if let Some(mut text) = imp.spare_text.borrow_mut().take() {
+                text.rebuild(screen.frame, screen.cells, selection);
+                text
+            } else {
+                crate::accessible_terminal::Text::from_frame(screen.frame, screen.cells, selection)
+            }
         } else {
             let mut old = imp.text.borrow_mut();
             let (caret, selected) = (old.caret, old.selection);
@@ -324,7 +333,8 @@ impl TerminalCanvas {
             self.update_contents(gtk::AccessibleTextContentChange::Remove, 0, old_len);
             imp.text_buffer.borrow_mut().take();
         }
-        *imp.text.borrow_mut() = next;
+        let old = imp.text.replace(next);
+        imp.spare_text.replace(Some(old));
         imp.text_revision.set(Some(key));
         if content_changed {
             self.update_contents(gtk::AccessibleTextContentChange::Insert, 0, new_len);
