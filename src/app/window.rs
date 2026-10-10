@@ -4,17 +4,12 @@ use super::*;
 impl Ui {
     pub(super) fn new(
         app: &adw::Application,
+        settings: Rc<RefCell<Settings>>,
         directory: Option<PathBuf>,
         owner: std::rc::Weak<Windows>,
         id: u64,
         endpoint: ipc::Endpoint,
     ) -> anyhow::Result<Rc<Self>> {
-        let settings = Rc::new(RefCell::new(storage::load::<Settings>("settings.json")?));
-        let desktop_settings = font::desktop_settings();
-        if let Some(desktop) = &desktop_settings {
-            settings.borrow_mut().system_font = desktop.string(font::KEY).to_string();
-        }
-        apply_appearance(&settings.borrow());
         let wake = ipc::Wake::new()?;
         let mut sessions = SessionManager::connect_at(endpoint.clone(), wake.clone())?;
         let initial: CommandReply = if let Some(directory) = directory {
@@ -215,7 +210,7 @@ impl Ui {
             heading,
             toast,
             settings,
-            desktop_settings,
+            preferences_dialog: RefCell::new(None),
             tabs: RefCell::new(Vec::new()),
             sessions: RefCell::new(sessions),
             catalog: RefCell::new(catalog),
@@ -274,23 +269,12 @@ impl Ui {
         ui.split.connect_show_sidebar_notify(move |split| {
             if let Some(ui) = weak.upgrade() {
                 let visible = split.shows_sidebar();
-                if ui.settings.borrow().show_sidebar != visible {
-                    ui.settings.borrow_mut().show_sidebar = visible;
-                    ui.persist_settings();
-                }
+                // Existing windows keep their own visibility. Save only the
+                // default for future windows in the shared preferences.
+                ui.settings.borrow_mut().show_sidebar = visible;
+                ui.persist_settings();
             }
         });
-        if let Some(desktop) = &ui.desktop_settings {
-            let weak = Rc::downgrade(&ui);
-            desktop.connect_changed(Some(font::KEY), move |desktop, _| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.settings.borrow_mut().system_font = desktop.string(font::KEY).to_string();
-                    if ui.settings.borrow().use_system_font {
-                        ui.redraw_terminals();
-                    }
-                }
-            });
-        }
         let weak = Rc::downgrade(&ui);
         let handler = adw::StyleManager::default().connect_dark_notify(move |_| {
             if let Some(ui) = weak.upgrade() {
