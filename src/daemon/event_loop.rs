@@ -129,6 +129,12 @@ pub fn run() -> anyhow::Result<()> {
         let mut deadline = quit_at;
         for next in [
             (saving.is_none() && !controls.is_empty()).then_some(now),
+            // Socket readiness cannot report commands already read into userspace.
+            daemon
+                .frontends
+                .values()
+                .any(Frontend::input_pending)
+                .then_some(now),
             attached.then_some(next_metadata),
             pending.then_some(next_frame),
             held.then_some(now + Duration::from_millis(100)),
@@ -204,7 +210,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         for &(id, index) in &frontend_indices {
-            if fds[index].revents == 0 {
+            if fds[index].revents == 0 && !daemon.frontends[&id].input_pending() {
                 continue;
             }
             let Some(mut frontend) = daemon.frontends.remove(&id) else {

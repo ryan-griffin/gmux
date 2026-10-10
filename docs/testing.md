@@ -281,6 +281,7 @@ building or starting services. Unknown names and desktop selections without
 | `bootstrap` | Interrupted downloads and extraction, recovery of older incomplete caches, cache reuse, checksum verification, and temporary-file cleanup. |
 | `startup-error` | A private incompatible-daemon handshake, content-sized standalone alerts, repeated CLI and desktop activation/open including `--new-window` during startup failure, initial focus, keyboard/pointer/system dismissal, keyboard scrolling of long plain-text error details with a fixed Close response, AT-SPI error descriptions, saved light/dark appearance, screenshots with and without high contrast, and neutral button fill. |
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |
+| `frontend-input` | Control RPC and a second client's PTY input during bounded command floods, buffered Attach, and fragmented 4 MiB UTF-8 paste integrity and timing. |
 | `scrollback` | Durable colored history across Quit/SIGTERM, exact indexed/RGB foreground/background and attribute cells, resets and fresh shell output, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
 | `workspace`, `sidebar-search`, `branch`, `title`, `scheduling` | Workspace state, sidebar behavior, process metadata, focus, and background work. |
 | `find`, `commands`, `font`, `resize`, `split-resize` | Search, palette accessibility, live settings, and sizing. |
@@ -324,6 +325,14 @@ Detailed rendering checks are in [renderer validation](renderer.md#validation).
 Backend cases are in [session validation](terminal-sessions.md#validation).
 Test counts come from the runner output; the suite changes as regressions are
 added.
+
+The `frontend-input` suite writes for at most three seconds or 16 MiB per flood
+and requires control replies and another pane's input echo within 200 ms.
+It also prints RSS high-water marks and ten complete paste transfer times.
+Use `--binary /path/to/gmux-daemon --measure --report artifacts/frontend-input.json`
+with `scripts/frontend-input-smoke-test.py` to record a baseline without latency
+assertions. The byte and socket-read limits remain 512 KiB and 32 reads per turn;
+the additional 64-request limit bounds decoding and dispatch of small commands.
 
 The general `smoke` suite covers startup, PTY workflows, and session reconnects.
 The runner selects its native mode. A direct invocation without `--native`
