@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 HEADLESS = ["bootstrap", "cargo-output", "daemon", "multi-client", "scrollback", "control", "icon"]
-DESKTOP = ["state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
+DESKTOP = ["startup-error", "state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
            "title", "scheduling", "resize", "split-resize", "font", "find", "commands", "main-menu", "window-close", "multi-window",
            "terminal-context-menu", "terminal-scrollbar", "terminal-renderer",
            "terminal-input", "terminal-copy", "notifications", "notification-focus", "notification-delivery",

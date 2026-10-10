@@ -18,6 +18,32 @@ about widgets. Directory and font selection use GTK choosers. Pane shadows come
 from Adwaita's `.card` style; terminal colors, active-pane outlines, and inactive
 pane dimming are application customizations.
 
+Startup failures use `AdwAlertDialog` with a heading, plain-text error details,
+and one neutral Close response. Close receives initial focus and is both the
+default response for Enter and the close response for Escape and window-manager
+dismissal. Default activation does not imply suggested-action styling.
+Repeated activation or directory opening raises the existing failure alert.
+
+The startup alert is a necessary exception to the HIG's parent-window rule:
+initialization can fail before a main window exists. Libadwaita's supported
+parentless presentation creates its native window, which Gmux registers with
+`GtkApplication` to stay alive until dismissal. It then reports the original
+startup error to stderr and returns a failure exit status.
+
+The previous fixed 560 × 340 window used `AdwStatusPage`, whose internal scrolled
+window could not fit its large icon, spacing, text, and child button. The alert
+uses libadwaita's content sizing and response layout. Ordinary errors fit without
+scrolling; long descriptions can scroll while Close stays outside the message's
+scrolled area. Error details remain plain text, including paths containing
+markup characters.
+
+Native validation of the previous layout found that GTK initially focused
+Close automatically, but the window had no default widget or Escape binding.
+The alert assigns focus and dismissal explicitly while retaining native styling.
+
+The [native startup-alert screenshot](images/startup-error.png) shows the neutral
+Close response with its keyboard focus outline.
+
 The Find field combines a `GtkText`, match-count label, and clear button under
 Adwaita's entry styling. This places the count inside the field while retaining
 its focus ring and error state.
@@ -129,6 +155,10 @@ menu, focus, preferences, and accessibility checks.
 - [GNOME HIG: menus](https://developer.gnome.org/hig/patterns/controls/menus.html)
 - [GNOME HIG: keyboard interaction](https://developer.gnome.org/hig/guidelines/keyboard.html)
 - [GNOME HIG: dialogs](https://developer.gnome.org/hig/patterns/feedback/dialogs.html)
+- [AdwAlertDialog response appearance](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/main/method.AlertDialog.set_response_appearance.html)
+- [AdwAlertDialog default response](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/main/method.AlertDialog.set_default_response.html)
+- [AdwDialog parentless presentation](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/main/method.Dialog.present.html)
+- [GtkApplication window lifetime](https://docs.gtk.org/gtk4/method.Application.add_window.html)
 - [GNOME HIG: text fields](https://developer.gnome.org/hig/patterns/controls/text-fields.html)
 - [GNOME HIG: writing style](https://developer.gnome.org/hig/guidelines/writing-style.html)
 - [Libadwaita style classes](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/main/style-classes.html)
