@@ -6,9 +6,10 @@ gmux_ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
 if [[ ! -f "$gmux_ghostty_prefix/include/ghostty/vt/terminal.h" ]]; then
     ./scripts/bootstrap-ghostty.sh
 fi
-cargo build --release --locked
-install -Dm755 target/release/gmux-daemon "$gmux_install_prefix/bin/gmux-daemon"
-install -Dm755 target/release/gmux "$gmux_install_prefix/bin/gmux"
+gmux_binaries=$(python3 ./scripts/cargo_build.py --release gmux gmux-daemon)
+mapfile -t gmux_binaries <<< "$gmux_binaries"
+install -Dm755 "${gmux_binaries[1]}" "$gmux_install_prefix/bin/gmux-daemon"
+install -Dm755 "${gmux_binaries[0]}" "$gmux_install_prefix/bin/gmux"
 mkdir -p "$gmux_install_prefix/lib/gmux"
 cp -L "$gmux_ghostty_prefix/lib/libghostty-vt.so" "$gmux_install_prefix/lib/gmux/libghostty-vt.so.0"
 install -Dm644 data/dev.gmux.Gmux.desktop "$gmux_install_prefix/share/applications/dev.gmux.Gmux.desktop"

@@ -61,7 +61,8 @@ def run(command, timeout, *, artifacts=False):
     return output.read_text() if artifacts else None
 
 
-from cargo_test_support import ARTIFACT_ENV, compiler_artifacts, native_output_dir
+from cargo_build import compiler_artifacts
+from cargo_test_support import ARTIFACT_ENV, native_output_dir
 # Never import an artifact selection from a previous invocation.
 os.environ.pop(ARTIFACT_ENV, None)
 if not args.skip_build or any(name not in ("bootstrap", "cargo-output", "icon") for name in names):
