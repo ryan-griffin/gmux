@@ -111,7 +111,7 @@ def chord(native, *keys):
         native.key(key, False)
 
 
-def capture(native, alert, close, name):
+def capture(native, alert, close, name, *, appearance):
     # Accessibility can expose allocations before the compositor draws them.
     deadline = time.monotonic() + 0.3
     while time.monotonic() < deadline:
@@ -135,7 +135,7 @@ def capture(native, alert, close, name):
     bx, by, bw, bh = bounds(close)
     rgb = frame.pixel(x + bx + bw // 4, y + by + bh // 2)
     assert max(rgb) - min(rgb) < 20, (name, "Close has an accent-colored fill", rgb)
-    assert (sum(rgb) < 3 * 128) == name.startswith(("dark", "long")), \
+    assert (sum(rgb) < 3 * 128) == (appearance == "dark"), \
         (name, "The startup alert did not use the saved appearance", rgb)
     return x, y
 
@@ -192,13 +192,13 @@ with (artifacts / "startup-error-smoke.log").open("w") as log, \
             remote.activate()
             remote.open([Gio.File.new_for_path(str(root))], "")
             remote.get_dbus_connection().flush_sync(None)
-            origin_x, origin_y = capture(native, alert, close, name)
+            origin_x, origin_y = capture(native, alert, close, name, appearance=appearance)
             if dismissal is not None:
                 chord(native, Gdk.KEY_Tab)
                 if not focused(close):
                     chord(native, Gdk.KEY_Shift_L, Gdk.KEY_Tab)
                 wait_accessible(lambda: focused(close))
-                capture(native, alert, close, name + "-keyboard")
+                capture(native, alert, close, name + "-keyboard", appearance=appearance)
             if dismissal is None:
                 x, y, width, height = bounds(close)
                 native.move(origin_x + x + width / 2, origin_y + y + height / 2)
@@ -226,7 +226,7 @@ with (artifacts / "startup-error-smoke.log").open("w") as log, \
             description = body.get_name()
             assert str(malformed) in description and "EOF" in description, description
             assert "<&>" in description, "Error details were interpreted as markup"
-            capture(native, alert, close, name)
+            capture(native, alert, close, name, appearance="dark")
             if name == "long":
                 chord(native, Gdk.KEY_Tab)
                 wait_accessible(lambda: not focused(close), message="Tab did not reach the scrollable message")
