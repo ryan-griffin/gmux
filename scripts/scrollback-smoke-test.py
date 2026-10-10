@@ -28,7 +28,7 @@ class History:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(8)
         self.socket.connect(str(fixture.path / "socket.stream"))
-        self.send("attach", version=6)
+        self.send("attach", version=7)
         self.send("subscribe", panes=[pane])
 
     def send(self, method, **params):

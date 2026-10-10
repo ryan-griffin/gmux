@@ -2,7 +2,9 @@
 use super::*;
 
 mod reconcile;
-use reconcile::{Selection, TabSelection, reconcile_selection, remove_exited_panes};
+use reconcile::{
+    Selection, TabSelection, preserve_window_state, reconcile_selection, remove_exited_panes,
+};
 
 impl Selection {
     fn capture(ui: &Ui) -> Self {
@@ -63,9 +65,34 @@ impl Ui {
     }
     pub(super) fn command(
         self: &Rc<Self>,
-        command: Command,
+        mut command: Command,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>) + 'static,
     ) {
+        if matches!(
+            &command,
+            Command::Split { pane: None, .. } | Command::Close { pane: None }
+        ) && self.active_pane().is_none()
+        {
+            callback(self, Err(anyhow::anyhow!("No active terminal")));
+            return;
+        }
+        // Resolve implicit targets in this window before crossing the daemon boundary.
+        match &mut command {
+            Command::New { workspace, .. } => {
+                if workspace.is_none() {
+                    *workspace = Some(self.selected_workspace());
+                }
+            }
+            Command::Split { pane, .. } | Command::Close { pane } => {
+                if pane.is_none() {
+                    *pane = self.active_pane().map(|pane| pane.id);
+                }
+            }
+            Command::Move { tab, .. } if tab.is_none() => {
+                *tab = Some(self.active.get());
+            }
+            _ => (),
+        }
         let reveal = matches!(command, Command::New { .. } | Command::Split { .. });
         let selection = Selection::capture(self);
         self.save_session();
@@ -86,6 +113,14 @@ impl Ui {
             callback(ui, result);
         });
     }
+    pub(super) fn apply_shared(self: &Rc<Self>, reply: CommandReply) -> anyhow::Result<()> {
+        if reply.revision <= self.revision.get() {
+            return Ok(());
+        }
+        let selection = Selection::capture(self);
+        self.apply_backend(reply, false, selection)?;
+        Ok(())
+    }
     fn apply_backend(
         self: &Rc<Self>,
         reply: CommandReply,
@@ -93,6 +128,14 @@ impl Ui {
         selection: Selection,
     ) -> anyhow::Result<CommandResult> {
         let previous_active = self.active.get();
+        let previous_focus = gtk::prelude::GtkWindowExt::focus(&self.window);
+        if reply.revision < self.revision.get() {
+            if reveal {
+                self.reveal_result(&reply.result);
+            }
+            return Ok(reply.result);
+        }
+        self.revision.set(reply.revision);
         let mut reply = reply;
         // Keep observed exits until every outstanding snapshot is handled,
         // including panes that exited before they could be attached.
@@ -102,9 +145,17 @@ impl Ui {
             session: mut state,
             catalog,
             metadata,
+            ..
         } = reply;
         let current = Selection::capture(self);
+        preserve_window_state(&mut state, &catalog, &current);
         reconcile_selection(&mut state, &catalog, &selection, &current, reveal);
+        // Split geometry belongs to this window. Keep ratios for surviving split nodes.
+        for saved in &mut state.tabs {
+            if let Some(tab) = self.tabs.borrow().iter().find(|tab| tab.id == saved.id) {
+                saved.layout.update_ratios(&tab.layout.borrow());
+            }
+        }
         *self.catalog.borrow_mut() = catalog;
         self.sessions.borrow_mut().install_metadata(metadata);
         let ids: HashSet<_> = state.tabs.iter().flat_map(|t| t.layout.ids()).collect();
@@ -118,10 +169,32 @@ impl Ui {
         for id in removed {
             self.close_pane(id)?;
         }
+        // Removing a selected tab/pane chooses its adjacent survivor locally.
+        // Use that choice instead of a different window's selection in the snapshot.
+        if current.active != 0 && !state.tabs.iter().any(|tab| tab.id == current.active) {
+            state.active = self.active.get();
+        }
+        for saved in &mut state.tabs {
+            if current
+                .tabs
+                .get(&saved.id)
+                .is_some_and(|tab| !saved.layout.contains(tab.active))
+                && let Some(tab) = self.tabs.borrow().iter().find(|tab| tab.id == saved.id)
+                && saved.layout.contains(tab.active)
+            {
+                saved.active = tab.active;
+            }
+        }
+        let order: HashMap<_, _> = state
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (tab.id, index))
+            .collect();
         for saved in state.tabs {
             let existing = self.tabs.borrow().iter().any(|t| t.id == saved.id);
             if !existing {
-                self.restore_tab(saved, true)?;
+                self.restore_tab(saved, false)?;
                 continue;
             }
             let new_ids: Vec<_> = {
@@ -155,6 +228,24 @@ impl Ui {
                 self.rebuild(saved.id);
             }
         }
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            if tabs
+                .iter()
+                .enumerate()
+                .any(|(index, tab)| order[&tab.id] != index)
+            {
+                self.changing.set(true);
+                tabs.sort_by_key(|tab| order[&tab.id]);
+                for tab in tabs.iter() {
+                    self.sidebar.remove(&tab.row);
+                }
+                for tab in tabs.iter() {
+                    self.sidebar.append(&tab.row);
+                }
+                self.changing.set(false);
+            }
+        }
         self.apply_filter(state.filter);
         self.refresh_workspace_ui();
         let visible = self
@@ -174,7 +265,24 @@ impl Ui {
             self.show_empty();
         }
         self.refresh_metadata();
+        if reveal {
+            self.reveal_result(&result);
+        } else if let Some(focus) = previous_focus.filter(|widget| widget.is_mapped()) {
+            focus.grab_focus();
+        }
         Ok(result)
+    }
+    fn reveal_result(self: &Rc<Self>, result: &CommandResult) {
+        let pane = match result.output {
+            gmux::control::CommandOutput::New { pane, .. }
+            | gmux::control::CommandOutput::Split { pane } => Some(pane),
+            _ => None,
+        };
+        if let Some(pane) = pane
+            && self.pane(Some(pane)).is_ok()
+        {
+            self.focus_pane(pane);
+        }
     }
     pub(super) fn mark_dirty(self: &Rc<Self>) {
         self.dirty.set(true);
@@ -261,6 +369,7 @@ impl Ui {
             "list" => {
                 let tabs = self.tabs.borrow();
                 Ok(json!({
+                    "window": self.id,
                     "active_tab": (self.active.get() != 0).then_some(self.active.get()),
                     "filter": self.filter.get(),
                     "tab_search": self.sidebar_search.text().as_str(),

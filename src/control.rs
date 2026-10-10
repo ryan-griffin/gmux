@@ -185,6 +185,8 @@ impl From<CommandOutput> for CommandResult {
 }
 #[derive(Serialize, Deserialize)]
 pub struct CommandReply {
+    #[serde(default)]
+    pub revision: u64,
     pub result: CommandResult,
     pub session: Session,
     pub catalog: WorkspaceCatalog,

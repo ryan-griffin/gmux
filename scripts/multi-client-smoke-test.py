@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Exercise independent daemon clients over shared PTYs and layout snapshots."""
+import json
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import time
+
+from cargo_test_support import cargo_binary
+from test_support import AppFixture, scenario, wait_for
+
+
+class Client:
+    def __init__(self, fixture, pane):
+        self.pane = pane
+        self.socket = socket.socket(socket.AF_UNIX)
+        self.socket.settimeout(6)
+        self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
+        self.cells = {}
+        self.frame = None
+        self.send("attach", version=7)
+        self.send("subscribe", panes=[pane])
+
+    def send(self, method, **params):
+        self.socket.sendall((json.dumps(dict(method=method, pane=self.pane, **params)) + "\n").encode())
+
+    def exact(self, size):
+        data = bytearray()
+        while len(data) < size:
+            part = self.socket.recv(size - len(data))
+            assert part, "Client disconnected"
+            data.extend(part)
+        return data
+
+    def until(self, predicate):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            size, = struct.unpack("<I", self.exact(4))
+            assert 4 <= size <= 16 * 1024 * 1024
+            body = self.exact(size)
+            header_size, = struct.unpack("<I", body[:4])
+            header = json.loads(body[4:4 + header_size])
+            if header["meta"]["id"] == self.pane and header["frame"]:
+                frame = header["frame"]
+                if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
+                    self.cells.clear()
+                self.frame = frame
+                cells = body[4 + header_size:]
+                for index, row in enumerate(header["rows"]):
+                    for col in range(frame["cols"]):
+                        start = (index * frame["cols"] + col) * 71
+                        self.cells[row, col] = cells[start:start + 64].split(b"\0", 1)[0].decode()
+            if predicate(header):
+                return header
+        raise AssertionError("Client did not receive expected state")
+
+    def text(self):
+        return "\n".join("".join(self.cells.get((row, col), " ") for col in range(self.frame["cols"]))
+                         for row in range(self.frame["rows"]))
+
+    def output(self, marker):
+        return self.until(lambda h: h["meta"]["id"] == self.pane and h["frame"] and marker in self.text())
+
+    def state(self, revision):
+        return self.until(lambda h: h.get("state", {}).get("revision", -1) >= revision)["state"]
+
+    def close(self):
+        self.socket.close()
+
+
+root = Path(__file__).resolve().parent.parent
+with AppFixture(dict(restore=False), prefix="gmux-multi-client-") as fixture:
+    fixture.start(cargo_binary("gmux-daemon"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for(lambda: fixture.rpc("daemon-info"))
+    created = fixture.rpc("_command", command=dict(method="new", directory=str(root)))
+    pane, tab = created["result"]["pane"], created["result"]["tab"]
+    first, second = Client(fixture, pane), Client(fixture, pane)
+    try:
+        with scenario("two clients see shared output and can both send input"):
+            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+            first.send("input", bytes=list(b"printf 'FIRST_INPUT\\n'\n"))
+            first.output("FIRST_INPUT")
+            second.output("FIRST_INPUT")
+            second.send("input", bytes=list(b"printf 'SECOND_INPUT\\n'\n"))
+            first.output("SECOND_INPUT")
+            second.output("SECOND_INPUT")
+
+        with scenario("interleaved paste transfers remain isolated per connection"):
+            text = "printf 'FIRST_PASTE\\n'"
+            first.send("paste-begin", size=len(text), enter=True, bottom=True)
+            first.send("paste-data", text=text[:8])
+            first.send("scroll-to", row=0, serial=5)
+            first.until(lambda h: h["meta"]["id"] == pane and h["scroll_serial"] == 5)
+            other = "printf 'SECOND_PASTE\\n'"
+            second.send("paste-begin", size=len(other), enter=True, bottom=True)
+            second.send("paste-data", text=other)
+            second.send("paste-end")
+            first.output("SECOND_PASTE")
+            second.output("SECOND_PASTE")
+            first.send("paste-data", text=text[8:])
+            first.send("paste-end")
+            first.output("FIRST_PASTE")
+            second.output("FIRST_PASTE")
+
+        with scenario("scrolling, selection, search, and clipboard replies stay local"):
+            first.send("input", bytes=list(b"for i in $(seq 1 80); do printf 'line %02d\\n' \"$i\"; done\n"))
+            first.output("line 80")
+            second.output("line 80")
+            first.send("scroll-to", row=0, serial=10)
+            first.until(lambda h: h["meta"]["id"] == pane and h["scroll_serial"] == 10)
+            assert first.frame["scrollback"]["offset"] == 0
+            row, line = next((row, line) for row, line in enumerate(first.text().splitlines()) if "FIRST_INPUT" in line)
+            col = line.index("FIRST_INPUT")
+            first.send("select", start=[col, row], end=[col + 10, row])
+            first.until(lambda h: h["meta"]["id"] == pane and h["selection"] is not None)
+            first.send("copy")
+            copied = first.until(lambda h: h["meta"]["id"] == pane and h["copy"] is not None)
+            assert "FIRST_INPUT" in copied["copy"], copied
+            second.send("copy")
+            rejected = second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
+            assert rejected["error"] == "Select terminal text to copy it" and rejected["selection"] is None
+            first.send("find", query="line")
+            first.until(lambda h: h["meta"]["id"] == pane and h["find"] and h["find"]["total"] == 80 and not h["find"]["pending"])
+            second.send("find", query="FIRST_INPUT")
+            second.until(lambda h: h["meta"]["id"] == pane and h["find"] and h["find"]["total"] == 1 and not h["find"]["pending"])
+            second.send("input", bytes=list(b"printf 'SHARED_WHILE_SCROLLED\\n'\n"))
+            second.output("SHARED_WHILE_SCROLLED")
+            first.until(lambda h: h["meta"]["id"] == pane and h["find"] and not h["find"]["pending"])
+            assert first.frame["scrollback"]["offset"] == 0 and "SHARED_WHILE_SCROLLED" not in first.text()
+
+        with scenario("focused client supplies the PTY size without resize contention"):
+            first.send("focused", active=True)
+            first.send("resize", cols=50, rows=12)
+            wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [50, 12])
+            second.send("resize", cols=70, rows=20)
+            second.send("copy")
+            second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
+            assert fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [50, 12]
+            second.send("focused", active=True)
+            wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [70, 20])
+
+        with scenario("shared layout and workspace changes reach every client"):
+            for command in [dict(method="workspace-new", name="Shared", directory=str(root)),
+                            dict(method="split", pane=pane), dict(method="rename", tab=tab, name="Shared tab")]:
+                result = fixture.rpc("_command", command=command)
+                states = []
+                for client in (first, second):
+                    state = client.state(result["revision"])
+                    assert state["catalog"] == result["catalog"] and state["session"]["tabs"] == result["session"]["tabs"]
+                    states.append(state)
+                assert states[0] == states[1], "Clients received different snapshots of the same revision"
+            split_pane = result["session"]["tabs"][0]["layout"]["Split"]["second"]["Pane"]
+            result = fixture.rpc("_command", command=dict(method="close", pane=split_pane))
+            for client in (first, second):
+                assert client.state(result["revision"])["session"]["tabs"][0]["layout"] == {"Pane": pane}
+
+        with scenario("a disconnect leaves the other client and shell running"):
+            first.close()
+            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
+            second.send("input", bytes=list(b"printf 'SURVIVOR_INPUT\\n'\n"))
+            second.output("SURVIVOR_INPUT")
+            assert not fixture.rpc("_metadata", pane=pane)["meta"]["exited"]
+    finally:
+        first.close()
+        second.close()
+print("PASS: shared sessions and layouts with independent daemon client views")

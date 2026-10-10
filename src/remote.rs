@@ -141,6 +141,7 @@ impl Drop for Connection {
 }
 
 pub struct SessionManager {
+    endpoint: ipc::Endpoint,
     connection: Rc<Connection>,
     receiver: incoming::Receiver,
     sessions: HashMap<u64, SessionHandle>,
@@ -150,6 +151,7 @@ pub struct SessionManager {
     pending_reads: HashMap<u64, u64>,
     wake: ipc::Wake,
     disconnected: bool,
+    state: Option<crate::control::CommandReply>,
 }
 
 pub fn ensure_daemon() -> anyhow::Result<()> {
@@ -223,7 +225,12 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
 impl SessionManager {
     pub fn connect(wake: ipc::Wake) -> anyhow::Result<Self> {
         ensure_daemon()?;
-        let socket = UnixStream::connect(ipc::companion_path(".stream"))?;
+        Self::connect_at(ipc::Endpoint::local(), wake)
+    }
+    /// Connect to an existing daemon without starting a local process or reading
+    /// its workspace/layout files. Remote tunnels can supply their own endpoint.
+    pub fn connect_at(endpoint: ipc::Endpoint, wake: ipc::Wake) -> anyhow::Result<Self> {
+        let socket = UnixStream::connect(&endpoint.stream)?;
         let mut writer = socket.try_clone()?;
         transport::command(
             &mut writer,
@@ -277,6 +284,7 @@ impl SessionManager {
             }
         });
         Ok(Self {
+            endpoint,
             connection: Rc::new(Connection {
                 commands,
                 pending_bytes,
@@ -290,12 +298,20 @@ impl SessionManager {
             pending_reads: HashMap::new(),
             wake,
             disconnected: false,
+            state: None,
         })
     }
     pub fn saved_session(&mut self) -> anyhow::Result<Session> {
-        let mut value = ipc::call(InternalRequest::State)?;
+        let mut value = self.endpoint.call(InternalRequest::State)?;
         self.install_metadata(serde_json::from_value(value["metadata"].take())?);
         Ok(serde_json::from_value(value["session"].take())?)
+    }
+    pub fn take_state(&mut self) -> Option<crate::control::CommandReply> {
+        self.state.take()
+    }
+    pub fn set_focused(&self, active: bool) -> anyhow::Result<()> {
+        self.connection
+            .send(StreamRequest::connection(StreamCommand::Focused { active }))
     }
     pub fn install_metadata(&mut self, metadata: Vec<Metadata>) {
         self.metadata.clear();
@@ -313,6 +329,9 @@ impl SessionManager {
             self.subscription_pending = true;
         }
         self.subscribe()
+    }
+    pub fn is_visible(&self, id: u64) -> bool {
+        self.visible.contains(&id)
     }
     fn subscribe(&mut self) -> anyhow::Result<()> {
         if self.subscription_pending {
@@ -393,7 +412,11 @@ impl SessionManager {
         let mut updates: HashMap<u64, SessionUpdate> = HashMap::new();
         for _ in 0..256 {
             match self.receiver.try_recv() {
-                Ok(Ok(packet)) => {
+                Ok(Ok(mut packet)) => {
+                    if let Some(state) = packet.header.state.take() {
+                        self.state = Some(state);
+                        continue;
+                    }
                     let id = packet.header.meta.id;
                     if packet.header.meta.exited || !packet.header.notifications.is_empty() {
                         let update = updates.entry(id).or_default();
@@ -487,6 +510,9 @@ pub struct RemoteSession {
     selection: Option<(u64, u64)>,
 }
 impl RemoteSession {
+    pub fn text(&self) -> String {
+        crate::engine::viewport_text(self.frame, &self.cells)
+    }
     fn command(&self, command: StreamCommand) -> anyhow::Result<()> {
         self.connection
             .send(StreamRequest::pane(self.id(), command))
@@ -833,6 +859,7 @@ mod tests {
         }));
         (
             SessionManager {
+                endpoint: ipc::Endpoint::local(),
                 connection,
                 receiver,
                 sessions: HashMap::from([(1, session.clone())]),
@@ -842,6 +869,7 @@ mod tests {
                 pending_reads: HashMap::new(),
                 wake: ipc::Wake::new().unwrap(),
                 disconnected: false,
+                state: None,
             },
             sender,
             session,
@@ -858,6 +886,7 @@ mod tests {
         sender
             .send(Ok(Packet {
                 header: Header {
+                    state: None,
                     meta,
                     frame: None,
                     scroll_serial: 0,
@@ -895,6 +924,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
+                        state: None,
                         meta,
                         frame: None,
                         scroll_serial: 0,
@@ -933,6 +963,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
+                        state: None,
                         meta,
                         frame: None,
                         scroll_serial: 0,
@@ -970,6 +1001,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
+                        state: None,
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
                         scroll_serial: 0,
@@ -1031,6 +1063,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
+                        state: None,
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
                         scroll_serial: serial,
@@ -1093,6 +1126,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
+                        state: None,
                         meta,
                         frame: None,
                         scroll_serial: 0,

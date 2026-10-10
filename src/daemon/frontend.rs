@@ -22,6 +22,13 @@ pub(super) struct Frontend {
     pub(super) selections: HashMap<u64, Option<(u64, u64)>>,
     pub(super) discarding: bool,
     pub(super) paste: Option<Paste>,
+    pub(super) views: HashMap<u64, crate::engine::EngineView>,
+    pub(super) clipboard: HashMap<u64, String>,
+    pub(super) errors: HashMap<u64, String>,
+    pub(super) state_revision: Option<u64>,
+    pub(super) sizes: HashMap<u64, (u16, u16, u32, u32, u16, u16)>,
+    pub(super) focused: bool,
+    pub(super) changed: HashSet<u64>,
 }
 pub(super) struct Paste {
     pub(super) pane: u64,
@@ -30,7 +37,32 @@ pub(super) struct Paste {
     pub(super) options: PasteOptions,
 }
 impl Frontend {
-    pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
+    pub(super) fn new(socket: UnixStream) -> Self {
+        Self {
+            socket,
+            input: Vec::new(),
+            output: Vec::new(),
+            offset: 0,
+            attached: false,
+            visible: HashSet::new(),
+            screens: HashMap::new(),
+            metadata: HashMap::new(),
+            scroll_serials: HashMap::new(),
+            sent_scroll_serials: HashMap::new(),
+            find: HashMap::new(),
+            selections: HashMap::new(),
+            discarding: false,
+            paste: None,
+            views: HashMap::new(),
+            clipboard: HashMap::new(),
+            errors: HashMap::new(),
+            state_revision: None,
+            sizes: HashMap::new(),
+            focused: false,
+            changed: HashSet::new(),
+        }
+    }
+    fn compact_output(&mut self) {
         // Compact after consuming at least half the buffer, rather than moving
         // pending packets for every partial socket write.
         if self.offset > 0
@@ -39,12 +71,24 @@ impl Frontend {
             self.output.drain(..self.offset);
             self.offset = 0;
         }
+    }
+    pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
+        self.compact_output();
         let start = self.output.len();
         packet.encode_into(&mut self.output)?;
         if self.output.len() - self.offset > MAX_PENDING {
             self.output.truncate(start);
             anyhow::bail!("Frontend is too slow");
         }
+        Ok(())
+    }
+    pub(super) fn queue_encoded(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.compact_output();
+        anyhow::ensure!(
+            self.output.len() - self.offset + bytes.len() <= MAX_PENDING,
+            "Frontend is too slow"
+        );
+        self.output.extend_from_slice(bytes);
         Ok(())
     }
     pub(super) fn flush(&mut self) -> anyhow::Result<()> {
@@ -97,7 +141,11 @@ impl Frontend {
     }
 }
 impl Daemon {
-    pub(super) fn input(&mut self, request: StreamRequest) -> anyhow::Result<()> {
+    pub(super) fn input(
+        &mut self,
+        frontend: &mut Frontend,
+        request: StreamRequest,
+    ) -> anyhow::Result<()> {
         let StreamRequest { pane, command } = request;
         match command {
             StreamCommand::Attach { version } => {
@@ -105,25 +153,46 @@ impl Daemon {
                     version == transport::VERSION,
                     "Incompatible frontend protocol"
                 );
-                self.frontend.as_mut().unwrap().attached = true;
+                frontend.attached = true;
                 return Ok(());
             }
             StreamCommand::Invalid { message, .. } => {
-                self.frontend.as_mut().unwrap().paste = None;
+                frontend.paste = None;
                 anyhow::bail!("{message}");
             }
             _ => {}
         }
-        anyhow::ensure!(
-            self.frontend.as_ref().is_some_and(|f| f.attached),
-            "Frontend must attach first"
-        );
+        anyhow::ensure!(frontend.attached, "Frontend must attach first");
+        if let StreamCommand::Focused { active } = command {
+            // Keep the last focused client as size owner while another app has focus.
+            if active {
+                frontend.focused = true;
+                for other in self.frontends.values_mut() {
+                    other.focused = false;
+                }
+                for (&id, &(cols, rows, cw, ch, width, height)) in &frontend.sizes {
+                    if frontend.visible.contains(&id)
+                        && let Some(session) = self.sessions.get_mut(&id)
+                        && session.resize(cols, rows, cw, ch, width, height)?
+                    {
+                        self.changed.insert(id);
+                    }
+                }
+            }
+            return Ok(());
+        }
         if let StreamCommand::Subscribe { panes } = command {
-            let frontend = self.frontend.as_mut().unwrap();
             for id in &panes {
                 if !frontend.visible.contains(id) {
                     frontend.screens.remove(id);
-                    self.changed.insert(*id);
+                    frontend.changed.insert(*id);
+                    if frontend.focused
+                        && let Some(&(cols, rows, cw, ch, width, height)) = frontend.sizes.get(id)
+                        && let Some(session) = self.sessions.get_mut(id)
+                        && session.resize(cols, rows, cw, ch, width, height)?
+                    {
+                        self.changed.insert(*id);
+                    }
                 }
             }
             frontend.screens.retain(|id, _| panes.contains(id));
@@ -133,18 +202,18 @@ impl Daemon {
         let id = match self.resolve_pane(pane) {
             Ok(id) => id,
             Err(error) => {
-                self.frontend.as_mut().unwrap().paste = None;
+                frontend.paste = None;
                 return Err(error);
             }
         };
         match command {
             StreamCommand::PasteBegin { size, options } => {
-                self.frontend.as_mut().unwrap().paste = None;
+                frontend.paste = None;
                 anyhow::ensure!(
                     size <= transport::MAX_PASTE,
                     "Paste is too large. The limit is 4 MiB."
                 );
-                self.frontend.as_mut().unwrap().paste = Some(Paste {
+                frontend.paste = Some(Paste {
                     pane: id,
                     size,
                     text: String::with_capacity(size),
@@ -153,10 +222,7 @@ impl Daemon {
                 return Ok(());
             }
             StreamCommand::PasteData { text } => {
-                let mut paste = self
-                    .frontend
-                    .as_mut()
-                    .unwrap()
+                let mut paste = frontend
                     .paste
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("No paste is in progress"))?;
@@ -167,14 +233,11 @@ impl Daemon {
                     "Invalid paste chunk"
                 );
                 paste.text.push_str(&text);
-                self.frontend.as_mut().unwrap().paste = Some(paste);
+                frontend.paste = Some(paste);
                 return Ok(());
             }
             StreamCommand::PasteEnd => {
-                let paste = self
-                    .frontend
-                    .as_mut()
-                    .unwrap()
+                let paste = frontend
                     .paste
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("No paste is in progress"))?;
@@ -182,13 +245,16 @@ impl Daemon {
                     paste.pane == id && paste.text.len() == paste.size,
                     "Incomplete paste"
                 );
-                return self.input(StreamRequest::pane(
-                    id,
-                    StreamCommand::Paste {
-                        text: paste.text,
-                        options: paste.options,
-                    },
-                ));
+                return self.input(
+                    frontend,
+                    StreamRequest::pane(
+                        id,
+                        StreamCommand::Paste {
+                            text: paste.text,
+                            options: paste.options,
+                        },
+                    ),
+                );
             }
             StreamCommand::MarkRead { through } => {
                 if self
@@ -204,18 +270,36 @@ impl Daemon {
             _ => {}
         }
         let session = self.sessions.get_mut(&id).unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
+            entry.insert(session.new_view()?);
+        }
+        let view = frontend.views.get_mut(&id).unwrap();
         match command {
-            StreamCommand::Copy => {
+            StreamCommand::Resize {
+                cols,
+                rows,
+                cw,
+                ch,
+                width,
+                height,
+            } => {
                 anyhow::ensure!(
-                    session.selection().is_some(),
-                    "Select terminal text to copy it"
+                    crate::viewport::valid(cols.into(), rows.into()),
+                    "Invalid terminal size"
                 );
-                self.clipboard.insert(id, session.copy()?);
+                frontend
+                    .sizes
+                    .insert(id, (cols, rows, cw, ch, width, height));
+                let owns_size = frontend.focused
+                    || !self
+                        .frontends
+                        .values()
+                        .any(|f| f.focused && f.visible.contains(&id));
+                if owns_size && session.resize(cols, rows, cw, ch, width, height)? {
+                    self.changed.insert(id);
+                }
+                return Ok(());
             }
-            StreamCommand::Find { query } => session.find(&query),
-            StreamCommand::FindAdvance { previous } => session.find_advance(previous),
-            StreamCommand::Select { start, end } => session.select(start, end)?,
-            StreamCommand::ClearSelection => session.clear_selection(),
             StreamCommand::Input { bytes } => session.send(&bytes)?,
             StreamCommand::Paste { text, options } => {
                 anyhow::ensure!(
@@ -227,7 +311,7 @@ impl Daemon {
                     bytes.push(b'\r');
                 }
                 if options.bottom {
-                    session.scroll(0, true);
+                    session.with_view(view, |engine| engine.scroll(0, true));
                 }
                 session.send(&bytes)?;
             }
@@ -241,7 +325,7 @@ impl Daemon {
                 let bytes = session.key(&name, cp, mods, release, &text);
                 if !bytes.is_empty() {
                     if !release {
-                        session.scroll(0, true);
+                        session.with_view(view, |engine| engine.scroll(0, true));
                     }
                     session.send(&bytes)?;
                 }
@@ -259,59 +343,147 @@ impl Daemon {
                     session.send(&bytes)?;
                 }
             }
-            StreamCommand::Scroll { delta, bottom } => session.scroll(delta, bottom),
-            StreamCommand::ScrollTo { row, serial } => {
-                session.scroll_to(row);
-                self.frontend
-                    .as_mut()
-                    .unwrap()
-                    .scroll_serials
-                    .insert(id, serial);
+            StreamCommand::Theme { theme } => {
+                session.set_theme(&theme)?;
+                self.changed.insert(id);
             }
-            StreamCommand::Theme { theme } => session.set_theme(&theme)?,
-            StreamCommand::Style { style } => session.set_cursor_style(style)?,
-            StreamCommand::Resize {
-                cols,
-                rows,
-                cw,
-                ch,
-                width,
-                height,
-            } => {
-                anyhow::ensure!(
-                    crate::viewport::valid(cols.into(), rows.into()),
-                    "Invalid terminal size"
-                );
-                session.resize(cols, rows, cw, ch, width, height)?;
+            StreamCommand::Style { style } => {
+                session.set_cursor_style(style)?;
+                self.changed.insert(id);
             }
-            // Connection, paste framing, and acknowledgement commands return above.
-            StreamCommand::Attach { .. }
-            | StreamCommand::Subscribe { .. }
-            | StreamCommand::PasteBegin { .. }
-            | StreamCommand::PasteData { .. }
-            | StreamCommand::PasteEnd
-            | StreamCommand::MarkRead { .. }
-            | StreamCommand::Invalid { .. } => unreachable!(),
+            command => session.with_view(view, |engine| -> anyhow::Result<()> {
+                // Search navigation uses this client's current viewport metadata.
+                engine.snapshot()?;
+                match command {
+                    StreamCommand::Copy => {
+                        anyhow::ensure!(
+                            engine.selection().is_some(),
+                            "Select terminal text to copy it"
+                        );
+                        frontend.clipboard.insert(id, engine.copy()?);
+                    }
+                    StreamCommand::Find { query } => engine.find(&query),
+                    StreamCommand::FindAdvance { previous } => engine.find_advance(previous),
+                    StreamCommand::Select { start, end } => engine.select(start, end)?,
+                    StreamCommand::ClearSelection => engine.clear_selection(),
+                    StreamCommand::Scroll { delta, bottom } => engine.scroll(delta, bottom),
+                    StreamCommand::ScrollTo { row, serial } => {
+                        engine.scroll_to(row);
+                        frontend.scroll_serials.insert(id, serial);
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })?,
         }
-        self.changed.insert(id);
+        frontend.changed.insert(id);
         Ok(())
     }
-    pub(super) fn updates(&mut self, metadata_due: bool) -> anyhow::Result<()> {
-        let Some(frontend) = self.frontend.as_mut().filter(|f| f.attached) else {
-            self.changed.clear();
-            return Ok(());
-        };
+    pub(super) fn updates_pending(&self) -> bool {
+        self.frontends.values().any(|frontend| {
+            frontend.attached
+                && (!self.changed.is_empty()
+                    || !self.notifications.is_empty()
+                    || !self.errors.is_empty()
+                    || !frontend.changed.is_empty()
+                    || frontend.state_revision != Some(self.revision)
+                    || frontend
+                        .views
+                        .values()
+                        .any(crate::engine::EngineView::find_pending))
+        })
+    }
+    pub(super) fn updates(&mut self, metadata_due: bool) {
+        let mut ids: Vec<_> = self.frontends.keys().copied().collect();
+        ids.sort_by_key(|id| (!self.frontends[id].focused, *id));
+        // Every window receives the same revision. Read the catalog, capture
+        // metadata, and serialize it once for this broadcast.
+        let mut state = None;
+        // Deliver each alert once, preferring a focused GUI. All clients receive unread state.
+        let mut notifications = std::mem::take(&mut self.notifications);
+        for id in ids {
+            let mut frontend = self.frontends.remove(&id).unwrap();
+            if !frontend.attached {
+                self.frontends.insert(id, frontend);
+                continue;
+            }
+            let result = (|| {
+                if frontend.state_revision != Some(self.revision) {
+                    let bytes = state
+                        .get_or_insert_with(|| self.state_packet())
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    frontend.queue_encoded(bytes)?;
+                    frontend.state_revision = Some(self.revision);
+                }
+                self.update_frontend(&mut frontend, metadata_due, &mut notifications)
+            })();
+            if let Err(error) = result {
+                eprintln!("Detaching frontend: {error}");
+            } else {
+                self.frontends.insert(id, frontend);
+            }
+        }
+        if !self.frontends.values().any(|f| f.attached) {
+            self.notifications = notifications;
+        }
+        self.changed.clear();
+        self.errors.clear();
+    }
+    fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        Packet {
+            header: Header {
+                state: Some(self.shared_state()?),
+                meta: Metadata {
+                    id: 0,
+                    directory: PathBuf::new(),
+                    title: String::new(),
+                    size: (80, 24),
+                    exited: false,
+                    unread: 0,
+                    busy: false,
+                    modes: [false; 2],
+                },
+                frame: None,
+                scroll_serial: 0,
+                rows: Vec::new(),
+                notifications: Vec::new(),
+                error: None,
+                find: None,
+                selection: None,
+                copy: None,
+            },
+            cells: Vec::new(),
+        }
+        .encode_into(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn update_frontend(
+        &mut self,
+        frontend: &mut Frontend,
+        metadata_due: bool,
+        notifications: &mut HashMap<u64, NotificationQueue>,
+    ) -> anyhow::Result<()> {
         for (&id, session) in &mut self.sessions {
-            let notify: Vec<_> = self
-                .notifications
+            let notify: Vec<_> = notifications
                 .remove(&id)
                 .unwrap_or_default()
                 .messages
                 .into_iter()
                 .collect();
-            let error = self.errors.remove(&id);
-            let mut copy = self.clipboard.remove(&id);
-            let changed = self.changed.contains(&id);
+            let error = frontend
+                .errors
+                .remove(&id)
+                .or_else(|| self.errors.get(&id).cloned());
+            let mut copy = frontend.clipboard.remove(&id);
+            let terminal_changed = self.changed.contains(&id);
+            let changed = terminal_changed
+                || frontend.changed.contains(&id)
+                || frontend
+                    .views
+                    .get(&id)
+                    .is_some_and(crate::engine::EngineView::find_pending);
             let screen =
                 frontend.visible.contains(&id) && (changed || !frontend.screens.contains_key(&id));
             if !metadata_due
@@ -326,6 +498,7 @@ impl Daemon {
             }
             let meta = Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0));
             if !screen
+                && !changed
                 && notify.is_empty()
                 && error.is_none()
                 && copy.is_none()
@@ -335,38 +508,54 @@ impl Daemon {
             }
             let mut rows = Vec::new();
             let mut cells = Vec::new();
-            let frame = if screen {
-                let snapshot = session.snapshot()?;
-                self.snapshots += 1;
-                let cols = snapshot.frame.cols as usize;
-                let old = frontend.screens.entry(id).or_default();
-                let full =
-                    old.frame.cols != snapshot.frame.cols || old.frame.rows != snapshot.frame.rows;
-                if full {
-                    old.cells.resize(snapshot.cells.len(), Cell::default());
+            let (frame, find, selection) = if screen || frontend.views.contains_key(&id) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
+                    entry.insert(session.new_view()?);
                 }
-                for (row, data) in snapshot.cells.chunks_exact(cols).enumerate() {
-                    let previous = &mut old.cells[row * cols..(row + 1) * cols];
-                    if full || *previous != *data {
-                        rows.push(row as u16);
-                        cells.extend_from_slice(data);
-                        previous.copy_from_slice(data);
+                let view = frontend.views.get_mut(&id).unwrap();
+                if terminal_changed {
+                    view.invalidate();
+                }
+                session.with_view(view, |engine| -> anyhow::Result<_> {
+                    engine.poll_find();
+                    if screen {
+                        engine.snapshot()?;
                     }
-                }
-                self.sent_rows += rows.len() as u64;
-                // A client can discard every row while detached; attachment always resends a full viewport.
-                let serial = frontend.scroll_serials.get(&id).copied().unwrap_or(0);
-                let send = full
-                    || !rows.is_empty()
-                    || old.frame != snapshot.frame
-                    || frontend.sent_scroll_serials.get(&id) != Some(&serial);
-                old.frame = snapshot.frame;
-                send.then_some(snapshot.frame)
+                    let frame = if screen {
+                        let frame = engine.frame;
+                        let cells_snapshot = &engine.cells;
+                        self.snapshots += 1;
+                        let cols = frame.cols as usize;
+                        let old = frontend.screens.entry(id).or_default();
+                        let full = old.frame.cols != frame.cols || old.frame.rows != frame.rows;
+                        if full {
+                            old.cells.resize(cells_snapshot.len(), Cell::default());
+                        }
+                        for (row, data) in cells_snapshot.chunks_exact(cols).enumerate() {
+                            let previous = &mut old.cells[row * cols..(row + 1) * cols];
+                            if full || *previous != *data {
+                                rows.push(row as u16);
+                                cells.extend_from_slice(data);
+                                previous.copy_from_slice(data);
+                            }
+                        }
+                        self.sent_rows += rows.len() as u64;
+                        // A client can discard every row while detached; attachment always resends a full viewport.
+                        let serial = frontend.scroll_serials.get(&id).copied().unwrap_or(0);
+                        let send = full
+                            || !rows.is_empty()
+                            || old.frame != frame
+                            || frontend.sent_scroll_serials.get(&id) != Some(&serial);
+                        old.frame = frame;
+                        send.then_some(frame)
+                    } else {
+                        None
+                    };
+                    Ok((frame, engine.find_state(), engine.selection()))
+                })?
             } else {
-                None
+                (None, crate::search::FindState::default(), None)
             };
-            let find = session.find_state();
-            let selection = session.selection();
             let find_changed = frontend.find.get(&id) != Some(&find);
             let selection_changed = frontend.selections.get(&id) != Some(&selection);
             if frame.is_none()
@@ -389,6 +578,7 @@ impl Daemon {
             if let Some(text) = copy.take() {
                 frontend.queue(Packet {
                     header: Header {
+                        state: None,
                         meta: meta.clone(),
                         frame: None,
                         scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
@@ -404,6 +594,7 @@ impl Daemon {
             }
             frontend.queue(Packet {
                 header: Header {
+                    state: None,
                     meta,
                     frame,
                     scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
@@ -417,7 +608,7 @@ impl Daemon {
                 cells,
             })?;
         }
-        self.changed.clear();
+        frontend.changed.clear();
         frontend.flush()?;
         Ok(())
     }

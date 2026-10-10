@@ -68,6 +68,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut quit_at = None;
     let mut fds = Vec::new();
     let mut pane_indices = Vec::new();
+    let mut frontend_indices = Vec::new();
     let mut ready = HashSet::new();
     let mut exited = Vec::new();
     loop {
@@ -96,7 +97,8 @@ pub fn run() -> anyhow::Result<()> {
                 revents: 0,
             },
         ]);
-        let frontend_index = daemon.frontend.as_ref().map(|frontend| {
+        frontend_indices.clear();
+        for (&id, frontend) in &daemon.frontends {
             let index = fds.len();
             fds.push(libc::pollfd {
                 fd: frontend.socket.as_raw_fd(),
@@ -108,8 +110,8 @@ pub fn run() -> anyhow::Result<()> {
                     },
                 revents: 0,
             });
-            index
-        });
+            frontend_indices.push((id, index));
+        }
         pane_indices.clear();
         for (&id, session) in &daemon.sessions {
             if let Some((fd, events)) = session.poll_fd() {
@@ -121,12 +123,8 @@ pub fn run() -> anyhow::Result<()> {
                 });
             }
         }
-        let attached = daemon.frontend.as_ref().is_some_and(|f| f.attached);
-        let pending = attached
-            && (!daemon.changed.is_empty()
-                || !daemon.notifications.is_empty()
-                || !daemon.errors.is_empty());
-        let searching = daemon.sessions.values().any(TerminalSession::find_pending);
+        let attached = daemon.frontends.values().any(|f| f.attached);
+        let pending = daemon.updates_pending();
         let held = daemon.sessions.values().any(TerminalSession::render_held);
         let mut deadline = quit_at;
         for next in [
@@ -134,7 +132,6 @@ pub fn run() -> anyhow::Result<()> {
             attached.then_some(next_metadata),
             pending.then_some(next_frame),
             held.then_some(now + Duration::from_millis(100)),
-            searching.then_some(now + Duration::from_millis(5)),
         ]
         .into_iter()
         .flatten()
@@ -155,22 +152,10 @@ pub fn run() -> anyhow::Result<()> {
                 match listener.accept() {
                     Ok((socket, _)) => {
                         socket.set_nonblocking(true)?;
-                        daemon.frontend = Some(Frontend {
-                            socket,
-                            input: Vec::new(),
-                            output: Vec::new(),
-                            offset: 0,
-                            attached: false,
-                            visible: HashSet::new(),
-                            screens: HashMap::new(),
-                            metadata: HashMap::new(),
-                            scroll_serials: HashMap::new(),
-                            sent_scroll_serials: HashMap::new(),
-                            find: HashMap::new(),
-                            selections: HashMap::new(),
-                            discarding: false,
-                            paste: None,
-                        });
+                        daemon.next_frontend += 1;
+                        daemon
+                            .frontends
+                            .insert(daemon.next_frontend, Frontend::new(socket));
                         next_metadata = Instant::now();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -218,30 +203,37 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        if let Some(index) = frontend_index
-            && fds[index].revents != 0
-            && let Some(frontend) = daemon.frontend.as_mut()
-        {
+        for &(id, index) in &frontend_indices {
+            if fds[index].revents == 0 {
+                continue;
+            }
+            let Some(mut frontend) = daemon.frontends.remove(&id) else {
+                continue;
+            };
+            let mut connected = true;
             match frontend.requests() {
                 Ok(requests) => {
                     for request in requests {
-                        let id = daemon.resolve_pane(request.pane).ok();
+                        let pane = daemon.resolve_pane(request.pane).ok();
                         let attach = request.is_attach();
-                        if let Err(e) = daemon.input(request) {
+                        if let Err(error) = daemon.input(&mut frontend, request) {
                             if attach {
-                                daemon.frontend = None;
+                                connected = false;
                                 break;
-                            } else if let Some(id) = id {
-                                daemon.errors.insert(id, e.to_string());
+                            }
+                            if let Some(pane) = pane {
+                                frontend.errors.insert(pane, error.to_string());
+                                daemon.changed.insert(pane);
                             } else {
-                                eprintln!("Frontend command failed: {e}");
+                                eprintln!("Frontend command failed: {error}");
                             }
                         }
                     }
                 }
-                Err(_) => {
-                    daemon.frontend = None;
-                }
+                Err(_) => connected = false,
+            }
+            if connected {
+                daemon.frontends.insert(id, frontend);
             }
         }
         for _ in 0..32 {
@@ -253,7 +245,7 @@ pub fn run() -> anyhow::Result<()> {
                 && method != "quit"
                 && method != "daemon-info"
                 && method != "notify"
-                && daemon.frontend.as_ref().is_some_and(|f| f.attached)
+                && daemon.frontends.values().any(|f| f.attached)
                 && ipc::companion_path(".ui").exists()
             {
                 // Forward UI actions on a worker so the owner can service backend requests
@@ -278,7 +270,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         let metadata_due =
-            daemon.frontend.as_ref().is_some_and(|f| f.attached) && Instant::now() >= next_metadata;
+            daemon.frontends.values().any(|f| f.attached) && Instant::now() >= next_metadata;
         ready.clear();
         ready.extend(
             pane_indices
@@ -289,9 +281,12 @@ pub fn run() -> anyhow::Result<()> {
         if child_event || metadata_due {
             ready.extend(daemon.sessions.keys().copied());
         }
-        ready.extend(daemon.sessions.iter().filter_map(|(&id, session)| {
-            (session.render_held() || session.find_pending()).then_some(id)
-        }));
+        ready.extend(
+            daemon
+                .sessions
+                .iter()
+                .filter_map(|(&id, session)| session.render_held().then_some(id)),
+        );
         // Flush queued input immediately, including terminal protocol replies.
         ready.extend(daemon.sessions.iter().filter_map(|(&id, s)| {
             s.poll_fd()
@@ -324,22 +319,16 @@ pub fn run() -> anyhow::Result<()> {
         if metadata_due {
             next_metadata = Instant::now() + Duration::from_secs(1);
         }
-        if (Instant::now() >= next_frame
-            && (!daemon.changed.is_empty()
-                || !daemon.notifications.is_empty()
-                || !daemon.errors.is_empty()))
+        if (Instant::now() >= next_frame && daemon.updates_pending())
             || metadata_due
             || !exited.is_empty()
         {
-            if let Err(error) = daemon.updates(metadata_due) {
-                eprintln!("Detaching frontend: {error}");
-                daemon.frontend = None;
-            }
+            daemon.updates(metadata_due);
             next_frame = Instant::now() + Duration::from_millis(16);
-        } else if let Some(frontend) = daemon.frontend.as_mut()
-            && frontend.flush().is_err()
-        {
-            daemon.frontend = None;
+        } else {
+            daemon
+                .frontends
+                .retain(|_, frontend| frontend.flush().is_ok());
         }
         let layout_changed = !exited.is_empty();
         for id in exited.drain(..) {
@@ -347,13 +336,16 @@ pub fn run() -> anyhow::Result<()> {
                 daemon.close(id);
             }
         }
+        if layout_changed {
+            daemon.revision += 1;
+        }
         if layout_changed
             && !daemon.quitting
             && let Err(error) = persistence.submit(Save::Session(daemon.session_snapshot()), true)
         {
             eprintln!("Could not save layout after process exit: {error}");
         }
-        if daemon.frontend.is_none() {
+        if daemon.frontends.is_empty() {
             daemon.changed.clear();
             daemon.errors.clear();
         }

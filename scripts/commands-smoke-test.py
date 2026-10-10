@@ -73,6 +73,9 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
 
         close_pane = wait_for(lambda: find("Close Pane", "list item"))
         close_window = wait_for(lambda: find("Close Window", "list item"))
+        new_window = wait_for(lambda: find("New Window", "list item"))
+        new_window_shortcut = wait_for(lambda: shortcut_labels(new_window))
+        assert new_window.get_state_set().contains(Atspi.StateType.SENSITIVE)
         pane_shortcut = wait_for(lambda: shortcut_labels(close_pane))
         wait_for(lambda: shortcut_labels(close_window) == pane_shortcut)
         assert not close_pane.get_state_set().contains(Atspi.StateType.SENSITIVE)
@@ -107,6 +110,7 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
             ("settings", "Preferences"), ("settigns", "Preferences"),
             ("font", "Preferences"), ("keybindings", "Keyboard Shortcuts"),
             ("new directory", "New Tab in Directory…"),
+            ("new window", "New Window"), ("another window", "New Window"),
             ("splti riht", "Split Right"), ("name", "Rename Tab…"),
             ("toggle sidebar", "Show or Hide Tabs"), ("manage", "Manage Workspaces…"),
         ]:
@@ -148,15 +152,25 @@ with (artifacts / f"commands-{appearance}.log").open("w") as log, AccessibilityF
         while shortcuts_dialog and shortcuts_dialog.get_role_name() != "dialog":
             shortcuts_dialog = shortcuts_dialog.get_parent()
         assert shortcuts_dialog, "Main Menu help must belong to the shortcuts dialog"
-        for title in ("New Tab", "New Tab in Directory…", "Show or Hide Tabs", "Split Right",
+        for title in ("New Window", "New Tab", "New Tab in Directory…", "Show or Hide Tabs", "Split Right",
                       "Split Down", "Find in Terminal…", "Zoom In", "Zoom Out", "Reset Zoom",
                       "Main Menu", "Commands…", "Toggle Fullscreen", "Quit Gmux"):
             wait_for(lambda: any(obj.get_role_name() == "label" and obj.get_name() == title
                                 for obj in descendants(shortcuts_dialog)))
+        application_section = wait_for(lambda: find("Application", "grouping"))
+        category = wait_for(lambda: find("Application", "toggle button"))
+        assert category.get_action_iface().do_action(0)
+        window_help = next(obj for obj in descendants(application_section)
+                           if obj.get_role_name() == "label" and obj.get_name() == "New Window")
+        wait_for(lambda: window_help.get_state_set().contains(Atspi.StateType.SHOWING))
+        help_item = window_help.get_parent()
+        while help_item.get_role_name() != "list item":
+            help_item = help_item.get_parent()
+        wait_for(lambda: shortcut_labels(help_item) - {"New Window"} == new_window_shortcut)
         print("PASS: command labels, related terms, typo matching, ranking, disabled matches, "
               "uniform rows, retained search focus, selection and no-result announcements, "
               "search-to-list accessibility relation, conditional Close Window shortcut labels, "
-              "and the Close Pane shortcut explanation")
+              "New Window shortcut help in the Application section, and the Close Pane shortcut explanation")
     finally:
         if listener:
             listener.deregister("object:announcement")

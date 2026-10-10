@@ -99,14 +99,18 @@ pub struct Ui {
     changing: Cell<bool>,
     dirty: Cell<bool>,
     save_source: RefCell<Option<glib::SourceId>>,
-    server: ipc::Server,
-    wake: ipc::Wake,
+    owner: std::rc::Weak<Windows>,
+    id: u64,
+    revision: Cell<u64>,
+    detaching: Cell<bool>,
     backend: ipc::Client,
     pending: RefCell<HashMap<u64, BackendCallback>>,
     command_count: Cell<usize>,
     command_exits: RefCell<HashSet<u64>>,
     keyboard: Rc<RefCell<crate::terminal::KeyboardModifiers>>,
     update_source: RefCell<Option<glib::SourceId>>,
+    branch_source: RefCell<Option<glib::SourceId>>,
+    theme_handler: RefCell<Option<glib::SignalHandlerId>>,
     branches: BranchWorker,
     branch_cache: RefCell<BranchCache>,
     branch_monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
@@ -118,6 +122,12 @@ impl Drop for Ui {
     fn drop(&mut self) {
         if let Some(source) = self.update_source.get_mut().take() {
             source.remove();
+        }
+        if let Some(source) = self.branch_source.get_mut().take() {
+            source.remove();
+        }
+        if let Some(handler) = self.theme_handler.get_mut().take() {
+            adw::StyleManager::default().disconnect(handler);
         }
         if let Some(source) = self.save_source.get_mut().take() {
             source.remove();
@@ -131,17 +141,216 @@ impl Drop for Ui {
     }
 }
 
-pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
+/// App-owned window lifetime and routing. Session data arrives from the daemon.
+struct Windows {
+    app: adw::Application,
+    endpoint: ipc::Endpoint,
+    windows: RefCell<Vec<Rc<Ui>>>,
+    next_id: Cell<u64>,
+    server: RefCell<Option<ipc::Server>>,
+    source: RefCell<Option<glib::SourceId>>,
+}
+impl Windows {
+    fn active(&self) -> Option<Rc<Ui>> {
+        let windows = self.windows.borrow();
+        windows
+            .iter()
+            .find(|ui| ui.window.is_active())
+            .or_else(|| windows.last())
+            .cloned()
+    }
+    fn create(self: &Rc<Self>, directory: Option<PathBuf>) -> anyhow::Result<Rc<Ui>> {
+        if self.server.borrow().is_none() {
+            let wake = ipc::Wake::new()?;
+            *self.server.borrow_mut() = Some(ipc::Server::start_at(
+                ipc::companion_path(".ui"),
+                wake.clone(),
+            )?);
+            let weak = Rc::downgrade(self);
+            *self.source.borrow_mut() = Some(glib_unix::unix_fd_add_local(
+                wake.as_raw_fd(),
+                glib::IOCondition::IN,
+                move |_, _| {
+                    wake.drain();
+                    let Some(owner) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    for _ in 0..16 {
+                        let request = owner.server.borrow().as_ref().unwrap().receiver.try_recv();
+                        let Ok(request) = request else {
+                            return glib::ControlFlow::Continue;
+                        };
+                        owner.route(request);
+                    }
+                    wake.notify();
+                    glib::ControlFlow::Continue
+                },
+            ));
+        }
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        gmux::remote::ensure_daemon()?;
+        let ui = Ui::new(
+            &self.app,
+            directory,
+            Rc::downgrade(self),
+            id,
+            self.endpoint.clone(),
+        )?;
+        self.windows.borrow_mut().push(ui.clone());
+        ui.window.present();
+        Ok(ui)
+    }
+    fn route(self: &Rc<Self>, request: ipc::Request) {
+        if request.body["method"] == "windows" {
+            let windows = self.windows.borrow();
+            let _ = request.reply.try_send(json!({"windows": windows.iter().map(|ui| json!({"id":ui.id,"active":ui.window.is_active(),"active_tab":ui.active.get()})).collect::<Vec<_>>() }));
+        } else if request.body["method"] == "new-window" {
+            let response = self
+                .create(None)
+                .map(|ui| json!({"window":ui.id}))
+                .unwrap_or_else(|error| json!({"error":error.to_string()}));
+            let _ = request.reply.try_send(response);
+        } else {
+            let ui = if let Some(id) = request.body.get("window") {
+                id.as_u64()
+                    .and_then(|id| self.windows.borrow().iter().find(|ui| ui.id == id).cloned())
+            } else {
+                self.active()
+            };
+            if let Some(ui) = ui {
+                ui.handle_control(request);
+            } else {
+                let _ = request
+                    .reply
+                    .try_send(json!({"error":"Window does not exist"}));
+            }
+        }
+    }
+}
+impl Drop for Windows {
+    fn drop(&mut self) {
+        if let Some(source) = self.source.get_mut().take() {
+            source.remove();
+        }
+    }
+}
+
+pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
+    gio::resources_register_include!("gmux.gresource")?;
     let application = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
+    application.connect_startup(|_| {
+        gtk::IconTheme::for_display(&gdk::Display::default().unwrap())
+            .add_resource_path("/dev/gmux/Gmux/icons");
+    });
+    application.add_main_option(
+        "new-window",
+        glib::Char::from(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Open another window",
+        None,
+    );
     glib::set_application_name("Gmux");
     glib::set_prgname(Some("gmux"));
-    let holder: Rc<RefCell<Option<Rc<Ui>>>> = Rc::new(RefCell::new(None));
+    let owner = Rc::new(Windows {
+        app: application.clone(),
+        endpoint: ipc::Endpoint::local(),
+        windows: RefCell::new(Vec::new()),
+        next_id: Cell::new(0),
+        server: RefCell::new(None),
+        source: RefCell::new(None),
+    });
     let startup_error = Rc::new(RefCell::new(None));
-    let activate_error = startup_error.clone();
-    let activate_holder = holder.clone();
+    let activate_owner = Rc::downgrade(&owner);
+    application.connect_activate(move |app| {
+        let Some(activate_owner) = activate_owner.upgrade() else {
+            return;
+        };
+        if let Some(ui) = activate_owner.active() {
+            ui.window.present();
+        } else if let Err(error) = activate_owner.create(None) {
+            show_startup_error(app, &error);
+        }
+    });
+    let command_owner = Rc::downgrade(&owner);
+    let command_error = startup_error.clone();
+    application.connect_command_line(move |app, command| {
+        let Some(command_owner) = command_owner.upgrade() else {
+            return glib::ExitCode::FAILURE;
+        };
+        let new = command
+            .options_dict()
+            .lookup::<bool>("new-window")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        let directory = command
+            .arguments()
+            .iter()
+            .skip(1)
+            .find(|arg| !arg.to_string_lossy().starts_with('-'))
+            .and_then(|arg| gio::File::for_uri(&arg.to_string_lossy()).path());
+        let existing = command_owner.active().filter(|_| !new);
+        let result = if let Some(ui) = existing {
+            if let Some(directory) = directory {
+                ui.new_tab(directory, None);
+            }
+            ui.window.present();
+            Ok(())
+        } else {
+            command_owner.create(directory).map(|_| ())
+        };
+        if let Err(error) = result {
+            *command_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
+            show_startup_error(app, &error);
+            glib::ExitCode::FAILURE
+        } else {
+            glib::ExitCode::SUCCESS
+        }
+    });
+    let open_owner = Rc::downgrade(&owner);
+    application.connect_open(move |app, files, _| {
+        let Some(open_owner) = open_owner.upgrade() else {
+            return;
+        };
+        for directory in files.iter().filter_map(gio::File::path) {
+            if let Some(ui) = open_owner.active() {
+                ui.new_tab(directory, None);
+                ui.window.present();
+            } else if let Err(error) = open_owner.create(Some(directory)) {
+                show_startup_error(app, &error);
+            }
+        }
+    });
+    let action = gio::SimpleAction::new("focus-notification", Some(&u64::static_variant_type()));
+    let notification_owner = Rc::downgrade(&owner);
+    action.connect_activate(move |_, value| {
+        if let (Some(ui), Some(pane)) = (
+            notification_owner
+                .upgrade()
+                .and_then(|owner| owner.active()),
+            value.and_then(|v| v.get::<u64>()),
+        ) {
+            ui.jump_to_pane(pane);
+        }
+    });
+    application.add_action(&action);
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let weak = Rc::downgrade(&owner);
+        glib_unix::unix_signal_add_local(signal, move || {
+            if let Some(owner) = weak.upgrade() {
+                let windows = owner.windows.borrow().clone();
+                for ui in windows {
+                    ui.detach_frontend();
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
     let directory = directory.map(std::path::absolute).transpose()?;
     if let Some(directory) = &directory {
         anyhow::ensure!(
@@ -150,63 +359,25 @@ pub fn run(directory: Option<PathBuf>) -> anyhow::Result<()> {
             directory.display()
         );
     }
-    application.connect_activate(move |app| {
-        if let Some(ui) = activate_holder.borrow().as_ref() {
-            ui.window.present();
-            return;
-        }
-        match Ui::new(app, None) {
-            Ok(ui) => {
-                ui.window.present();
-                *activate_holder.borrow_mut() = Some(ui);
-            }
-            Err(error) => {
-                *activate_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
-                show_startup_error(app, &error);
-            }
-        }
-    });
-    let open_holder = holder.clone();
-    let open_error = startup_error.clone();
-    application.connect_open(move |app, files, _| {
-        let directories = files.iter().filter_map(gio::File::path).collect::<Vec<_>>();
-        let Some(first) = directories.first() else {
-            return;
-        };
-        let existing = open_holder.borrow().as_ref().cloned();
-        let (ui, skip) = if let Some(ui) = existing {
-            (ui, 0)
-        } else {
-            match Ui::new(app, Some(first.clone())) {
-                Ok(ui) => {
-                    *open_holder.borrow_mut() = Some(ui.clone());
-                    (ui, 1)
-                }
-                Err(error) => {
-                    *open_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
-                    show_startup_error(app, &error);
-                    return;
-                }
-            }
-        };
-        for directory in directories.into_iter().skip(skip) {
-            ui.new_tab(directory, None);
-        }
-        ui.window.present();
-    });
-    // Forward explicit directories through GApplication's open signal so an
-    // already-running instance receives them too.
     let mut arguments = vec!["gmux".to_string()];
+    if new_window {
+        arguments.push("--new-window".into());
+    }
     if let Some(directory) = directory {
         arguments.push(gio::File::for_path(directory).uri().to_string());
     }
     let code = application.run_with_args(&arguments);
-    if let Some(error) = startup_error.borrow_mut().take() {
-        anyhow::bail!("{error}");
-    }
-    if let Some(ui) = holder.borrow_mut().take() {
+    let windows = owner.windows.borrow_mut().drain(..).collect::<Vec<_>>();
+    for ui in windows {
         ui.tabs.borrow_mut().clear();
         ui.sessions.borrow_mut().clear();
+    }
+    if let Some(source) = owner.source.borrow_mut().take() {
+        source.remove();
+    }
+    owner.server.borrow_mut().take();
+    if let Some(error) = startup_error.borrow_mut().take() {
+        anyhow::bail!("{error}");
     }
     anyhow::ensure!(code == glib::ExitCode::SUCCESS, "Gmux exited with {code:?}");
     Ok(())
@@ -286,11 +457,14 @@ impl Ui {
         self.toast.add_toast(adw::Toast::new(message));
     }
     pub(super) fn notify(&self, tab: u64, pane: u64, message: String) {
-        if self.window.is_active()
-            && self
-                .active_pane()
-                .is_some_and(|terminal| terminal.id == pane && terminal.area.has_focus())
-        {
+        if self.owner.upgrade().is_some_and(|owner| {
+            owner.windows.borrow().iter().any(|ui| {
+                ui.window.is_active()
+                    && ui
+                        .active_pane()
+                        .is_some_and(|terminal| terminal.id == pane && terminal.area.has_focus())
+            })
+        }) {
             self.mark_read(pane);
             return;
         }

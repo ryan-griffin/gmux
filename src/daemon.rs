@@ -81,10 +81,11 @@ fn reserve_id_range(last_id: &mut u64, count: u64) -> anyhow::Result<u64> {
 struct Daemon {
     sessions: HashMap<u64, TerminalSession>,
     state: Session,
-    frontend: Option<Frontend>,
+    frontends: HashMap<u64, Frontend>,
+    next_frontend: u64,
+    revision: u64,
     changed: HashSet<u64>,
     notifications: HashMap<u64, NotificationQueue>,
-    clipboard: HashMap<u64, String>,
     errors: HashMap<u64, String>,
     unread: HashMap<u64, u64>,
     alert_sequence: u64,
@@ -114,10 +115,11 @@ impl Daemon {
                 active: saved.active,
                 ..Session::default()
             },
-            frontend: None,
+            frontends: HashMap::new(),
+            next_frontend: 0,
+            revision: 0,
             changed: HashSet::new(),
             notifications: HashMap::new(),
-            clipboard: HashMap::new(),
             errors: HashMap::new(),
             unread: HashMap::new(),
             alert_sequence: 0,
@@ -314,11 +316,13 @@ impl Daemon {
         self.state.scrollback.remove(&id);
         self.unread.remove(&id);
         self.notifications.remove(&id);
-        self.clipboard.remove(&id);
         self.errors.remove(&id);
         self.changed.remove(&id);
-        if let Some(frontend) = &mut self.frontend {
+        for frontend in self.frontends.values_mut() {
             frontend.visible.remove(&id);
+            frontend.views.remove(&id);
+            frontend.clipboard.remove(&id);
+            frontend.errors.remove(&id);
             if frontend
                 .paste
                 .as_ref()
@@ -327,6 +331,8 @@ impl Daemon {
                 frontend.paste = None;
             }
             frontend.screens.remove(&id);
+            frontend.sizes.remove(&id);
+            frontend.changed.remove(&id);
             frontend.metadata.remove(&id);
             frontend.scroll_serials.remove(&id);
             frontend.sent_scroll_serials.remove(&id);
@@ -384,6 +390,19 @@ impl Daemon {
                 }
             }
         }
+    }
+    fn shared_state(&self) -> anyhow::Result<crate::control::CommandReply> {
+        Ok(crate::control::CommandReply {
+            revision: self.revision,
+            result: CommandOutput::Done { ok: true }.into(),
+            session: self.state.clone(),
+            catalog: storage::load_catalog()?,
+            metadata: self
+                .sessions
+                .iter()
+                .map(|(&id, s)| Self::metadata(s, self.unread.get(&id).copied().unwrap_or(0)))
+                .collect(),
+        })
     }
     fn session_snapshot(&mut self) -> Session {
         self.refresh_state();
@@ -476,6 +495,7 @@ mod tests {
         queue.push("\x01".repeat(MAX_NOTIFICATION_BYTES));
         let packet = Packet {
             header: Header {
+                state: None,
                 meta: Metadata {
                     id: 1,
                     directory: PathBuf::from("/tmp"),
@@ -545,27 +565,14 @@ mod tests {
             },
             0
         );
-        let mut frontend = Frontend {
-            socket,
-            input: Vec::new(),
-            output: Vec::new(),
-            offset: 0,
-            attached: true,
-            visible: HashSet::new(),
-            screens: HashMap::new(),
-            metadata: HashMap::new(),
-            scroll_serials: HashMap::new(),
-            sent_scroll_serials: HashMap::new(),
-            find: HashMap::new(),
-            selections: HashMap::new(),
-            discarding: false,
-            paste: None,
-        };
+        let mut frontend = Frontend::new(socket);
+        frontend.attached = true;
         let packet = |text| {
             let mut cell = Cell::default();
             cell.text[0] = text;
             Packet {
                 header: Header {
+                    state: None,
                     meta: Metadata {
                         id: 1,
                         directory: PathBuf::from("/tmp"),
@@ -612,7 +619,9 @@ mod tests {
                 result => panic!("Unexpected socket read: {result:?}"),
             }
             if !queued_second && frontend.offset >= frontend.output.len() / 2 {
-                frontend.queue(packet(b'b')).unwrap();
+                let mut bytes = Vec::new();
+                packet(b'b').encode_into(&mut bytes).unwrap();
+                frontend.queue_encoded(&bytes).unwrap();
                 assert_eq!(frontend.offset, 0, "Consumed bytes should be compacted");
                 queued_second = true;
             }

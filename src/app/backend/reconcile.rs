@@ -54,6 +54,34 @@ pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<u64
     reply.metadata.retain(|meta| !exited.contains(&meta.id));
 }
 
+/// A daemon snapshot carries shared objects; each window keeps its own selection.
+pub(super) fn preserve_window_state(
+    state: &mut Session,
+    catalog: &WorkspaceCatalog,
+    current: &Selection,
+) {
+    state.active = current.active;
+    state.filter = match current.filter {
+        TabFilter::Workspace(id)
+            if !catalog
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == id) =>
+        {
+            TabFilter::Unassigned
+        }
+        filter => filter,
+    };
+    for saved in &mut state.tabs {
+        if let Some(tab) = current.tabs.get(&saved.id)
+            && saved.layout.contains(tab.active)
+        {
+            saved.active = tab.active;
+        }
+    }
+    repair_active_tab(state, current);
+}
+
 pub(super) fn reconcile_selection(
     state: &mut Session,
     catalog: &WorkspaceCatalog,
@@ -170,6 +198,40 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn shared_snapshots_preserve_the_windows_existing_tab_pane_and_filter() {
+        let mut split = tab(1, 101, Some(10));
+        split.layout.split(101, 102, false);
+        let local = session(
+            vec![split.clone(), tab(2, 201, None)],
+            1,
+            TabFilter::Workspace(10),
+        );
+        let current = selection(&local);
+        let catalog = WorkspaceCatalog {
+            workspaces: vec![WorkspaceDefinition {
+                id: 10,
+                name: "Project".into(),
+                directory: ".".into(),
+            }],
+        };
+        split.active = 102;
+        let mut incoming = session(
+            vec![tab(3, 301, None), split, tab(2, 201, None)],
+            3,
+            TabFilter::All,
+        );
+        preserve_window_state(&mut incoming, &catalog, &current);
+        assert_eq!(incoming.active, 1);
+        assert!(incoming.filter == TabFilter::Workspace(10));
+        assert_eq!(incoming.tabs[1].active, 101);
+        let empty = selection(&session(local.tabs, 0, TabFilter::All));
+        preserve_window_state(&mut incoming, &catalog, &empty);
+        // A new shared tab populates a previously empty view without changing its filter.
+        assert!(incoming.filter == TabFilter::All);
+        assert_eq!(incoming.active, 3);
     }
 
     fn reconcile(state: &mut Session, requested: &Selection, current: &Selection, reveal: bool) {
@@ -301,6 +363,7 @@ mod tests {
             }
             split.active = active;
             let mut reply = CommandReply {
+                revision: 0,
                 result: CommandOutput::Done { ok: true }.into(),
                 session: session(vec![split, tab(3, 301, None)], 1, TabFilter::All),
                 catalog: WorkspaceCatalog::default(),

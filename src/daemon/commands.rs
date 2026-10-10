@@ -80,6 +80,7 @@ struct ControlReply {
     kind: ReplyKind,
     sender: std::sync::mpsc::SyncSender<Value>,
     value: Value,
+    broadcast: bool,
 }
 pub(super) struct PendingControl {
     reply: ControlReply,
@@ -103,10 +104,18 @@ impl PendingControl {
             Request::Internal(InternalRequest::Presentation { .. }) => ReplyKind::Presentation,
             _ => ReplyKind::Direct,
         };
+        let broadcast = matches!(
+            &request.body,
+            Request::Layout(_)
+                | Request::Internal(
+                    InternalRequest::Command { .. } | InternalRequest::Close { .. }
+                )
+        );
         let result = daemon.control(request.body);
         let failed = result.is_err();
         let reply = ControlReply {
             kind,
+            broadcast,
             sender: request.reply,
             value: result.unwrap_or_else(|error| json!({"error":error.to_string()})),
         };
@@ -168,9 +177,13 @@ impl ControlReply {
         }
         self
     }
-    fn send(mut self, daemon: &Daemon) {
+    fn send(mut self, daemon: &mut Daemon) {
+        if self.broadcast && self.value.get("error").is_none() {
+            daemon.revision += 1;
+        }
         if self.kind == ReplyKind::Command && self.value.get("error").is_none() {
             let result = (|| -> anyhow::Result<()> {
+                self.value["revision"] = json!(daemon.revision);
                 self.value["session"] = serde_json::to_value(&daemon.state)?;
                 self.value["catalog"] = serde_json::to_value(storage::load_catalog()?)?;
                 self.value["metadata"] = json!(
@@ -495,7 +508,7 @@ impl Daemon {
                 Ok(json!({"version":transport::VERSION,"quitting":self.quitting}))
             }
             Request::Public(PublicRequest::DaemonInfo) => Ok(
-                json!({"version":transport::VERSION,"pid":std::process::id(),"attached":self.frontend.as_ref().is_some_and(|f|f.attached),"panes":self.sessions.len(),"uptime_seconds":self.started.elapsed().as_secs(),"snapshots":self.snapshots,"sent_rows":self.sent_rows}),
+                json!({"version":transport::VERSION,"pid":std::process::id(),"attached":self.frontends.values().any(|f|f.attached),"frontends":self.frontends.values().filter(|f|f.attached).count(),"panes":self.sessions.len(),"uptime_seconds":self.started.elapsed().as_secs(),"snapshots":self.snapshots,"sent_rows":self.sent_rows}),
             ),
             Request::Internal(InternalRequest::Busy { panes: ids }) => {
                 let busy = ids
@@ -553,9 +566,7 @@ impl Daemon {
             }
             Request::Internal(InternalRequest::State) => {
                 self.refresh_state();
-                Ok(
-                    json!({"session":self.state,"metadata":self.sessions.iter().map(|(&id, s)|Self::metadata(s,self.unread.get(&id).copied().unwrap_or(0))).collect::<Vec<_>>() }),
-                )
+                Ok(serde_json::to_value(self.shared_state()?)?)
             }
             Request::Internal(InternalRequest::Metadata { pane }) => {
                 let id = self.resolve_pane(pane)?;
@@ -567,7 +578,28 @@ impl Daemon {
             }
             Request::Internal(InternalRequest::Copy { pane }) => {
                 let id = self.resolve_pane(pane)?;
-                Ok(json!({"text":self.sessions[&id].copy()?}))
+                let frontend = self
+                    .frontends
+                    .iter()
+                    .filter(|(_, f)| f.views.contains_key(&id))
+                    .max_by_key(|(client, f)| (f.focused, **client))
+                    .map(|(&client, _)| client);
+                let text = if let Some(client) = frontend {
+                    let view = self
+                        .frontends
+                        .get_mut(&client)
+                        .unwrap()
+                        .views
+                        .get_mut(&id)
+                        .unwrap();
+                    self.sessions
+                        .get_mut(&id)
+                        .unwrap()
+                        .with_view(view, |engine| engine.copy())?
+                } else {
+                    String::new()
+                };
+                Ok(json!({"text":text}))
             }
             Request::Internal(InternalRequest::Read { pane })
             | Request::Public(PublicRequest::Read { pane }) => {

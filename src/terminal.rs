@@ -425,6 +425,9 @@ impl Terminal {
     pub fn send_text(&self, text: &str, enter: bool) -> anyhow::Result<()> {
         self.session.borrow_mut().send_text(text, enter)
     }
+    pub fn text(&self) -> String {
+        self.session.borrow().text()
+    }
     pub fn tick(self: &Rc<Self>, update: &SessionUpdate) {
         if let Some(error) = &update.error {
             self.show_status(error);

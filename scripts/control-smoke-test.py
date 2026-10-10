@@ -150,7 +150,7 @@ with AppFixture() as fixture:
             data = exact(size)
             header_size, = struct.unpack("<I", data[:4])
             return json.loads(data[4:4+header_size])
-        send("attach", version=6)
+        send("attach", version=7)
         send("subscribe", panes=[pane])
         header = wait_for(lambda: (h if (h := packet())["meta"]["id"] == pane and h["notifications"] else None))
         assert header["notifications"] == [large_alert(i) for i in range(21, 24)], "Retain whole recent alerts within the byte budget"
