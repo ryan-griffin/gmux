@@ -266,13 +266,19 @@ pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
     });
     let startup_error = Rc::new(RefCell::new(None));
     let activate_owner = Rc::downgrade(&owner);
+    let activate_error = startup_error.clone();
     application.connect_activate(move |app| {
         let Some(activate_owner) = activate_owner.upgrade() else {
             return;
         };
         if let Some(ui) = activate_owner.active() {
             ui.window.present();
+        } else if activate_error.borrow().is_some() {
+            if let Some(window) = app.active_window() {
+                window.present();
+            }
         } else if let Err(error) = activate_owner.create(None) {
+            *activate_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
             show_startup_error(app, &error);
         }
     });
@@ -282,6 +288,12 @@ pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
         let Some(command_owner) = command_owner.upgrade() else {
             return glib::ExitCode::FAILURE;
         };
+        if command_owner.active().is_none() && command_error.borrow().is_some() {
+            if let Some(window) = app.active_window() {
+                window.present();
+            }
+            return glib::ExitCode::SUCCESS;
+        }
         let new = command
             .options_dict()
             .lookup::<bool>("new-window")
@@ -313,16 +325,25 @@ pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
         }
     });
     let open_owner = Rc::downgrade(&owner);
+    let open_error = startup_error.clone();
     application.connect_open(move |app, files, _| {
         let Some(open_owner) = open_owner.upgrade() else {
             return;
         };
+        if open_owner.active().is_none() && open_error.borrow().is_some() {
+            if let Some(window) = app.active_window() {
+                window.present();
+            }
+            return;
+        }
         for directory in files.iter().filter_map(gio::File::path) {
             if let Some(ui) = open_owner.active() {
                 ui.new_tab(directory, None);
                 ui.window.present();
             } else if let Err(error) = open_owner.create(Some(directory)) {
+                *open_error.borrow_mut() = Some(format!("Could not start Gmux: {error:#}"));
                 show_startup_error(app, &error);
+                return;
             }
         }
     });
@@ -384,28 +405,26 @@ pub fn run(directory: Option<PathBuf>, new_window: bool) -> anyhow::Result<()> {
 }
 
 fn show_startup_error(app: &adw::Application, error: &anyhow::Error) {
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Gmux")
-        .default_width(560)
-        .default_height(340)
+    // The daemon check can fail before window setup applies the saved appearance.
+    if app.windows().is_empty()
+        && let Ok(settings) = storage::load::<Settings>("settings.json")
+    {
+        apply_appearance(&settings);
+    }
+    let dialog = adw::AlertDialog::builder()
+        .heading("Could Not Start Gmux")
+        .body(format!("{error:#}"))
         .build();
-    let page = adw::StatusPage::builder()
-        .title("Could Not Start Gmux")
-        .description(format!("{error:#}"))
-        .icon_name("dialog-warning-symbolic")
-        .build();
-    let close = gtk::Button::with_label("Close");
-    close.set_halign(gtk::Align::Center);
-    let weak = window.downgrade();
-    close.connect_clicked(move |_| {
-        if let Some(window) = weak.upgrade() {
-            window.close();
-        }
-    });
-    page.set_child(Some(&close));
-    window.set_content(Some(&page));
-    window.present();
+    dialog.add_response("close", "_Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+    // Start on the only action instead of the scrollable message.
+    dialog.set_focus(dialog.default_widget().as_ref());
+    // Startup can fail before a main window exists. Libadwaita creates the
+    // standalone window; registering it keeps GApplication alive until dismissal.
+    dialog.present(None::<&gtk::Widget>);
+    let window = dialog.root().and_downcast::<gtk::Window>().unwrap();
+    window.set_application(Some(app));
 }
 
 impl Ui {

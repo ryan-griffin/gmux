@@ -271,6 +271,7 @@ building or starting services. Unknown names and desktop selections without
 | --- | --- |
 | `cargo-output` | Real Cargo executable artifacts and native host target/config selection, redirected output, stale-binary rejection, and unsupported-target errors. |
 | `bootstrap` | Interrupted downloads and extraction, recovery of older incomplete caches, cache reuse, checksum verification, and temporary-file cleanup. |
+| `startup-error` | A private incompatible-daemon handshake, content-sized standalone alerts, repeated activation/open, initial focus, keyboard/pointer/system dismissal, keyboard scrolling of long plain-text error details with a fixed Close response, AT-SPI error descriptions, and light/dark/high-contrast screenshots and neutral button fill. |
 | `daemon`, `control`, `state-recovery` | Session lifecycle, command ordering, persistence failures, transport validation, and startup recovery. |
 | `scrollback` | Durable colored history across Quit/SIGTERM, exact indexed/RGB foreground/background and attribute cells, resets and fresh shell output, Unicode wraps, bounded versioned snapshots, corruption and startup recovery, and deleted-pane cleanup. |
 | `workspace`, `sidebar-search`, `branch`, `title`, `scheduling` | Workspace state, sidebar behavior, process metadata, focus, and background work. |
