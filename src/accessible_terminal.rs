@@ -56,6 +56,28 @@ impl Text {
         }
         self.offsets.push(offset);
         self.update_positions(frame, selection);
+        if self.has_excess_capacity(self.used_bytes()) {
+            self.value.shrink_to_fit();
+            self.offsets.shrink_to_fit();
+            self.cell_ends.shrink_to_fit();
+            self.spans.shrink_to_fit();
+        }
+    }
+    /// Heap capacity, excluding allocator overhead and the Text struct itself.
+    pub fn capacity_bytes(&self) -> usize {
+        self.value.capacity()
+            + (self.offsets.capacity() + self.cell_ends.capacity()) * size_of::<u32>()
+            + self.spans.capacity() * size_of::<Range<usize>>()
+    }
+    pub fn used_bytes(&self) -> usize {
+        self.value.len()
+            + (self.offsets.len() + self.cell_ends.len()) * size_of::<u32>()
+            + self.spans.len() * size_of::<Range<usize>>()
+    }
+    pub fn has_excess_capacity(&self, used_bytes: usize) -> bool {
+        // Allow slack for ordinary resizes. Reclaim capacity above four times
+        // the current text and mappings' live storage.
+        self.capacity_bytes() > used_bytes.saturating_mul(4)
     }
     pub fn char_count(&self) -> u32 {
         self.offsets.last().copied().unwrap_or(0)
@@ -232,13 +254,11 @@ mod tests {
             &cells[..2],
             None,
         );
-        assert_eq!(allocations(&text), storage);
         assert_eq!(text.value, "界");
         assert_eq!(text.offsets, [0, 0, 1]);
         assert_eq!(text.selection, None);
         assert_eq!(text.extents(0, 1, 8.0, 16.0), Some((0.0, 0.0, 16.0, 16.0)));
         text.rebuild(Frame::default(), &[], Some((0, 0)));
-        assert_eq!(allocations(&text), storage);
         assert!(text.value.is_empty());
         assert_eq!(text.offsets, [0]);
         assert_eq!(text.char_count(), 0);
@@ -246,6 +266,48 @@ mod tests {
         assert_eq!(text.selection, None);
         assert!(text.spans.is_empty());
         assert!(text.cell_ends.is_empty());
+    }
+
+    #[test]
+    fn shrinking_a_large_viewport_releases_capacity_and_preserves_unicode_mappings() {
+        let mut text = Text::from_frame(
+            Frame {
+                cols: 512,
+                rows: 256,
+                ..Frame::default()
+            },
+            &vec![Cell::default(); 512 * 256],
+            None,
+        );
+        assert!(text.capacity_bytes() > 5 * 1024 * 1024);
+        let frame = Frame {
+            cols: 80,
+            rows: 24,
+            cursor_x: 2,
+            ..Frame::default()
+        };
+        let mut cells = vec![Cell::default(); 80 * 24];
+        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[1].flags = 64;
+        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        let expected = Text::from_frame(frame, &cells, Some((0, 2)));
+        // The canvas must drop its old, large text instead of keeping it as a
+        // spare, even if there are no further text changes after this resize.
+        assert!(text.has_excess_capacity(expected.used_bytes()));
+        text.rebuild(frame, &cells, Some((0, 2)));
+        assert!(text.capacity_bytes() <= expected.capacity_bytes());
+        assert!(text.capacity_bytes() < 100 * 1024);
+        assert!(!text.has_excess_capacity(expected.used_bytes()));
+        assert_eq!(text.value, expected.value);
+        assert_eq!(text.offsets, expected.offsets);
+        assert_eq!(text.cell_ends, expected.cell_ends);
+        assert_eq!(text.spans, expected.spans);
+        assert_eq!(text.caret, 1);
+        assert_eq!(text.selection, Some((0, 3)));
+        assert_eq!(text.extents(0, 1, 8.0, 16.0), Some((0.0, 0.0, 16.0, 16.0)));
+        assert_eq!(text.extents(1, 3, 8.0, 16.0), Some((16.0, 0.0, 8.0, 16.0)));
+        assert_eq!(text.offset_at(12.0, 8.0, 8.0, 16.0), Some(0));
+        assert_eq!(text.offset_at(20.0, 8.0, 8.0, 16.0), Some(1));
     }
     #[test]
     fn text_offsets_count_characters_and_preserve_wide_clusters() {

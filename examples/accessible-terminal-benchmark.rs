@@ -57,6 +57,46 @@ fn measure(mut run: impl FnMut()) -> Value {
     })
 }
 
+fn retention() -> Vec<Value> {
+    let mut results = Vec::new();
+    for unicode in [false, true] {
+        let mut text = Text::default();
+        let mut spare: Option<Text> = None;
+        for (cols, rows) in [(80, 24), (240, 80), (512, 256), (80, 24)] {
+            let frame = Frame {
+                cols,
+                rows,
+                ..Frame::default()
+            };
+            let cells = fixture(cols, rows, unicode);
+            // Follow the canvas's build, replace and spare-retention sequence.
+            let mut updates = Vec::new();
+            for _ in 0..3 {
+                let mut next = spare.take().unwrap_or_default();
+                next.rebuild(frame, &cells, None);
+                let used_bytes = next.used_bytes();
+                let old = std::mem::replace(&mut text, next);
+                spare = (!old.has_excess_capacity(used_bytes)).then_some(old);
+                let active_bytes = text.capacity_bytes();
+                let spare_bytes = spare.as_ref().map_or(0, Text::capacity_bytes);
+                updates.push(json!({
+                    "active_capacity_bytes": active_bytes,
+                    "active_used_bytes": text.used_bytes(),
+                    "spare_capacity_bytes": spare_bytes,
+                    "combined_capacity_bytes": active_bytes + spare_bytes,
+                }));
+            }
+            results.push(json!({
+                "cols": cols,
+                "rows": rows,
+                "fixture": if unicode { "unicode" } else { "ascii" },
+                "updates": updates,
+            }));
+        }
+    }
+    results
+}
+
 fn main() {
     let mut results = Vec::new();
     for (cols, rows) in [(80, 24), (240, 80), (512, 256)] {
@@ -108,6 +148,7 @@ fn main() {
         serde_json::to_string_pretty(&json!({
             "scope": "isolated accessible text; no GTK, transport or rendering",
             "results": results,
+            "retention": retention(),
         }))
         .unwrap()
     );

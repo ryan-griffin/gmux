@@ -115,17 +115,75 @@ full viewport, including a single changed row. These results support the small
 invalidation/reuse change; they do not establish an application CPU or latency
 improvement or justify the complexity of updating global Unicode mappings by row.
 
-The canvas retains two sets of buffers at their largest capacities until it is
-destroyed. The old implementation also held old and new text during each
-rebuild, but freed the old allocations afterward. The retained memory is the
-tradeoff for reuse. Removal notifications still read the old text before the
-canvas swaps buffers; insertion notifications read the new text afterward.
+The canvas retains a spare set of buffers when its capacity is proportionate
+to the current text. The retention review below measures the memory cost and
+the policy for releasing large allocations after shrinking. Removal
+notifications still read the old text before the canvas swaps buffers;
+insertion notifications read the new text afterward.
 
 Local reports are `artifacts/accessibility-benchmark/before-{1,2,3}.json`,
 `after-{1,2,3}.json` and `summary.json`. The preserved baseline executable's
 SHA-256 is `6ff8e3278411e03e0f5fb7c0df9a93fee2acf7e8e92f8ce6c41d653f48af3806`;
 the updated executable's is
 `0a0c9e0da0baaf73c014908029d313db198199aa9512537674725f68fcd8bbe9`.
+
+### Buffer retention after resizing
+
+A review of `33c98e5` measured heap capacity for the string, offsets, cell ends
+and character spans. This is the sum of their capacities times element sizes,
+excluding allocator overhead, the 120-byte `Text` struct and other GTK or
+terminal allocations. It measures memory owned by `Text`, not process RSS.
+The x86_64 release run used the same ASCII and Unicode fixtures and grew each
+viewport through 80 × 24, 240 × 80 and 512 × 256, then returned to 80 × 24.
+Three updates at each size warmed both buffers. Capacities can depend on growth
+history; a freshly constructed 512 × 256 Unicode buffer uses 5.50 MiB rather
+than the 5.59 MiB reached in this sequence.
+
+| Viewport after warmup | Fixture | Active bytes | Spare bytes | Combined capacity |
+| --- | --- | ---: | ---: | ---: |
+| 80 × 24 | ASCII | 80,644 | 80,644 | 157.51 KiB |
+| 80 × 24 | Unicode | 84,484 | 84,484 | 165.01 KiB |
+| 240 × 80 | ASCII | 806,404 | 806,404 | 1.54 MiB |
+| 240 × 80 | Unicode | 844,804 | 844,804 | 1.61 MiB |
+| 512 × 256 | ASCII | 5,505,028 | 5,505,028 | 10.50 MiB |
+| 512 × 256 | Unicode | 5,857,284 | 5,857,284 | 11.17 MiB |
+| Return to 80 × 24 at `33c98e5` | ASCII | 5,505,028 | 5,505,028 | 10.50 MiB |
+| Return to 80 × 24 at `33c98e5` | Unicode | 5,857,284 | 5,857,284 | 11.17 MiB |
+
+The initial 2–11% reuse gain saved about 1–2 µs per rebuild at 80 × 24 and
+229–283 µs at 512 × 256. A 79–83 KiB spare at normal size is a modest cost,
+and reuse avoids allocation during repeated text changes. Keeping over 10 MiB
+per terminal after returning to normal size provides the same small normal-size
+saving, so unlimited retention was not justified.
+
+The revised policy keeps reuse and slack for ordinary resizes. When a rebuilt
+buffer's capacity exceeds four times its live data bytes, it shrinks its
+allocations. After replacing the active text, the canvas discards the old text
+if its capacity exceeds four times the new live data bytes. This releases the
+oversized spare on the first resize update, even when no more text changes
+arrive. It does not change text invalidation or Unicode indexing.
+
+| Return to 80 × 24 with the policy | Fixture | Active bytes | Spare bytes | Combined capacity |
+| --- | --- | ---: | ---: | ---: |
+| First update | ASCII | 48,395 | 0 | 47.26 KiB |
+| First update | Unicode | 55,115 | 0 | 53.82 KiB |
+| Both small buffers warm | ASCII | 48,395 | 80,644 | 126.01 KiB |
+| Both small buffers warm | Unicode | 55,115 | 84,484 | 136.33 KiB |
+
+Three alternating release runs before and after the policy used the same CPU
+and batch method. With the policy, fresh versus reused rebuilds took 31.78
+versus 30.48 µs for normal ASCII and 34.13 versus 33.24 µs for normal Unicode.
+At 512 × 256 they took 2322.54 versus 2108.00 µs for ASCII and 2545.28 versus
+2318.37 µs for Unicode. Steady-size reuse still saved about 2–9% across the
+fixtures. The color-only row comparison and position update took 0.344–2.122 µs.
+These remain isolated timings; the policy is justified by reclaimed capacity
+after shrinking, not an application performance claim.
+
+The benchmark's `retention` output records the growth/shrink sequence and each
+update's active, spare and combined capacity. Local evidence is in
+`artifacts/accessibility-retention/baseline-memory.json`, `pre-policy-{1,2,3}.json`,
+`policy-{1,2,3}.json` and `summary.json`. The updated benchmark executable's
+SHA-256 is `044eca43c4ec11ea76da81bf245ec96883917551b96fc7ef05493a7bc5ed5d5c`.
 
 ## Fallback-font batching comparison
 
