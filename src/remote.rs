@@ -392,6 +392,7 @@ impl SessionManager {
                 80 * 24
             ],
             revision: 0,
+            text_revision: 0,
             read_through: 0,
             scroll_serial: ValueCell::new(0),
             scroll_acknowledged: 0,
@@ -437,20 +438,29 @@ impl SessionManager {
                         update.changed |= session.selection != packet.header.selection;
                         session.selection = packet.header.selection;
                         if let Some(frame) = packet.header.frame {
+                            let mut text_changed = (frame.cols, frame.rows)
+                                != (session.frame.cols, session.frame.rows);
                             session
                                 .cells
                                 .resize(frame.cols as usize * frame.rows as usize, Cell::default());
                             let cols = frame.cols as usize;
                             for (index, row) in packet.header.rows.iter().enumerate() {
-                                session.cells[*row as usize * cols..(*row as usize + 1) * cols]
-                                    .copy_from_slice(
-                                        &packet.cells[index * cols..(index + 1) * cols],
-                                    );
+                                let previous = &mut session.cells
+                                    [*row as usize * cols..(*row as usize + 1) * cols];
+                                let next = &packet.cells[index * cols..(index + 1) * cols];
+                                // Accessibility only uses glyph bytes and the
+                                // wide-cell continuation flag, not rendition.
+                                text_changed = text_changed
+                                    || previous.iter().zip(next).any(|(a, b)| !a.text_eq(b));
+                                previous.copy_from_slice(next);
                             }
                             session.frame = frame;
                             session.scroll_acknowledged = packet.header.scroll_serial;
                             if !packet.header.rows.is_empty() {
                                 session.revision = session.revision.wrapping_add(1);
+                            }
+                            if text_changed {
+                                session.text_revision = session.text_revision.wrapping_add(1);
                             }
                             update.changed = true;
                         }
@@ -502,6 +512,7 @@ pub struct RemoteSession {
     frame: Frame,
     cells: Vec<Cell>,
     revision: u64,
+    text_revision: u64,
     read_through: u64,
     scroll_serial: ValueCell<u64>,
     scroll_acknowledged: u64,
@@ -681,6 +692,7 @@ impl RemoteSession {
             frame: self.frame,
             cells: &self.cells,
             revision: self.revision,
+            text_revision: self.text_revision,
         }
     }
 }
@@ -850,6 +862,7 @@ mod tests {
             },
             cells: vec![Cell::default(); 4],
             revision: 0,
+            text_revision: 0,
             read_through: 0,
             scroll_serial: ValueCell::new(0),
             scroll_acknowledged: 0,
@@ -1023,11 +1036,117 @@ mod tests {
         let session = session.borrow();
         let screen = session.snapshot();
         assert_eq!(screen.revision, 2);
+        assert_eq!(screen.text_revision, 2);
         assert_eq!(screen.frame.cursor_y, 1);
         assert_eq!(
             screen.cells.iter().map(Cell::text).collect::<Vec<_>>(),
             ["a", "a", "b", "b"]
         );
+    }
+
+    fn send_frame(
+        sender: &incoming::Sender,
+        session: &SessionHandle,
+        frame: Frame,
+        rows: Vec<u16>,
+        cells: Vec<Cell>,
+        selection: Option<(u64, u64)>,
+    ) {
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    state: None,
+                    meta: session.borrow().meta.clone(),
+                    frame: Some(frame),
+                    scroll_serial: 0,
+                    rows,
+                    notifications: vec![],
+                    error: None,
+                    find: None,
+                    selection,
+                    copy: None,
+                },
+                cells,
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn color_and_style_rows_preserve_text_revision_and_still_repaint() {
+        let (mut manager, sender, session) = manager();
+        let frame = session.borrow().frame;
+        let mut cells = session.borrow().cells.clone();
+        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[1].flags = 64;
+        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        send_frame(&sender, &session, frame, vec![0, 1], cells.clone(), None);
+        assert!(manager.poll()[&1].changed);
+        assert_eq!(session.borrow().snapshot().text_revision, 1);
+        for cell in &mut cells {
+            cell.fg = [1, 2, 3];
+            cell.bg = [4, 5, 6];
+            cell.flags |= 63;
+        }
+        send_frame(&sender, &session, frame, vec![0, 1], cells.clone(), None);
+        assert!(manager.poll()[&1].changed);
+        let session = session.borrow();
+        let screen = session.snapshot();
+        assert_eq!(screen.revision, 2);
+        assert_eq!(screen.text_revision, 1);
+        assert!(screen.cells == cells);
+    }
+
+    #[test]
+    fn single_row_text_and_wide_layout_updates_invalidate_accessible_text() {
+        let (mut manager, sender, session) = manager();
+        let frame = session.borrow().frame;
+        let mut row = vec![Cell::default(); 2];
+        row[0].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        row[1].text[0] = b'X';
+        send_frame(&sender, &session, frame, vec![1], row.clone(), None);
+        assert!(manager.poll()[&1].changed);
+        assert_eq!(session.borrow().snapshot().text_revision, 1);
+        assert!(session.borrow().snapshot().cells[..2] == [Cell::default(); 2]);
+        // The same concatenated text can occupy different cells. Its caret and
+        // geometry mappings must still be rebuilt.
+        row[0].text = [0; 64];
+        row[0].text[0] = b'e';
+        row[1].text[..3].copy_from_slice("\u{301}X".as_bytes());
+        send_frame(&sender, &session, frame, vec![1], row.clone(), None);
+        assert!(manager.poll()[&1].changed);
+        assert_eq!(session.borrow().snapshot().text_revision, 2);
+        row[1].flags = 64;
+        send_frame(&sender, &session, frame, vec![1], row, None);
+        assert!(manager.poll()[&1].changed);
+        assert_eq!(session.borrow().snapshot().text_revision, 3);
+    }
+
+    #[test]
+    fn geometry_and_positions_survive_frames_without_row_deltas() {
+        let (mut manager, sender, session) = manager();
+        let frame = Frame {
+            cursor_x: 1,
+            cursor_y: 1,
+            ..session.borrow().frame
+        };
+        send_frame(&sender, &session, frame, vec![], vec![], Some((1, 3)));
+        assert!(manager.poll()[&1].changed);
+        assert_eq!(session.borrow().snapshot().text_revision, 0);
+        assert_eq!(session.borrow().snapshot().frame.cursor_y, 1);
+        assert_eq!(session.borrow().selection(), Some((1, 3)));
+        let frame = Frame {
+            cols: 4,
+            rows: 1,
+            ..frame
+        };
+        send_frame(&sender, &session, frame, vec![], vec![], None);
+        assert!(manager.poll()[&1].changed);
+        let session = session.borrow();
+        let screen = session.snapshot();
+        assert_eq!(screen.revision, 0);
+        assert_eq!(screen.text_revision, 1);
+        assert_eq!((screen.frame.cols, screen.frame.rows), (4, 1));
+        assert_eq!(screen.cells.len(), 4);
     }
     #[test]
     fn scroll_requests_coalesce_under_backpressure_and_ignore_stale_acknowledgements() {

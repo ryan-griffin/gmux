@@ -186,6 +186,77 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             else:
                 assert outside == -1, (outside, row_bounds.x, row_bounds.width)
             native.click_color((30, 90, 180))
+            wait_for(lambda: Atspi.Text.get_n_selections(text_iface) == 0)
+
+            # Keep a raw process alive so repainting a row does not also print
+            # another shell prompt. Color-only output must preserve the text,
+            # cached grapheme boundaries, geometry and notification behavior.
+            accessibility_probe = temp / "accessibility.py"
+            accessibility_probe.write_text("""import os, termios, tty
+old = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, '\\x1b[3J\\x1b[2J\\x1b[H界éX\\r\\nUNCHANGED_ROW\\x1b[4;1H'.encode())
+    while True:
+        action = os.read(0, 1)
+        if action == b'q':
+            break
+        if action in (b'c', b't', b'u'):
+            glyphs = {'c': '界éX', 't': '界éZ', 'u': '🙂öQ'}[action.decode()]
+            os.write(1, ('\\x1b7\\x1b[H\\x1b[48;2;50;130;210m' + glyphs + '\\x1b8').encode())
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, old)
+""")
+            rpc("send", pane=pane, text=f"python3 {shlex.quote(str(accessibility_probe))}", paste=True, enter=True)
+            initial_text = wait_for(lambda: (value if value.startswith("界éX") and
+                value.splitlines()[1].startswith("UNCHANGED_ROW") else None)
+                if (value := Atspi.Text.get_text(text_iface, 0, -1)) else None)
+            initial_caret = Atspi.Text.get_caret_offset(text_iface)
+            initial_geometry = Atspi.Text.get_character_extents(text_iface, 0, Atspi.CoordType.WINDOW)
+            initial_cluster = Atspi.Text.get_string_at_offset(text_iface, 2, Atspi.TextGranularity.CHAR)
+            assert initial_cluster.content == "é"
+            text_events = []
+
+            def text_changed(event, _data):
+                if event.source.get_process_id() == app.pid and event.source.get_role_name() == "terminal":
+                    text_events.append((event.type, event.detail1, event.detail2))
+
+            listener = Atspi.EventListener.new(text_changed, None)
+            assert listener.register("object:text-changed")
+            try:
+                rpc("send", pane=pane, text="c")
+                wait_for(lambda: native.frame(timeout=0.1, fresh=False).color_bounds((50, 130, 210)))
+                # Drain queued AT-SPI signals after observing the rendered row.
+                deadline = time.monotonic() + .15
+                while time.monotonic() < deadline:
+                    while GLib.MainContext.default().pending():
+                        GLib.MainContext.default().iteration(False)
+                    time.sleep(.005)
+                assert Atspi.Text.get_text(text_iface, 0, -1) == initial_text
+                assert Atspi.Text.get_caret_offset(text_iface) == initial_caret
+                assert not text_events, ("Color-only output replaced accessible text", text_events)
+                cluster = Atspi.Text.get_string_at_offset(text_iface, 2, Atspi.TextGranularity.CHAR)
+                assert (cluster.start_offset, cluster.end_offset, cluster.content) == (1, 3, "é")
+                geometry = Atspi.Text.get_character_extents(text_iface, 0, Atspi.CoordType.WINDOW)
+                assert (geometry.x, geometry.y, geometry.width, geometry.height) == (
+                    initial_geometry.x, initial_geometry.y, initial_geometry.width, initial_geometry.height)
+                for action, expected in [("t", "界éZ"), ("u", "🙂öQ"), ("t", "界éZ")]:
+                    text_events.clear()
+                    rpc("send", pane=pane, text=action)
+                    updated = wait_for(lambda: (value if value.startswith(expected) else None)
+                        if (value := Atspi.Text.get_text(text_iface, 0, -1)) else None)
+                    wait_for(lambda: any(kind.endswith(":insert") for kind, _, _ in text_events),
+                             context=GLib.MainContext.default())
+                    assert any(kind.endswith(":delete") for kind, _, _ in text_events), text_events
+                    assert updated.splitlines()[1:] == initial_text.splitlines()[1:]
+                    assert Atspi.Text.get_caret_offset(text_iface) == initial_caret
+                    cluster = Atspi.Text.get_string_at_offset(text_iface, 2, Atspi.TextGranularity.CHAR)
+                    assert (cluster.start_offset, cluster.end_offset, cluster.content) == (1, 3, expected[1:3])
+            finally:
+                listener.deregister("object:text-changed")
+                rpc("send", pane=pane, text="q")
+            wait_for(lambda: "GMUX_INPUT>" in Atspi.Text.get_text(text_iface, 0, -1))
+            native.click_color((30, 90, 180))
             rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[H\\033[48;2;230;30;45mHISTORY_START\\033[0m\\n'; seq 1 120; printf '\\033[48;2;30;200;80mHISTORY_END\\033[0m\\n'", paste=True, enter=True)
             wait_for(lambda: "HISTORY_END" in rpc("read", pane=pane)["text"])
 
@@ -367,6 +438,7 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             assert rpc("daemon-info")["attached"] and app.poll() is None
             print("PASS: native Wayland keyboard input, Kitty modifier presses/releases with both sides and Caps Lock, "
                   "accessible terminal text, caret and selection, composited output, "
+                  "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
                   "wide-glyph geometry, stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
                   "fast edge drags during overscroll without viewport bouncing, "
                   "edge and release cancellation, "

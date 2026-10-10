@@ -35,6 +35,10 @@ test = false
 name = "renderer-check"
 test = false
 
+[[example]]
+name = "accessible-terminal-benchmark"
+test = false
+
 [profile.dev]
 debug = 0
 
