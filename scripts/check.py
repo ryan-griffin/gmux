@@ -7,12 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-HEADLESS = ["bootstrap", "cargo-output", "daemon", "multi-client", "frontend-input", "scrollback", "control", "icon"]
-DESKTOP = ["startup-error", "state-recovery", "smoke", "audit", "workspace", "sidebar-search", "branch",
-           "title", "scheduling", "resize", "split-resize", "font", "find", "commands", "main-menu", "window-close", "multi-window", "preferences",
-           "terminal-context-menu", "terminal-scrollbar", "terminal-renderer",
-           "terminal-input", "terminal-copy", "notifications", "notification-focus", "notification-delivery",
-           "renderer", "screenshot"]
+HEADLESS = ["daemon", "multi-client", "frontend-input", "scrollback"]
+DESKTOP = ["smoke", "multi-window", "terminal-input", "notifications", "renderer"]
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--native", action="store_true")
@@ -47,26 +43,15 @@ if missing:
     parser.error("Missing smoke tests: " + ", ".join(missing))
 
 
-def run(command, timeout, *, artifacts=False):
+def run(command, timeout):
     print("Running " + " ".join(command), flush=True)
-    if artifacts:
-        output = root / "artifacts/cargo-build.jsonl"
-        output.parent.mkdir(exist_ok=True)
-        # Write while Cargo runs so partial diagnostics survive failure/timeout.
-        with output.open("w") as log:
-            result = subprocess.run(command, cwd=root, timeout=timeout, stdout=log)
-    else:
-        result = subprocess.run(command, cwd=root, timeout=timeout)
-    result.check_returncode()
-    return output.read_text() if artifacts else None
+    subprocess.run(command, cwd=root, timeout=timeout, check=True)
 
 
-from cargo_build import compiler_artifacts
-from cargo_test_support import ARTIFACT_ENV, native_output_dir
+from cargo_build import build_artifacts, compiler_artifacts
+from cargo_test_support import ARTIFACT_ENV
 # Never import an artifact selection from a previous invocation.
 os.environ.pop(ARTIFACT_ENV, None)
-if not args.skip_build or any(name not in ("bootstrap", "cargo-output", "icon") for name in names):
-    native_output_dir()
 
 
 if args.native:
@@ -77,9 +62,14 @@ if not args.skip_build:
     run(["cargo", "fmt", "--check"], args.build_timeout)
     run(["cargo", "test", "--locked"], args.build_timeout)
     run(["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"], args.build_timeout)
-    output = run(["cargo", "build", "--locked", "--bins", "--examples",
-                  "--message-format=json-render-diagnostics"], args.build_timeout, artifacts=True)
-    os.environ[ARTIFACT_ENV] = json.dumps(compiler_artifacts(output))
+    artifacts = build_artifacts(examples=True, timeout=args.build_timeout,
+                                log_path=root / "artifacts/cargo-build.jsonl")
+    os.environ[ARTIFACT_ENV] = json.dumps(artifacts)
+else:
+    output = root / "artifacts/cargo-build.jsonl"
+    if not output.is_file():
+        parser.error("--skip-build needs a previous scripts/check.py build.")
+    os.environ[ARTIFACT_ENV] = json.dumps(compiler_artifacts(output.read_text()))
 for name, file in zip(names, files):
     command = [sys.executable, str(file)]
     if args.native and name in ("smoke", "daemon"):

@@ -13,8 +13,10 @@ mod terminal;
 mod terminal_canvas;
 
 use clap::{Parser, Subcommand};
-use gmux::{ipc, model, storage, theme};
-use serde_json::json;
+use gmux::{
+    control::{Command as LayoutCommand, PublicRequest},
+    ipc, model, storage, theme,
+};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -117,55 +119,58 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if let Some(command) = cli.command {
         let request = match command {
-            Command::Quit => json!({"method":"quit"}),
-            Command::List => json!({"method":"list"}),
+            Command::Quit => serde_json::to_value(PublicRequest::Quit)?,
+            Command::List => serde_json::to_value(PublicRequest::List)?,
             Command::New {
                 name,
                 directory,
                 workspace,
-            } => serde_json::to_value(gmux::control::Command::New {
+            } => serde_json::to_value(LayoutCommand::New {
                 name,
                 directory: directory.map(std::path::absolute).transpose()?,
                 workspace: workspace.map(Some),
             })?,
             Command::Workspace { command } => match command {
                 WorkspaceCommand::New { name, directory } => {
-                    serde_json::to_value(gmux::control::Command::WorkspaceNew {
+                    serde_json::to_value(LayoutCommand::WorkspaceNew {
                         name,
                         directory: directory.map(std::path::absolute).transpose()?,
                         tab: None,
                     })?
                 }
                 WorkspaceCommand::Delete { id } => {
-                    serde_json::to_value(gmux::control::Command::WorkspaceDelete { workspace: id })?
+                    serde_json::to_value(LayoutCommand::WorkspaceDelete { workspace: id })?
                 }
             },
             Command::Move { tab, workspace } => {
-                serde_json::to_value(gmux::control::Command::Move { tab, workspace })?
+                serde_json::to_value(LayoutCommand::Move { tab, workspace })?
             }
             Command::Split { pane, down } => {
-                serde_json::to_value(gmux::control::Command::Split { pane, down })?
+                serde_json::to_value(LayoutCommand::Split { pane, down })?
             }
-            Command::Send { text, pane, enter } => {
-                json!({"method":"send", "pane":pane, "text":text, "paste":true, "enter":enter})
-            }
-            Command::Read { pane } => json!({"method":"read", "pane":pane}),
+            Command::Send { text, pane, enter } => serde_json::to_value(PublicRequest::Send {
+                text,
+                pane,
+                paste: true,
+                enter,
+            })?,
+            Command::Read { pane } => serde_json::to_value(PublicRequest::Read { pane })?,
             Command::Notify { message, pane } => {
-                json!({"method":"notify", "pane":pane, "message":message})
+                serde_json::to_value(PublicRequest::Notify { message, pane })?
             }
             Command::Focus {
                 tab,
                 workspace,
                 pane,
-            } => {
-                json!({"method":"focus", "tab":tab, "workspace":workspace, "pane":pane})
-            }
-            Command::Close { pane } => {
-                serde_json::to_value(gmux::control::Command::Close { pane })?
-            }
-            Command::Screenshot { path } => {
-                json!({"method":"screenshot", "path":std::path::absolute(path)?})
-            }
+            } => serde_json::to_value(PublicRequest::Focus {
+                tab,
+                workspace,
+                pane,
+            })?,
+            Command::Close { pane } => serde_json::to_value(LayoutCommand::Close { pane })?,
+            Command::Screenshot { path } => serde_json::to_value(PublicRequest::Screenshot {
+                path: std::path::absolute(path)?,
+            })?,
             Command::Rpc { request } => serde_json::from_str(&request)?,
         };
         let response = ipc::call(request)?;

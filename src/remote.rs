@@ -221,10 +221,6 @@ pub fn ensure_daemon() -> anyhow::Result<()> {
 }
 
 impl SessionManager {
-    pub fn connect(wake: ipc::Wake) -> anyhow::Result<Self> {
-        ensure_daemon()?;
-        Self::connect_at(ipc::Endpoint::local(), wake)
-    }
     /// Connect to an existing daemon without starting a local process or reading
     /// its workspace/layout files. Remote tunnels can supply their own endpoint.
     pub fn connect_at(endpoint: ipc::Endpoint, wake: ipc::Wake) -> anyhow::Result<Self> {

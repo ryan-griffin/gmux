@@ -5,19 +5,16 @@ import json
 from pathlib import Path
 import platform
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DEPS = ROOT / ".deps"
-# Reviewed main on 2026-10-08; includes Ghostty fixes #14509, #14482, #14480.
 REVISION = "8f0dd3709050b1026f6324368805033197d8b4a5"
 SOURCE_SHA256 = "f4869fc667ea0a1c93705e363ceca06d394b67ad1d3dde756a7fa5c15691f9cb"
 # Must match the source's build.zig.zon and src/build/zig.zig requirement.
 ZIG_VERSION = "0.16.0"
-EXTRACTED = ".gmux-extracted"
 
 
 def download(url, destination, checksum=None):
@@ -53,10 +50,6 @@ def extract(archive_path, destination):
         tree = Path(directory, destination.name)
         if not tree.is_dir():
             raise SystemExit(f"{archive_path} does not contain {destination.name}")
-        (tree / EXTRACTED).touch()
-        # Replace partial trees left by older bootstrap attempts.
-        if destination.exists():
-            shutil.rmtree(destination)
         tree.replace(destination)
 
 
@@ -69,12 +62,12 @@ def main():
     source_archive = DEPS / "ghostty.tar.gz"
     download(f"https://codeload.github.com/ghostty-org/ghostty/tar.gz/{REVISION}", source_archive, SOURCE_SHA256)
     source = DEPS / f"ghostty-{REVISION}"
-    if not (source / EXTRACTED).is_file():
+    if not source.is_dir():
         extract(source_archive, source)
 
     zig_dir = DEPS / f"zig-{arch}-linux-{ZIG_VERSION}"
     zig = zig_dir / "zig"
-    if not zig.exists() or not (zig_dir / EXTRACTED).is_file():
+    if not zig_dir.is_dir():
         index = subprocess.check_output(["curl", "-fsSL", "https://ziglang.org/download/index.json"])
         release = json.loads(index)[ZIG_VERSION][f"{arch}-linux"]
         zig_archive = DEPS / "zig.tar.xz"

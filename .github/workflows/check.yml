@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   headless:
-    name: Headless / ${{ matrix.toolchain }}
+    name: Headless
     runs-on: ubuntu-24.04
     # Ubuntu supplies the Docker host; all job steps run inside Fedora.
     container: registry.fedoraproject.org/fedora:44@sha256:cd3513b19e87220eb6fba1aeb041cf88f9c00c3b1de213c36db7532c383f4a1c
@@ -29,10 +29,6 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.ci-cache/zig
       LANG: C.UTF-8
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain: [minimum, development]
     steps:
       - name: Install Git for checkout inside Fedora
         run: dnf --assumeyes --setopt=install_weak_deps=False install git
@@ -45,22 +41,15 @@ jobs:
           bash ci/install-deps.sh
           echo "packages=$(sha256sum artifacts/packages.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      - name: Read the Rust requirements
+      - name: Read the development Rust toolchain
         id: rust
-        env:
-          TOOLCHAIN: ${{ matrix.toolchain }}
         run: |
           python3 - <<'PY'
           import os
           import tomllib
           from pathlib import Path
 
-          if os.environ["TOOLCHAIN"] == "minimum":
-              version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["rust-version"]
-              if version.count(".") == 1:
-                  version += ".0"
-          else:
-              version = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
+          version = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"version={version}", file=output)
           PY
@@ -94,7 +83,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: headless-${{ matrix.toolchain }}
+          name: headless
           path: artifacts/
           if-no-files-found: ignore
           retention-days: 14

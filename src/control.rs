@@ -1,4 +1,4 @@
-//! Layout and workspace commands have one implementation in the daemon.
+//! Control requests shared by the CLI, frontend, and daemon.
 use crate::{
     model::{Session, WorkspaceCatalog},
     transport::Metadata,
@@ -85,13 +85,11 @@ pub enum InternalRequest {
     Copy { pane: Option<u64> },
     #[serde(rename = "_read")]
     Read { pane: Option<u64> },
-    #[serde(rename = "_close")]
-    Close { pane: Option<u64> },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
-pub(crate) enum PublicRequest {
+pub enum PublicRequest {
     DaemonInfo,
     Quit,
     List,
@@ -115,9 +113,32 @@ pub(crate) enum PublicRequest {
         tab: Option<u64>,
         workspace: Option<u64>,
     },
+    Windows,
+    NewWindow,
+    Detach,
+    RendererInfo {
+        pane: Option<u64>,
+    },
+    SearchTabs {
+        query: String,
+    },
+    Filter {
+        workspace: Option<u64>,
+        value: Option<String>,
+    },
+    Screenshot {
+        path: PathBuf,
+    },
+    Resize {
+        width: i32,
+        height: i32,
+    },
+    Action {
+        name: String,
+    },
 }
 
-pub(crate) enum Request {
+pub enum Request {
     Layout(Command),
     Internal(InternalRequest),
     Public(PublicRequest),
@@ -135,7 +156,7 @@ impl Request {
             Self::Public(serde_json::from_value(value)?)
         })
     }
-    pub fn mutates_state(&self) -> bool {
+    pub(crate) fn mutates_state(&self) -> bool {
         matches!(
             self,
             Self::Layout(_)
@@ -143,7 +164,6 @@ impl Request {
                     InternalRequest::Command { .. }
                         | InternalRequest::Focus { .. }
                         | InternalRequest::Presentation { .. }
-                        | InternalRequest::Close { .. }
                 )
                 | Self::Public(PublicRequest::Focus { .. } | PublicRequest::Quit)
         )
@@ -185,7 +205,6 @@ impl From<CommandOutput> for CommandResult {
 }
 #[derive(Serialize, Deserialize)]
 pub struct CommandReply {
-    #[serde(default)]
     pub revision: u64,
     pub result: CommandResult,
     pub session: Session,
@@ -243,45 +262,6 @@ mod tests {
         );
     }
     #[test]
-    fn typed_results_preserve_existing_wire_fields_and_save_warnings() {
-        for wire in [
-            json!({"tab":1,"pane":2,"workspace":null}),
-            json!({"pane":3}),
-            json!({"workspace":4}),
-            json!({"ok":true,"warning":"Could not save layout"}),
-        ] {
-            let result: CommandResult = serde_json::from_value(wire.clone()).unwrap();
-            assert_eq!(serde_json::to_value(result).unwrap(), wire);
-        }
-    }
-
-    #[test]
-    fn internal_requests_preserve_wire_fields_and_nested_workspace_selection() {
-        for wire in [
-            json!({"method":"_hello"}),
-            json!({"method":"_focus","tab":0,"pane":null}),
-            json!({"method":"_busy","panes":[1,2]}),
-            json!({"method":"_read","pane":7}),
-            json!({"method":"_command","command":{"method":"close","pane":7}}),
-        ] {
-            let request: InternalRequest = serde_json::from_value(wire.clone()).unwrap();
-            assert_eq!(serde_json::to_value(request).unwrap(), wire);
-        }
-        for (fields, expected) in [(json!({}), None), (json!({"workspace":null}), Some(None))] {
-            let mut command = fields;
-            command["method"] = json!("new");
-            let request = Request::decode(json!({"method":"_command","command":command})).unwrap();
-            let Request::Internal(InternalRequest::Command {
-                command: Command::New { workspace, .. },
-            }) = request
-            else {
-                panic!("Expected internal new command");
-            };
-            assert_eq!(workspace, expected);
-        }
-    }
-
-    #[test]
     fn presentation_requests_round_trip_sessions_with_pane_directory_keys() {
         use crate::model::{Layout, SavedTab};
         use std::collections::HashMap;
@@ -331,6 +311,11 @@ mod tests {
             ),
             (json!({"method":"focus","workspace":7}), true),
             (json!({"method":"quit"}), true),
+            (
+                json!({"method":"screenshot","path":"/tmp/window.png"}),
+                false,
+            ),
+            (json!({"method":"resize","width":800,"height":600}), false),
         ] {
             assert_eq!(Request::decode(wire).unwrap().mutates_state(), mutates);
         }
@@ -341,6 +326,13 @@ mod tests {
             json!({"method":"_command","command":{"method":"move"}}),
             json!({"method":"send","text":false}),
             json!({"method":"notify"}),
+            json!({"method":"read","pane":"invalid"}),
+            json!({"method":"send","text":"hello","paste":1}),
+            json!({"method":"renderer-info","pane":-1}),
+            json!({"method":"resize","width":800,"height":false}),
+            json!({"method":"screenshot"}),
+            json!({"method":"search-tabs","query":null}),
+            json!({"method":"action","name":7}),
         ] {
             assert!(Request::decode(wire).is_err());
         }

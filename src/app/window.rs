@@ -521,17 +521,19 @@ impl Ui {
         *ui.branch_source.borrow_mut() = Some(source);
         Ok(ui)
     }
-    pub(super) fn handle_control(self: &Rc<Self>, request: ipc::Request) {
+    pub(super) fn handle_control(
+        self: &Rc<Self>,
+        request: Request,
+        reply: std::sync::mpsc::SyncSender<Value>,
+    ) {
         let ui = self;
-        let method = request.body["method"].as_str().unwrap_or("");
-        let action_command = if method == "action" {
-            let name = request.body["name"].as_str().unwrap_or("");
+        let action_command = if let Request::Public(PublicRequest::Action { name }) = &request {
             if ui
                 .window
                 .lookup_action(name)
                 .is_some_and(|a| a.is_enabled())
             {
-                match name {
+                match name.as_str() {
                     "new" => Some(Command::New {
                         directory: Some(ui.default_directory()),
                         name: None,
@@ -550,7 +552,6 @@ impl Ui {
             None
         };
         if let Some(command) = action_command {
-            let reply = request.reply;
             ui.command(command, move |_, result| {
                 let response = result
                     .map(|_| json!({"ok":true}))
@@ -559,15 +560,7 @@ impl Ui {
             });
             return;
         }
-        if gmux::control::Command::supports(method) {
-            let reply = request.reply;
-            let command = match serde_json::from_value(request.body) {
-                Ok(command) => command,
-                Err(error) => {
-                    let _ = reply.try_send(json!({"error":error.to_string()}));
-                    return;
-                }
-            };
+        if let Request::Layout(command) = request {
             ui.command(command, move |_, result| {
                 let response = result
                     .and_then(|result| Ok(serde_json::to_value(result)?))
@@ -576,36 +569,35 @@ impl Ui {
             });
             return;
         }
-        if method == "read" {
-            let pane = match backend::RequestTargets::decode(&request.body)
-                .and_then(|targets| ui.pane(targets.pane))
-            {
+        if let Request::Public(PublicRequest::Read { pane }) = request {
+            let pane = match ui.pane(pane) {
                 Ok(pane) => pane,
                 Err(error) => {
-                    let _ = request.reply.try_send(json!({"error":error.to_string()}));
+                    let _ = reply.try_send(json!({"error":error.to_string()}));
                     return;
                 }
             };
             if ui.sessions.borrow().is_visible(pane.id) {
-                let _ = request.reply.try_send(json!({"text":pane.text()}));
+                let _ = reply.try_send(json!({"text":pane.text()}));
                 return;
             }
             let body = InternalRequest::Read {
                 pane: Some(pane.id),
             };
-            let reply = request.reply;
             ui.request(body, move |_, result| {
                 let _ = reply.try_send(result.unwrap_or_else(|e| json!({"error":e.to_string()})));
             });
             return;
         }
-        let response = ui
-            .handle_request(request.body)
-            .unwrap_or_else(|error| json!({"error":error.to_string()}));
+        let response = match request {
+            Request::Public(request) => ui.handle_request(request),
+            _ => Err(anyhow::anyhow!("Request requires the daemon socket")),
+        };
+        let response = response.unwrap_or_else(|error| json!({"error":error.to_string()}));
         if ui.dirty.replace(false) {
             ui.save_session();
         }
-        let _ = request.reply.try_send(response);
+        let _ = reply.try_send(response);
     }
 }
 

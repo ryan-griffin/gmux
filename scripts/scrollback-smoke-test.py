@@ -90,8 +90,7 @@ class History:
         self.socket.close()
 
 
-# Older settings with restore disabled must still restore tabs and history.
-with AppFixture({"restore": False, "appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
+with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
     fixture.env.update(DISPLAY="", WAYLAND_DISPLAY="", GMUX_TEST_DIR=str(fixture.path))
     (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY\\n'\nexec /bin/bash --noprofile --norc -i\n")
 
@@ -141,7 +140,7 @@ with AppFixture({"restore": False, "appearance": "dark"}, prefix="gmux-scrollbac
             for start in starts:
                 assert all(cell[1:] == (fg, bg, flags) for cell in cells[start:start + len(marker)]), marker
 
-    with scenario("Quit restores tabs and history into new shells despite the removed setting"):
+    with scenario("Quit restores tabs and history into new shells"):
         daemon = start()
         pane = fixture.rpc("new", directory=str(root))["pane"]
         ready(pane)

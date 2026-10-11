@@ -1,6 +1,5 @@
 """Shared socket calls, waits, accessibility traversal, and private app fixtures."""
 import json
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -79,84 +78,6 @@ def scenario(name):
     print(f"PASS: {name}", flush=True)
 
 
-@contextmanager
-def delayed_command_reply(fixture, method, *, match=None):
-    """Hold a prepared command reply while frontend navigation stays live."""
-    original = fixture.env["GMUX_SOCKET"]
-    proxy = str(fixture.path / "command-proxy")
-    Path(proxy + ".stream").symlink_to(original + ".stream")
-    Path(original + ".ui").symlink_to(proxy + ".ui")
-    arrived, release = threading.Event(), threading.Event()
-    listener = socket.socket(socket.AF_UNIX)
-    listener.bind(proxy)
-    listener.listen()
-    closed = threading.Event()
-
-    def relay(connection):
-        with connection, socket.socket(socket.AF_UNIX) as backend:
-            request = connection.makefile("rb").readline()
-            body = json.loads(request)
-            backend.connect(original)
-            backend.sendall(request)
-            response = backend.makefile("rb").readline()
-            command = body.get("command", {})
-            if (body.get("method") == "_command" and command.get("method") == method
-                    and (match is None or match(command))):
-                arrived.set()
-                if not release.wait(5):
-                    return
-            try:
-                connection.sendall(response)
-            except OSError:
-                pass  # Fixture cleanup can close a request that failed its assertion.
-
-    def serve():
-        while not closed.is_set():
-            try:
-                connection, _ = listener.accept()
-            except OSError:
-                return
-            threading.Thread(target=relay, args=(connection,), daemon=True).start()
-
-    server = threading.Thread(target=serve, daemon=True)
-    server.start()
-    fixture.env["GMUX_SOCKET"] = proxy
-    try:
-        yield arrived, release
-    finally:
-        release.set()
-        fixture.env["GMUX_SOCKET"] = original
-        closed.set()
-        listener.shutdown(socket.SHUT_RDWR)
-        listener.close()
-        server.join(timeout=1)
-        Path(proxy).unlink()
-        Path(proxy + ".stream").unlink()
-        Path(original + ".ui").unlink()
-
-
-class DelayedCommand:
-    def __init__(self, fixture, method, arrived, release):
-        self.fixture = fixture
-        self.method = method
-        self.arrived = arrived
-        self.release = release
-
-    @contextmanager
-    def command(self, **params):
-        """Run navigation assertions while a prepared command reply is held."""
-        self.arrived.clear()
-        self.release.clear()
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            command = pool.submit(self.fixture.rpc, self.method, **params)
-            try:
-                assert self.arrived.wait(3), f"The {self.method} reply did not reach the delay gate"
-                yield
-            finally:
-                self.release.set()
-            command.result(timeout=3)
-
-
 def wait_accessible(predicate, timeout=12, **kwargs):
     from gi.repository import GLib
     return wait_for(predicate, timeout, context=GLib.MainContext.default(),
@@ -230,18 +151,13 @@ class AccessibilityFixture:
 
 class DelayedViewport:
     """Relay a private daemon stream, with controllable reply latency."""
-    def __init__(self, socket_path, proxy_path, *, observe_header=None):
+    def __init__(self, socket_path, proxy_path):
         self.socket_path = str(socket_path)
         self.proxy_path = str(proxy_path)
         self.delay = 0
         self.closed = threading.Event()
-        self.reply_hold = threading.Event()
-        self.reply_held = threading.Event()
-        self.reply_release = threading.Event()
-        self.reply_release.set()
         self.sockets = []
         self.threads = []
-        self.observe_header = observe_header
 
     def __enter__(self):
         import socket
@@ -253,26 +169,11 @@ class DelayedViewport:
         self.sockets.append(listener)
 
         def relay(source, destination, delayed=False):
-            pending = b""
             try:
                 while data := source.recv(65536):
-                    if delayed and self.reply_hold.is_set():
-                        self.reply_held.set()
-                        assert self.reply_release.wait(12), "Viewport reply barrier was not released"
                     if self.closed.wait(self.delay if delayed else 0):
                         return
                     destination.sendall(data)
-                    if delayed and self.observe_header is not None:
-                        pending += data
-                        while len(pending) >= 4:
-                            size = int.from_bytes(pending[:4], "little")
-                            assert 4 <= size <= 16 * 1024 * 1024, "Invalid viewport packet size"
-                            if len(pending) < 4 + size:
-                                break
-                            header_size = int.from_bytes(pending[4:8], "little")
-                            assert header_size <= size - 4, "Invalid viewport header size"
-                            self.observe_header(json.loads(pending[8:8 + header_size]))
-                            pending = pending[4 + size:]
             except OSError:
                 pass  # Closing the fixture interrupts blocked stream operations.
 
@@ -294,22 +195,9 @@ class DelayedViewport:
         worker.start()
         return self
 
-    @contextmanager
-    def hold_replies(self):
-        """Keep frontend commands live while daemon updates wait at a barrier."""
-        self.reply_held.clear()
-        self.reply_release.clear()
-        self.reply_hold.set()
-        try:
-            yield self.reply_held
-        finally:
-            self.reply_hold.clear()
-            self.reply_release.set()
-
     def __exit__(self, *_):
         import socket
         self.closed.set()
-        self.reply_release.set()
         for connection in self.sockets:
             try:
                 connection.shutdown(socket.SHUT_RDWR)
@@ -352,16 +240,6 @@ class AppFixture:
         assert process.poll() is None, "Application exited before attaching to its daemon"
         wait_for(lambda: self.rpc("renderer-info")["gtk"], message="Application did not construct its window")
         return process
-
-    @contextmanager
-    def delayed_app(self, binary, method, *, match=None, **kwargs):
-        """Restart with a command proxy before the app connects to its daemon."""
-        self.stop()
-        self.start(Path(binary).with_name("gmux-daemon"), **kwargs)
-        wait_for(lambda: self.rpc("daemon-info"))
-        with delayed_command_reply(self, method, match=match) as (arrived, release):
-            self.start_app(binary, **kwargs)
-            yield DelayedCommand(self, method, arrived, release)
 
     def stop(self):
         try:

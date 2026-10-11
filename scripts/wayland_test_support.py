@@ -1,5 +1,4 @@
 """Native input and composited frames in an isolated Mutter Wayland session."""
-from contextlib import contextmanager
 import os
 from pathlib import Path
 import select
@@ -30,43 +29,6 @@ def wait_for(predicate, timeout=12):
             return value
         time.sleep(0.01)
     raise AssertionError("Native Wayland test did not reach the expected state")
-
-
-@contextmanager
-def monitor_scale(scale):
-    # GDK_SCALE does not override Wayland's preferred surface scale. Configure
-    # the private Mutter monitor so this exercises a fractional-scale surface.
-    interface = "org.gnome.Mutter.DisplayConfig"
-    path = "/org/gnome/Mutter/DisplayConfig"
-    assert os.environ.get("GMUX_WAYLAND_TEST") == "1", "Use the isolated Wayland fixture"
-    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-
-    def call(method, signature=None, arguments=()):
-        return bus.call_sync(interface, path, interface, method,
-                             GLib.Variant(signature, arguments) if signature else None,
-                             None, Gio.DBusCallFlags.NONE, 5000, None)
-
-    def state():
-        return call("GetCurrentState").unpack()
-
-    original = state()[2][0][2]
-
-    def apply(value):
-        serial, monitors, logical, properties = state()
-        assert len(monitors) == len(logical) == 1, "Expected the fixture's single virtual monitor"
-        specification, modes, _ = monitors[0]
-        mode = next(mode for mode in modes if mode[6].get("is-current"))
-        assert value in mode[5], (value, mode[5])
-        call("ApplyMonitorsConfig", "(uua(iiduba(ssa{sv}))a{sv})",
-             (serial, 1, [(0, 0, float(value), 0, True, [(specification[0], mode[0], {})])],
-              {"layout-mode": GLib.Variant("u", properties["layout-mode"])}))
-        wait_for(lambda: state()[2][0][2] == value)
-
-    try:
-        apply(scale)
-        yield
-    finally:
-        apply(original)
 
 
 def session_environment(directory):
@@ -107,7 +69,7 @@ def ensure_wayland_session():
         return
     for command in ("dbus-run-session", "mutter", "pipewire", "wireplumber"):
         if not shutil.which(command):
-            raise SystemExit(f"Native Wayland tests require {command}; see docs/renderer.md")
+            raise SystemExit(f"Native Wayland tests require {command}; see docs/testing.md")
     with tempfile.TemporaryDirectory(prefix="gmux-wayland-") as directory:
         env = session_environment(directory)
         command = ["dbus-run-session", "--", sys.executable, __file__, str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
@@ -166,64 +128,6 @@ def _run(script, arguments):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
-
-
-class ClipboardObserver:
-    """Require a new text owner and retain exact clipboard failure details."""
-    def __init__(self, native):
-        self.native = native
-        self.owners = []
-        self.last_text = None
-        self.last_error = None
-        native.bus.signal_subscribe(REMOTE, REMOTE + ".Session", "SelectionOwnerChanged", native.remote,
-            None, Gio.DBusSignalFlags.NONE, self.owner_changed)
-
-    def owner_changed(self, connection, sender, path, interface, signal, parameters):
-        self.owners.append(parameters.unpack()[0])
-
-    def checkpoint(self):
-        context = GLib.MainContext.default()
-        while context.pending():
-            context.iteration(False)
-        return len(self.owners)
-
-    @staticmethod
-    def text_owner(owner):
-        formats = owner.get("mime-types", [])
-        # Unpack the tuple containing Mutter's string array when present.
-        if len(formats) == 1 and isinstance(formats[0], (tuple, list)):
-            formats = formats[0]
-        return owner.get("session-is-owner") is False and any(
-            isinstance(mime, str) and mime.split(";", 1)[0] == "text/plain" for mime in formats)
-
-    def read(self):
-        try:
-            self.last_text = self.native.clipboard_text()
-            return self.last_text
-        except (OSError, GLib.Error) as error:
-            self.last_error = dict(type=type(error).__name__, message=str(error))
-            for name in ("domain", "code", "message", "errno"):
-                if hasattr(error, name):
-                    self.last_error[name] = getattr(error, name)
-            raise
-
-    def wait_for_text(self, text, checkpoint):
-        from test_support import wait_accessible
-
-        def published():
-            exact = self.read() == text
-            return exact and bool(self.owners[checkpoint:]) and self.text_owner(self.owners[-1])
-
-        try:
-            wait_accessible(published, message="Copy did not publish exact text with a new text clipboard owner")
-        except AssertionError as error:
-            raise AssertionError(f"{error}; last owner={self.owners[-1:]!r}; "
-                f"last text={self.last_text!r}; last error={self.last_error!r}") from error
-        assert self.read() == text, (self.last_text, text)
-
-    def assert_preserved(self, text, checkpoint):
-        assert self.checkpoint() == checkpoint, ("Clipboard owner changed", self.owners[checkpoint:])
-        assert self.read() == text, ("Clipboard text changed", self.last_text, text)
 
 
 class Frame:

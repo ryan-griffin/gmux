@@ -12,8 +12,7 @@ if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
     rustup-init -y --no-modify-path --default-toolchain none
 fi
 
-# CI sets this to the package minimum or the development toolchain. Local
-# container runs default to the checked-in development toolchain.
+# Use the checked-in development toolchain unless explicitly overridden.
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')}"
 rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
 rustc --version

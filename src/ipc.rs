@@ -257,9 +257,6 @@ pub struct Client {
     next: std::cell::Cell<u64>,
 }
 impl Client {
-    pub fn new(wake: Wake) -> Self {
-        Self::at(socket_path(), wake)
-    }
     fn at(path: PathBuf, wake: Wake) -> Self {
         let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
         let worker = jobs.clone();
