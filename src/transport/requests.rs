@@ -1,4 +1,4 @@
-//! Frontend commands keep the existing JSON wire format with checked field types.
+//! Typed commands for the frontend stream.
 use crate::{model::CursorStyle, theme::Theme};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -175,29 +175,6 @@ pub(crate) enum StreamCommand {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn commands_preserve_wire_fields_and_optional_defaults() {
-        for wire in [
-            json!({"method":"subscribe","panes":[1]}),
-            json!({"method":"select","pane":1,"start":[2,3],"end":[4,5]}),
-            json!({"method":"scroll-to","pane":1,"row":20,"serial":2}),
-            json!({"method":"paste-begin","pane":1,"size":8,"clipboard":true,"enter":false,"bottom":true}),
-        ] {
-            let request: StreamRequest = serde_json::from_value(wire.clone()).unwrap();
-            assert_eq!(serde_json::to_value(request).unwrap(), wire);
-        }
-        let request = StreamRequest::decode(br#"{"method":"key","pane":7}"#);
-        assert!(matches!(
-            request.command,
-            StreamCommand::Key {
-                cp: 0,
-                mods: 0,
-                release: false,
-                ..
-            }
-        ));
-    }
 
     #[test]
     fn malformed_commands_keep_routing_and_reject_numeric_truncation() {

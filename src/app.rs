@@ -10,7 +10,7 @@ use crate::{
 };
 use adw::prelude::*;
 use gmux::{
-    control::{Command, CommandReply, CommandResult, InternalRequest},
+    control::{Command, CommandReply, CommandResult, InternalRequest, PublicRequest, Request},
     remote::SessionManager,
 };
 use gtk::{gdk, gio, glib, pango};
@@ -208,24 +208,32 @@ impl Windows {
         Ok(ui)
     }
     fn route(self: &Rc<Self>, request: ipc::Request) {
-        if request.body["method"] == "windows" {
+        let window = request.body.get("window").cloned();
+        let body = match Request::decode(request.body) {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = request.reply.try_send(json!({"error":error.to_string()}));
+                return;
+            }
+        };
+        if matches!(body, Request::Public(PublicRequest::Windows)) {
             let windows = self.windows.borrow();
             let _ = request.reply.try_send(json!({"windows": windows.iter().map(|ui| json!({"id":ui.id,"active":ui.window.is_active(),"active_tab":ui.active.get()})).collect::<Vec<_>>() }));
-        } else if request.body["method"] == "new-window" {
+        } else if matches!(body, Request::Public(PublicRequest::NewWindow)) {
             let response = self
                 .create(None)
                 .map(|ui| json!({"window":ui.id}))
                 .unwrap_or_else(|error| json!({"error":error.to_string()}));
             let _ = request.reply.try_send(response);
         } else {
-            let ui = if let Some(id) = request.body.get("window") {
+            let ui = if let Some(id) = window {
                 id.as_u64()
                     .and_then(|id| self.windows.borrow().iter().find(|ui| ui.id == id).cloned())
             } else {
                 self.active()
             };
             if let Some(ui) = ui {
-                ui.handle_control(request);
+                ui.handle_control(body, request.reply);
             } else {
                 let _ = request
                     .reply

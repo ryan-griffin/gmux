@@ -107,7 +107,6 @@ pub struct Engine {
     pub frame: Frame,
     pub cells: Vec<Cell>,
     size: (u16, u16),
-    revision: u64,
     find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
 }
@@ -285,7 +284,6 @@ impl Engine {
             frame: Frame::default(),
             cells: vec![Cell::default(); 80 * 24],
             size: (80, 24),
-            revision: 0,
             find: crate::search::HistorySearch::default(),
             find_row: Vec::new(),
         };
@@ -339,9 +337,6 @@ impl Engine {
             )
         };
         anyhow::ensure!(result >= 0, "Ghostty render-state update failed");
-        if result != 0 {
-            self.revision = self.revision.wrapping_add(1);
-        }
         Ok(result != 0)
     }
     pub fn find(&mut self, query: &str) {
@@ -447,9 +442,6 @@ impl Engine {
         );
         bytes.truncate(written);
         Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-    pub fn revision(&self) -> u64 {
-        self.revision
     }
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }

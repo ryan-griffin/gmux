@@ -29,27 +29,6 @@ impl Selection {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct RequestTargets {
-    pub(super) pane: Option<u64>,
-    tab: Option<u64>,
-    workspace: Option<u64>,
-}
-
-impl RequestTargets {
-    pub(super) fn decode(request: &Value) -> anyhow::Result<Self> {
-        Ok(serde::Deserialize::deserialize(request)?)
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct SendOptions {
-    #[serde(default)]
-    paste: bool,
-    #[serde(default)]
-    enter: bool,
-}
-
 impl Ui {
     pub(super) fn request(
         self: &Rc<Self>,
@@ -330,24 +309,18 @@ impl Ui {
             eprintln!("Could not save session: {e}");
         }
     }
-    pub(super) fn handle_request(self: &Rc<Self>, request: Value) -> anyhow::Result<Value> {
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
-        let targets = RequestTargets::decode(&request)?;
-        let pane_id = targets.pane;
-        match method {
-            "detach" => {
+    pub(super) fn handle_request(self: &Rc<Self>, request: PublicRequest) -> anyhow::Result<Value> {
+        match request {
+            PublicRequest::Detach => {
                 let window = self.window.clone();
                 glib::timeout_add_local_once(Duration::from_millis(50), move || {
                     window.close();
                 });
                 Ok(json!({"ok":true}))
             }
-            "renderer-info" => {
-                let pane = if pane_id.is_some() {
-                    Some(self.pane(pane_id)?)
+            PublicRequest::RendererInfo { pane } => {
+                let pane = if pane.is_some() {
+                    Some(self.pane(pane)?)
                 } else {
                     self.active_pane()
                 };
@@ -363,7 +336,7 @@ impl Ui {
                     "viewport": pane.map(|pane| pane.renderer_geometry()),
                 }))
             }
-            "list" => {
+            PublicRequest::List => {
                 let tabs = self.tabs.borrow();
                 Ok(json!({
                     "window": self.id,
@@ -389,19 +362,15 @@ impl Ui {
                     })).collect::<Vec<_>>()
                 }))
             }
-            "search-tabs" => {
-                let query = request
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("search-tabs requires a query"))?;
+            PublicRequest::SearchTabs { query } => {
                 let changing = self.changing.replace(true);
-                self.sidebar_search.set_text(query);
+                self.sidebar_search.set_text(&query);
                 self.changing.set(changing);
                 self.refresh_sidebar();
                 Ok(json!({"ok": true}))
             }
-            "filter" => {
-                let filter = if let Some(id) = targets.workspace {
+            PublicRequest::Filter { workspace, value } => {
+                let filter = if let Some(id) = workspace {
                     anyhow::ensure!(
                         self.catalog
                             .borrow()
@@ -412,7 +381,7 @@ impl Ui {
                     );
                     TabFilter::Workspace(id)
                 } else {
-                    match request.get("value").and_then(Value::as_str) {
+                    match value.as_deref() {
                         Some("all") => TabFilter::All,
                         Some("unassigned") => TabFilter::Unassigned,
                         _ => {
@@ -423,32 +392,36 @@ impl Ui {
                 self.set_filter(filter);
                 Ok(json!({"ok": true}))
             }
-            "send" => {
-                let options: SendOptions = serde::Deserialize::deserialize(&request)?;
-                let pane = self.pane(pane_id)?;
-                let text = request
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("send requires text"))?;
-                if options.paste {
-                    pane.send_text(text, options.enter)?;
+            PublicRequest::Send {
+                pane,
+                text,
+                paste,
+                enter,
+            } => {
+                let pane = self.pane(pane)?;
+                if paste {
+                    pane.send_text(&text, enter)?;
                 } else {
                     pane.send(text.as_bytes())?;
                 }
                 Ok(json!({"ok":true}))
             }
-            "focus" => {
-                if let Some(pane) = pane_id {
+            PublicRequest::Focus {
+                pane,
+                tab,
+                workspace,
+            } => {
+                if let Some(pane) = pane {
                     self.pane(Some(pane))?;
                     self.jump_to_pane(pane);
-                } else if let Some(id) = targets.tab {
+                } else if let Some(id) = tab {
                     anyhow::ensure!(
                         self.tabs.borrow().iter().any(|w| w.id == id),
                         "Tab {id} does not exist"
                     );
                     self.switch(id);
                     self.window.present();
-                } else if let Some(id) = targets.workspace {
+                } else if let Some(id) = workspace {
                     anyhow::ensure!(
                         self.catalog
                             .borrow()
@@ -464,23 +437,11 @@ impl Ui {
                 }
                 Ok(json!({"ok":true}))
             }
-            "screenshot" => {
-                let path = request
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("screenshot requires a path"))?;
-                self.capture_window(path)?;
+            PublicRequest::Screenshot { path } => {
+                self.capture_window(&path)?;
                 Ok(json!({"path":path}))
             }
-            "resize" => {
-                let width = request
-                    .get("width")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| anyhow::anyhow!("resize requires width"))?;
-                let height = request
-                    .get("height")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| anyhow::anyhow!("resize requires height"))?;
+            PublicRequest::Resize { width, height } => {
                 anyhow::ensure!(
                     (360..=7680).contains(&width) && (280..=4320).contains(&height),
                     "Window size is outside the supported range"
@@ -490,41 +451,37 @@ impl Ui {
                 if self.window.is_maximized() {
                     self.window.unmaximize();
                 }
-                self.window.set_default_size(width as i32, height as i32);
+                self.window.set_default_size(width, height);
                 Ok(json!({"ok":true}))
             }
-            "action" => {
-                let name = request
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("action requires a name"))?;
+            PublicRequest::Action { name } => {
                 anyhow::ensure!(
-                    self.window.lookup_action(name).is_some(),
+                    self.window.lookup_action(&name).is_some(),
                     "Unknown action: {name}"
                 );
                 anyhow::ensure!(
                     self.window
-                        .lookup_action(name)
+                        .lookup_action(&name)
                         .is_some_and(|a| a.is_enabled()),
                     "Action unavailable: {name}"
                 );
                 anyhow::ensure!(
                     self.window
-                        .lookup_action(name)
+                        .lookup_action(&name)
                         .is_some_and(|a| a.parameter_type().is_none()),
                     "Action requires parameters: {name}. Use the corresponding socket method"
                 );
-                self.action(name);
+                self.action(&name);
                 Ok(json!({"ok":true}))
             }
-            _ => anyhow::bail!("Unknown method: {method}"),
+            _ => anyhow::bail!("Request cannot be handled by this window"),
         }
     }
 
     // Diagnostic screenshots need a fresh snapshot even when the compositor
     // pauses the window. WidgetPaintable returns its cached render node in that
-    // case. See docs/screenshot-diagnostics.md for tested public alternatives.
-    pub(super) fn capture_window(&self, path: &str) -> anyhow::Result<()> {
+    // case. See docs/ui.md for the screenshot diagnostic's constraints.
+    pub(super) fn capture_window(&self, path: &Path) -> anyhow::Result<()> {
         let bounds = self
             .window
             .compute_bounds(&self.window)

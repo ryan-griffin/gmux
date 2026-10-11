@@ -4,6 +4,9 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def compiler_artifacts(output, *, profile="debug"):
@@ -28,24 +31,39 @@ def compiler_artifacts(output, *, profile="debug"):
     return artifacts
 
 
+def build_artifacts(profile="debug", *, target=None, examples=False, timeout=None, log_path=None):
+    command = ["cargo", "build", "--locked", "--bins", "--message-format=json-render-diagnostics"]
+    if examples:
+        command.append("--examples")
+    if profile == "release":
+        command.append("--release")
+    if target:
+        command.extend(["--target", target])
+    print("Running " + " ".join(command), file=sys.stderr, flush=True)
+    if log_path is None:
+        result = subprocess.run(command, cwd=ROOT, check=True, timeout=timeout,
+                                text=True, stdout=subprocess.PIPE)
+        output = result.stdout
+    else:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep partial output for diagnostics when Cargo fails or times out.
+        with log_path.open("w") as log:
+            subprocess.run(command, cwd=ROOT, check=True, timeout=timeout, stdout=log)
+        output = log_path.read_text()
+    return compiler_artifacts(output, profile=profile)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--target", help="Build for an explicit Cargo target")
     parser.add_argument("binaries", nargs="+", help="Binary names, in output order")
     args = parser.parse_args()
-    command = ["cargo", "build", "--locked", "--bins", "--message-format=json-render-diagnostics"]
-    if args.release:
-        command.append("--release")
-    if args.target:
-        command.extend(["--target", args.target])
+    profile = "release" if args.release else "debug"
     try:
-        build = subprocess.run(command, cwd=Path(__file__).resolve().parent.parent,
-                               check=True, text=True, stdout=subprocess.PIPE)
+        artifacts = build_artifacts(profile, target=args.target)
     except subprocess.CalledProcessError as error:
         raise SystemExit(error.returncode) from None
-    profile = "release" if args.release else "debug"
-    artifacts = compiler_artifacts(build.stdout, profile=profile)
     keys = [f"{profile}/bin/{name}" for name in args.binaries]
     for key in keys:
         if key not in artifacts:

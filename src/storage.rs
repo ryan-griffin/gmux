@@ -192,6 +192,14 @@ mod tests {
             assert_eq!(std::fs::read(&file).unwrap(), bytes);
             assert!(!file.with_extension("tmp").exists());
         }
+        let mut outdated = serde_json::to_value(Session::default()).unwrap();
+        outdated.as_object_mut().unwrap().remove("scrollback");
+        let bytes = serde_json::to_vec(&outdated).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        assert!(load_at::<Session>(&file).is_err());
+        assert!(save_at(&file, &Session::default()).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert!(serde_json::from_str::<crate::model::Settings>(r#"{"restore":false}"#).is_err());
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]

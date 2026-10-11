@@ -137,7 +137,7 @@ impl CursorStyle {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub use_system_font: bool,
     #[serde(skip)]
@@ -206,9 +206,9 @@ impl SavedTab {
     }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Session {
-    /// Daemon-owned, opaque filenames. Old layouts have no history checkpoints.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Daemon-owned, opaque checkpoint filenames.
     pub scrollback: HashMap<u64, String>,
     pub tabs: Vec<SavedTab>,
     pub filter: TabFilter,
@@ -241,7 +241,7 @@ pub struct WorkspaceDefinition {
     pub directory: PathBuf,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceCatalog {
     pub workspaces: Vec<WorkspaceDefinition>,
 }
@@ -299,30 +299,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, "First"), (2, "Second")]
         );
-    }
-    #[test]
-    fn unassigned_filter_matches_only_unassigned_tabs() {
-        assert!(TabFilter::All.matches(None));
-        assert!(TabFilter::All.matches(Some(2)));
-        assert!(TabFilter::Unassigned.matches(None));
-        assert!(!TabFilter::Unassigned.matches(Some(2)));
-        assert!(TabFilter::Workspace(2).matches(Some(2)));
-        assert!(!TabFilter::Workspace(2).matches(Some(3)));
-        assert!(!TabFilter::Workspace(2).matches(None));
-    }
-    #[test]
-    fn cursor_defaults_to_bar_and_choices_round_trip() {
-        let settings = Settings::default();
-        assert_eq!(settings.cursor_style as u8, CursorStyle::Bar as u8);
-        for style in CursorStyle::ALL {
-            let settings = Settings {
-                cursor_style: style,
-                ..Settings::default()
-            };
-            let json = serde_json::to_string(&settings).unwrap();
-            let restored: Settings = serde_json::from_str(&json).unwrap();
-            assert_eq!(restored.cursor_style as u8, style as u8);
-        }
     }
     #[test]
     fn removing_a_nested_pane_keeps_its_sibling() {

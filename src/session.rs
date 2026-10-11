@@ -21,8 +21,7 @@ pub struct ScreenSnapshot<'a> {
     pub frame: Frame,
     pub cells: &'a [Cell],
     pub revision: u64,
-    /// Changes when text or wide-cell layout may differ. Local engine snapshots
-    /// conservatively use the cell revision; remote snapshots inspect row deltas.
+    /// Changes when text or wide-cell layout may differ.
     pub text_revision: u64,
 }
 
@@ -61,7 +60,7 @@ impl Drop for Pty {
     }
 }
 
-pub struct TerminalSession {
+pub(crate) struct TerminalSession {
     id: u64,
     engine: Engine,
     pty: Option<Pty>,
@@ -182,27 +181,27 @@ impl TerminalSession {
         })
     }
 
-    pub fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> u64 {
         self.id
     }
 
-    pub fn directory(&self) -> &Path {
+    pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
 
-    pub fn size(&self) -> (u16, u16) {
+    pub(crate) fn size(&self) -> (u16, u16) {
         (self.size.cols, self.size.rows)
     }
 
-    pub fn exited(&self) -> bool {
+    pub(crate) fn exited(&self) -> bool {
         self.exited
     }
 
-    pub fn title(&self) -> String {
+    pub(crate) fn title(&self) -> String {
         self.title.display(&self.directory, self.pid)
     }
 
-    pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
+    pub(crate) fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         anyhow::ensure!(!self.exited, "This terminal's process has exited");
         let pty = self
             .pty
@@ -217,7 +216,7 @@ impl TerminalSession {
         Ok(())
     }
 
-    pub fn send_text(&mut self, text: &str, enter: bool) -> anyhow::Result<()> {
+    pub(crate) fn send_text(&mut self, text: &str, enter: bool) -> anyhow::Result<()> {
         let mut bytes = self.paste(text, false)?;
         if enter {
             bytes.push(b'\r');
@@ -225,7 +224,7 @@ impl TerminalSession {
         self.send(&bytes)
     }
 
-    pub fn poll(&mut self) -> SessionUpdate {
+    pub(crate) fn poll(&mut self) -> SessionUpdate {
         let mut update = SessionUpdate {
             changed: self.engine.expire_render_hold(),
             ..SessionUpdate::default()
@@ -326,7 +325,7 @@ impl TerminalSession {
         }
     }
 
-    pub fn refresh_directory(&mut self) {
+    pub(crate) fn refresh_directory(&mut self) {
         let actual_directory = self
             .foreground_pid()
             .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok());
@@ -344,7 +343,7 @@ impl TerminalSession {
         self.refresh_title(None);
     }
 
-    pub fn busy(&self) -> bool {
+    pub(crate) fn busy(&self) -> bool {
         !self.exited
             && self
                 .foreground_pid()
@@ -352,16 +351,16 @@ impl TerminalSession {
                 .is_some_and(|(fg, pid)| fg != pid)
     }
 
-    pub fn set_cursor_style(&mut self, style: CursorStyle) -> anyhow::Result<()> {
+    pub(crate) fn set_cursor_style(&mut self, style: CursorStyle) -> anyhow::Result<()> {
         self.engine.set_cursor_style(style)
     }
 
-    pub fn set_theme(&mut self, theme: &Theme) -> anyhow::Result<()> {
+    pub(crate) fn set_theme(&mut self, theme: &Theme) -> anyhow::Result<()> {
         self.engine.set_theme(theme)
     }
 
     /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.
-    pub fn resize(
+    pub(crate) fn resize(
         &mut self,
         cols: u16,
         rows: u16,
@@ -392,68 +391,37 @@ impl TerminalSession {
         Ok(true)
     }
 
-    pub fn snapshot(&mut self) -> anyhow::Result<ScreenSnapshot<'_>> {
-        self.engine.snapshot()?;
-        Ok(ScreenSnapshot {
-            frame: self.engine.frame,
-            cells: &self.engine.cells,
-            revision: self.engine.revision(),
-            text_revision: self.engine.revision(),
-        })
-    }
-
     pub(crate) fn checkpoint(&self) -> anyhow::Result<Vec<u8>> {
         self.engine.checkpoint()
     }
 
-    pub fn text(&mut self) -> anyhow::Result<String> {
+    pub(crate) fn text(&mut self) -> anyhow::Result<String> {
         self.engine.text()
     }
 
-    pub fn find(&mut self, query: &str) {
-        self.engine.find(query);
-    }
-    pub fn find_advance(&mut self, previous: bool) {
-        self.engine.find_advance(previous);
-    }
-    pub fn find_state(&self) -> crate::search::FindState {
-        self.engine.find_state()
-    }
-    pub fn select(&mut self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
-        self.engine.select(start, end)
-    }
-    pub fn clear_selection(&mut self) {
-        self.engine.clear_selection();
-    }
-    pub fn clear_screen(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn clear_screen(&mut self) -> anyhow::Result<()> {
         self.engine.clear_screen()
     }
-    pub fn selection(&self) -> Option<(u64, u64)> {
-        self.engine.selection()
-    }
-    pub fn copy(&self) -> anyhow::Result<String> {
-        self.engine.copy()
-    }
-    pub fn mode(&self, mode: i32) -> bool {
+    pub(crate) fn mode(&self, mode: i32) -> bool {
         self.engine.mode(mode)
     }
 
-    pub fn scroll(&mut self, delta: isize, bottom: bool) {
-        self.engine.scroll(delta, bottom);
-    }
-    pub fn scroll_to(&mut self, row: u64) {
-        self.engine.scroll_to(row);
-    }
-
-    pub fn paste(&mut self, text: &str, clipboard: bool) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn paste(&mut self, text: &str, clipboard: bool) -> anyhow::Result<Vec<u8>> {
         self.engine.paste(text, clipboard)
     }
 
-    pub fn key(&mut self, name: &str, cp: u32, mods: u16, release: bool, text: &str) -> Vec<u8> {
+    pub(crate) fn key(
+        &mut self,
+        name: &str,
+        cp: u32,
+        mods: u16,
+        release: bool,
+        text: &str,
+    ) -> Vec<u8> {
         self.engine.key(name, cp, mods, release, text)
     }
 
-    pub fn mouse(
+    pub(crate) fn mouse(
         &mut self,
         position: (f32, f32),
         metrics: (u32, u32),
@@ -464,11 +432,6 @@ impl TerminalSession {
     ) -> Vec<u8> {
         self.engine
             .mouse(position, metrics, action, button, mods, pressed)
-    }
-
-    pub fn close(&mut self) {
-        self.exited = true;
-        self.pty.take();
     }
 
     pub(crate) fn poll_fd(&self) -> Option<(libc::c_int, libc::c_short)> {
@@ -575,9 +538,9 @@ mod tests {
         assert_eq!(session.size(), (40, 3));
         assert_eq!(session.title(), "Detached worker");
         assert!(session.text().unwrap().contains("line-40"));
-        session.scroll(-100, false);
+        session.engine.scroll(-100, false);
         assert!(session.text().unwrap().contains("line-01"));
-        session.scroll(0, true);
+        session.engine.scroll(0, true);
         session.send_text("hello", true).unwrap();
         wait_for(|| notification(&mut session, "input-received"));
         assert!(session.text().unwrap().contains("reattached:hello"));
@@ -718,28 +681,22 @@ mod tests {
         );
         session.refresh_directory();
         assert_eq!(session.directory(), directory.0.join("child"));
-        let screen = session.snapshot().unwrap();
-        assert_eq!((screen.frame.cols, screen.frame.rows), (91, 37));
-        assert_eq!(screen.cells.len(), 91 * 37);
+        session.engine.snapshot().unwrap();
+        assert_eq!(
+            (session.engine.frame.cols, session.engine.frame.rows),
+            (91, 37)
+        );
+        assert_eq!(session.engine.cells.len(), 91 * 37);
     }
 
     #[test]
-    fn closing_or_dropping_session_terminates_its_process() {
+    fn dropping_session_terminates_its_process() {
         let directory = TestDirectory::new();
         let script = "printf 'alive\\n\\033]9;ready\\007'; IFS= read -r request";
-        let mut first = start(1, &directory.0, script);
-        wait_for(|| notification(&mut first, "ready"));
-        let first_pid = first.pid.unwrap();
-        first.close();
-        assert!(first.exited());
-        assert!(first.send(b"input").is_err());
-        assert_eq!(first.text().unwrap(), "alive");
-        wait_for(|| !Path::new(&format!("/proc/{first_pid}")).exists());
-
-        let mut second = start(2, &directory.0, script);
-        wait_for(|| notification(&mut second, "ready"));
-        let second_pid = second.pid.unwrap();
-        drop(second);
-        wait_for(|| !Path::new(&format!("/proc/{second_pid}")).exists());
+        let mut session = start(1, &directory.0, script);
+        wait_for(|| notification(&mut session, "ready"));
+        let pid = session.pid.unwrap();
+        drop(session);
+        wait_for(|| !Path::new(&format!("/proc/{pid}")).exists());
     }
 }

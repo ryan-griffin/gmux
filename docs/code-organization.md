@@ -1,97 +1,57 @@
 # Code organization
 
-The GTK application and headless daemon keep their state in parent modules.
-Child modules implement methods on those owners, with `pub(super)` visibility
-where other parts of the owner need them. This follows the existing workspace UI
-pattern and keeps UI types out of the daemon.
+Gmux has a GTK frontend and a headless daemon. The daemon owns terminal processes
+and shared layouts. Each window owns its presentation and terminal views.
 
-## GTK application
+## Frontend
 
-`src/app.rs` contains the `Windows` registry, per-window `Ui` and `Tab` objects,
-startup and shutdown cleanup, search feedback, and notification handling. The
-registry owns the UI socket and routes requests to a selected window. Its child modules group the larger workflows.
-Application callbacks hold weak references to the registry. Resources and icon
-paths register once at startup; each window removes its update and branch timers
-and disconnects its global theme callback when dropped.
+`src/main.rs` handles CLI entry and application startup. `src/app.rs` owns the
+application and window registry. Its submodules handle:
 
-| Module | Responsibility |
-| --- | --- |
-| `app/window.rs` | Construct the window, widgets, menus, and update callbacks. |
-| `app/tabs.rs` | Create and restore tabs, manage pane layouts, and report the active window's focus. |
-| `app/split.rs` | Allocate split panes from saved proportions without cumulative rounding. |
-| `app/actions.rs` | Register window actions and keyboard accelerators. |
-| `app/dialogs.rs` | Close and Quit confirmation, folder selection, tab naming, and the command palette. |
-| `app/preferences.rs` | Preferences, settings persistence, and terminal settings updates. |
-| `app/backend.rs` | Queue backend requests, reconcile versioned shared state while preserving window choices, save presentation, and handle UI socket methods. |
-| `app/branches.rs` | Repository watches, branch lookup scheduling, and branch labels. |
-| `app/workspaces.rs` | Workspace dialogs, filters, menus, and sidebar search. |
+- `window.rs`: window construction and daemon updates.
+- `tabs.rs`, `split.rs`, `workspaces.rs`: tabs, pane layouts, workspace controls,
+  and sidebar search.
+- `actions.rs`, `dialogs.rs`, `preferences.rs`: actions, dialogs, command palette,
+  and settings.
+- `backend.rs`: asynchronous requests, state reconciliation, presentation saves,
+  and GUI socket commands.
+- `branches.rs`: repository watches and branch updates.
 
-`src/terminal.rs` builds the pane widgets and manages rendering, selection, and
-session updates. `terminal/input.rs` installs keyboard, pointer, selection,
-clipboard, focus, and scrolling callbacks through separate setup methods.
-The callbacks keep weak references to the terminal.
+`src/terminal.rs` builds pane widgets. `terminal/input.rs` handles keyboard,
+pointer, clipboard, and scroll input. `src/remote.rs` queues terminal commands
+and applies viewport packets from the daemon.
 
-## Terminal rendering
+See [UI behavior](ui.md) for interaction details.
 
-| Module | Responsibility |
-| --- | --- |
-| `src/renderer.rs` | Build GSK scenes and retain row, text-batch, and glyph caches. |
-| `src/render.rs` | Shape glyphs with Pango and generate cell graphics, decorations, and cursors. |
-| `src/terminal_canvas.rs` | Implement the scrollable terminal widget and its accessible text interface. |
-| `src/accessible_terminal.rs` | Map viewport cells to accessible text, caret, selection, and geometry. |
+## Terminal engine and rendering
 
-The [renderer design](renderer.md) explains paint order, invalidation, and scroll
-cache reuse.
+`src/session.rs` owns PTYs and child processes. `src/engine.rs` wraps Ghostty's
+terminal engine. `src/ghostty_bridge.h` defines the C/Rust boundary, and
+`src/ghostty_bridge.c` keeps Ghostty implementation types private. `build.rs`
+generates Rust bindings with bindgen and checks struct layouts at compile time.
+Edit the shared header when changing the boundary.
 
-## Headless daemon
+`src/renderer.rs` builds GSK scenes and caches rows and glyphs. `src/render.rs`
+handles Pango shaping and cell graphics. `src/terminal_canvas.rs` implements the
+scrollable widget and accessible text interface; `src/accessible_terminal.rs`
+maps cells to Unicode text and geometry.
 
-`src/daemon.rs` owns sessions, the live layout, notifications, and state helpers.
+See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 
-| Module | Responsibility |
-| --- | --- |
-| `daemon/event_loop.rs` | Poll PTYs, sockets, signals, and disk-worker completions. |
-| `daemon/frontend.rs` | Buffer stream traffic, dispatch terminal input, assemble pastes, and publish viewports. |
-| `daemon/commands.rs` | Execute layout and control commands and track their persistence stages. |
+## Daemon and persistence
 
-The command module represents prepared saves and pending save stages explicitly.
-[Session scheduling](terminal-sessions.md#ownership-and-scheduling) describes
-their ordering, deferred workspace changes, and failure behavior.
+`src/daemon.rs` owns live sessions and shared state. Its submodules handle:
 
-## Shared data and protocols
+- `event_loop.rs`: PTYs, sockets, signals, and disk-worker completions.
+- `frontend.rs`: stream input, paste assembly, subscriptions, and viewport output.
+- `commands.rs`: layout and control commands, including ordered saves.
 
-`src/ghostty_bridge.h` is the source of truth for the C/Rust engine boundary.
-It defines `GmuxCell`, `GmuxFrame`, `GmuxScrollback`, event and writer callbacks,
-and all exported function signatures using C types. `src/ghostty_bridge.c` includes that
-header and keeps upstream Ghostty types private, including the opaque engine.
-The C compiler rejects conflicting definitions and exported functions without
-header prototypes.
+`src/model.rs` defines settings, layouts, and workspaces. `src/storage.rs`
+loads JSON and writes files atomically. `src/persistence.rs` runs the disk worker.
+`src/scrollback.rs` handles history checkpoints.
 
-`build.rs` uses bindgen to generate the Rust declarations in `OUT_DIR` for
-Cargo's target architecture, using the C compiler's flags and include paths.
-The generated code checks each struct's size, alignment, and every member
-offset at compile time against Clang's C layout.
-These checks run during ordinary builds and tests on x86_64 and aarch64 Linux;
-they do not run a host executable or assume the host's pointer width. Edit the
-header for ABI changes, and keep ownership and callback handling in
-`src/engine.rs`. Generated declarations are not tracked.
+`src/control.rs` defines control requests and replies. `src/ipc.rs` handles
+control sockets and asynchronous requests. `src/transport.rs` encodes viewport
+packets, and `transport/requests.rs` defines stream commands.
 
-`Frame` and `Scrollback` retain their serde derives and field order. Viewport
-packets still serialize JSON metadata and individual cell fields rather than
-copying C struct memory or padding.
-
-`src/model.rs` contains settings, layouts, sessions, and workspace definitions.
-Its catalog validation removes invalid IDs, blank names, and duplicate IDs.
-`src/storage.rs` reads state files and publishes durable atomic writes.
-`storage::load_catalog()` applies the same validation for the UI and daemon.
-`src/persistence.rs` runs the daemon's ordered disk worker.
-
-`src/control.rs` defines layout commands, results, and internal control requests.
-Decoded requests determine whether a command must wait for an earlier save.
-`src/transport/requests.rs` defines typed frontend stream commands and paste
-options; `src/transport.rs` encodes viewport packets and enforces wire limits.
-The frontend queues typed commands in `src/remote.rs` and serializes them at the
-socket boundary. Invalid stream fields retain enough routing information to
-report an error to the affected pane.
-
-Use the [testing guide](testing.md) for Rust and isolated Wayland checks after
-changes across these modules.
+See [background sessions](terminal-sessions.md) for lifecycle and protocol limits.

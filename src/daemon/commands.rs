@@ -106,10 +106,7 @@ impl PendingControl {
         };
         let broadcast = matches!(
             &request.body,
-            Request::Layout(_)
-                | Request::Internal(
-                    InternalRequest::Command { .. } | InternalRequest::Close { .. }
-                )
+            Request::Layout(_) | Request::Internal(InternalRequest::Command { .. })
         );
         let result = daemon.control(request.body);
         let failed = result.is_err();
@@ -606,13 +603,6 @@ impl Daemon {
                 let id = self.resolve_pane(pane)?;
                 Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
             }
-            Request::Internal(InternalRequest::Close { pane }) => {
-                let id = pane
-                    .or_else(|| self.resolve_pane(None).ok())
-                    .ok_or_else(|| anyhow::anyhow!("close requires pane"))?;
-                self.close(id);
-                Ok(self.response_with_session_save(json!({"ok":true})))
-            }
             Request::Public(PublicRequest::Quit) => {
                 let checkpoint = self.prepare_checkpoint();
                 let warning = match checkpoint {
@@ -684,6 +674,7 @@ impl Daemon {
                 }
                 Ok(self.response_with_session_save(json!({"ok":true})))
             }
+            Request::Public(_) => anyhow::bail!("Request requires an open window"),
         }
     }
 }
