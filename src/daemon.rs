@@ -34,7 +34,7 @@ mod frontend;
 mod hosting;
 mod network;
 
-use commands::{ControlRequest, PendingControl, PreparedSave};
+use commands::{ControlRequest, PendingControl};
 pub use event_loop::run;
 use frontend::Frontend;
 
@@ -107,7 +107,7 @@ struct Daemon {
     snapshots: u64,
     sent_rows: u64,
     started: Instant,
-    pending_write: Option<PreparedSave>,
+    pending_write: Option<Save>,
     checkpointed: bool,
     git: Option<crate::branch::Service>,
     git_dirty: bool,
@@ -372,7 +372,7 @@ impl Daemon {
         Save::Execution(self.execution_snapshot())
     }
     fn prepare_state_save(&mut self) {
-        self.pending_write = Some(PreparedSave(self.state_save()));
+        self.pending_write = Some(self.state_save());
     }
 
     fn prepare_checkpoint(&mut self) -> anyhow::Result<crate::scrollback::Checkpoint> {

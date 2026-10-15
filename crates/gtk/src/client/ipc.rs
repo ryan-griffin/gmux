@@ -38,7 +38,7 @@ pub fn call(body: impl serde::Serialize) -> anyhow::Result<Value> {
             | "_desktop-tab"
     );
     let path = ipc::companion_path(".ui");
-    if client && let Some(reply) = ipc::call_if_running(&path, &body)? {
+    if client && let Some(reply) = ipc::call_if_running(&path, &body, None)? {
         return Ok(reply);
     }
     if matches!(

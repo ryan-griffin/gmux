@@ -47,7 +47,15 @@ impl Ui {
                 return;
             }
         };
-        match self.backend.request(routed.0, routed.1) {
+        self.submit_request(routed.0, routed.1, callback);
+    }
+    fn submit_request(
+        self: &Rc<Self>,
+        destination: Option<model::DaemonId>,
+        body: Value,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<Value>) + 'static,
+    ) {
+        match self.backend.request(destination, body) {
             Ok(id) => {
                 self.pending.borrow_mut().insert(id, Box::new(callback));
             }
@@ -123,7 +131,7 @@ impl Ui {
         let selection = Selection::capture(self);
         self.save_session();
         self.command_count.set(self.command_count.get() + 1);
-        self.request(route.body, move |ui, result| {
+        self.submit_request(route.destination, route.body, move |ui, result| {
             let projected = result.and_then(|value| {
                 let raw = serde_json::from_value(value)?;
                 ui.sessions.borrow_mut().project(raw)

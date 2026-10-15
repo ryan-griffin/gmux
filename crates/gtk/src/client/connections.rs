@@ -70,6 +70,7 @@ pub struct Connections {
     status_changed: bool,
 }
 pub struct Route {
+    pub destination: Option<DaemonId>,
     pub body: Value,
     pub assign: Option<(Option<u64>, Option<u64>)>,
 }
@@ -1041,7 +1042,11 @@ impl Connections {
                 "Connection is disconnected or connecting. Reconnect in Manage Connections before creating a tab or pane"
             );
         }
-        Ok(Route { body, assign })
+        Ok(Route {
+            destination: daemon,
+            body,
+            assign,
+        })
     }
 }
 

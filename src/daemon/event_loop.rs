@@ -192,10 +192,7 @@ pub fn run() -> anyhow::Result<()> {
         }
         for (id, result) in persistence.results() {
             if saving.as_ref().is_some_and(|pending| pending.id == id) {
-                saving = saving
-                    .take()
-                    .unwrap()
-                    .complete(&mut daemon, &persistence, result);
+                saving.take().unwrap().complete(&mut daemon, result);
             } else if let Err(error) = result {
                 eprintln!("Could not save layout: {error}");
             }

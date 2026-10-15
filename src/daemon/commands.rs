@@ -1,8 +1,7 @@
-//! Layout commands and their ordered persistence stages.
+//! Layout commands and their ordered persistence.
 use super::*;
 use gmux_client::control::{InternalRequest, PublicRequest, Request};
 
-pub(super) struct PreparedSave(pub(super) Save);
 pub(super) struct ControlRequest {
     pub(super) body: Request,
     reply: std::sync::mpsc::SyncSender<Value>,
@@ -73,8 +72,7 @@ impl PendingControl {
         };
         let save = daemon.pending_write.take();
         if !failed && let Some(save) = save {
-            let PreparedSave(job) = save;
-            match worker.submit(job, false) {
+            match worker.submit(save, false) {
                 Ok(id) => return Some(Self { reply, id }),
                 Err(error) => reply.save_failed(error.to_string()).send(daemon),
             }
@@ -83,19 +81,13 @@ impl PendingControl {
         }
         None
     }
-    pub(super) fn complete(
-        self,
-        daemon: &mut Daemon,
-        _worker: &Worker,
-        result: Result<(), String>,
-    ) -> Option<Self> {
+    pub(super) fn complete(self, daemon: &mut Daemon, result: Result<(), String>) {
         let Self { reply, .. } = self;
         if let Err(error) = result {
             reply.save_failed(error).send(daemon);
         } else {
             reply.send(daemon);
         }
-        None
     }
 }
 impl ControlReply {
@@ -380,7 +372,7 @@ impl Daemon {
                 let checkpoint = self.prepare_checkpoint();
                 let warning = match checkpoint {
                     Ok(checkpoint) => {
-                        self.pending_write = Some(PreparedSave(Save::Checkpoint(checkpoint)));
+                        self.pending_write = Some(Save::Checkpoint(checkpoint));
                         None
                     }
                     Err(error) => {

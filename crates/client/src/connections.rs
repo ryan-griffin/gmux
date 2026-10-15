@@ -171,20 +171,20 @@ pub fn call_at(
     let result = match serde_json::from_value::<Request>(body)? {
         Request::ConnectionList => {
             let catalog = Catalog::load()?;
-            let mut result = hosting_status()?;
+            let mut result = hosting_status(cancellation)?;
             result["local"]["name"] = json!(catalog.local_name());
             result["hostname"] = json!(crate::model::hostname());
             result["remotes"] = json!(catalog.remotes);
             result
         }
-        Request::HostingGet => hosting_status()?,
+        Request::HostingGet => hosting_status(cancellation)?,
         Request::HostingSet { hosting } => {
-            set_hosting(&hosting)?;
+            set_hosting(&hosting, cancellation)?;
             json!({"hosting":hosting})
         }
         Request::LocalStart => {
             crate::local::ensure_daemon(cancellation)?;
-            let mut state = ipc::call(json!({"method":"hosting-get"}))?;
+            let mut state = call(&ipc::Endpoint::local(), json!({"method":"hosting-get"}))?;
             state["local"]["name"] = json!(Catalog::load()?.local_name());
             state
         }
@@ -302,14 +302,14 @@ pub fn call_at(
                             // Both inputs and the catalog's file write are prepared
                             // before changing the daemon; publish the name last.
                             if let Some(hosting) = &hosting {
-                                set_hosting(hosting)?;
+                                set_hosting(hosting, cancellation)?;
                             }
                             Ok(())
                         },
                     )?;
                     result["name"] = json!(name);
                 } else if let Some(hosting) = &hosting {
-                    set_hosting(hosting)?;
+                    set_hosting(hosting, cancellation)?;
                 }
                 if let Some(hosting) = hosting {
                     result["hosting"] = serde_json::to_value(hosting)?;
@@ -397,8 +397,12 @@ pub fn call_at(
     Ok(result)
 }
 
-fn hosting_status() -> anyhow::Result<Value> {
-    let current = ipc::call_if_running(&ipc::socket_path(), json!({"method":"hosting-get"}))?;
+fn hosting_status(cancellation: Option<&ipc::Cancellation>) -> anyhow::Result<Value> {
+    let current = ipc::call_if_running(
+        &ipc::socket_path(),
+        json!({"method":"hosting-get"}),
+        cancellation,
+    )?;
     let running = current.is_some();
     let mut result = match current {
         Some(value) => value,
@@ -412,13 +416,17 @@ fn hosting_status() -> anyhow::Result<Value> {
     Ok(result)
 }
 
-fn set_hosting(hosting: &network::Hosting) -> anyhow::Result<()> {
+fn set_hosting(
+    hosting: &network::Hosting,
+    cancellation: Option<&ipc::Cancellation>,
+) -> anyhow::Result<()> {
     if hosting.enabled {
         hosting.authentication.token()?;
     }
     if ipc::call_if_running(
         &ipc::socket_path(),
         json!({"method":"hosting-set","hosting":hosting}),
+        cancellation,
     )?
     .is_none()
     {

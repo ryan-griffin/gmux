@@ -208,6 +208,33 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         expected = sorted(existing, key=lambda t: (-t["created_at"], t["reference"]["daemon"], -t["id"]))
         assert references() == [t["reference"] for t in expected], "Imported tabs must use their original creation times"
 
+    with scenario("local commands and inherited shell targets stay local with a remote default"):
+        launcher = a.start(cli, "--connection", "server", stdout=log, stderr=log)
+        assert launcher.wait(timeout=8) == 0
+        assert view()["daemon"] == identities[1]
+        remote_execution = b.rpc("_state")["session"]
+        command(a, "rename", "--connection", "local", "--tab", own[0]["tab"], "Explicit local")
+        assert a.rpc("list", client=False)["tabs"][0]["name"] == "Explicit local"
+        created_local = command(a, "new", "--connection", "local", "--directory", str(a.path))
+        assert created_local["daemon"] == identities[0]
+        a.rpc("focus", connection="local", pane=created_local["pane"])
+        a.rpc("action", name="split-down")
+        assert len(tab(identities[0], created_local["tab"])["panes"]) == 2
+        command(a, "close-tab", "--connection", "local", "--tab", created_local["tab"])
+        inherited = dict(a.env, GMUX_PANE=str(own[0]["pane"]), GMUX_TAB=str(own[0]["tab"]))
+        split = command(a, "split", env=inherited)
+        assert split["daemon"] == identities[0]
+        command(a, "close", env=dict(inherited, GMUX_PANE=str(split["pane"])))
+        workspace = a.rpc("workspace-add", name="Shell target")["workspace"]
+        command(a, "move", "--workspace", workspace, env=inherited)
+        assert tab(identities[0], own[0]["tab"])["workspace"] == workspace
+        a.rpc("workspace-remove", workspace=workspace)
+        assert b.rpc("_state")["session"] == remote_execution
+        command(a, "rename", "--connection", "local", "--tab", own[0]["tab"], "Local")
+        launcher = a.start(cli, "--connection", "local", stdout=log, stderr=log)
+        assert launcher.wait(timeout=8) == 0
+        assert view()["daemon"] == identities[0]
+
     with scenario("GTK CLI renames, resets, and closes tabs on the selected connection"):
         original_names = ["Local", "Server", "Other"]
         for index, connection in ((0, "local"), (1, "server")):

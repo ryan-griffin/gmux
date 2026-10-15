@@ -84,6 +84,9 @@ appear before or after a command. Omitting it selects the local daemon in `gmux`
 and the window's default connection in `gmux-gtk`. `--connection local` always
 selects this computer; its current display name also works. Selecting it does not
 start a daemon. The local entry can be renamed, but cannot be removed.
+Targets inherited from `GMUX_PANE` or `GMUX_TAB` select local execution even when
+the window defaults to a remote. To select a remote target instead, pass
+`--connection` and an explicit ID.
 
 ## Graphical clients
 

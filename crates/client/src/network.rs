@@ -192,8 +192,7 @@ fn connect_before(
             daemon: expected,
         },
     )?;
-    // Read only the handshake. Stream packets may immediately follow it.
-    let value = read_json(&mut BufReader::with_capacity(1, &mut stream), MAX_HANDSHAKE)?;
+    let value = read_handshake(&mut stream)?;
     check_error(&value)?;
     let hello: ConnectionInfo = serde_json::from_value(value)?;
     anyhow::ensure!(
@@ -205,6 +204,32 @@ fn connect_before(
         "Remote connection identity changed"
     );
     Ok((stream.socket, hello))
+}
+
+/// Read in chunks without consuming viewport packets after the handshake.
+fn read_handshake(stream: &mut TimedStream) -> anyhow::Result<Value> {
+    let mut bytes = [0; MAX_HANDSHAKE + 1];
+    let mut length = 0;
+    loop {
+        if let Some(deadline) = stream.deadline {
+            stream.socket.set_read_timeout(Some(remaining(deadline)?))?;
+        }
+        let available = match stream.socket.peek(&mut bytes[length..]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        anyhow::ensure!(available != 0, "Incomplete network handshake");
+        let size = bytes[length..length + available]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(available, |end| end + 1);
+        stream.read_exact(&mut bytes[length..length + size])?;
+        length += size;
+        anyhow::ensure!(length <= MAX_HANDSHAKE, "Network handshake is too large");
+        if bytes[length - 1] == b'\n' {
+            return Ok(serde_json::from_slice(&bytes[..length])?);
+        }
+    }
 }
 pub fn check_error(value: &Value) -> anyhow::Result<()> {
     if let Some(error) = value.get("error") {
@@ -449,29 +474,71 @@ mod tests {
     }
 
     #[test]
-    fn partial_messages_do_not_restart_the_io_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut peer, _) = listener.accept().unwrap();
-        let writer = std::thread::spawn(move || {
-            for byte in b"{\"slow\":true}\n" {
-                if peer.write_all(&[*byte]).is_err() {
-                    break;
+    fn chunked_handshakes_preserve_following_packets_and_enforce_the_size_limit() {
+        for (first, last, valid) in [
+            (b"{\"ok\":true}\nviewport".to_vec(), Vec::new(), true),
+            (b"{\"ok\":".to_vec(), b"true}\nviewport".to_vec(), true),
+            (vec![b' '; MAX_HANDSHAKE + 1], Vec::new(), false),
+            (b"{\"ok\":true}".to_vec(), Vec::new(), false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let writer = std::thread::spawn(move || {
+                peer.write_all(&first).unwrap();
+                if !last.is_empty() {
+                    std::thread::sleep(Duration::from_millis(20));
+                    peer.write_all(&last).unwrap();
                 }
-                std::thread::sleep(Duration::from_millis(30));
+            });
+            let mut stream = TimedStream {
+                socket,
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
+            };
+            let result = read_handshake(&mut stream);
+            if valid {
+                assert_eq!(result.unwrap(), json!({"ok":true}));
+                let mut trailing = [0; 8];
+                stream.read_exact(&mut trailing).unwrap();
+                assert_eq!(&trailing, b"viewport");
+            } else {
+                assert!(result.is_err());
             }
-        });
-        let mut stream = TimedStream {
-            socket,
-            deadline: Some(Instant::now() + Duration::from_millis(100)),
-        };
-        let error = read_json(&mut BufReader::new(&mut stream), MAX_HANDSHAKE).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ));
-        stream.socket.shutdown(Shutdown::Both).unwrap();
-        writer.join().unwrap();
+            writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_messages_do_not_restart_the_io_deadline() {
+        for handshake in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let writer = std::thread::spawn(move || {
+                for byte in b"{\"slow\":true}\n" {
+                    if peer.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            });
+            let mut stream = TimedStream {
+                socket,
+                deadline: Some(Instant::now() + Duration::from_millis(100)),
+            };
+            let result = if handshake {
+                read_handshake(&mut stream)
+            } else {
+                read_json(&mut BufReader::new(&mut stream), MAX_HANDSHAKE)
+            };
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ));
+            stream.socket.shutdown(Shutdown::Both).unwrap();
+            writer.join().unwrap();
+        }
     }
 
     #[test]

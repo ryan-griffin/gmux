@@ -248,6 +248,7 @@ fn launch_in_running_app(cli: &Cli) -> anyhow::Result<bool> {
                 .transpose()?,
             new_window: cli.new_window,
         },
+        None,
     )?
     .is_some())
 }
@@ -258,6 +259,20 @@ fn main() -> anyhow::Result<()> {
     if let Some(name) = &cli.connection
         && name != "local"
         && gmux_client::connections::Catalog::load()?.is_local(name)
+    {
+        cli.connection = Some("local".into());
+    }
+    // IDs inherited from a shell belong to this computer, independently of
+    // the active window's default connection.
+    if cli.connection.is_none()
+        && let Some((name, args)) = matches.subcommand()
+        && match name {
+            "split" | "close" | "send" | "read" | "notify" => {
+                args.value_source("pane") == Some(clap::parser::ValueSource::EnvVariable)
+            }
+            "move" => args.value_source("tab") == Some(clap::parser::ValueSource::EnvVariable),
+            _ => false,
+        }
     {
         cli.connection = Some("local".into());
     }

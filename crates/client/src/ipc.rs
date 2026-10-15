@@ -502,7 +502,11 @@ pub fn call_at(path: &Path, request: impl serde::Serialize) -> anyhow::Result<Va
 pub fn call_if_running(
     path: &Path,
     request: impl serde::Serialize,
+    cancellation: Option<&Cancellation>,
 ) -> anyhow::Result<Option<Value>> {
+    if let Some(cancellation) = cancellation {
+        cancellation.check()?;
+    }
     let stream = match UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(error)
@@ -511,11 +515,14 @@ pub fn call_if_running(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
             return Ok(None);
         }
         Err(error) => return Err(error.into()),
     };
-    call_on(stream, request, None).map(Some)
+    call_on(stream, request, cancellation).map(Some)
 }
 
 /// Interrupt one active control call or stream handshake without waiting for its socket timeout.
@@ -776,11 +783,11 @@ mod tests {
             crate::model::DaemonId::generate().unwrap()
         ));
         let request = serde_json::json!({"method":"new"});
-        assert!(call_if_running(&path, &request).unwrap().is_none());
+        assert!(call_if_running(&path, &request, None).unwrap().is_none());
         let listener = UnixListener::bind(&path).unwrap();
         drop(listener);
         assert!(path.exists());
-        assert!(call_if_running(&path, &request).unwrap().is_none());
+        assert!(call_if_running(&path, &request, None).unwrap().is_none());
         std::fs::remove_file(&path).unwrap();
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
@@ -793,9 +800,49 @@ mod tests {
             assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), request);
             // A crash after accepting a mutation must never resubmit it elsewhere.
         });
-        assert!(call_if_running(&path, serde_json::json!({"method":"new"})).is_err());
+        assert!(call_if_running(&path, serde_json::json!({"method":"new"}), None).is_err());
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canceling_a_client_probe_interrupts_the_reply_without_triggering_offline_fallback() {
+        let path = std::env::temp_dir().join(format!(
+            "gmux-cancel-probe-{}.sock",
+            crate::model::DaemonId::generate().unwrap()
+        ));
+        let server = Server::start_at(path.clone(), Wake::new().unwrap()).unwrap();
+        let cancellation = Cancellation::default();
+        let calls = cancellation.clone();
+        let control = path.clone();
+        let worker = std::thread::spawn(move || {
+            call_if_running(
+                &control,
+                serde_json::json!({"method":"hosting-get"}),
+                Some(&calls),
+            )
+        });
+        let held = server
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        cancellation.cancel();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().to_string(),
+            "Request canceled"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        drop(server);
+        assert!(
+            call_if_running(
+                &path,
+                serde_json::json!({"method":"hosting-get"}),
+                Some(&cancellation)
+            )
+            .is_err()
+        );
     }
 
     #[test]

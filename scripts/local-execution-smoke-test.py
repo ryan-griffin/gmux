@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Exercise GTK's opt-in local execution alongside direct remote connections."""
 import json
+import os
 from pathlib import Path
+import signal
 import time
 
 import gi
@@ -241,6 +243,22 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         assert quit_client.wait(timeout=8) == 0
         app.wait(timeout=8)
         assert local.rpc("daemon-info")["attached"] == 0
+
+    with scenario("closing GTK cancels a configuration read from a stalled unused local daemon"):
+        app = local.start(gtk, stdout=log, stderr=log)
+        wait_for(lambda: local.rpc("renderer-info", check=False).get("gtk"))
+        pid = local.rpc("daemon-info")["pid"]
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            local.rpc("action", name="manage-connections")
+            wait_for(lambda: any(task.joinpath("wchan").read_text().strip() == "unix_stream_read_generic"
+                                 for task in Path(f"/proc/{app.pid}/task").iterdir()))
+            started = time.monotonic()
+            app.terminate()
+            assert app.wait(timeout=2) == 0
+            assert time.monotonic() - started < 2
+        finally:
+            os.kill(pid, signal.SIGCONT)
 
 
 print("PASS: optional local execution, offline configuration, independent remotes, and daemon lifecycle")
