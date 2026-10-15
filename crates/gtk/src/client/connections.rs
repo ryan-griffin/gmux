@@ -9,7 +9,6 @@ use super::{
 };
 use gmux_client::{
     control as execution, ipc, remote::SessionHandle, session::SessionUpdate, theme::Theme,
-    transport::Metadata,
 };
 use serde_json::{Value, json};
 use std::{
@@ -27,7 +26,6 @@ struct Origin {
     home_directory: Option<PathBuf>,
     link: Connection,
     state: Session,
-    metadata: Vec<Metadata>,
     revision: u64,
     last_id: u64,
 }
@@ -43,7 +41,6 @@ impl Origin {
             home_directory: None,
             link,
             state: Session::default(),
-            metadata: Vec::new(),
             revision: 0,
             last_id: 0,
         }
@@ -358,14 +355,22 @@ impl Connections {
         &mut self,
         reply: execution::CommandReply,
     ) -> anyhow::Result<CommandReply> {
-        self.refresh_organization();
-        let result = self.ingest_execution(reply)?;
-        Ok(self.combined(result))
+        self.project(BackendReply::Execution { reply })
     }
     pub fn project(&mut self, reply: BackendReply) -> anyhow::Result<CommandReply> {
         self.refresh_organization();
         let result = match reply {
-            BackendReply::Execution { reply } => self.ingest_execution(reply)?,
+            BackendReply::Execution { reply } => {
+                // Control replies can create panes before their stream snapshot arrives.
+                // Stream metadata is installed by Connection::poll instead.
+                if let Some(origin) = self.origins.get_mut(&reply.daemon)
+                    && reply.revision >= origin.revision
+                    && let Some(manager) = origin.link.manager_mut()
+                {
+                    manager.install_metadata(&reply.metadata, reply.revision);
+                }
+                self.ingest_execution(reply)?
+            }
             BackendReply::Organization { result } => result,
         };
         Ok(self.combined(result))
@@ -456,10 +461,6 @@ impl Connections {
                 .organization
                 .desktop
                 .execution_session(daemon, reply.session);
-            origin.metadata = reply.metadata;
-            if let Some(manager) = origin.link.manager_mut() {
-                manager.install_metadata(&origin.metadata, origin.revision);
-            }
         }
         match &mut result.output {
             CommandOutput::New { tab, pane, .. } => {
@@ -480,7 +481,6 @@ impl Connections {
             .map(|(index, tab)| (tab.reference, index))
             .collect();
         let mut tabs = Vec::new();
-        let mut metadata = Vec::new();
         let handles = &mut self.handles;
         let mut execution_count = 0;
         for (&daemon, origin) in &self.origins {
@@ -511,11 +511,6 @@ impl Connections {
                     .collect();
                 tabs.push(tab);
             }
-            for meta in &origin.metadata {
-                let mut meta = meta.clone();
-                meta.id = handles.get(daemon, meta.id);
-                metadata.push(meta);
-            }
         }
         // Insertions mark themselves dirty. A lower count detects removals without
         // scanning the maps for ordinary title, directory, or metadata updates.
@@ -534,24 +529,7 @@ impl Connections {
         self.revision += 1;
         CommandReply {
             daemon: self.primary,
-            home_directory: self
-                .primary
-                .and_then(|id| self.origins.get(&id))
-                .and_then(|o| o.home_directory.clone())
-                .unwrap_or_default(),
-            machine_kind: self
-                .primary
-                .and_then(|id| self.origins.get(&id))
-                .map_or(MachineKind::Unknown, |o| o.machine.kind),
-            machine_name: self
-                .primary
-                .and_then(|id| self.origins.get(&id))
-                .map_or_else(String::new, |o| o.machine.name.clone()),
             revision: self.revision,
-            last_id: self
-                .primary
-                .and_then(|id| self.origins.get(&id))
-                .map_or(0, |o| o.last_id),
             result,
             session: Session {
                 tabs,
@@ -562,9 +540,7 @@ impl Connections {
                 maximized: self.desktop.maximized,
             },
             catalog: self.organization.catalog.clone(),
-            metadata,
             desktop: None,
-            remotes: Vec::new(),
         }
     }
     /// Apply local definitions before remote snapshots and produce one view for the batch.

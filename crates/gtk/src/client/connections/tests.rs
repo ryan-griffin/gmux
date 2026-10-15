@@ -179,6 +179,73 @@ fn connection_names_remain_routable_independently_of_live_status() {
 }
 
 #[test]
+fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_stale_metadata() {
+    use gmux_client::transport::{Header, Metadata, Packet};
+    use std::{
+        io::Write,
+        time::{Duration, Instant},
+    };
+
+    let mut f = Fixture::new(2);
+    for host in 0..2 {
+        let daemon = f.ids[host];
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let manager =
+            SessionManager::from_stream(ipc::Endpoint::local(), f.hub.wake.clone(), daemon, socket)
+                .unwrap();
+        f.hub.origins.get_mut(&daemon).unwrap().link =
+            Connection::from_session(manager, f.hub.wake.clone());
+        let with_metadata = |mut reply: execution::CommandReply, title: &str| {
+            reply.metadata = reply
+                .session
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.layout.ids())
+                .map(|id| Metadata {
+                    id,
+                    title: title.into(),
+                    directory: "/home/test/project".into(),
+                    size: (80, 24),
+                    ..Default::default()
+                })
+                .collect();
+            reply
+        };
+        f.hub
+            .project_execution(with_metadata(f.execution(host, 1, 2), "control"))
+            .unwrap();
+        let pane = f.hub.lookup(daemon, 2).unwrap();
+        let handle = f.hub.attach(pane, &Theme::adwaita(true)).unwrap();
+        assert_eq!(handle.borrow().title(), "control");
+        f.hub
+            .project_execution(with_metadata(f.execution(host, 1, 1), "stale"))
+            .unwrap();
+        assert_eq!(handle.borrow().title(), "control");
+
+        let packet = Packet {
+            header: Header {
+                state: Some(with_metadata(f.execution(host, 2, 3), "stream")),
+                ..Default::default()
+            },
+            cells: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        packet.encode_into(&mut bytes).unwrap();
+        peer.write_all(&bytes).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while f.hub.origins[&daemon].revision < 3 {
+            f.hub.poll();
+            assert!(Instant::now() < deadline, "Stream snapshot did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(handle.borrow().title(), "stream");
+        let new_pane = f.hub.lookup(daemon, 5).unwrap();
+        let new_handle = f.hub.attach(new_pane, &Theme::adwaita(true)).unwrap();
+        assert_eq!(new_handle.borrow().title(), "stream");
+    }
+}
+
+#[test]
 fn stream_loss_updates_local_and_remote_status_without_discarding_cached_execution() {
     use std::time::{Duration, Instant};
     let mut f = Fixture::new(2);

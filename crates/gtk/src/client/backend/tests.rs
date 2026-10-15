@@ -85,6 +85,55 @@ fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<Value>)>
 }
 
 #[test]
+fn full_remote_capacity_leaves_room_for_local_execution_and_configuration() {
+    let f = Fixture::new();
+    let backend = f.backend();
+    // Invalid setup still allocates its independent lane without starting a handshake.
+    let setup = backend
+        .request(None, json!({"method":"connection-add"}))
+        .unwrap();
+    let replies = collect(&backend, 1);
+    assert!(
+        replies
+            .iter()
+            .any(|(id, result)| *id == setup && result.is_err())
+    );
+    backend.request(None, remote("configuration")).unwrap();
+    f.answer(f.incoming(), f.local);
+    assert!(
+        collect(&backend, 1)
+            .iter()
+            .all(|(_, result)| result.is_ok())
+    );
+
+    let daemons: Vec<_> = std::iter::once(f.local)
+        .chain((0..gmux_client::connections::MAX_REMOTES).map(|_| DaemonId::generate().unwrap()))
+        .collect();
+    for &daemon in &daemons {
+        let id = backend.request(daemon, remote("execution")).unwrap();
+        f.answer(f.incoming(), daemon);
+        let replies = collect(&backend, 1);
+        assert!(
+            replies
+                .iter()
+                .any(|(reply, result)| *reply == id && result.is_ok())
+        );
+    }
+    let replacement = DaemonId::generate().unwrap();
+    assert!(backend.request(replacement, remote("overflow")).is_err());
+    let removed = daemons[1];
+    backend.retain_connections(|daemon| daemon != removed);
+    backend.request(replacement, remote("replacement")).unwrap();
+    f.answer(f.incoming(), replacement);
+    assert!(
+        collect(&backend, 1)
+            .iter()
+            .all(|(_, result)| result.is_ok())
+    );
+    assert_eq!(backend.outstanding.get(), 0);
+}
+
+#[test]
 fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves_its_order() {
     let f = Fixture::new();
     let backend = f.backend();

@@ -8,6 +8,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub const MAX_REMOTES: usize = 32;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
@@ -217,8 +219,8 @@ pub fn call_at(
             }
             Catalog::edit(|catalog| {
                 anyhow::ensure!(
-                    catalog.remotes.len() < 32,
-                    "Up to 32 remote connections can be configured"
+                    catalog.remotes.len() < MAX_REMOTES,
+                    "Up to {MAX_REMOTES} remote connections can be configured"
                 );
                 anyhow::ensure!(
                     !catalog.remotes.iter().any(|r| r.daemon == client.daemon),

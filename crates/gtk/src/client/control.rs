@@ -1,6 +1,5 @@
 //! Organization and navigation requests served by execution clients.
 use crate::client::model::{DaemonId, Session, WorkspaceCatalog};
-use gmux_client::transport::Metadata;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -228,20 +227,12 @@ pub enum BackendReply {
 #[derive(Serialize, Deserialize)]
 pub struct CommandReply {
     pub daemon: Option<crate::model::DaemonId>,
-    pub home_directory: PathBuf,
-    pub machine_kind: crate::model::MachineKind,
-    pub machine_name: String,
     pub revision: u64,
-    /// Highest ID allocated by the reply's daemon, including closed tabs and panes.
-    pub last_id: u64,
     pub result: CommandResult,
     pub session: Session,
     pub catalog: WorkspaceCatalog,
-    pub metadata: Vec<Metadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<crate::client::model::DesktopState>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remotes: Vec<crate::model::Machine>,
 }
 
 impl Command {

@@ -124,7 +124,11 @@ impl Backend {
                     .map_or(Lane::Configuration, Lane::Execution)
             };
             if !workers.contains_key(&lane) {
-                anyhow::ensure!(workers.len() < 34, "Too many execution queues");
+                // One lane per remote, plus local execution, configuration, and connection setup.
+                anyhow::ensure!(
+                    workers.len() < gmux_client::connections::MAX_REMOTES + 3,
+                    "Too many execution queues"
+                );
                 workers.insert(
                     lane,
                     Worker::new(

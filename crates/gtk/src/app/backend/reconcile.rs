@@ -51,7 +51,6 @@ pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<u64
         saved.layout = layout;
         true
     });
-    reply.metadata.retain(|meta| !exited.contains(&meta.id));
 }
 
 /// A daemon snapshot carries shared objects; each window keeps its own selection.
@@ -157,7 +156,6 @@ mod tests {
     use super::*;
     use crate::client::control::CommandOutput;
     use crate::model::{Layout, TabState, WorkspaceDefinition};
-    use serde_json::json;
 
     fn tab(id: u64, pane: u64, workspace: Option<u64>) -> TabState {
         TabState {
@@ -384,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_exits_remove_metadata_and_focus_the_next_or_last_surviving_pane() {
+    fn observed_exits_prune_layouts_and_focus_the_next_or_last_surviving_pane() {
         for (active, exiting, expected) in
             [(102, [101, 102, 301], 103), (104, [103, 104, 301], 102)]
         {
@@ -395,27 +393,12 @@ mod tests {
             }
             split.active = active;
             let mut reply = CommandReply {
-                home_directory: "/home/test".into(),
-                machine_kind: crate::model::MachineKind::Unknown,
-                machine_name: "test-host".into(),
                 desktop: None,
-                remotes: Vec::new(),
                 daemon: Some(crate::model::DaemonId::generate().unwrap()),
                 revision: 0,
-                last_id: 301,
                 result: CommandOutput::Done { ok: true }.into(),
                 session: session(vec![split, tab(3, 301, None)], 1, TabFilter::All),
                 catalog: WorkspaceCatalog::default(),
-                metadata: [101, 102, 103, 104, 301]
-                    .into_iter()
-                    .map(|id| {
-                        serde_json::from_value(json!({
-                            "id": id, "directory": ".", "title": "", "size": [80, 24],
-                            "exited": false, "unread": 0, "busy": false, "modes": [false, false],
-                        }))
-                        .unwrap()
-                    })
-                    .collect(),
             };
             let original = serde_json::to_value(&reply).unwrap();
             remove_exited_panes(&mut reply, &HashSet::new());
@@ -427,8 +410,6 @@ mod tests {
             assert_eq!(reply.session.tabs[0].active, expected);
             assert_eq!(reply.session.tabs[0].layout.ids().len(), 2);
             assert_eq!(reply.session.tabs[0].directories.len(), 2);
-            assert_eq!(reply.metadata.len(), 2);
-            assert!(reply.metadata.iter().all(|meta| !exited.contains(&meta.id)));
         }
     }
 }
