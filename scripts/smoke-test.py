@@ -19,7 +19,7 @@ parser.add_argument("--native", action="store_true")
 parser.add_argument("--binary", type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
-binary = args.binary.resolve() if args.binary else cargo_binary("gmux")
+binary = args.binary.resolve() if args.binary else cargo_binary("gmux-gtk")
 assert binary.is_file(), "Run cargo build first"
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)

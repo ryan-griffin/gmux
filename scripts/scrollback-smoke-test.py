@@ -28,7 +28,7 @@ class History:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(8)
         self.socket.connect(str(fixture.path / "socket.stream"))
-        self.send("attach", version=7)
+        self.send("attach", version=18, daemon=fixture.rpc("_hello")["daemon"])
         self.send("subscribe", panes=[pane])
 
     def send(self, method, **params):
@@ -95,7 +95,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
     (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY\\n'\nexec /bin/bash --noprofile --norc -i\n")
 
     def start():
-        daemon = fixture.start(cargo_binary("gmux-daemon"), stdout=log, stderr=log)
+        daemon = fixture.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
         wait_for(lambda: fixture.rpc("daemon-info"))
         assert daemon.poll() is None
         return daemon
@@ -154,7 +154,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         send(survivor, "printf 'SURVIVING_HISTORY\\n'")
         wait_for(lambda: "SURVIVING_HISTORY" in fixture.rpc("read", pane=survivor)["text"])
         stop(daemon)
-        saved = json.loads((fixture.config / "session.json").read_text())
+        saved = json.loads((fixture.config / "execution.json").read_text())
         snapshot_path = fixture.config / "scrollback" / saved["scrollback"][str(pane)]
         assert snapshot_path.read_bytes()[12:52] == ghostty_revision.encode(), "Snapshot must declare the actual build pin"
         assert snapshot_path.stat().st_mode & 0o777 == 0o600
@@ -176,7 +176,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
     with scenario("checkpoint disk locks leave PTY processing active"):
         daemon = start()
         ready(pane)
-        lock = (fixture.config / ".session.json.lock").open("a")
+        lock = (fixture.config / ".execution.json.lock").open("a")
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             with ThreadPoolExecutor() as pool:
@@ -192,7 +192,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
             lock.close()
         assert daemon.wait(timeout=8) == 0
 
-    session_path = fixture.config / "session.json"
+    session_path = fixture.config / "execution.json"
     baseline = session_path.read_bytes()
     saved = json.loads(baseline)
     snapshot_path = fixture.config / "scrollback" / saved["scrollback"][str(pane)]

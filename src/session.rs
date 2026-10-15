@@ -1,13 +1,10 @@
 //! Terminal processes and state, independent of GTK widgets and rendering.
 
 use crate::{
-    Cell, Frame,
     engine::Engine,
-    ipc,
-    model::CursorStyle,
-    theme::Theme,
     title::{ForegroundProcess, PaneTitle},
 };
+use gmux_client::{ipc, model::CursorStyle, session::SessionUpdate, theme::Theme};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     cell::RefCell,
@@ -15,26 +12,6 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-
-/// A borrowed viewport. Taking a snapshot does not copy the cell buffer.
-pub struct ScreenSnapshot<'a> {
-    pub frame: Frame,
-    pub cells: &'a [Cell],
-    pub revision: u64,
-    /// Changes when text or wide-cell layout may differ.
-    pub text_revision: u64,
-}
-
-#[derive(Default)]
-pub struct SessionUpdate {
-    pub changed: bool,
-    pub exited: bool,
-    pub directory_changed: bool,
-    pub unread: Option<bool>,
-    pub error: Option<String>,
-    pub notifications: Vec<String>,
-    pub copy: Option<String>,
-}
 
 struct Pty {
     master: Box<dyn MasterPty + Send>,
@@ -74,6 +51,12 @@ pub(crate) struct TerminalSession {
 }
 
 impl TerminalSession {
+    pub(crate) fn use_view_appearance(
+        &mut self,
+        view: &crate::engine::EngineView,
+    ) -> anyhow::Result<()> {
+        self.engine.use_view_appearance(view)
+    }
     pub(crate) fn new_view(&self) -> anyhow::Result<crate::engine::EngineView> {
         self.engine.new_view()
     }
@@ -209,7 +192,7 @@ impl TerminalSession {
             .ok_or_else(|| anyhow::anyhow!("Session is closed"))?;
         let mut pending = pty.pending.borrow_mut();
         anyhow::ensure!(
-            pending.len() + bytes.len() <= 2 * crate::transport::MAX_PASTE,
+            pending.len() + bytes.len() <= 2 * gmux_client::transport::MAX_PASTE,
             "Terminal input queue is full"
         );
         pending.extend(bytes);
@@ -334,7 +317,7 @@ impl TerminalSession {
         } else {
             // Prefer the live process directory to stale OSC metadata after cd.
             let pwd = self.engine.metadata(true);
-            if let Ok((path, _)) = glib::filename_from_uri(&pwd)
+            if let Some(path) = directory_from_uri(&pwd)
                 && path.is_dir()
             {
                 self.directory = path;
@@ -351,14 +334,6 @@ impl TerminalSession {
                 .is_some_and(|(fg, pid)| fg != pid)
     }
 
-    pub(crate) fn set_cursor_style(&mut self, style: CursorStyle) -> anyhow::Result<()> {
-        self.engine.set_cursor_style(style)
-    }
-
-    pub(crate) fn set_theme(&mut self, theme: &Theme) -> anyhow::Result<()> {
-        self.engine.set_theme(theme)
-    }
-
     /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.
     pub(crate) fn resize(
         &mut self,
@@ -370,7 +345,7 @@ impl TerminalSession {
         height: u16,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(
-            crate::viewport::valid(cols as u64, rows as u64),
+            gmux_client::viewport::valid(cols as u64, rows as u64),
             "Invalid terminal size"
         );
         let size = PtySize {
@@ -452,6 +427,62 @@ impl TerminalSession {
 
     pub(crate) fn render_held(&self) -> bool {
         self.engine.mode(2026)
+    }
+}
+
+/// Decode OSC 7 file URIs without a desktop-library dependency. Paths may
+/// contain arbitrary Unix bytes; malformed escapes and NUL are invalid.
+fn directory_from_uri(uri: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut path = uri.strip_prefix("file:")?;
+    if let Some(authority) = path.strip_prefix("//") {
+        path = &authority[authority.find('/')?..];
+    }
+    if !path.starts_with('/') || path.contains(['?', '#']) {
+        return None;
+    }
+    let mut bytes = path.bytes();
+    let mut decoded = Vec::with_capacity(path.len());
+    while let Some(byte) = bytes.next() {
+        let byte = if byte == b'%' {
+            let high = (bytes.next()? as char).to_digit(16)?;
+            let low = (bytes.next()? as char).to_digit(16)?;
+            (high * 16 + low) as u8
+        } else {
+            byte
+        };
+        if byte == 0 {
+            return None;
+        }
+        decoded.push(byte);
+    }
+    Some(std::ffi::OsString::from_vec(decoded).into())
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::directory_from_uri;
+
+    #[test]
+    fn osc_directories_decode_paths_and_reject_malformed_uris() {
+        for uri in [
+            "file:/tmp/a%20b",
+            "file:///tmp/a%20b",
+            "file://host/tmp/a%20b",
+        ] {
+            assert_eq!(directory_from_uri(uri).unwrap().to_str(), Some("/tmp/a b"));
+        }
+        for uri in [
+            "https://host/tmp",
+            "file:relative",
+            "file://host",
+            "file:/tmp/%",
+            "file:/tmp/%GG",
+            "file:/tmp/%00",
+            "file:/tmp/#fragment",
+        ] {
+            assert!(directory_from_uri(uri).is_none(), "{uri}");
+        }
     }
 }
 

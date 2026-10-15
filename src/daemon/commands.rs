@@ -1,57 +1,8 @@
 //! Layout commands and their ordered persistence stages.
 use super::*;
-use crate::control::{InternalRequest, PublicRequest, Request};
+use gmux_client::control::{InternalRequest, PublicRequest, Request};
 
-pub(super) enum CatalogEffect {
-    Assign { tab: u64, workspace: u64 },
-    Remove(u64),
-}
-impl CatalogEffect {
-    fn apply(self, daemon: &mut Daemon) {
-        match self {
-            Self::Assign { tab, workspace } => {
-                if let Some(tab) = daemon.state.tabs.iter_mut().find(|t| t.id == tab) {
-                    tab.workspace = Some(workspace);
-                }
-            }
-            Self::Remove(workspace) => {
-                for tab in &mut daemon.state.tabs {
-                    if tab.workspace == Some(workspace) {
-                        tab.workspace = None;
-                    }
-                }
-                if daemon.state.filter == TabFilter::Workspace(workspace) {
-                    daemon.state.filter = TabFilter::Unassigned;
-                }
-            }
-        }
-        daemon.select_visible();
-    }
-}
-
-pub(super) enum PreparedSave {
-    Session(Session),
-    Checkpoint(crate::scrollback::Checkpoint),
-    Catalog {
-        catalog: WorkspaceCatalog,
-        effect: Option<CatalogEffect>,
-    },
-}
-enum SaveStage {
-    Session,
-    Catalog { effect: Option<CatalogEffect> },
-}
-impl PreparedSave {
-    fn into_job(self) -> (Save, SaveStage) {
-        match self {
-            Self::Session(session) => (Save::Session(session), SaveStage::Session),
-            Self::Checkpoint(value) => (Save::Checkpoint(value), SaveStage::Session),
-            Self::Catalog { catalog, effect } => {
-                (Save::Catalog(catalog), SaveStage::Catalog { effect })
-            }
-        }
-    }
-}
+pub(super) struct PreparedSave(pub(super) Save);
 pub(super) struct ControlRequest {
     pub(super) body: Request,
     reply: std::sync::mpsc::SyncSender<Value>,
@@ -74,7 +25,7 @@ impl ControlRequest {
 enum ReplyKind {
     Direct,
     Command,
-    Presentation,
+    Execution,
 }
 struct ControlReply {
     kind: ReplyKind,
@@ -85,7 +36,6 @@ struct ControlReply {
 pub(super) struct PendingControl {
     reply: ControlReply,
     pub(super) id: u64,
-    stage: SaveStage,
 }
 impl PendingControl {
     pub(super) fn start(
@@ -100,14 +50,19 @@ impl PendingControl {
             return None;
         }
         let kind = match &request.body {
+            Request::Internal(InternalRequest::Execution { request })
+                if request.mutates_state() =>
+            {
+                ReplyKind::Execution
+            }
             Request::Internal(InternalRequest::Command { .. }) => ReplyKind::Command,
-            Request::Internal(InternalRequest::Presentation { .. }) => ReplyKind::Presentation,
             _ => ReplyKind::Direct,
         };
-        let broadcast = matches!(
-            &request.body,
-            Request::Layout(_) | Request::Internal(InternalRequest::Command { .. })
-        );
+        let broadcast = matches!(kind, ReplyKind::Execution | ReplyKind::Command)
+            || matches!(
+                &request.body,
+                Request::Layout(_) | Request::Internal(InternalRequest::Command { .. })
+            );
         let result = daemon.control(request.body);
         let failed = result.is_err();
         let reply = ControlReply {
@@ -118,10 +73,10 @@ impl PendingControl {
         };
         let save = daemon.pending_write.take();
         if !failed && let Some(save) = save {
-            let (job, stage) = save.into_job();
+            let PreparedSave(job) = save;
             match worker.submit(job, false) {
-                Ok(id) => return Some(Self { reply, id, stage }),
-                Err(error) => reply.save_failed(&stage, error.to_string()).send(daemon),
+                Ok(id) => return Some(Self { reply, id }),
+                Err(error) => reply.save_failed(error.to_string()).send(daemon),
             }
         } else {
             reply.send(daemon);
@@ -131,29 +86,12 @@ impl PendingControl {
     pub(super) fn complete(
         self,
         daemon: &mut Daemon,
-        worker: &Worker,
+        _worker: &Worker,
         result: Result<(), String>,
     ) -> Option<Self> {
-        let Self { reply, stage, .. } = self;
+        let Self { reply, .. } = self;
         if let Err(error) = result {
-            reply.save_failed(&stage, error).send(daemon);
-        } else if let SaveStage::Catalog {
-            effect: Some(effect),
-        } = stage
-        {
-            effect.apply(daemon);
-            match worker.submit(Save::Session(daemon.session_snapshot()), false) {
-                Ok(id) => {
-                    return Some(Self {
-                        reply,
-                        id,
-                        stage: SaveStage::Session,
-                    });
-                }
-                Err(error) => reply
-                    .save_failed(&SaveStage::Session, error.to_string())
-                    .send(daemon),
-            }
+            reply.save_failed(error).send(daemon);
         } else {
             reply.send(daemon);
         }
@@ -161,79 +99,37 @@ impl PendingControl {
     }
 }
 impl ControlReply {
-    fn save_failed(mut self, stage: &SaveStage, error: String) -> Self {
-        if matches!(stage, SaveStage::Catalog { .. }) || self.kind == ReplyKind::Presentation {
-            self.value = json!({"error":error});
+    fn save_failed(mut self, error: String) -> Self {
+        let result = if matches!(self.kind, ReplyKind::Command | ReplyKind::Execution) {
+            &mut self.value["result"]
         } else {
-            let result = if self.kind == ReplyKind::Command {
-                &mut self.value["result"]
-            } else {
-                &mut self.value
-            };
-            result["warning"] = json!(format!("Could not save layout or scrollback: {error}"));
-        }
+            &mut self.value
+        };
+        result["warning"] = json!(format!("Could not save execution or scrollback: {error}"));
         self
     }
     fn send(mut self, daemon: &mut Daemon) {
         if self.broadcast && self.value.get("error").is_none() {
             daemon.revision += 1;
+            self.value["daemon"] = json!(daemon.id);
         }
-        if self.kind == ReplyKind::Command && self.value.get("error").is_none() {
-            let result = (|| -> anyhow::Result<()> {
-                self.value["revision"] = json!(daemon.revision);
-                self.value["session"] = serde_json::to_value(&daemon.state)?;
-                self.value["catalog"] = serde_json::to_value(storage::load_catalog()?)?;
-                self.value["metadata"] = json!(
-                    daemon
-                        .sessions
-                        .iter()
-                        .map(|(&id, session)| {
-                            Daemon::metadata(session, daemon.unread.get(&id).copied().unwrap_or(0))
-                        })
-                        .collect::<Vec<_>>()
-                );
-                Ok(())
-            })();
-            if let Err(error) = result {
-                self.value = json!({"error":error.to_string()});
-            }
+        if matches!(self.kind, ReplyKind::Command | ReplyKind::Execution)
+            && self.value.get("error").is_none()
+        {
+            self.value = (|| -> anyhow::Result<Value> {
+                let result = serde_json::from_value(self.value["result"].take())?;
+                let mut reply = daemon.execution_state();
+                reply.result = result;
+                Ok(serde_json::to_value(reply)?)
+            })()
+            .unwrap_or_else(|error| json!({"error":error.to_string()}));
         }
         let _ = self.sender.try_send(self.value);
     }
 }
 impl Daemon {
-    pub(super) fn response_with_session_save(&mut self, result: Value) -> Value {
-        self.prepare_session_save();
-        result
-    }
     pub(super) fn list(&mut self) -> anyhow::Result<Value> {
         self.refresh_state();
-        let catalog = storage::load_catalog()?;
-        let workspaces: Vec<_> = catalog
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                let mut tabs = self
-                    .state
-                    .tabs
-                    .iter()
-                    .filter(|tab| tab.workspace == Some(workspace.id));
-                let count = tabs.clone().count();
-                let unread = tabs.any(|tab| {
-                    tab.layout
-                        .ids()
-                        .iter()
-                        .any(|id| self.unread.contains_key(id))
-                });
-                json!({
-                    "id": workspace.id,
-                    "name": workspace.name,
-                    "directory": workspace.directory,
-                    "tabs": count,
-                    "unread": unread,
-                })
-            })
-            .collect();
         let tabs: Vec<_> = self
             .state
             .tabs
@@ -246,6 +142,7 @@ impl Daemon {
                     .map(|session| {
                         json!({
                             "id": session.id(),
+                            "reference": PaneRef { daemon: self.id, id: session.id() },
                             "title": session.title(),
                             "directory": session.directory(),
                             "exited": session.exited(),
@@ -255,10 +152,9 @@ impl Daemon {
                     .collect();
                 json!({
                     "id": tab.id,
+                    "created_at": tab.created_at,
+                    "reference": TabRef { daemon: self.id, id: tab.id },
                     "name": tab.name,
-                    "workspace": tab.workspace,
-                    "visible": self.state.filter.matches(tab.workspace),
-                    "active_pane": tab.active,
                     "unread": ids.iter().any(|id| self.unread.contains_key(id)),
                     "layout": tab.layout,
                     "panes": panes,
@@ -266,41 +162,19 @@ impl Daemon {
             })
             .collect();
         Ok(json!({
-            "active_tab": (self.state.active != 0).then_some(self.state.active),
-            "filter": self.state.filter,
-            "tab_search": "",
-            "workspaces": workspaces,
+            "daemon": self.id,
             "tabs": tabs,
         }))
     }
-    pub(super) fn result_with_session_save(&mut self, output: CommandOutput) -> CommandResult {
-        self.prepare_session_save();
+    pub(super) fn result_with_state_save(&mut self, output: CommandOutput) -> CommandResult {
+        self.prepare_state_save();
         output.into()
     }
     pub(super) fn execute(&mut self, command: Command) -> anyhow::Result<CommandResult> {
-        let mut catalog = storage::load_catalog()?;
         match command {
-            Command::New {
-                directory,
-                name,
-                workspace,
-            } => {
-                let workspace = workspace.unwrap_or(match self.state.filter {
-                    TabFilter::Workspace(id) => Some(id),
-                    _ => None,
-                });
-                let definition = workspace
-                    .map(|id| {
-                        catalog
-                            .workspaces
-                            .iter()
-                            .find(|w| w.id == id)
-                            .ok_or_else(|| anyhow::anyhow!("Workspace {id} does not exist"))
-                    })
-                    .transpose()?;
-                let directory = directory
-                    .or_else(|| definition.map(|w| w.directory.clone()))
-                    .unwrap_or_else(model::home);
+            Command::New { directory, name } => {
+                let directory = directory.unwrap_or_else(model::home);
+                let directory = model::expand_home(&directory);
                 anyhow::ensure!(
                     directory.is_dir(),
                     "{} is not a directory",
@@ -308,37 +182,39 @@ impl Daemon {
                 );
                 let tab = self.reserve_ids(2)?;
                 let pane = tab + 1;
-                let settings = storage::load::<Settings>("settings.json")?;
                 let session = TerminalSession::spawn(
                     pane,
                     tab,
                     directory.clone(),
-                    settings.cursor_style,
-                    &Theme::adwaita(settings.appearance != "light"),
+                    CursorStyle::default(),
+                    &Theme::adwaita(true),
                     None,
                 )?;
                 self.sessions.insert(pane, session);
                 let name = name.filter(|n| !n.trim().is_empty());
+                let created_at = creation_timestamp(
+                    self.state
+                        .tabs
+                        .iter()
+                        .map(|tab| tab.created_at)
+                        .max()
+                        .unwrap_or(0),
+                    SystemTime::now(),
+                );
                 self.state.tabs.insert(
                     0,
-                    SavedTab {
+                    ExecutionTab {
                         id: tab,
+                        created_at,
                         name: name
                             .clone()
                             .unwrap_or_else(|| model::directory_name(&directory)),
                         custom_name: name.is_some(),
-                        workspace,
-                        layout: Layout::Pane(pane),
+                        layout: PaneTree::Pane(pane),
                         directories: HashMap::from([(pane, directory)]),
-                        active: pane,
                     },
                 );
-                self.focus_tab(tab)?;
-                Ok(self.result_with_session_save(CommandOutput::New {
-                    tab,
-                    pane,
-                    workspace,
-                }))
+                Ok(self.result_with_state_save(CommandOutput::New { tab, pane }))
             }
             Command::Split { pane, down } => {
                 let target = self.resolve_pane(pane)?;
@@ -356,27 +232,24 @@ impl Daemon {
                 self.sessions.get_mut(&target).unwrap().refresh_directory();
                 let directory = self.sessions[&target].directory().to_path_buf();
                 let pane = self.reserve_ids(1)?;
-                let settings = storage::load::<Settings>("settings.json")?;
                 let session = TerminalSession::spawn(
                     pane,
                     tab_id,
                     directory.clone(),
-                    settings.cursor_style,
-                    &Theme::adwaita(settings.appearance != "light"),
+                    CursorStyle::default(),
+                    &Theme::adwaita(true),
                     None,
                 )?;
                 self.sessions.insert(pane, session);
                 let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
                 tab.layout.split(target, pane, down);
-                tab.active = pane;
                 tab.directories.insert(pane, directory);
-                self.focus_tab(tab_id)?;
-                Ok(self.result_with_session_save(CommandOutput::Split { pane }))
+                Ok(self.result_with_state_save(CommandOutput::Split { pane }))
             }
             Command::Close { pane } => {
                 let pane = self.resolve_pane(pane)?;
                 self.close(pane);
-                Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
+                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
             Command::CloseTab { tab } => {
                 let panes = self
@@ -390,7 +263,7 @@ impl Daemon {
                 for pane in panes {
                     self.close(pane);
                 }
-                Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
+                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
             Command::Rename { tab, name } => {
                 let name = name.trim();
@@ -403,7 +276,7 @@ impl Daemon {
                     .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?;
                 tab.name = name.to_owned();
                 tab.custom_name = true;
-                Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
+                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
             Command::RemoveTabName { tab } => {
                 let tab = self
@@ -414,99 +287,43 @@ impl Daemon {
                     .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?;
                 let session = self
                     .sessions
-                    .get_mut(&tab.active)
-                    .ok_or_else(|| anyhow::anyhow!("The tab's active pane has been closed"))?;
+                    .get_mut(&tab.layout.ids()[0])
+                    .ok_or_else(|| anyhow::anyhow!("The tab's pane has been closed"))?;
                 session.refresh_directory();
                 tab.name = session.title();
                 tab.custom_name = false;
-                Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
-            }
-            Command::WorkspaceNew {
-                name,
-                directory,
-                tab,
-            } => {
-                let directory = directory.unwrap_or_else(model::home);
-                anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
-                let name = catalog.validate_name(&name, None)?;
-                if let Some(id) = tab {
-                    anyhow::ensure!(
-                        self.state.tabs.iter().any(|t| t.id == id),
-                        "The tab has been closed"
-                    );
-                }
-                let workspace = self.reserve_ids(1)?;
-                catalog.workspaces.push(model::WorkspaceDefinition {
-                    id: workspace,
-                    name,
-                    directory,
-                });
-                self.pending_write = Some(PreparedSave::Catalog {
-                    catalog,
-                    effect: tab.map(|tab| CatalogEffect::Assign { tab, workspace }),
-                });
-                Ok(CommandOutput::Workspace { workspace }.into())
-            }
-            Command::WorkspaceEdit {
-                workspace,
-                name,
-                directory,
-            } => {
-                let name = catalog.validate_name(&name, Some(workspace))?;
-                anyhow::ensure!(directory.is_dir(), "Choose an existing directory");
-                let definition = catalog
-                    .workspaces
-                    .iter_mut()
-                    .find(|w| w.id == workspace)
-                    .ok_or_else(|| anyhow::anyhow!("Workspace no longer exists"))?;
-                definition.name = name;
-                definition.directory = directory;
-                self.pending_write = Some(PreparedSave::Catalog {
-                    catalog,
-                    effect: None,
-                });
-                Ok(CommandOutput::Workspace { workspace }.into())
-            }
-            Command::WorkspaceDelete { workspace } => {
-                anyhow::ensure!(
-                    catalog.workspaces.iter().any(|w| w.id == workspace),
-                    "Workspace {workspace} does not exist"
-                );
-                catalog.workspaces.retain(|w| w.id != workspace);
-                self.pending_write = Some(PreparedSave::Catalog {
-                    catalog,
-                    effect: Some(CatalogEffect::Remove(workspace)),
-                });
-                Ok(CommandOutput::Done { ok: true }.into())
-            }
-            Command::Move { tab, workspace } => {
-                let tab = tab.unwrap_or(self.state.active);
-                if let Some(id) = workspace {
-                    anyhow::ensure!(
-                        catalog.workspaces.iter().any(|w| w.id == id),
-                        "Workspace {id} does not exist"
-                    );
-                }
-                self.state
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.id == tab)
-                    .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?
-                    .workspace = workspace;
-                self.select_visible();
-                Ok(self.result_with_session_save(CommandOutput::Done { ok: true }))
+                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
         }
     }
     pub(super) fn control(&mut self, request: Request) -> anyhow::Result<Value> {
         match request {
-            Request::Layout(command) => Ok(serde_json::to_value(self.execute(command)?)?),
-            Request::Internal(InternalRequest::Hello) => {
-                Ok(json!({"version":transport::VERSION,"quitting":self.quitting}))
+            Request::Execution(request) => self.execute_remote(request),
+            Request::Internal(InternalRequest::Execution { request }) => {
+                self.execute_remote(request)
             }
-            Request::Public(PublicRequest::DaemonInfo) => Ok(
-                json!({"version":transport::VERSION,"pid":std::process::id(),"attached":self.frontends.values().any(|f|f.attached),"frontends":self.frontends.values().filter(|f|f.attached).count(),"panes":self.sessions.len(),"uptime_seconds":self.started.elapsed().as_secs(),"snapshots":self.snapshots,"sent_rows":self.sent_rows}),
+            Request::Layout(command) => Ok(serde_json::to_value(self.execute(command)?)?),
+            Request::Internal(InternalRequest::Hello) => Ok(
+                json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_client::model::MachineKind::local(),"hostname":model::hostname(),"home_directory":model::home(),"quitting":self.quitting}),
             ),
+            Request::Public(PublicRequest::DaemonInfo) => Ok(json!({
+                "version": transport::VERSION,
+                "daemon": self.id,
+                "hostname": model::hostname(),
+                "home_directory": model::home(),
+                "machine_kind": model::MachineKind::local(),
+                "listen": self.hosting.address(),
+                "pid": std::process::id(),
+                "attached": self.frontends.values().any(|f| f.attached && !f.remote),
+                "frontends": self.frontends.values().filter(|f| f.attached && !f.remote).count(),
+                "remote_frontends": self.frontends.values().filter(|f| f.attached && f.remote).count(),
+                "panes": self.sessions.len(),
+                "uptime_seconds": self.started.elapsed().as_secs(),
+                "snapshots": self.snapshots,
+                "sent_rows": self.sent_rows,
+                "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),
+                "git": self.git.as_ref().map_or_else(crate::branch::Stats::default, crate::branch::Service::stats),
+            })),
             Request::Internal(InternalRequest::Busy { panes: ids }) => {
                 let busy = ids
                     .into_iter()
@@ -517,53 +334,9 @@ impl Daemon {
                 let result = self.execute(command)?;
                 Ok(json!({"result":result}))
             }
-            Request::Internal(InternalRequest::Focus { tab: tab_id, pane }) => {
-                if tab_id == 0 {
-                    self.state.active = 0;
-                } else {
-                    let pane = pane.ok_or_else(|| anyhow::anyhow!("focus requires a pane"))?;
-                    let tab = self
-                        .state
-                        .tabs
-                        .iter_mut()
-                        .find(|tab| tab.id == tab_id)
-                        .ok_or_else(|| anyhow::anyhow!("Tab {tab_id} does not exist"))?;
-                    anyhow::ensure!(
-                        tab.layout.contains(pane),
-                        "Pane {pane} does not belong to tab {tab_id}"
-                    );
-                    tab.active = pane;
-                    self.focus_tab(tab_id)?;
-                }
-                Ok(json!({"ok":true}))
-            }
-            Request::Internal(InternalRequest::Presentation { session: state }) => {
-                self.state.width = state.width;
-                self.state.height = state.height;
-                self.state.maximized = state.maximized;
-                self.state.filter = state.filter;
-                if state.active == 0 || self.state.tabs.iter().any(|t| t.id == state.active) {
-                    self.state.active = state.active;
-                }
-                for saved in state.tabs {
-                    if let Some(tab) = self.state.tabs.iter_mut().find(|t| t.id == saved.id) {
-                        if tab.layout.ids() == saved.layout.ids() {
-                            tab.layout.update_ratios(&saved.layout);
-                            if tab.layout.contains(saved.active) {
-                                tab.active = saved.active;
-                            }
-                        }
-                        if !tab.custom_name {
-                            tab.name = saved.name;
-                        }
-                    }
-                }
-                self.prepare_session_save();
-                Ok(json!({"ok":true}))
-            }
             Request::Internal(InternalRequest::State) => {
                 self.refresh_state();
-                Ok(serde_json::to_value(self.shared_state()?)?)
+                Ok(serde_json::to_value(self.execution_state())?)
             }
             Request::Internal(InternalRequest::Metadata { pane }) => {
                 let id = self.resolve_pane(pane)?;
@@ -607,11 +380,11 @@ impl Daemon {
                 let checkpoint = self.prepare_checkpoint();
                 let warning = match checkpoint {
                     Ok(checkpoint) => {
-                        self.pending_write = Some(PreparedSave::Checkpoint(checkpoint));
+                        self.pending_write = Some(PreparedSave(Save::Checkpoint(checkpoint)));
                         None
                     }
                     Err(error) => {
-                        self.prepare_session_save();
+                        self.prepare_state_save();
                         Some(format!("Could not capture scrollback: {error}"))
                     }
                 };
@@ -640,41 +413,76 @@ impl Daemon {
                 self.queue_notifications(id, [message]);
                 Ok(json!({"ok":true}))
             }
-            Request::Public(PublicRequest::Focus {
-                pane,
-                tab,
-                workspace,
-            }) => {
-                if let Some(id) = pane {
-                    self.resolve_pane(pane)?;
-                    let tab = self
-                        .state
-                        .tabs
-                        .iter_mut()
-                        .find(|t| t.layout.contains(id))
-                        .unwrap();
-                    tab.active = id;
-                    let tab_id = tab.id;
-                    self.focus_tab(tab_id)?;
-                    self.unread.remove(&id);
-                } else if let Some(id) = tab {
-                    self.focus_tab(id)?;
-                } else if let Some(id) = workspace {
+        }
+    }
+    fn execute_remote(
+        &mut self,
+        request: gmux_client::control::ExecutionRequest,
+    ) -> anyhow::Result<Value> {
+        use gmux_client::control::ExecutionRequest;
+        let request = match request.command() {
+            Ok(command) => {
+                if let Command::New {
+                    directory: Some(directory),
+                    ..
+                } = &command
+                {
                     anyhow::ensure!(
-                        storage::load_catalog()?
-                            .workspaces
-                            .iter()
-                            .any(|w| w.id == id),
-                        "Workspace {id} does not exist"
+                        model::is_machine_directory(directory),
+                        "Remote directories must be absolute paths or start with ~/ on the remote machine"
                     );
-                    self.state.filter = TabFilter::Workspace(id);
-                    self.select_visible();
-                } else {
-                    anyhow::bail!("focus requires a tab, pane, or workspace");
                 }
-                Ok(self.response_with_session_save(json!({"ok":true})))
+                let result = self.execute(command)?;
+                return Ok(json!({"result":result}));
             }
-            Request::Public(_) => anyhow::bail!("Request requires an open window"),
+            Err(request) => request,
+        };
+        match request {
+            ExecutionRequest::List => self.list(),
+            ExecutionRequest::DaemonInfo => {
+                self.control(Request::Public(PublicRequest::DaemonInfo))
+            }
+            ExecutionRequest::Quit => self.control(Request::Public(PublicRequest::Quit)),
+            ExecutionRequest::State => {
+                self.refresh_state();
+                Ok(serde_json::to_value(self.execution_state())?)
+            }
+            ExecutionRequest::Read { pane } => {
+                self.control(Request::Internal(InternalRequest::Read {
+                    pane: Some(pane),
+                }))
+            }
+            ExecutionRequest::Send {
+                pane,
+                text,
+                paste,
+                enter,
+            } => self.control(Request::Public(PublicRequest::Send {
+                pane: Some(pane),
+                text,
+                paste,
+                enter,
+            })),
+            ExecutionRequest::Notify { pane, message } => {
+                self.control(Request::Public(PublicRequest::Notify {
+                    pane: Some(pane),
+                    message,
+                }))
+            }
+            ExecutionRequest::Busy { panes } => {
+                self.control(Request::Internal(InternalRequest::Busy { panes }))
+            }
+            ExecutionRequest::Metadata { pane } => {
+                self.control(Request::Internal(InternalRequest::Metadata {
+                    pane: Some(pane),
+                }))
+            }
+            ExecutionRequest::Copy { pane } => {
+                self.control(Request::Internal(InternalRequest::Copy {
+                    pane: Some(pane),
+                }))
+            }
+            _ => unreachable!("Execution commands were handled above"),
         }
     }
 }

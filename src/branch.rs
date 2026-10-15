@@ -13,23 +13,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod service;
+mod watches;
+pub(crate) use service::{Service, Stats};
+
 type Jobs = Vec<(u64, PathBuf)>;
-type Results = Vec<(u64, PathBuf, u64, Option<Branch>)>;
+type Results = Vec<Completion>;
 const WORKERS: usize = 2;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Branch {
+struct Branch {
     pub name: String,
     pub head: Option<PathBuf>,
 }
 
 /// Order completed lookups by request generation, including missing HEADs.
 #[derive(Default)]
-pub struct BranchCache(HashMap<PathBuf, (u64, Branch)>);
+struct BranchCache(HashMap<PathBuf, (u64, Branch)>);
 impl BranchCache {
-    pub fn resolve(&mut self, head: &Path, generation: u64, mut branch: Branch) -> Branch {
+    fn resolve(&mut self, head: &Path, generation: u64, mut branch: Branch) -> Branch {
         if let Some((newer, branch)) = self.0.get(head)
             && *newer > generation
         {
@@ -41,12 +45,29 @@ impl BranchCache {
             .insert(head.to_path_buf(), (generation, branch.clone()));
         branch
     }
-    pub fn retain_heads(&mut self, heads: &HashSet<PathBuf>) {
-        self.0.retain(|head, _| heads.contains(head));
+    fn retain_heads(&mut self, heads: &HashSet<&Path>) {
+        self.0.retain(|head, _| heads.contains(head.as_path()));
     }
 }
 
-fn bounded_output(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+fn bounded_output(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: Option<&gmux_client::ipc::Wake>,
+) -> io::Result<Output> {
+    if let Some(cancel) = cancel {
+        let mut fd = libc::pollfd {
+            fd: cancel.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut fd, 1, 0) } > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Git lookup cancelled",
+            ));
+        }
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -105,17 +126,36 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> io::Result<Output
             } else {
                 remaining
             };
-            let mut pollfd = libc::pollfd {
-                fd: if eof { -1 } else { fd },
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if unsafe { libc::poll(&mut pollfd, 1, wait.as_nanos().div_ceil(1_000_000) as i32) } < 0
+            let mut pollfds = [
+                libc::pollfd {
+                    fd: if eof { -1 } else { fd },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: cancel.map_or(-1, AsRawFd::as_raw_fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            if unsafe {
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    2,
+                    wait.as_nanos().div_ceil(1_000_000) as i32,
+                )
+            } < 0
             {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
                     return Err(error);
                 }
+            }
+            if pollfds[1].revents != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Git lookup cancelled",
+                ));
             }
         }
     })();
@@ -130,7 +170,7 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> io::Result<Output
     result
 }
 
-fn lookup(directory: &Path) -> Option<Branch> {
+fn lookup(directory: &Path, cancel: Option<&gmux_client::ipc::Wake>) -> Option<Branch> {
     let output = bounded_output(
         Command::new("git").arg("-C").arg(directory).args([
             "rev-parse",
@@ -141,6 +181,7 @@ fn lookup(directory: &Path) -> Option<Branch> {
             "HEAD",
         ]),
         LOOKUP_TIMEOUT,
+        cancel,
     )
     .ok()?;
     let stdout = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
@@ -162,6 +203,7 @@ fn lookup(directory: &Path) -> Option<Branch> {
                 .arg(directory)
                 .args(["branch", "--show-current"]),
             LOOKUP_TIMEOUT,
+            cancel,
         )
         .ok()?;
         if output.status.success() {
@@ -187,22 +229,28 @@ struct Completion {
 
 /// Two bounded workers publish independently. Refreshes for the same directory
 /// share a lookup and coalesce into one follow-up while that lookup is running.
-pub struct BranchWorker {
+struct BranchWorker {
     senders: Vec<mpsc::SyncSender<Job>>,
     receiver: mpsc::Receiver<Completion>,
     running: RefCell<[Option<PathBuf>; WORKERS]>,
     queued: RefCell<BTreeMap<u64, PathBuf>>,
     generation: Cell<u64>,
     last_dispatched: Cell<u64>,
+    lookups: Cell<u64>,
+    cancel: Option<gmux_client::ipc::Wake>,
 }
 
 impl BranchWorker {
-    pub fn new(wake: crate::ipc::Wake) -> Self {
-        Self::with_lookup(wake, lookup)
+    fn new(wake: gmux_client::ipc::Wake) -> Self {
+        let cancel = gmux_client::ipc::Wake::new().ok();
+        let stop = cancel.clone();
+        let mut worker = Self::with_lookup(wake, move |directory| lookup(directory, stop.as_ref()));
+        worker.cancel = cancel;
+        worker
     }
 
     fn with_lookup(
-        wake: crate::ipc::Wake,
+        wake: gmux_client::ipc::Wake,
         lookup: impl Fn(&Path) -> Option<Branch> + Send + Sync + 'static,
     ) -> Self {
         let lookup = Arc::new(lookup);
@@ -238,13 +286,15 @@ impl BranchWorker {
             queued: RefCell::new(BTreeMap::new()),
             generation: Cell::new(0),
             last_dispatched: Cell::new(0),
+            lookups: Cell::new(0),
+            cancel: None,
         }
     }
 
-    pub fn retain_tabs(&self, tabs: &HashSet<u64>) {
+    fn retain_tabs(&self, tabs: &HashSet<u64>) {
         self.queued.borrow_mut().retain(|id, _| tabs.contains(id));
     }
-    pub fn refresh_subset(&self, jobs: Jobs) {
+    fn refresh_subset(&self, jobs: Jobs) {
         self.queued.borrow_mut().extend(jobs);
         self.dispatch();
     }
@@ -296,25 +346,30 @@ impl BranchWorker {
                 .is_err()
             {
                 running[worker] = None;
+            } else {
+                self.lookups.set(self.lookups.get() + 1);
             }
         }
     }
 
-    pub fn results(&self) -> Results {
+    fn results(&self) -> Results {
         let mut results = Vec::new();
         for completion in self.receiver.try_iter() {
             self.running.borrow_mut()[completion.worker] = None;
-            results.extend(completion.job.tabs.into_iter().map(|id| {
-                (
-                    id,
-                    completion.job.directory.clone(),
-                    completion.job.generation,
-                    completion.branch.clone(),
-                )
-            }));
+            results.push(completion);
         }
         self.dispatch();
         results
+    }
+}
+
+impl Drop for BranchWorker {
+    fn drop(&mut self) {
+        // Leave the descriptor readable so every worker wakes and stops its Git
+        // process group before exiting. Idle workers stop when senders close.
+        if let Some(cancel) = &self.cancel {
+            cancel.notify();
+        }
     }
 }
 
@@ -323,12 +378,27 @@ mod tests {
     use super::*;
     use std::{collections::HashSet, sync::Mutex};
 
-    fn wait_results(worker: &BranchWorker, wake: &crate::ipc::Wake) -> Results {
+    fn wait_results(
+        worker: &BranchWorker,
+        wake: &gmux_client::ipc::Wake,
+    ) -> Vec<(u64, PathBuf, u64, Option<Branch>)> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let results = worker.results();
             if !results.is_empty() {
-                return results;
+                return results
+                    .into_iter()
+                    .flat_map(|completion| {
+                        completion.job.tabs.into_iter().map(move |id| {
+                            (
+                                id,
+                                completion.job.directory.clone(),
+                                completion.job.generation,
+                                completion.branch.clone(),
+                            )
+                        })
+                    })
+                    .collect();
             }
             let mut fd = libc::pollfd {
                 fd: wake.as_raw_fd(),
@@ -350,7 +420,7 @@ mod tests {
         let (started, lookups) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let gate = Mutex::new(gate);
-        let wake = crate::ipc::Wake::new().unwrap();
+        let wake = gmux_client::ipc::Wake::new().unwrap();
         let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
             started.send(directory.to_path_buf()).unwrap();
             if directory == Path::new("slow") {
@@ -393,7 +463,7 @@ mod tests {
         let (started, lookups) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let gate = Mutex::new(gate);
-        let wake = crate::ipc::Wake::new().unwrap();
+        let wake = gmux_client::ipc::Wake::new().unwrap();
         let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
             started.send(directory.to_path_buf()).unwrap();
             if directory.starts_with("held-a") || directory.starts_with("held-b") {
@@ -441,7 +511,7 @@ mod tests {
         let (release_b, gate_b) = mpsc::channel();
         let gate_a = Mutex::new(Some(gate_a));
         let gate_b = Mutex::new(Some(gate_b));
-        let wake = crate::ipc::Wake::new().unwrap();
+        let wake = gmux_client::ipc::Wake::new().unwrap();
         let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
             started.send(directory.to_path_buf()).unwrap();
             let gate = if directory == Path::new("a") {
@@ -498,6 +568,7 @@ mod tests {
         let error = bounded_output(
             Command::new("/bin/sh").args(["-c", "exec 1>&-; sleep 30"]),
             Duration::from_millis(50),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -505,6 +576,7 @@ mod tests {
         let output = bounded_output(
             Command::new("/bin/sh").args(["-c", "printf branch"]),
             Duration::from_secs(1),
+            None,
         )
         .unwrap();
         assert!(output.status.success());

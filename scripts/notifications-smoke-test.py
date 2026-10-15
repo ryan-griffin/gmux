@@ -31,7 +31,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
     temp = Path(directory)
     config = temp / "config/gmux"
     config.mkdir(parents=True)
-    (config / "settings.json").write_text(json.dumps(dict(desktop_notifications=False)))
+    (config / "clients/gtk").mkdir(parents=True, exist_ok=True)
+    (config / "clients/gtk/settings.json").write_text(json.dumps(dict(local_execution=True, desktop_notifications=False)))
     shell = temp / "shell"
     shell.write_text("#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
     shell.chmod(0o700)
@@ -48,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
 
         def start():
             global app
-            app = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
+            app = subprocess.Popen([str(cargo_binary("gmux-gtk"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
 
@@ -67,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             stream = socket.socket(socket.AF_UNIX)
             stream.settimeout(6)
             stream.connect(env["GMUX_SOCKET"] + ".stream")
-            command("attach", version=7)
+            command("attach", version=18, daemon=rpc("_hello")["daemon"])
 
         def command(method, **params):
             stream.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())

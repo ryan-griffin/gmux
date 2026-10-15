@@ -6,6 +6,12 @@
 #include <time.h>
 
 // Keep the moving libghostty ABI on this side of the Rust boundary.
+typedef struct {
+    uint8_t background[3], foreground[3], cursor[3], ansi[16][3];
+    uint8_t cursor_style;
+    bool dark;
+} Appearance;
+
 struct GmuxEngine {
     GhosttyTerminal terminal;
     GhosttyRenderState render;
@@ -25,6 +31,8 @@ struct GmuxEngine {
     GmuxView *views;
     bool view_held;
     bool clear_pending;
+    Appearance appearance, applied;
+    int appearance_error;
 };
 
 struct GmuxView {
@@ -35,7 +43,39 @@ struct GmuxView {
     GhosttyTrackedGridRef viewport, selection_start, selection_end;
     bool held_used;
     bool captured;
+    Appearance appearance;
 };
+
+static int apply_appearance(GmuxEngine *e, const Appearance *appearance) {
+    // Identical defaults leave Ghostty's incremental row tracking untouched.
+    // Updating defaults preserves OSC colors and explicit program cursor styles.
+    if (e->applied.cursor_style == UINT8_MAX ||
+        memcmp(e->applied.background, appearance->background, 3) ||
+        memcmp(e->applied.foreground, appearance->foreground, 3) ||
+        memcmp(e->applied.cursor, appearance->cursor, 3) ||
+        memcmp(e->applied.ansi, appearance->ansi, sizeof(appearance->ansi))) {
+        GhosttyColorRgb bg, fg, cursor, palette[256];
+        memcpy(&bg, appearance->background, 3);
+        memcpy(&fg, appearance->foreground, 3);
+        memcpy(&cursor, appearance->cursor, 3);
+        GhosttyResult result = ghostty_terminal_get(e->terminal,
+            GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT, palette);
+        if (result) return result;
+        memcpy(palette, appearance->ansi, sizeof(appearance->ansi));
+        if ((result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg)) ||
+            (result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg)) ||
+            (result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor)) ||
+            (result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, palette)))
+            return result;
+    }
+    if (e->applied.cursor_style != appearance->cursor_style) {
+        GhosttyTerminalCursorStyle style = (GhosttyTerminalCursorStyle)appearance->cursor_style;
+        GhosttyResult result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE, &style);
+        if (result) return result;
+    }
+    e->applied = *appearance;
+    return 0;
+}
 
 static void swap_view(GmuxEngine *e, GmuxView *v) {
 #define SWAP(field, type) do { type tmp=e->field; e->field=v->field; v->field=tmp; } while (0)
@@ -48,6 +88,7 @@ GmuxView *gmux_engine_view_new(GmuxEngine *e) {
     GmuxView *v = calloc(1, sizeof(*v));
     if (!v) return NULL;
     v->owner=e; v->next=e->views; e->views=v;
+    v->appearance=e->appearance;
     return v;
 }
 void gmux_engine_view_free(GmuxView *v) {
@@ -66,6 +107,7 @@ void gmux_engine_view_free(GmuxView *v) {
 void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
     gmux_engine_expire_render_hold(e);
     swap_view(e, v);
+    e->appearance_error=apply_appearance(e, &v->appearance);
     v->held_used=e->held && v->captured; e->view_held=e->held;
     if (v->held_used) {
         GhosttyRenderState render=e->render; e->render=v->render; v->render=render;
@@ -93,6 +135,8 @@ void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
         GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
     }
     e->view_held=false;
+    // Restore the size owner's defaults before parsing PTY output or answering queries.
+    e->appearance_error=apply_appearance(e, &e->appearance);
     swap_view(e, v);
     gmux_engine_scroll(e, 0, true);
 }
@@ -192,6 +236,7 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     if (!e) return NULL;
     e->userdata = ud;
     e->callback = cb;
+    e->applied.cursor_style = UINT8_MAX;
     if (ghostty_terminal_new(NULL, &e->terminal, 80, 24) ||
         ghostty_render_state_new(NULL, &e->render) ||
         ghostty_render_state_row_iterator_new(NULL, &e->iterator) ||
@@ -366,20 +411,15 @@ done:
 }
 int gmux_engine_theme(GmuxEngine *e, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *ansi, bool dark) {
-    GhosttyColorRgb bg, fg, cursor_color, palette[256];
-    memcpy(&bg, background, 3);
-    memcpy(&fg, foreground, 3);
-    memcpy(&cursor_color, cursor, 3);
-    GhosttyResult result = ghostty_terminal_get(e->terminal,
-        GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT, palette);
+    Appearance appearance=e->appearance;
+    memcpy(appearance.background, background, 3);
+    memcpy(appearance.foreground, foreground, 3);
+    memcpy(appearance.cursor, cursor, 3);
+    memcpy(appearance.ansi, ansi, sizeof(appearance.ansi));
+    appearance.dark=dark;
+    int result=apply_appearance(e, &appearance);
     if (result) return result;
-    // Retain the standard extended palette and any program's OSC overrides.
-    memcpy(palette, ansi, 16 * sizeof(GhosttyColorRgb));
-    if ((result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg)) ||
-        (result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg)) ||
-        (result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor_color)) ||
-        (result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, palette)))
-        return result;
+    e->appearance=appearance;
     bool changed = e->dark != dark;
     e->dark = dark;
     GhosttyTerminalModeConfig mode = {.mode = ghostty_mode_new(2031, false)};
@@ -391,6 +431,25 @@ int gmux_engine_theme(GmuxEngine *e, const uint8_t *background,
             e->callback(e->userdata, 0, (const uint8_t *)report, len);
     }
     return 0;
+}
+void gmux_engine_view_theme(GmuxView *v, const uint8_t *background,
+    const uint8_t *foreground, const uint8_t *cursor, const uint8_t *ansi, bool dark) {
+    memcpy(v->appearance.background, background, 3);
+    memcpy(v->appearance.foreground, foreground, 3);
+    memcpy(v->appearance.cursor, cursor, 3);
+    memcpy(v->appearance.ansi, ansi, sizeof(v->appearance.ansi));
+    v->appearance.dark=dark;
+}
+int gmux_engine_view_cursor_style(GmuxView *v, uint8_t style) {
+    if (style > GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW) return GHOSTTY_INVALID_VALUE;
+    v->appearance.cursor_style=style;
+    return 0;
+}
+int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
+    int result=gmux_engine_theme(e, v->appearance.background, v->appearance.foreground,
+        v->appearance.cursor, (const uint8_t *)v->appearance.ansi, v->appearance.dark);
+    if (result) return result;
+    return gmux_engine_cursor_style(e, v->appearance.cursor_style);
 }
 void gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
     if (e->clear_pending) {
@@ -431,8 +490,11 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
 }
 int gmux_engine_cursor_style(GmuxEngine *e, uint8_t style) {
     if (style > GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW) return GHOSTTY_INVALID_VALUE;
-    GhosttyTerminalCursorStyle value = (GhosttyTerminalCursorStyle)style;
-    return ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE, &value);
+    Appearance appearance=e->appearance;
+    appearance.cursor_style=style;
+    int result=apply_appearance(e, &appearance);
+    if (!result) e->appearance=appearance;
+    return result;
 }
 int gmux_engine_resize(GmuxEngine *e, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch) {
     return ghostty_terminal_resize(e->terminal, cols, rows, cw, ch);
@@ -488,6 +550,7 @@ int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len, bool clipb
     return ghostty_terminal_paste(e->terminal, &paste, NULL);
 }
 int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap) {
+    if (e->appearance_error) return -1;
     if (!e->view_held) gmux_engine_expire_render_hold(e);
     if (e->held) {
         GhosttyRenderStateDirty dirty=GHOSTTY_RENDER_STATE_DIRTY_FULL;

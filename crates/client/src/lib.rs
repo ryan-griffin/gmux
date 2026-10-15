@@ -1,0 +1,18 @@
+//! Direct daemon connections, execution commands, and terminal viewport streams.
+pub mod cells;
+pub use cells::{Cell, Frame, Scrollback};
+pub mod connection;
+pub mod connections;
+pub mod control;
+mod incoming;
+pub mod ipc;
+pub mod local;
+pub mod model;
+pub mod network;
+pub mod remote;
+pub mod search;
+pub mod session;
+pub mod storage;
+pub mod theme;
+pub mod transport;
+pub mod viewport;

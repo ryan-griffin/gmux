@@ -42,8 +42,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     shell.chmod(0o700)
     config = temp / "config/gmux"
     config.mkdir(parents=True)
-    (config / "settings.json").write_text(json.dumps(dict(
-        use_system_font=False, font="Monospace", font_size=12, appearance="dark",
+    (config / "clients/gtk").mkdir(parents=True, exist_ok=True)
+    (config / "clients/gtk/settings.json").write_text(json.dumps(dict(
+        local_execution=True, use_system_font=False, font="Monospace", font_size=12, appearance="dark",
         show_sidebar=False, desktop_notifications=False)))
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
@@ -56,9 +57,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     with (artifacts / "terminal-input-smoke.log").open("w") as log, WaylandInput() as native, \
             DelayedViewport(env["GMUX_SOCKET"], temp / "frontend") as proxy, AccessibilityFixture():
         try:
-            daemon = subprocess.Popen([str(cargo_binary("gmux-daemon"))], env=env, stdout=log, stderr=log)
+            daemon = subprocess.Popen([str(cargo_binary("gmux")), "serve"], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info"))
-            app = subprocess.Popen([str(cargo_binary("gmux"))],
+            app = subprocess.Popen([str(cargo_binary("gmux-gtk"))],
                 env=dict(env, GMUX_SOCKET=proxy.proxy_path), stdout=log, stderr=log)
             wait_for(lambda: rpc("daemon-info")["attached"])
             pane = rpc("new", name="Native Wayland input")["pane"]
