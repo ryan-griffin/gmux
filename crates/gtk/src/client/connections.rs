@@ -926,22 +926,65 @@ impl Connections {
             .ok_or_else(|| anyhow::anyhow!("No connection is selected"))?;
         Ok((Some(daemon), self.wrap(daemon, value)?))
     }
-    pub fn incoming_command(&self, command: &mut Command) -> anyhow::Result<()> {
+    /// Resolve socket IDs and implicit window targets before dispatch. A selector
+    /// constrains the target even when it is also the window's default connection.
+    pub fn incoming_command(
+        &self,
+        command: &mut Command,
+        connection: Option<&str>,
+        active_pane: Option<u64>,
+        active_tab: Option<u64>,
+    ) -> anyhow::Result<Option<DaemonId>> {
+        let selected = connection
+            .map(|name| self.connection_id(name))
+            .transpose()?;
+        let mut destination = selected.or(self.primary);
+        let target = |id: Option<u64>, active: Option<u64>, kind: &str| {
+            let handle = match id {
+                Some(id) => self.external_handle(connection, id)?,
+                None => active.ok_or_else(|| anyhow::anyhow!("No active {kind}"))?,
+            };
+            let reference = self.checked_ref(handle)?;
+            anyhow::ensure!(
+                id.is_some() || selected.is_none_or(|daemon| daemon == reference.daemon),
+                "Specify a {kind} on the selected connection"
+            );
+            Ok::<_, anyhow::Error>((handle, reference.daemon))
+        };
         match command {
-            Command::Split { pane: Some(id), .. } | Command::Close { pane: Some(id) } => {
-                *id = self.default_handle(*id)?
+            Command::Split { pane, .. } | Command::Close { pane } => {
+                let (handle, daemon) = target(*pane, active_pane, "pane")?;
+                *pane = Some(handle);
+                destination = Some(daemon);
+            }
+            Command::Move { tab, .. } => {
+                let (handle, daemon) = target(*tab, active_tab, "tab")?;
+                *tab = Some(handle);
+                destination = Some(daemon);
             }
             Command::Rename { tab: id, .. }
             | Command::CloseTab { tab: id }
-            | Command::ResetName { tab: id }
-            | Command::Move { tab: Some(id), .. }
-            | Command::WorkspaceAdd { tab: Some(id), .. } => *id = self.default_handle(*id)?,
-            _ => (),
+            | Command::ResetName { tab: id } => {
+                let (handle, daemon) = target(Some(*id), None, "tab")?;
+                *id = handle;
+                destination = Some(daemon);
+            }
+            Command::WorkspaceAdd { .. }
+            | Command::WorkspaceEdit { .. }
+            | Command::WorkspaceRemove { .. } => {
+                anyhow::ensure!(
+                    connection.is_none(),
+                    "Workspace commands control the GTK app; omit connection"
+                );
+                if let Command::WorkspaceAdd { tab: Some(id), .. } = command {
+                    *id = self.default_handle(*id)?;
+                }
+            }
+            Command::New { .. } => (),
         }
-        Ok(())
+        Ok(destination)
     }
-    pub fn external_result(&self, value: &mut Value) {
-        let mut daemon = self.primary;
+    pub fn external_result(&self, value: &mut Value, mut daemon: Option<DaemonId>) {
         if let Some(id) = value["tab"].as_u64() {
             let r = self.tab_ref(id);
             daemon = Some(r.daemon);

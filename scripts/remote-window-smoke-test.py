@@ -274,27 +274,64 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         assert launcher.wait(timeout=8) == 0
         assert view()["daemon"] == identities[0]
 
+    with scenario("explicit local selectors reject implicit targets on an active remote tab"):
+        assert view()["daemon"] == identities[0]
+        a.rpc("focus", connection="server", pane=own[1]["pane"])
+        before = [fixture.rpc("_state", client=False)["execution"] for fixture in (a, b, c)]
+        clean_env = {key: value for key, value in a.env.items() if key not in ("GMUX_PANE", "GMUX_TAB")}
+        for connection in ("local", local_name):
+            for method, target in (("split", "pane"), ("close", "pane"), ("move", "tab")):
+                error = command(a, method, "--connection", connection, check=False, env=clean_env)
+                assert f"Specify a {target} on the selected connection" in error, error
+                error = a.rpc(method, connection=connection, workspace=None, check=False)
+                assert f"Specify a {target} on the selected connection" in error["error"], error
+        assert [fixture.rpc("_state", client=False)["execution"] for fixture in (a, b, c)] == before
+        assert all(item["workspace"] is None for item in view()["tabs"])
+
     with scenario("GTK CLI renames, resets, and closes tabs on the selected connection"):
         original_names = ["Local", "Server", "Other"]
         for index, connection in ((0, "local"), (1, "server")):
             fixture = (a, b)[index]
             target = own[index]["tab"]
-            command(a, "rename", "--tab", target, "CLI renamed", "--connection", connection)
+            renamed = command(a, "rename", "--tab", target, "CLI renamed", "--connection", connection)
+            assert renamed["daemon"] == identities[index], renamed
             wait_for(lambda: tab(identities[index], target)["name"] == "CLI renamed")
             assert fixture.rpc("list", client=False)["tabs"][0]["name"] == "CLI renamed"
             for other in range(3):
                 if other != index:
                     assert tab(identities[other], own[other]["tab"])["name"] == original_names[other]
-            command(a, "reset-name", "--tab", target, "--connection", connection)
+            reset = command(a, "reset-name", "--tab", target, "--connection", connection)
+            assert reset["daemon"] == identities[index], reset
             assert not fixture.rpc("_state", client=False)["execution"]["tabs"][0]["custom_name"]
             wait_for(lambda: tab(identities[index], target)["name"] != "CLI renamed")
             command(a, "rename", "--tab", target, original_names[index], "--connection", connection)
             wait_for(lambda: tab(identities[index], target)["name"] == original_names[index])
             temporary = command(a, "new", "--connection", connection)
             command(a, "split", "--pane", temporary["pane"], "--connection", connection)
-            command(a, "close-tab", "--tab", temporary["tab"], "--connection", connection)
+            closed = command(a, "close-tab", "--tab", temporary["tab"], "--connection", connection)
+            assert closed["daemon"] == identities[index], closed
             wait_for(lambda: len(view()["tabs"]) == 3)
             assert [item["id"] for item in fixture.rpc("list", client=False)["tabs"]] == [target]
+
+    with scenario("pending command replies keep their daemon when the window default changes"):
+        with (b.config / ".execution.json.lock").open("a") as lock, ThreadPoolExecutor(max_workers=1) as pool:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                pending = pool.submit(command, a, "rename", "--connection", "server",
+                                      "--tab", own[1]["tab"], "Pending rename")
+                wait_for(lambda: b.rpc("list")["tabs"][0]["name"] == "Pending rename")
+                assert not pending.done(), "The command replied before its save completed"
+                launcher = a.start(cli, "--connection", "other", stdout=log, stderr=log)
+                assert launcher.wait(timeout=8) == 0
+                assert view()["daemon"] == identities[2]
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            renamed = pending.result(timeout=5)
+            assert renamed["daemon"] == identities[1], renamed
+        command(a, "rename", "--connection", "server", "--tab", own[1]["tab"], "Server")
+        launcher = a.start(cli, "--connection", "local", stdout=log, stderr=log)
+        assert launcher.wait(timeout=8) == 0
+        assert view()["daemon"] == identities[0]
 
     with scenario("local and remote tabs show the owning active pane's branch and share subscriptions between windows"):
         for index in range(3):
@@ -373,7 +410,8 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         assert [f.rpc("_state", client=False)["execution"] for f in (a, b, c)] == before
         split = command(a, "--connection", "server", "split", "--pane", own[1]["pane"])
         assert split["daemon"] == identities[1]
-        command(a, "--connection", "server", "close", "--pane", split["pane"])
+        closed = command(a, "--connection", "server", "close", "--pane", split["pane"])
+        assert closed["daemon"] == identities[1], closed
         wait_for(lambda: len(tab(identities[1], own[1]["tab"])["panes"]) == 1)
 
     with scenario("explicit remote creation keeps All Tabs visible and targets the chosen connection"):
@@ -395,7 +433,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         assert view()["active_reference"]["daemon"] == identities[1]
         wait_for(lambda: len(tab(identities[1], created["tab"])["panes"]) == 2)
         # An implicit command uses the selected remote pane.
-        a.rpc("close")
+        assert a.rpc("close")["daemon"] == identities[1]
         wait_for(lambda: len(tab(identities[1], created["tab"])["panes"]) == 1)
         assert "desktop" not in b.rpc("_state")
 

@@ -686,63 +686,27 @@ impl Ui {
             return;
         }
         if let Request::Layout(mut command) = request {
-            let destination = match connection
-                .as_deref()
-                .map(|name| ui.sessions.borrow().connection_id(name))
-                .transpose()
-            {
-                Ok(destination) => destination.or_else(|| ui.sessions.borrow().default_daemon()),
+            let active_pane = ui.active_pane().map(|pane| pane.id);
+            let active_tab = (ui.active.get() != 0).then_some(ui.active.get());
+            let destination = match ui.sessions.borrow().incoming_command(
+                &mut command,
+                connection.as_deref(),
+                active_pane,
+                active_tab,
+            ) {
+                Ok(destination) => destination,
                 Err(error) => {
                     let _ = reply.try_send(json!({"error":error.to_string()}));
                     return;
                 }
             };
-            if destination != ui.sessions.borrow().default_daemon() {
-                let error = match &command {
-                    Command::Split { pane: None, .. } | Command::Close { pane: None } => {
-                        Some("Specify a pane on the selected connection")
-                    }
-                    Command::Move { tab: None, .. } => {
-                        Some("Specify a tab on the selected connection")
-                    }
-                    Command::WorkspaceAdd { .. }
-                    | Command::WorkspaceEdit { .. }
-                    | Command::WorkspaceRemove { .. } => {
-                        Some("Workspace commands control the GTK app; omit connection")
-                    }
-                    _ => None,
-                };
-                if let Some(error) = error {
-                    let _ = reply.try_send(json!({"error":error}));
-                    return;
-                }
-            }
-            let incoming = if let Some(connection) = connection.as_deref() {
-                match &mut command {
-                    Command::Split { pane: Some(id), .. }
-                    | Command::Close { pane: Some(id) }
-                    | Command::Rename { tab: id, .. }
-                    | Command::CloseTab { tab: id }
-                    | Command::ResetName { tab: id }
-                    | Command::Move { tab: Some(id), .. } => ui
-                        .sessions
-                        .borrow()
-                        .external_handle(Some(connection), *id)
-                        .map(|handle| *id = handle),
-                    _ => Ok(()),
-                }
-            } else {
-                ui.sessions.borrow().incoming_command(&mut command)
-            };
-            if let Err(error) = incoming {
-                let _ = reply.try_send(json!({"error":error.to_string()}));
-                return;
-            }
             ui.command_on(command, destination, move |ui, result| {
                 let response = result
                     .and_then(|result| {
                         let mut value = serde_json::to_value(result)?;
-                        ui.sessions.borrow().external_result(&mut value);
+                        ui.sessions
+                            .borrow()
+                            .external_result(&mut value, destination);
                         Ok(value)
                     })
                     .unwrap_or_else(|e| json!({"error":e.to_string()}));

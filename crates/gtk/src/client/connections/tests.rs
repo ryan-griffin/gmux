@@ -582,7 +582,7 @@ fn closed_results_remain_translatable_and_handle_storage_is_bounded_under_churn(
         f.hub.snapshot = Some(projected);
         f.hub.prune_handles([]);
         let mut result = json!({"tab":tab, "pane":pane});
-        f.hub.external_result(&mut result);
+        f.hub.external_result(&mut result, Some(f.ids[0]));
         assert_eq!(
             result,
             json!({"tab":id * 2, "pane":id * 2 + 1, "daemon":f.ids[0]})
