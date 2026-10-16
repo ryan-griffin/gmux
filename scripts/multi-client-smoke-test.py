@@ -15,13 +15,13 @@ from test_support import AppFixture, assert_stays, scenario, wait_for
 root = Path(__file__).resolve().parent.parent
 with AppFixture(prefix="gmux-multi-client-") as fixture:
     fixture.start(cargo_binary("gmux"), "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    wait_for(lambda: fixture.rpc("daemon-info"))
+    wait_for(lambda: fixture.rpc("status"))
     created = fixture.rpc("_command", command=dict(method="new", directory=str(root)))
     pane, tab = created["result"]["pane"], created["result"]["tab"]
     first, second = Client(fixture, pane), Client(fixture, pane)
     try:
         with scenario("two clients see shared output and can both send input"):
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
             first.send("input", bytes=list(b"printf 'FIRST_INPUT\\n'\n"))
             first.output("FIRST_INPUT")
             second.output("FIRST_INPUT")
@@ -111,19 +111,19 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
                 states = []
                 for client in (first, second):
                     state = client.state(result["revision"])
-                    assert state["session"]["tabs"] == result["session"]["tabs"]
+                    assert state["execution"]["tabs"] == result["execution"]["tabs"]
                     states.append(state)
                 assert states[0] == states[1], "Clients received different snapshots of the same revision"
-            split_pane = result["session"]["tabs"][0]["layout"]["Split"]["second"]["Pane"]
+            split_pane = result["execution"]["tabs"][0]["layout"]["Split"]["second"]["Pane"]
             result = fixture.rpc("_command", command=dict(method="close", pane=split_pane))
             for client in (first, second):
-                assert client.state(result["revision"])["session"]["tabs"][0]["layout"] == {"Pane": pane}
+                assert client.state(result["revision"])["execution"]["tabs"][0]["layout"] == {"Pane": pane}
 
         with scenario("a disconnect leaves the other client and shell running"):
             first.send("focused", active=True)
             wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [50, 12])
             first.close()
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 1)
             wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [70, 20],
                      message="Disconnecting the size owner did not apply the survivor's cached size")
             second.send("input", bytes=list(b"printf 'SURVIVOR_INPUT\\n'\n"))
@@ -137,7 +137,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-client-ownership.log").open("w") as log:
     fixture.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
-    wait_for(lambda: fixture.rpc("daemon-info"))
+    wait_for(lambda: fixture.rpc("status"))
     pane = fixture.rpc("_command", command=dict(method="new", directory=str(root)))["result"]["pane"]
     other = fixture.rpc("_command", command=dict(method="new", directory=str(root)))["result"]["pane"]
     first, second, third = (Client(fixture, pane) for _ in range(3))
@@ -202,7 +202,7 @@ with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-clien
             unsized.send("resize", cols=80, rows=24)
             expect_size(80, 24)
             unsized.close()
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 3)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 3)
             assert size() == [80, 24], "A disconnect without a sized survivor changed geometry"
             for client in (first, second, third):
                 client.send("subscribe", panes=[pane])
@@ -217,7 +217,7 @@ with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-clien
             # Keep the request half open so detachment comes from writing a reply.
             third.socket.shutdown(socket.SHUT_RD)
             third.send("scroll-to", row=0, serial=9)
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
             expect_size(55, 13)
             expect_frame(first, 55, 13)
 
@@ -230,13 +230,13 @@ with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-clien
             slow.barrier(10)
             # Reattachment requests full frames without changing the surviving views.
             for serial in range(11, 41):
-                if fixture.rpc("daemon-info")["frontends"] == 2:
+                if fixture.rpc("status")["local_clients"] == 2:
                     break
                 slow.send("subscribe", panes=[])
                 slow.send("subscribe", panes=[pane])
                 first.barrier(serial)
                 time.sleep(0.025)
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
             expect_size(55, 13)
             expect_frame(first, 55, 13)
             assert "Frontend is too slow" in (artifacts / "multi-client-ownership.log").read_text(), "The owner did not detach through the pending-output limit"

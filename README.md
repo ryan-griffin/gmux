@@ -66,9 +66,10 @@ To build and run the graphical client from the checkout:
 ```
 
 The app opens without starting or connecting to a local daemon. In **Manage
-Connections…**, open the **This Computer** entry, enable **Local Execution**, and
-Save to start or attach to the local daemon. Gmux remembers this choice for future
-launches. You can also add remote connections and use them without local execution.
+Connections…**, open the **This Computer** entry, turn on **Local Daemon**, and
+Save. This starts or attaches to the daemon and remembers the choice for future
+launches. While enabled, Gmux restarts the daemon if it stops. You can also add remote
+connections and use them without local execution.
 
 Create tabs with the plus button and split panes through Terminal Actions.
 Manage workspaces through the main menu. Use the command palette or Keyboard
@@ -88,7 +89,9 @@ Shortcuts dialog to find other actions.
 Closing a window leaves its terminals running. Reopen Gmux to reconnect, or use
 **Quit Gmux** or Ctrl+Shift+Q to stop the app's connected local daemon and its
 terminals, including those used by other clients. Remote terminals keep running.
-`gmux stop` stops the addressed daemon even when GTK is closed. After a daemon restart, Gmux restores the saved layout
+`gmux stop` stops the addressed daemon even when GTK is closed. An open GTK client
+with **Local Daemon** enabled restarts it; turn the toggle off to keep it stopped.
+After a daemon restart, Gmux restores the saved layout
 and text history with fresh shells.
 Commands and jobs do not resume.
 
@@ -124,7 +127,7 @@ without `--connection`; `gmux --connection NAME stop` stops a particular daemon.
 Serve a machine's terminals over a private network such as Tailscale:
 
 ```sh
-gmux connection edit local --allow-remote true --listen 100.64.0.10:7331 --auth none
+gmux connection edit local --remote-access true --listen-address 100.64.0.10:7331 --auth none
 gmux serve --background
 ```
 
@@ -145,7 +148,7 @@ Use `edit` and `remove` to update saved connections. Use `--connection NAME` in
 either binary to select a saved connection, or
 `--connection local` for this computer. Removing a connection leaves its terminals
 running. `gmux connection edit local` also configures incoming access with
-`--allow-remote true|false`, `--listen`, and `--auth`, including while the daemon is
+`--remote-access true|false`, `--listen-address`, and `--auth`, including while the daemon is
 stopped. `gmux connection list` reports its saved settings and live listener state.
 
 Run `gmux-gtk --connection server` to select a remote as the window's default
@@ -159,9 +162,11 @@ Local and remote connections share one tab sidebar. Each tab shows its connectio
 name and an icon for the computer's hardware type. Disconnected connections use
 an offline icon and warning color. Open **Manage Connections…** to edit the local
 connection, enable local execution, add remote connections, choose authentication,
-reconnect, or remove saved connections. Names default to hostnames. Disabling **Local Execution** disconnects the app and leaves the daemon and its
-terminals running. **Stop Daemon…** stops local execution while keeping the app
-and remote connections open. The **Local Connection** dialog can enable or disable
+reconnect, or remove saved connections. Names default to hostnames. The **Local Daemon**
+toggle is saved with the other dialog settings. Cancel discards the draft. Saving
+it off asks for confirmation, stops its terminals, and leaves the app and remote
+connections open. Saving it on also enables automatic startup and recovery.
+The **Local Connection** dialog can enable or disable
 **Allow Remote Connections** independently, without restarting. Set its
 listening address and optional authentication, then Save. The sidebar header
 filters by workspace or shows All Tabs. New Tab uses the window's default connection. The plus button's

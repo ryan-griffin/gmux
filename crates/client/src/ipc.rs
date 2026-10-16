@@ -260,7 +260,7 @@ impl Endpoint {
     pub fn stop(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Value> {
         match self {
             Self::Unix { .. } => crate::local::stop(self, cancellation),
-            Self::Tcp { .. } => self.execute(&crate::control::ExecutionRequest::Quit, cancellation),
+            Self::Tcp { .. } => self.execute(&crate::control::ExecutionRequest::Stop, cancellation),
             Self::Saved { name, daemon } => Self::resolve(name, *daemon)?.stop(cancellation),
         }
     }
@@ -818,7 +818,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             call_if_running(
                 &control,
-                serde_json::json!({"method":"hosting-get"}),
+                serde_json::json!({"method":"remote-access-get"}),
                 Some(&calls),
             )
         });
@@ -838,7 +838,7 @@ mod tests {
         assert!(
             call_if_running(
                 &path,
-                serde_json::json!({"method":"hosting-get"}),
+                serde_json::json!({"method":"remote-access-get"}),
                 Some(&cancellation)
             )
             .is_err()

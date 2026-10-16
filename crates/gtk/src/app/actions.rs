@@ -32,7 +32,7 @@ impl Ui {
             ("fullscreen", &["F11"]),
             ("quit", &["<Control><Shift>q"]),
             ("rename", &[]),
-            ("remove-active-tab-name", &[]),
+            ("reset-active-tab-name", &[]),
             ("about", &[]),
             ("new-workspace", &[]),
             ("manage-workspaces", &[]),
@@ -155,11 +155,11 @@ impl Ui {
             }
         });
         self.window.add_action(&action);
-        let action = gio::SimpleAction::new("remove-tab-name", Some(&u64::static_variant_type()));
+        let action = gio::SimpleAction::new("reset-name", Some(&u64::static_variant_type()));
         let weak = Rc::downgrade(self);
         action.connect_activate(move |_, value| {
             if let (Some(ui), Some(id)) = (weak.upgrade(), value.and_then(|v| v.get::<u64>())) {
-                ui.remove_tab_name(id);
+                ui.reset_tab_name(id);
             }
         });
         self.window.add_action(&action);
@@ -286,7 +286,7 @@ impl Ui {
             "preferences" => self.preferences(),
             "shortcuts" => self.shortcuts(),
             "rename" => self.rename_tab(self.active.get()),
-            "remove-active-tab-name" => self.remove_tab_name(self.active.get()),
+            "reset-active-tab-name" => self.reset_tab_name(self.active.get()),
             "fullscreen" => {
                 if self.window.is_fullscreen() {
                     self.window.unfullscreen();
@@ -299,7 +299,7 @@ impl Ui {
             _ => (),
         }
     }
-    pub(super) fn remove_tab_name(self: &Rc<Self>, id: u64) {
+    pub(super) fn reset_tab_name(self: &Rc<Self>, id: u64) {
         if !self
             .tabs
             .borrow()
@@ -308,7 +308,7 @@ impl Ui {
         {
             return;
         }
-        self.command(Command::RemoveTabName { tab: id }, |ui, result| {
+        self.command(Command::ResetName { tab: id }, |ui, result| {
             if let Err(error) = result {
                 ui.message(&error.to_string());
             }
@@ -328,7 +328,7 @@ pub(super) const TAB_ACTIONS: &[&str] = &[
     "find",
     "clear-screen",
     "rename",
-    "remove-active-tab-name",
+    "reset-active-tab-name",
     "next-tab",
     "previous-tab",
     "next-pane",

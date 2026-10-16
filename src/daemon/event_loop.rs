@@ -58,7 +58,7 @@ pub fn run() -> anyhow::Result<()> {
     }
     let _cleanup = SocketCleanup(stream_path);
     let mut daemon = Daemon::new()?;
-    daemon.hosting = hosting::Hosting::start(daemon.id)?;
+    daemon.remote_access = remote_access::RemoteAccess::start(daemon.id)?;
     let mut persistence = Worker::new(wake.clone());
     // Optional cache cleanup must not rewrite execution.json during startup.
     persistence.submit(Save::Prune, false)?;
@@ -265,9 +265,9 @@ pub fn run() -> anyhow::Result<()> {
                 break;
             };
             let method = request.body["method"].as_str().unwrap_or("");
-            if hosting::Hosting::handles(method) {
+            if remote_access::RemoteAccess::handles(method) {
                 let result = daemon
-                    .hosting
+                    .remote_access
                     .call(daemon.id, request.body)
                     .unwrap_or_else(|e| json!({"error":e.to_string()}));
                 let _ = request.reply.try_send(result);

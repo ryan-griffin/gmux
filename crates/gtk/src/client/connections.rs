@@ -188,7 +188,7 @@ impl Connections {
     }
     fn required_default(&self) -> anyhow::Result<DaemonId> {
         self.primary.ok_or_else(|| {
-            anyhow::anyhow!("Enable Local Execution or add a connection in Manage Connections")
+            anyhow::anyhow!("Enable the Local Daemon or add a connection in Manage Connections")
         })
     }
     fn handle(&mut self, daemon: DaemonId, id: u64) -> u64 {
@@ -290,7 +290,7 @@ impl Connections {
     pub fn kind(&self, daemon: DaemonId) -> MachineKind {
         self.origins
             .get(&daemon)
-            .map_or(MachineKind::Unknown, |origin| origin.machine.kind)
+            .map_or(MachineKind::Unknown, |origin| origin.machine.machine_kind)
     }
     pub fn connection_id(&self, name: &str) -> anyhow::Result<DaemonId> {
         if name == "local" {
@@ -396,13 +396,13 @@ impl Connections {
                     Machine {
                         name: remote.name.clone(),
                         daemon: remote.daemon,
-                        kind: remote.kind,
+                        machine_kind: remote.machine_kind,
                     },
                     self.wake.clone(),
                 )
             });
             origin.machine.name = remote.name.clone();
-            origin.machine.kind = remote.kind;
+            origin.machine.machine_kind = remote.machine_kind;
             if connection_changed
                 || (renamed && origin.link.status() == ConnectionStatus::Connecting)
             {
@@ -453,14 +453,14 @@ impl Connections {
             .get_mut(&daemon)
             .ok_or_else(|| anyhow::anyhow!("Unknown daemon"))?;
         if reply.revision >= origin.revision {
-            origin.machine.kind = reply.machine_kind;
+            origin.machine.machine_kind = reply.machine_kind;
             origin.home_directory = Some(reply.home_directory);
             origin.revision = reply.revision;
-            origin.last_id = reply.session.last_id;
+            origin.last_id = reply.execution.last_id;
             origin.state = self
                 .organization
                 .desktop
-                .execution_session(daemon, reply.session);
+                .execution_session(daemon, reply.execution);
         }
         match &mut result.output {
             CommandOutput::New { tab, pane, .. } => {
@@ -913,7 +913,7 @@ impl Connections {
             }
             Command::Rename { tab: id, .. }
             | Command::CloseTab { tab: id }
-            | Command::RemoveTabName { tab: id }
+            | Command::ResetName { tab: id }
             | Command::Move { tab: Some(id), .. }
             | Command::WorkspaceAdd { tab: Some(id), .. } => *id = self.default_handle(*id)?,
             _ => (),
@@ -968,7 +968,7 @@ impl Connections {
                     workspace,
                     daemon.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Enable Local Execution or add a connection in Manage Connections"
+                            "Enable the Local Daemon or add a connection in Manage Connections"
                         )
                     })?,
                     directory.take(),
@@ -982,7 +982,7 @@ impl Connections {
             }
             Command::CloseTab { tab }
             | Command::Rename { tab, .. }
-            | Command::RemoveTabName { tab } => {
+            | Command::ResetName { tab } => {
                 let r = self.checked_ref(*tab)?;
                 daemon = Some(r.daemon);
                 *tab = r.id;

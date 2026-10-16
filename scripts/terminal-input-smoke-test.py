@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     config.mkdir(parents=True)
     (config / "clients/gtk").mkdir(parents=True, exist_ok=True)
     (config / "clients/gtk/settings.json").write_text(json.dumps(dict(
-        local_execution=True, use_system_font=False, font="Monospace", font_size=12, appearance="dark",
+        local_daemon_enabled=True, use_system_font=False, font="Monospace", font_size=12, appearance="dark",
         show_sidebar=False, desktop_notifications=False)))
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
@@ -58,10 +58,10 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             DelayedViewport(env["GMUX_SOCKET"], temp / "frontend") as proxy, AccessibilityFixture():
         try:
             daemon = subprocess.Popen([str(cargo_binary("gmux")), "serve"], env=env, stdout=log, stderr=log)
-            wait_for(lambda: rpc("daemon-info"))
+            wait_for(lambda: rpc("status"))
             app = subprocess.Popen([str(cargo_binary("gmux-gtk"))],
                 env=dict(env, GMUX_SOCKET=proxy.proxy_path), stdout=log, stderr=log)
-            wait_for(lambda: rpc("daemon-info")["attached"])
+            wait_for(lambda: rpc("status")["local_clients"])
             pane = rpc("new", name="Native Wayland input")["pane"]
             terminal = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
                 if obj.get_process_id() == app.pid and obj.get_role_name() == "terminal"), None))
@@ -436,7 +436,7 @@ finally:
                 native.key(symbol, False)
             expected_hash = hashlib.sha256(b"\x1b[200~" + encoded + b"\x1b[201~").hexdigest()
             wait_for(lambda: expected_hash in rpc("read", pane=pane)["text"], context=GLib.MainContext.default())
-            assert rpc("daemon-info")["attached"] and app.poll() is None
+            assert rpc("status")["local_clients"] and app.poll() is None
             print("PASS: native Wayland keyboard input, Kitty modifier presses/releases with both sides and Caps Lock, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "

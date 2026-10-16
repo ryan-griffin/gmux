@@ -31,8 +31,8 @@ use std::{
 mod commands;
 mod event_loop;
 mod frontend;
-mod hosting;
 mod network;
+mod remote_access;
 
 use commands::{ControlRequest, PendingControl};
 pub use event_loop::run;
@@ -93,7 +93,7 @@ fn creation_timestamp(previous: u64, now: SystemTime) -> u64 {
 struct Daemon {
     sessions: HashMap<u64, TerminalSession>,
     id: DaemonId,
-    hosting: hosting::Hosting,
+    remote_access: remote_access::RemoteAccess,
     state: ExecutionState,
     frontends: HashMap<u64, Frontend>,
     next_frontend: u64,
@@ -152,7 +152,7 @@ impl Daemon {
         let mut daemon = Self {
             sessions: HashMap::new(),
             id,
-            hosting: Default::default(),
+            remote_access: Default::default(),
             state: ExecutionState {
                 last_id,
                 ..Default::default()
@@ -258,14 +258,14 @@ impl Daemon {
             .retain(|id, _| daemon.sessions.contains_key(id));
         Ok(daemon)
     }
-    fn metadata(session: &TerminalSession, unread: u64) -> Metadata {
+    fn metadata(session: &TerminalSession, unread_sequence: u64) -> Metadata {
         Metadata {
             id: session.id(),
             directory: session.directory().to_path_buf(),
             title: session.title(),
             size: session.size(),
             exited: session.exited(),
-            unread,
+            unread_sequence,
             busy: session.busy(),
             modes: [session.mode(0), session.mode(1004)],
         }
@@ -355,10 +355,10 @@ impl Daemon {
             daemon: self.id,
             home_directory: model::home(),
             machine_kind: model::MachineKind::local(),
-            machine_name: model::hostname().into(),
+            hostname: model::hostname().into(),
             revision: self.revision,
             result: CommandOutput::Done { ok: true }.into(),
-            session: execution,
+            execution,
             metadata: self
                 .sessions
                 .iter()
@@ -477,7 +477,7 @@ mod tests {
                     title: "shell".into(),
                     size: (512, 256),
                     exited: false,
-                    unread: 1,
+                    unread_sequence: 1,
                     busy: false,
                     modes: [false; 2],
                 },
@@ -555,7 +555,7 @@ mod tests {
                         title: "shell".into(),
                         size: (80, 24),
                         exited: false,
-                        unread: 0,
+                        unread_sequence: 0,
                         busy: false,
                         modes: [false; 2],
                     },

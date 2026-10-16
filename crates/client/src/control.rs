@@ -8,8 +8,8 @@ use std::path::PathBuf;
 pub enum ExecutionRequest {
     State,
     List,
-    DaemonInfo,
-    Quit,
+    Status,
+    Stop,
     New {
         directory: Option<PathBuf>,
         name: Option<String>,
@@ -29,7 +29,7 @@ pub enum ExecutionRequest {
         tab: u64,
         name: String,
     },
-    RemoveTabName {
+    ResetName {
         tab: u64,
     },
     Read {
@@ -66,7 +66,7 @@ impl ExecutionRequest {
                 | Self::Close { .. }
                 | Self::CloseTab { .. }
                 | Self::Rename { .. }
-                | Self::RemoveTabName { .. }
+                | Self::ResetName { .. }
         )
     }
     pub fn command(self) -> Result<Command, Self> {
@@ -79,7 +79,7 @@ impl ExecutionRequest {
             Self::Close { pane } => Command::Close { pane: Some(pane) },
             Self::CloseTab { tab } => Command::CloseTab { tab },
             Self::Rename { tab, name } => Command::Rename { tab, name },
-            Self::RemoveTabName { tab } => Command::RemoveTabName { tab },
+            Self::ResetName { tab } => Command::ResetName { tab },
             request => return Err(request),
         })
     }
@@ -107,7 +107,7 @@ pub enum Command {
         tab: u64,
         name: String,
     },
-    RemoveTabName {
+    ResetName {
         tab: u64,
     },
 }
@@ -136,8 +136,8 @@ pub enum InternalRequest {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum PublicRequest {
-    DaemonInfo,
-    Quit,
+    Status,
+    Stop,
     List,
     Read {
         pane: Option<u64>,
@@ -167,7 +167,9 @@ impl Request {
     /// selects the public command result rather than a full execution snapshot.
     pub(crate) fn execution(self) -> anyhow::Result<(ExecutionRequest, bool)> {
         let pane = |pane: Option<u64>| {
-            pane.ok_or_else(|| anyhow::anyhow!("Remote pane commands require an explicit --pane"))
+            pane.ok_or_else(|| {
+                anyhow::anyhow!("Remote pane requests require an explicit pane field")
+            })
         };
         let command = |command: Command| -> anyhow::Result<ExecutionRequest> {
             Ok(match command {
@@ -179,7 +181,7 @@ impl Request {
                 Command::Close { pane: id } => ExecutionRequest::Close { pane: pane(id)? },
                 Command::CloseTab { tab } => ExecutionRequest::CloseTab { tab },
                 Command::Rename { tab, name } => ExecutionRequest::Rename { tab, name },
-                Command::RemoveTabName { tab } => ExecutionRequest::RemoveTabName { tab },
+                Command::ResetName { tab } => ExecutionRequest::ResetName { tab },
             })
         };
         Ok(match self {
@@ -203,8 +205,8 @@ impl Request {
             Self::Internal(InternalRequest::Hello) => {
                 anyhow::bail!("Hello is part of connection setup")
             }
-            Self::Public(PublicRequest::DaemonInfo) => (ExecutionRequest::DaemonInfo, false),
-            Self::Public(PublicRequest::Quit) => (ExecutionRequest::Quit, false),
+            Self::Public(PublicRequest::Status) => (ExecutionRequest::Status, false),
+            Self::Public(PublicRequest::Stop) => (ExecutionRequest::Stop, false),
             Self::Public(PublicRequest::List) => (ExecutionRequest::List, false),
             Self::Public(PublicRequest::Read { pane: id }) => {
                 (ExecutionRequest::Read { pane: pane(id)? }, false)
@@ -250,12 +252,12 @@ impl Request {
         match self {
             Self::Execution(request) => request.mutates_state(),
             Self::Internal(InternalRequest::Execution {
-                request: ExecutionRequest::Quit,
+                request: ExecutionRequest::Stop,
             }) => true,
             Self::Internal(InternalRequest::Execution { request }) => request.mutates_state(),
             Self::Layout(_)
             | Self::Internal(InternalRequest::Command { .. })
-            | Self::Public(PublicRequest::Quit) => true,
+            | Self::Public(PublicRequest::Stop) => true,
             _ => false,
         }
     }
@@ -288,10 +290,10 @@ pub struct CommandReply {
     pub daemon: crate::model::DaemonId,
     pub home_directory: PathBuf,
     pub machine_kind: crate::model::MachineKind,
-    pub machine_name: String,
+    pub hostname: String,
     pub revision: u64,
     pub result: CommandResult,
-    pub session: ExecutionState,
+    pub execution: ExecutionState,
     pub metadata: Vec<Metadata>,
 }
 
@@ -316,7 +318,7 @@ impl Command {
     pub fn supports(method: &str) -> bool {
         matches!(
             method,
-            "new" | "split" | "close" | "close-tab" | "rename" | "remove-tab-name"
+            "new" | "split" | "close" | "close-tab" | "rename" | "reset-name"
         )
     }
 }

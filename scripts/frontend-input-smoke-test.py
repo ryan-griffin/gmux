@@ -27,7 +27,7 @@ class Client:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(6)
         self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
-        self.send("attach", version=18, daemon=fixture.rpc("_hello")["daemon"])
+        self.send("attach", version=20, daemon=fixture.rpc("_hello")["daemon"])
 
     def send(self, method, **params):
         self.socket.sendall(wire(method, pane=self.pane, **params))
@@ -108,7 +108,7 @@ results = []
 for kind in ("valid-input-scroll", "empty-lines-input"):
     with scenario(kind), AppFixture(prefix="gmux-frontend-input-") as fixture:
         daemon = fixture.start(binary, "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        wait_for(lambda: fixture.rpc("daemon-info"))
+        wait_for(lambda: fixture.rpc("status"))
         pane = fixture.rpc("new")["pane"]
         other = fixture.rpc("split", pane=pane)["pane"]
         noisy, observer = Client(fixture, pane), Client(fixture, other)
@@ -131,7 +131,7 @@ for kind in ("valid-input-scroll", "empty-lines-input"):
                     if not writer.is_alive():
                         break
                     start = time.monotonic()
-                    fixture.rpc("daemon-info")
+                    fixture.rpc("status")
                     controls.append(time.monotonic() - start)
                     marker = f"FAIR_INPUT_{index}"
                     start = time.monotonic()
@@ -152,7 +152,7 @@ for kind in ("valid-input-scroll", "empty-lines-input"):
 
 with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture() as fixture:
     fixture.start(binary, "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    wait_for(lambda: fixture.rpc("daemon-info"))
+    wait_for(lambda: fixture.rpc("status"))
     pane = fixture.rpc("new")["pane"]
     client = None
     try:
@@ -160,8 +160,8 @@ with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture() 
         with socket.socket(socket.AF_UNIX) as delayed:
             delayed.settimeout(3)
             delayed.connect(fixture.env["GMUX_SOCKET"] + ".stream")
-            delayed.sendall(wire("focused", active=False) * 128 + wire("attach", version=18, daemon=fixture.rpc("_hello")["daemon"]))
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
+            delayed.sendall(wire("focused", active=False) * 128 + wire("attach", version=20, daemon=fixture.rpc("_hello")["daemon"]))
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 1)
             # State output proves Attach ran even when it was left in a read buffer.
             assert delayed.recv(4), "Buffered Attach did not run"
 

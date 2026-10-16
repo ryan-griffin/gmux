@@ -124,7 +124,7 @@ enum ConnectionCommand {
     },
     /// Edit a saved connection, or use local for this computer's name and incoming access.
     #[command(group(clap::ArgGroup::new("changes").required(true).multiple(true)
-        .args(["new_name", "use_hostname", "address", "auth", "listen", "allow_remote"])))]
+        .args(["new_name", "use_hostname", "address", "auth", "listen_address", "remote_access"])))]
     Edit {
         /// Current connection name, or local for this computer.
         #[arg(value_name = "CONNECTION")]
@@ -140,12 +140,12 @@ enum ConnectionCommand {
         address: Option<String>,
         /// Allow incoming TCP connections locally. Disabling leaves terminals running.
         #[arg(long, value_name = "BOOL")]
-        allow_remote: Option<bool>,
-        /// Incoming TCP listen address for the local connection.
+        remote_access: Option<bool>,
+        /// Incoming TCP listening address for the local connection.
         #[arg(long)]
-        listen: Option<SocketAddr>,
+        listen_address: Option<SocketAddr>,
         /// Authentication for the remote daemon, or incoming clients when editing local.
-        #[arg(long, value_enum, required_if_eq("allow_remote", "true"))]
+        #[arg(long, value_enum, required_if_eq("remote_access", "true"))]
         auth: Option<Auth>,
         /// File containing the shared authentication token.
         #[arg(long, requires = "auth", required_if_eq("auth", "token"))]
@@ -275,9 +275,10 @@ fn run() -> anyhow::Result<()> {
         );
     }
     let stop = matches!(&cli.command, Command::Stop);
+    let plain_text = matches!(&cli.command, Command::Read { .. });
     let request = match cli.command {
         Command::Serve(_) => unreachable!(),
-        Command::Status => serde_json::to_value(PublicRequest::DaemonInfo)?,
+        Command::Status => serde_json::to_value(PublicRequest::Status)?,
         Command::List => serde_json::to_value(PublicRequest::List)?,
         Command::New { name, directory } => serde_json::to_value(TerminalCommand::New {
             name,
@@ -297,7 +298,7 @@ fn run() -> anyhow::Result<()> {
         Command::Rename { tab, name } => {
             serde_json::to_value(TerminalCommand::Rename { tab, name })?
         }
-        Command::ResetName { tab } => serde_json::to_value(TerminalCommand::RemoveTabName { tab })?,
+        Command::ResetName { tab } => serde_json::to_value(TerminalCommand::ResetName { tab })?,
         Command::Send { text, pane, enter } => serde_json::to_value(PublicRequest::Send {
             pane,
             text,
@@ -308,7 +309,7 @@ fn run() -> anyhow::Result<()> {
         Command::Notify { message, pane } => {
             serde_json::to_value(PublicRequest::Notify { pane, message })?
         }
-        Command::Stop => serde_json::to_value(PublicRequest::Quit)?,
+        Command::Stop => serde_json::to_value(PublicRequest::Stop)?,
         Command::Rpc { request } => serde_json::from_str(&request)?,
         Command::Connection { command } => match command {
             ConnectionCommand::List => json!({"method":"connection-list"}),
@@ -329,8 +330,8 @@ fn run() -> anyhow::Result<()> {
                 new_name,
                 use_hostname,
                 address,
-                allow_remote,
-                listen,
+                remote_access,
+                listen_address,
                 auth,
                 token_file,
             } => {
@@ -343,29 +344,32 @@ fn run() -> anyhow::Result<()> {
                 if local {
                     anyhow::ensure!(
                         address.is_none(),
-                        "Use --listen for the local daemon's incoming address"
+                        "Use --listen-address for the local daemon's incoming address"
                     );
                     request["connection"] = json!("local");
-                    if allow_remote.is_some() || listen.is_some() || authentication.is_some() {
+                    if remote_access.is_some()
+                        || listen_address.is_some()
+                        || authentication.is_some()
+                    {
                         let current =
-                            gmux_client::connections::call(json!({"method":"hosting-get"}))?;
-                        let mut hosting: network::Hosting =
-                            serde_json::from_value(current["hosting"].clone())?;
-                        if let Some(enabled) = allow_remote {
-                            hosting.enabled = enabled;
+                            gmux_client::connections::call(json!({"method":"remote-access-get"}))?;
+                        let mut config: network::RemoteAccess =
+                            serde_json::from_value(current["remote_access"].clone())?;
+                        if let Some(enabled) = remote_access {
+                            config.enabled = enabled;
                         }
-                        if let Some(address) = listen {
-                            hosting.address = address;
+                        if let Some(address) = listen_address {
+                            config.listen_address = address;
                         }
                         if let Some(authentication) = authentication {
-                            hosting.authentication = authentication;
+                            config.authentication = authentication;
                         }
-                        request["hosting"] = serde_json::to_value(hosting)?;
+                        request["remote_access"] = serde_json::to_value(config)?;
                     }
                 } else {
                     anyhow::ensure!(
-                        allow_remote.is_none() && listen.is_none(),
-                        "--allow-remote and --listen apply only to the local connection"
+                        remote_access.is_none() && listen_address.is_none(),
+                        "--remote-access and --listen-address apply only to the local connection"
                     );
                     request["address"] = json!(address);
                     request["authentication"] = serde_json::to_value(authentication)?;
@@ -394,7 +398,7 @@ fn run() -> anyhow::Result<()> {
     } else {
         gmux_client::connections::call(request)?
     };
-    if let Some(text) = response.get("text").and_then(Value::as_str) {
+    if plain_text && let Some(text) = response.get("text").and_then(Value::as_str) {
         println!("{text}");
     } else {
         println!("{}", serde_json::to_string_pretty(&response)?);

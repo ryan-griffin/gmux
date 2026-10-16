@@ -50,10 +50,10 @@ impl Fixture {
             daemon,
             home_directory: "/home/test".into(),
             machine_kind: MachineKind::Server,
-            machine_name: "test-host".into(),
+            hostname: "test-host".into(),
             revision: 1,
             result: control::CommandOutput::Done { ok: true }.into(),
-            session: Default::default(),
+            execution: Default::default(),
             metadata: Vec::new(),
         };
         request
@@ -85,7 +85,7 @@ fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<Value>)>
 }
 
 #[test]
-fn full_remote_capacity_leaves_room_for_local_execution_and_configuration() {
+fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
     let f = Fixture::new();
     let backend = f.backend();
     // Invalid setup still allocates its independent lane without starting a handshake.

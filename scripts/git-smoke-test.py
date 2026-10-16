@@ -31,7 +31,7 @@ def branch(client, name, *, pane=None, directory=None):
 
 
 def stats(fixture):
-    return fixture.rpc("daemon-info")["git"]
+    return fixture.rpc("status")["git"]
 
 
 def settled(fixture):
@@ -44,11 +44,11 @@ with (artifacts / "git-smoke.log").open("w") as log, AppFixture() as owner, AppF
     git(repository, "init", "--initial-branch=initial")
     nested = repository / "nested"
     nested.mkdir()
-    owner.rpc("connection-edit", connection="local", hosting=dict(
-        enabled=True, address="127.0.0.1:0", authentication=dict(mode="none")))
+    owner.rpc("connection-edit", connection="local", remote_access=dict(
+        enabled=True, listen_address="127.0.0.1:0", authentication=dict(mode="none")))
     owner.start(daemon, "serve", stdout=log, stderr=log)
     receiver.start(daemon, "serve", stdout=log, stderr=log)
-    address = wait_for(lambda: owner.rpc("daemon-info")["listen"])
+    address = wait_for(lambda: owner.rpc("status")["bound_address"])
     receiver.rpc("connection-add", name="owner", address=address, authentication=dict(mode="none"))
     pane = owner.rpc("new", directory=str(repository))["pane"]
     nested_pane = owner.rpc("new", directory=str(nested))["pane"]
@@ -59,7 +59,7 @@ with (artifacts / "git-smoke.log").open("w") as log, AppFixture() as owner, AppF
         remote = Client(receiver, pane, connection="owner")
         clients.append(remote)
         with scenario("headless execution and ordinary stream clients perform no Git work"):
-            assert owner.rpc("daemon-info")["git_subscribers"] == 0
+            assert owner.rpc("status")["git_subscribers"] == 0
             assert stats(owner) == dict(panes=0, repositories=0, watches=0, workers=0, lookups=0, pending=0)
             local.send("paste", text="printf 'NO_GIT_WORK\n'", enter=True)
             local.output("NO_GIT_WORK")
@@ -76,7 +76,7 @@ with (artifacts / "git-smoke.log").open("w") as log, AppFixture() as owner, AppF
             branch(remote, "initial", directory=repository)
             branch(remote, "initial", pane=nested_pane, directory=nested)
             after = settled(owner)
-            assert owner.rpc("daemon-info")["git_subscribers"] == 2
+            assert owner.rpc("status")["git_subscribers"] == 2
             assert after["panes"] == 2 and after["repositories"] == 1 and after["workers"] == 2
             assert after["watches"] == before["watches"] and after["lookups"] == before["lookups"]
             assert stats(receiver)["workers"] == 0, "The receiver must not inspect the remote filesystem"
@@ -133,14 +133,14 @@ with (artifacts / "git-smoke.log").open("w") as log, AppFixture() as owner, AppF
         with scenario("unsubscribe and disconnect release the last repository watches without stopping execution"):
             local.send("git-subscribe", panes=[])
             local.barrier(2)
-            wait_for(lambda: owner.rpc("daemon-info")["git_subscribers"] == 1)
+            wait_for(lambda: owner.rpc("status")["git_subscribers"] == 1)
             assert settled(owner)["panes"] == 2
             remote.close()
             clients.remove(remote)
-            wait_for(lambda: owner.rpc("daemon-info")["git_subscribers"] == 0)
+            wait_for(lambda: owner.rpc("status")["git_subscribers"] == 0)
             wait_for(lambda: stats(owner)["workers"] == 0 and stats(owner)["watches"] == 0)
             assert len(owner.rpc("list")["tabs"]) == 3
-            assert "git" not in owner.rpc("_state")["session"]
+            assert "git" not in owner.rpc("_state")["execution"]
             local.send("paste", text="printf 'AFTER_GIT_DETACH\n'", enter=True)
             local.output("AFTER_GIT_DETACH")
     finally:
@@ -153,7 +153,7 @@ with (artifacts / "git-smoke.log").open("w") as log, AppFixture() as owner, AppF
         missing.env["PATH"] = str(tools)
         missing.env["SHELL"] = "/bin/sh"
         missing.start(daemon, "serve", stdout=log, stderr=log)
-        wait_for(lambda: missing.rpc("daemon-info"))
+        wait_for(lambda: missing.rpc("status"))
         pane = missing.rpc("new", directory=str(missing.path))["pane"]
         client = Client(missing, pane)
         try:

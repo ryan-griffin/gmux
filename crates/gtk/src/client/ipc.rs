@@ -14,7 +14,7 @@ pub fn call(body: impl serde::Serialize) -> anyhow::Result<Value> {
             | "close"
             | "close-tab"
             | "rename"
-            | "remove-tab-name"
+            | "reset-name"
             | "list"
             | "read"
             | "send"

@@ -14,7 +14,7 @@ struct RemoteDefinition {
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 struct LocalDefinition {
     name: String,
-    kind: model::MachineKind,
+    machine_kind: model::MachineKind,
     daemon: Option<DaemonId>,
 }
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
@@ -23,14 +23,14 @@ struct ConnectionList {
     running: bool,
     hostname: String,
     remotes: Vec<RemoteDefinition>,
-    hosting: gmux_client::network::Hosting,
-    hosting_error: Option<String>,
+    remote_access: gmux_client::network::RemoteAccess,
+    remote_access_error: Option<String>,
 }
 struct RemoteRow {
     daemon: DaemonId,
     row: adw::ActionRow,
     icon: gtk::Image,
-    kind: Cell<model::MachineKind>,
+    machine_kind: Cell<model::MachineKind>,
     status: gtk::Label,
     reconnect: gtk::Button,
 }
@@ -166,7 +166,7 @@ impl ConnectionControls {
                 .use_markup(false)
                 .activatable(true)
                 .build();
-            let icon = machine::icon(local.kind);
+            let icon = machine::icon(local.machine_kind);
             row.add_prefix(&icon);
             let weak = Rc::downgrade(ui);
             row.connect_activated(move |_| {
@@ -179,9 +179,8 @@ impl ConnectionControls {
                             Ok(list) => ui.local_connection_editor(
                                 &list.local.name,
                                 &list.hostname,
-                                &list.hosting,
-                                list.hosting_error.as_deref(),
-                                list.running,
+                                &list.remote_access,
+                                list.remote_access_error.as_deref(),
                             ),
                             Err(error) => ui.message(&error.to_string()),
                         },
@@ -239,7 +238,7 @@ impl ConnectionControls {
                 daemon,
                 row,
                 icon,
-                kind: Cell::new(kind),
+                machine_kind: Cell::new(kind),
                 status,
                 reconnect,
             });
@@ -250,7 +249,7 @@ impl ConnectionControls {
         let sessions = ui.sessions.borrow();
         for remote in self.rows.borrow().iter() {
             let kind = sessions.kind(remote.daemon);
-            if remote.kind.replace(kind) != kind {
+            if remote.machine_kind.replace(kind) != kind {
                 machine::update_icon(&remote.icon, kind);
             }
             let (status, error, reconnect) = match sessions.connection_status(remote.daemon) {
@@ -545,9 +544,8 @@ impl Ui {
         self: &Rc<Self>,
         current: &str,
         hostname: &str,
-        hosting: &gmux_client::network::Hosting,
-        hosting_error: Option<&str>,
-        running: bool,
+        remote_access: &gmux_client::network::RemoteAccess,
+        remote_access_error: Option<&str>,
     ) {
         let Some(dialog) = self
             .connection_editor_dialog
@@ -585,114 +583,34 @@ impl Ui {
         let error = error_label();
         group.add(&error);
         page.add(&group);
-        let execution_group = adw::PreferencesGroup::builder()
-            .title("Execution")
-            .description("Disabling local execution disconnects this app. The daemon and its terminals keep running")
+        let local_group = adw::PreferencesGroup::new();
+        let local_connection = adw::SwitchRow::builder()
+            .title("Local Daemon")
+            .subtitle("Run terminals on this computer")
+            .active(self.settings.borrow().local_daemon_enabled)
             .build();
-        let local_execution = adw::SwitchRow::builder()
-            .title("Local Execution")
-            .subtitle("Save to start or connect now and on future launches")
-            .active(self.settings.borrow().local_execution)
+        local_group.add(&local_connection);
+        page.add(&local_group);
+        let access_group = adw::PreferencesGroup::builder()
+            .title("Remote Access")
+            .description("Control how other computers connect when the local daemon is running")
             .build();
-        execution_group.add(&local_execution);
-        let runtime = adw::ButtonRow::builder()
-            .title(if running {
-                "Stop Daemon…"
-            } else {
-                "Start Daemon"
-            })
-            .tooltip_text(if running {
-                "Stop this daemon's terminals and disable Local Execution"
-            } else {
-                "Start with saved settings and enable Local Execution"
-            })
-            .build();
-        execution_group.add(&runtime);
-        page.add(&execution_group);
-        let weak = Rc::downgrade(self);
-        let close = dialog.downgrade();
-        let runtime_error = error.downgrade();
-        let runtime_view = view.downgrade();
-        runtime.connect_activated(move |_| {
-            let Some(ui) = weak.upgrade() else { return };
-            let busy_dialog = close.clone();
-            let busy_view = runtime_view.clone();
-            let finished_view = runtime_view.clone();
-            let close = close.clone();
-            let error = runtime_error.clone();
-            let finish = move |ui: &Rc<Ui>, result: anyhow::Result<()>| {
-                if let Some(view) = finished_view.upgrade() {
-                    view.set_sensitive(true);
-                }
-                if let Some(dialog) = close.upgrade() {
-                    dialog.set_can_close(true);
-                    match result {
-                        Ok(()) => {
-                            dialog.close();
-                        }
-                        Err(message) => {
-                            if let Some(error) = error.upgrade() {
-                                show_error(&error, message);
-                            }
-                        }
-                    }
-                }
-                if let Some(controls) = ui.connections_dialog.borrow().as_ref() {
-                    controls.refresh(ui);
-                }
-            };
-            if running {
-                let confirm = adw::AlertDialog::builder()
-                    .heading("Stop Local Daemon?")
-                    .body("All terminals managed by this daemon will stop, including those used by other clients. Remote terminals will keep running")
-                    .build();
-                confirm.add_response("cancel", "Cancel");
-                confirm.add_response("stop", "Stop Daemon");
-                confirm.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
-                confirm.set_default_response(Some("cancel"));
-                confirm.set_close_response("cancel");
-                let weak = Rc::downgrade(&ui);
-                let finish = RefCell::new(Some(finish));
-                confirm.connect_response(Some("stop"), move |_, _| {
-                    if let (Some(ui), Some(finish)) = (weak.upgrade(), finish.borrow_mut().take()) {
-                        if let Some(view) = busy_view.upgrade() {
-                            view.set_sensitive(false);
-                        }
-                        if let Some(dialog) = busy_dialog.upgrade() {
-                            dialog.set_can_close(false);
-                        }
-                        ui.stop_local(finish);
-                    }
-                });
-                confirm.present(Some(&ui.window));
-            } else {
-                if let Some(view) = busy_view.upgrade() {
-                    view.set_sensitive(false);
-                }
-                if let Some(dialog) = busy_dialog.upgrade() {
-                    dialog.set_can_close(false);
-                }
-                ui.set_local_execution(true, finish);
-            }
-        });
-        let host_group = adw::PreferencesGroup::builder().title("Incoming Connections")
-            .description("Enter an IP address and port to listen on. A loopback address accepts only local connections").build();
         let enabled = adw::SwitchRow::builder()
             .title("Allow Remote Connections")
-            .active(hosting.enabled)
+            .active(remote_access.enabled)
             .build();
         let address = adw::EntryRow::builder()
             .title("Listening Address")
-            .text(hosting.address.to_string())
+            .text(remote_access.listen_address.to_string())
             .activates_default(true)
             .build();
-        host_group.add(&enabled);
-        host_group.add(&address);
-        page.add(&host_group);
+        access_group.add(&enabled);
+        access_group.add(&address);
+        page.add(&access_group);
         let (credentials, authentication, token) =
-            authentication_fields(self, &hosting.authentication);
+            authentication_fields(self, &remote_access.authentication);
         page.add(&credentials);
-        let original_address = hosting.address;
+        let original_address = remote_access.listen_address;
         let fields = (
             enabled.downgrade(),
             address.downgrade(),
@@ -707,10 +625,9 @@ impl Ui {
         let hostname = hostname.to_owned();
         let default_name = hostname.clone();
         let original_name = current.to_owned();
-        let original_hosting = hosting.clone();
-        let original_execution = self.settings.borrow().local_execution;
-        let execution = local_execution.downgrade();
-        let runtime_action = runtime.downgrade();
+        let original_remote_access = remote_access.clone();
+        let original_execution = self.settings.borrow().local_daemon_enabled;
+        let execution = local_connection.downgrade();
         let validate = Rc::new(move || {
             if let (
                 Some(enabled),
@@ -741,21 +658,14 @@ impl Ui {
                 let token = token.text();
                 let changed = execution.is_active() != original_execution
                     || name.trim() != original_name
-                    || enabled.is_active() != original_hosting.enabled
-                    || address.is_none_or(|address| address != original_hosting.address)
+                    || enabled.is_active() != original_remote_access.enabled
+                    || address
+                        .is_none_or(|address| address != original_remote_access.listen_address)
                     || authentication_changed(
-                        &original_hosting.authentication,
+                        &original_remote_access.authentication,
                         auth.selected(),
                         &token,
                     );
-                if let Some(runtime) = runtime_action.upgrade() {
-                    runtime.set_sensitive(!changed);
-                    runtime.set_tooltip_text(if changed {
-                        Some("Save or cancel changes before starting or stopping the daemon")
-                    } else {
-                        None
-                    });
-                }
                 save.set_sensitive(
                     changed
                         && !name.trim().is_empty()
@@ -777,9 +687,9 @@ impl Ui {
         let changed = validate.clone();
         enabled.connect_active_notify(move |_| changed());
         let changed = validate.clone();
-        local_execution.connect_active_notify(move |_| changed());
+        local_connection.connect_active_notify(move |_| changed());
         validate();
-        if let Some(message) = hosting_error {
+        if let Some(message) = remote_access_error {
             show_error(&error, message);
         }
         view.set_content(Some(&page));
@@ -813,44 +723,79 @@ impl Ui {
             let view = view.downgrade();
             let button = button.downgrade();
             let error = error.downgrade();
-            let hosting = gmux_client::network::Hosting {
+            let restore = Rc::new(move || {
+                if let Some(dialog) = close.upgrade() {
+                    dialog.set_can_close(true);
+                }
+                if let Some(view) = view.upgrade() {
+                    view.set_sensitive(true);
+                }
+                if let Some(button) = button.upgrade() {
+                    button.set_label("Save");
+                }
+            });
+            let abort = restore.clone();
+            let close = dialog.downgrade();
+            let finish = move |_: &Rc<Ui>, result: anyhow::Result<()>| {
+                restore();
+                match result {
+                    Ok(()) => {
+                        if let Some(dialog) = close.upgrade() {
+                            dialog.close();
+                        }
+                    }
+                    Err(message) => {
+                        if let Some(error) = error.upgrade() {
+                            show_error(&error, message);
+                        }
+                    }
+                }
+            };
+            let remote_access = gmux_client::network::RemoteAccess {
                 enabled: enabled.is_active(),
-                address: address.text().trim().parse().unwrap_or(original_address),
+                listen_address: address.text().trim().parse().unwrap_or(original_address),
                 authentication,
             };
-            let execution = local_execution.is_active();
-            ui.request(
-                json!({"method":"connection-edit","connection":"local","name":value,"hosting":hosting}),
-                move |ui, result| {
-                    let finish = move |_: &Rc<Ui>, result: anyhow::Result<()>| {
-                        if let Some(dialog) = close.upgrade() {
-                            dialog.set_can_close(true);
+            let execution = local_connection.is_active();
+            let execution_changed = execution != original_execution;
+            let confirm_stop = execution_changed && !execution && ui.settings.borrow().local_daemon_enabled;
+            let apply = move |ui: &Rc<Ui>| {
+                ui.request(
+                    json!({"method":"connection-edit","connection":"local","name":value,"remote_access":remote_access}),
+                    move |ui, result| match result {
+                        Ok(_) if execution_changed && execution != ui.settings.borrow().local_daemon_enabled => {
+                            ui.set_local_daemon_enabled(execution, finish);
                         }
-                        if let Some(view) = view.upgrade() {
-                            view.set_sensitive(true);
-                        }
-                        if let Some(button) = button.upgrade() {
-                            button.set_label("Save");
-                        }
-                        match result {
-                            Ok(_) => {
-                                if let Some(dialog) = close.upgrade() {
-                                    dialog.close();
-                                }
-                            }
-                            Err(message) => {
-                                if let Some(error) = error.upgrade() {
-                                    show_error(&error, message);
-                                }
-                            }
-                        }
-                    };
-                    match result {
-                        Ok(_) => ui.set_local_execution(execution, finish),
+                        Ok(_) => finish(ui, Ok(())),
                         Err(error) => finish(ui, Err(error)),
+                    },
+                );
+            };
+            if confirm_stop {
+                let confirm = adw::AlertDialog::builder()
+                    .heading("Stop Local Daemon?")
+                    .body("All terminals managed by this daemon will stop, including those used by other clients. Remote terminals will keep running")
+                    .build();
+                confirm.add_response("cancel", "Cancel");
+                confirm.add_response("stop", "Stop Daemon");
+                confirm.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+                confirm.set_default_response(Some("cancel"));
+                confirm.set_close_response("cancel");
+                let weak = Rc::downgrade(&ui);
+                let apply = RefCell::new(Some(apply));
+                confirm.connect_response(None, move |_, response| {
+                    if response == "stop" {
+                        if let (Some(ui), Some(apply)) = (weak.upgrade(), apply.borrow_mut().take()) {
+                            apply(&ui);
+                        }
+                    } else {
+                        abort();
                     }
-                },
-            );
+                });
+                confirm.present(Some(&ui.window));
+            } else {
+                apply(&ui);
+            }
         });
         dialog.present(Some(&self.window));
         if let Some(button) = default_button.upgrade() {

@@ -411,7 +411,7 @@ impl Ui {
                 .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
             {
                 let available = enabled
-                    && (*name != "remove-active-tab-name"
+                    && (*name != "reset-active-tab-name"
                         || self
                             .tabs
                             .borrow()

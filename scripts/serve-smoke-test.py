@@ -34,7 +34,7 @@ def incoming(fixture, *args):
 
 with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixture() as client:
     with scenario("serve accepts launch options and rejects connection configuration flags"):
-        for args in (("--listen", "127.0.0.1:0"), ("--auth", "none"), ("--token-file", "token")):
+        for args in (("--listen-address", "127.0.0.1:0"), ("--auth", "none"), ("--token-file", "token")):
             _, error = launch(fixture, *args, success=False)
             assert "unexpected argument" in error, error
         assert not Path(fixture.env["GMUX_SOCKET"]).exists()
@@ -43,7 +43,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         started = time.monotonic()
         launcher, _ = launch(fixture)
         startup_ms = (time.monotonic() - started) * 1000
-        info = fixture.rpc("daemon-info")
+        info = fixture.rpc("status")
         pid = info["pid"]
         assert pid != launcher
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -67,7 +67,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
     with scenario("duplicate starts fail and concurrent starts produce exactly one successful launcher"):
         _, error = launch(fixture, success=False)
         assert "already running or starting" in error and "connection edit local" in error, error
-        assert fixture.rpc("daemon-info")["pid"] == pid
+        assert fixture.rpc("status")["pid"] == pid
         assert fixture.rpc("list")["tabs"][0]["id"] == tab["tab"]
         stop_daemon(fixture.env["GMUX_SOCKET"])
         children = [fixture.start(binary, "serve", "--background", stdout=subprocess.PIPE,
@@ -80,7 +80,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
             else:
                 assert "already running or starting" in stderr, (stdout, stderr)
         assert successes == 1, successes
-        restarted = fixture.rpc("daemon-info")
+        restarted = fixture.rpc("status")
         assert restarted["pid"] != pid
         assert restarted["daemon"] == info["daemon"]
         assert len(fixture.rpc("list")["tabs"]) == 1
@@ -91,7 +91,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         assert json.loads(stopped.stdout)["ok"]
         assert not Path(fixture.env["GMUX_SOCKET"]).exists()
         launch(fixture)
-        assert fixture.rpc("daemon-info")["daemon"] == info["daemon"]
+        assert fixture.rpc("status")["daemon"] == info["daemon"]
         assert len(fixture.rpc("list")["tabs"]) == 1
 
     with scenario("serve rejects a held startup lock before a control socket exists"):
@@ -105,13 +105,13 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
                 assert child.returncode != 0 and "already running or starting" in stderr, (stdout, stderr)
             assert not Path(fixture.env["GMUX_SOCKET"]).exists()
         launch(fixture)
-        assert fixture.rpc("daemon-info")["daemon"] == info["daemon"]
+        assert fixture.rpc("status")["daemon"] == info["daemon"]
 
     with scenario("GTK's launcher waits for startup races and attaches to the same daemon"):
         stop_daemon(fixture.env["GMUX_SOCKET"])
         with Path(fixture.env["GMUX_SOCKET"] + ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            children = [fixture.start(binary, "rpc", '{"method":"local-start"}',
+            children = [fixture.start(binary, "rpc", '{"method":"local-daemon-start"}',
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                         for _ in range(2)]
             time.sleep(.3)
@@ -119,20 +119,20 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         for child in children:
             stdout, stderr = child.communicate(timeout=12)
             assert child.returncode == 0, (stdout, stderr)
-        running = fixture.rpc("daemon-info")["pid"]
-        attached = subprocess.run([str(binary), "rpc", '{"method":"local-start"}'],
+        running = fixture.rpc("status")["pid"]
+        attached = subprocess.run([str(binary), "rpc", '{"method":"local-daemon-start"}'],
                                   env=fixture.env, capture_output=True, text=True, timeout=12)
         assert attached.returncode == 0, attached.stderr
-        assert fixture.rpc("daemon-info")["pid"] == running
+        assert fixture.rpc("status")["pid"] == running
 
     with scenario("background serve uses saved incoming settings and token paths"):
         stop_daemon(fixture.env["GMUX_SOCKET"])
         token = fixture.path / "token"
         token.write_text("a" * 64 + "\n")
-        incoming(fixture, "--allow-remote", "true", "--listen", "127.0.0.1:0",
+        incoming(fixture, "--remote-access", "true", "--listen-address", "127.0.0.1:0",
                  "--auth", "token", "--token-file", "token")
         launch(fixture)
-        address = fixture.rpc("daemon-info")["listen"]
+        address = fixture.rpc("status")["bound_address"]
         subprocess.run([str(binary), "connection", "add", address, "--name", "server", "--auth", "token",
                         "--token-file", str(token)], env=client.env,
                        capture_output=True, text=True, timeout=12, check=True)
@@ -148,16 +148,16 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
             occupied.bind(("127.0.0.1", 0))
             occupied.listen()
             address = f"127.0.0.1:{occupied.getsockname()[1]}"
-            incoming(fixture, "--allow-remote", "true", "--listen", address, "--auth", "none")
+            incoming(fixture, "--remote-access", "true", "--listen-address", address, "--auth", "none")
             launch(fixture)
             status = subprocess.run([str(binary), "connection", "list"], env=fixture.env,
                                     capture_output=True, text=True, timeout=12, check=True)
-            assert "Address already in use" in json.loads(status.stdout)["hosting_error"], status.stdout
-            assert fixture.rpc("daemon-info")["listen"] is None
-        running = fixture.rpc("daemon-info")["pid"]
-        incoming(fixture, "--listen", "127.0.0.1:0")
-        assert fixture.rpc("daemon-info")["pid"] == running
-        assert fixture.rpc("daemon-info")["listen"]
+            assert "Address already in use" in json.loads(status.stdout)["remote_access_error"], status.stdout
+            assert fixture.rpc("status")["bound_address"] is None
+        running = fixture.rpc("status")["pid"]
+        incoming(fixture, "--listen-address", "127.0.0.1:0")
+        assert fixture.rpc("status")["pid"] == running
+        assert fixture.rpc("status")["bound_address"]
 
     with scenario("the daemon validates saved execution and reports startup failure in its log"):
         stop_daemon(fixture.env["GMUX_SOCKET"])

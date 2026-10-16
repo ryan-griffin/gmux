@@ -178,7 +178,7 @@ impl Ui {
             } else {
                 (
                     "No Connections",
-                    "Enable Local Execution or add a remote connection in Manage Connections",
+                    "Enable the Local Daemon or add a remote connection in Manage Connections",
                 )
             };
             self.empty.set_title(title);
@@ -284,7 +284,7 @@ impl Ui {
             if tab.custom_name {
                 let remove_name = gio::MenuItem::new(Some("Use _Automatic Tab Name"), None);
                 remove_name.set_action_and_target_value(
-                    Some("win.remove-tab-name"),
+                    Some("win.reset-name"),
                     Some(&tab.id.to_variant()),
                 );
                 menu.append_item(&remove_name);

@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
     if args.native:
         settings = temp / "config/gmux/clients/gtk/settings.json"
         settings.parent.mkdir(parents=True)
-        settings.write_text(json.dumps(dict(local_execution=True)))
+        settings.write_text(json.dumps(dict(local_daemon_enabled=True)))
     log = (artifacts / "daemon-smoke.log").open("w")
     daemon = None
     app = None
@@ -123,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         duplicate = subprocess.run([str(cargo_binary("gmux")), "serve"], env=env,
                                    capture_output=True, text=True, timeout=5)
         assert duplicate.returncode != 0 and "already running or starting" in duplicate.stderr, duplicate
-        assert rpc("daemon-info")["pid"] == daemon.pid
+        assert rpc("status")["pid"] == daemon.pid
         first = cli("new", "--directory", root)
         pane = first["pane"]
         assert cli("status")["pid"] == daemon.pid
@@ -149,8 +149,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         time.sleep(0.1)
         cli("send", "--pane", pane, "printf '\\033[2J\\033[HHEADLESS_READY'", "--enter")
         wait_for(lambda: "HEADLESS_READY" in cli("read", "--pane", pane, text=True))
-        assert rpc("daemon-info")["snapshots"] == 0, "Detached output must not extract viewports"
-        pid = rpc("daemon-info")["pid"]
+        assert rpc("status")["snapshots"] == 0, "Detached output must not extract viewports"
+        pid = rpc("status")["pid"]
         before = ticks(pid)
         time.sleep(1.1)
         idle_ticks = ticks(pid) - before
@@ -159,7 +159,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=18, daemon=rpc("_hello")["daemon"])
+        command("attach", version=20, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header
@@ -190,11 +190,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert header["rows"] == [2], f"Expected one changed row, received {header['rows']}"
 
         hidden = rpc("split", pane=pane)["pane"]
-        count = rpc("daemon-info")["snapshots"]
+        count = rpc("status")["snapshots"]
         send(hidden, "for i in $(seq 1 300); do printf 'hidden %s\\n' \"$i\"; done")
         wait_for(lambda: "hidden 300" in rpc("read", pane=hidden)["text"])
         time.sleep(0.1)
-        assert rpc("daemon-info")["snapshots"] == count, "Hidden output must not extract a render snapshot"
+        assert rpc("status")["snapshots"] == count, "Hidden output must not extract a render snapshot"
         command("subscribe", panes=[hidden])
         header, cells = screen(hidden)
         assert len(header["rows"]) == header["frame"]["rows"], "New subscription must resync every row"
@@ -209,7 +209,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert header["frame"]["scrollback"]["offset"] == 12
         stream.close()
         stream = None
-        wait_for(lambda: not rpc("daemon-info")["attached"])
+        wait_for(lambda: not rpc("status")["local_clients"])
 
         # Raw terminal status query must receive a reply without a frontend.
         reply_file = temp / "reply"
@@ -222,7 +222,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         if args.native:
             def start_app():
                 process = subprocess.Popen([str(cargo_binary("gmux-gtk"))], env=env, stdout=log, stderr=log)
-                wait_for(lambda: (temp / "socket.ui").exists() and rpc("daemon-info")["attached"])
+                wait_for(lambda: (temp / "socket.ui").exists() and rpc("status")["local_clients"])
                 wait_for(lambda: rpc("renderer-info")["gtk"])
                 listed = rpc("list")
                 identity = rpc("_hello")["daemon"]
@@ -241,9 +241,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
             wait_for(progress.exists)
-            assert rpc("daemon-info")["pid"] == pid
+            assert rpc("status")["pid"] == pid
             assert "BACKGROUND_CONTINUED" in rpc("read", pane=pane)["text"]
             app = start_app()
             assert [p["id"] for p in rpc("list")["tabs"][0]["panes"]] == [pane, hidden]
@@ -255,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             app.kill()
             app.wait(timeout=8)
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
             assert Path(env["GMUX_SOCKET"] + ".ui").exists(), "Exercise a stale frontend socket"
             cli("send", "printf 'AFTER_FRONTEND_CRASH\\n'", "--pane", pane, "--enter")
             wait_for(lambda: "AFTER_FRONTEND_CRASH" in rpc("read", pane=pane)["text"])
@@ -269,9 +269,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             daemon = None
             assert app.poll() is None, "Stopping execution must leave the client open"
             wait_for(lambda: rpc("renderer-info")["gtk"])
+            wait_for(lambda: rpc("status")["pid"] != pid and rpc("status")["local_clients"])
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
+            cli("stop")
             wait_for(lambda: not Path(f"/proc/{command_pid}").exists())
             wait_for(lambda: not Path(f"/proc/{original_pid.strip()}").exists())
         else:
@@ -299,7 +301,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=18, daemon=rpc("_hello")["daemon"])
+        command("attach", version=20, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[hidden])
         screen(hidden)
         command("scroll-to", pane=hidden, row=0, serial=99)
@@ -320,7 +322,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         daemon = None
         assert not (temp / "socket").exists(), "SIGTERM must clean up the socket"
 
-        print(f"PASS: headless PTYs, {idle_ticks} idle CPU ticks, one-row packets, ordered copy with absent and blank selections, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Quit/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and an open client after daemon Stop" if args.native else ""))
+        print(f"PASS: headless PTYs, {idle_ticks} idle CPU ticks, one-row packets, ordered copy with absent and blank selections, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Stop/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and an open client after daemon Stop" if args.native else ""))
     finally:
         if stream:
             stream.close()

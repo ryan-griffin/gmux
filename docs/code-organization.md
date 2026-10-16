@@ -24,7 +24,7 @@ the same connection selection and queued directory handling. Its submodules hand
 - `backend.rs`: asynchronous requests, state reconciliation, presentation saves,
   and GUI socket commands.
 - `management.rs`: management lists and temporary editor dialogs.
-- `connections_dialog.rs`: local connection name and hosting editor, remote connection list and forms,
+- `connections_dialog.rs`: local connection name and remote access editor, remote connection list and forms,
   authentication file selection, reconnect, and removal dialogs.
 - `connection_menu.rs`: shared connection choices, stable daemon targets, and live availability.
 - `machine.rs`: machine icons, labels, and connection captions.
@@ -78,7 +78,7 @@ handles Unix sockets, direct TCP endpoints, cancellation, and request workers.
 `transport.rs` and `transport/requests.rs` encode viewport packets and stream commands.
 `network.rs` contains client TCP authentication and bounded I/O. In core,
 `src/daemon/network.rs` accepts incoming TCP connections and forwards execution
-requests and streams. `src/daemon/hosting.rs` owns listener configuration and lifecycle.
+requests and streams. `src/daemon/remote_access.rs` owns listener configuration and lifecycle.
 There is no outgoing connection registry or proxy in the daemon.
 
 See [background sessions](terminal-sessions.md) for lifecycle and protocol limits.

@@ -61,7 +61,7 @@ Local layout replies contain their result IDs and the daemon identity:
 {"tab":1,"pane":2,"daemon":"..."}
 ```
 
-Use `daemon-info` to discover the daemon identity and protocol version. IDs are
+Use `status` to discover the daemon identity and protocol version. IDs are
 scoped to a persistent daemon identity and are never reused by that daemon.
 A process restart preserves identity; a new installation at the same address
 may have a different identity.
@@ -74,10 +74,10 @@ and window actions. It is not part of the daemon API.
 ## Direct TCP connections
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 18:
+handshake. The current protocol version is 20:
 
 ```json
-{"version":18,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":20,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -102,43 +102,62 @@ the caller.
 
 Local and TCP control connections support these methods:
 
-- `daemon-info` reports identity, version, process ID, listener address, attached
-  clients, and execution statistics.
+- `status` reports identity, version, process ID, `hostname`, `bound_address`,
+  attached Unix and TCP stream counts in `local_clients` and `remote_clients`,
+  and execution statistics. Connection display names are client-owned aliases; `hostname`
+  always identifies the daemon's host.
 - `list` returns this daemon's tabs, topology, and pane metadata. Tab and pane
   references contain `daemon` and `id`.
 - `new` creates a tab. Optional `directory` and `name` fields choose its working
   directory and shared name. Omitted directories use the daemon's home directory.
 - `split` creates a pane beside `pane`. Set `down` to true for a vertical split.
 - `close` terminates `pane`; `close-tab` terminates every pane in `tab`.
-- `rename` sets `tab`'s shared `name`; `remove-tab-name` restores its automatic name.
+- `rename` sets `tab`'s shared `name`; `reset-name` restores its automatic name.
 - `send` writes `text` to `pane`. Set `paste` for terminal paste handling and
-  `enter` to submit the text as a command.
+  `enter` to append a carriage return and submit the text as a command.
+  `enter` works with both raw input and paste handling.
 - `read` returns a pane's visible terminal contents in `text`.
 - `notify` delivers `message` to clients viewing `pane` and records an unread alert.
-- `quit` checkpoints history, stops the addressed daemon, and terminates all of
-  its terminal processes. The CLI calls this operation `stop`.
+- `stop` checkpoints history, stops the addressed daemon, and terminates all of
+  its terminal processes. `quit` belongs to the GTK app API.
 
 Both transports also expose `state`, `busy`, `metadata`, and `copy` for execution
-clients. `state` returns the execution snapshot and revision. Layout mutations
-over TCP return a snapshot with `result` containing the operation's output.
-The Rust control helper unwraps those results for CLI-style requests.
+clients. `state` returns the execution snapshot in `execution`, together with
+the daemon's identity, `hostname`, revision, and pane metadata. Layout mutations
+over TCP return the same snapshot with `result` containing the operation's
+output. The Rust control helper unwraps those results for CLI-style requests.
+GTK's separate client API uses `session` for its assembled window view.
+
+The `rpc` subcommand in both binaries prints the complete JSON reply, including
+the `text` field returned by `read` and `copy`. The ordinary `read` subcommand
+prints terminal text directly.
 
 Pane targets must be explicit over TCP. Destination directories must be absolute
 or begin with `~/`, which the destination daemon expands. Local CLI commands
 resolve relative paths against the calling shell. The daemon CLI never uses a
 local shell's `GMUX_PANE` to select a remote pane.
 
-Hosting configuration uses `hosting-get` and `hosting-set` on the local control
-socket. Saved outgoing connections belong to the client library and use no daemon
-API. Incoming TCP connections address only the serving daemon, including its
-shutdown operation. They cannot manage hosting or client state.
+Remote access configuration uses `remote-access-get` and `remote-access-set` on
+the local control socket. The `remote_access` object contains `enabled`,
+`listen_address`, and `authentication`. These are saved settings that can be
+edited while the daemon is running or stopped. `bound_address` reports the
+actual listener address, or null when no listener is running;
+`remote_access_error` reports a listener startup failure. The configured
+`listen_address` can use port zero to request an available port.
+
+Saved outgoing connections belong to the client library and use no daemon API.
+Incoming TCP connections address only the serving daemon, including its shutdown
+operation. They cannot manage remote access or client state. Client lifecycle
+helpers `local-daemon-start` and `local-daemon-stop` start or attach to the local
+daemon and wait for its shutdown, respectively. They are handled by the client
+library and cannot be sent directly to a daemon.
 
 ## Terminal streams
 
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":18,"daemon":"returned-identity"}
+{"method":"attach","version":20,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -164,6 +183,11 @@ contains pane `meta`, an optional `frame`, changed `rows`, and optional executio
 `state`, Git metadata, notifications, search results, selection, copy text, or
 errors. A full viewport arrives on subscription; later packets contain changed
 rows. Metadata-only packets have no cell data.
+
+Pane metadata uses `unread_sequence` for the newest unread alert's sequence
+number, or zero after acknowledgement. Send that sequence as `through` in
+`mark-read` to acknowledge alerts without clearing newer ones. Listings use
+the boolean `unread` field to indicate whether alerts remain.
 
 For each row listed in the header, there are `frame.cols` cells in column order.
 Each cell has 71 bytes: 64 bytes of zero-padded UTF-8 text, three RGB foreground

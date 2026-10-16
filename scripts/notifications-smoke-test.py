@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
     config = temp / "config/gmux"
     config.mkdir(parents=True)
     (config / "clients/gtk").mkdir(parents=True, exist_ok=True)
-    (config / "clients/gtk/settings.json").write_text(json.dumps(dict(local_execution=True, desktop_notifications=False)))
+    (config / "clients/gtk/settings.json").write_text(json.dumps(dict(local_daemon_enabled=True, desktop_notifications=False)))
     shell = temp / "shell"
     shell.write_text("#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
     shell.chmod(0o700)
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
         def start():
             global app
             app = subprocess.Popen([str(cargo_binary("gmux-gtk"))], env=env, stdout=log, stderr=log)
-            wait_for(lambda: rpc("daemon-info")["attached"])
+            wait_for(lambda: rpc("status")["local_clients"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
 
         def detach():
@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
 
         def send(pane, text):
             rpc("send", pane=pane, text=text, paste=True, enter=True)
@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             stream = socket.socket(socket.AF_UNIX)
             stream.settimeout(6)
             stream.connect(env["GMUX_SOCKET"] + ".stream")
-            command("attach", version=18, daemon=rpc("_hello")["daemon"])
+            command("attach", version=20, daemon=rpc("_hello")["daemon"])
 
         def command(method, **params):
             stream.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
@@ -99,14 +99,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
                 assert all(len(state["tabs"]) == 2 for state in states), "Queued GUI requests must all receive replies"
             send(background["pane"], "printf '\\033]9;UNREAD_OSC\\007'")
             wait_for(lambda: tab(background["tab"])["unread"])
-            daemon_pid = rpc("daemon-info")["pid"]
+            daemon_pid = rpc("status")["pid"]
             detach()
             assert tab(background["tab"])["unread"]
             start()
-            assert rpc("daemon-info")["pid"] == daemon_pid
+            assert rpc("status")["pid"] == daemon_pid
             assert tab(background["tab"])["unread"], "An unread alert must survive window reopening"
             rpc("focus", pane=background["pane"])
-            wait_for(lambda: rpc("_metadata", pane=background["pane"])["meta"]["unread"] == 0)
+            wait_for(lambda: rpc("_metadata", pane=background["pane"])["meta"]["unread_sequence"] == 0)
             assert not tab(background["tab"])["unread"]
             rpc("focus", pane=foreground["pane"])
             detach()
@@ -126,27 +126,27 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             attach_stream()
             header = packet(queued)
             assert header["notifications"] == [f"cli-{i}" for i in range(36, 100)], header
-            sequence = header["meta"]["unread"]
+            sequence = header["meta"]["unread_sequence"]
             rpc("notify", pane=queued, message="NEWER_ALERT")
             command("mark-read", pane=queued, through=sequence)
-            newer = wait_for(lambda: (value := rpc("_metadata", pane=queued)["meta"]["unread"]) > sequence and value)
+            newer = wait_for(lambda: (value := rpc("_metadata", pane=queued)["meta"]["unread_sequence"]) > sequence and value)
             time.sleep(0.1)
-            assert rpc("_metadata", pane=queued)["meta"]["unread"] == newer, "A stale acknowledgement must preserve a new alert"
+            assert rpc("_metadata", pane=queued)["meta"]["unread_sequence"] == newer, "A stale acknowledgement must preserve a new alert"
             command("mark-read", pane=queued, through=newer)
-            wait_for(lambda: rpc("_metadata", pane=queued)["meta"]["unread"] == 0)
+            wait_for(lambda: rpc("_metadata", pane=queued)["meta"]["unread_sequence"] == 0)
             stream.close()
             stream = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
 
             previous = newer
             send(queued, "for i in $(seq 0 99); do printf '\\033]9;osc-%s\\007' \"$i\"; done")
-            wait_for(lambda: rpc("_metadata", pane=queued)["meta"]["unread"] >= previous + 100)
+            wait_for(lambda: rpc("_metadata", pane=queued)["meta"]["unread_sequence"] >= previous + 100)
             attach_stream()
             header = packet(queued)
             assert header["notifications"] == [f"osc-{i}" for i in range(36, 100)], header
             stream.close()
             stream = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
             start()
             assert tab(background["tab"])["unread"], "Unread state must survive delivery of queued alerts"
             print("PASS: unread OSC/CLI alerts survive reconnect, GUI reads clear daemon flags, stale acknowledgements preserve newer alerts, both queues retain the latest 64 messages, and queued GUI requests drain without a polling timer")

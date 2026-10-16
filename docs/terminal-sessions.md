@@ -58,8 +58,9 @@ Slow client disk writes leave the UI free to read the last committed state.
 
 State lives under `$XDG_CONFIG_HOME/gmux/`, normally `~/.config/gmux/`:
 
-- `clients/gtk/settings.json`: GTK preferences, including `local_execution`, which
-  defaults to false. Enabling it starts or attaches to the local daemon on launch.
+- `clients/gtk/settings.json`: GTK preferences, including `local_daemon_enabled`, which
+  defaults to false. It controls the Local Daemon toggle, starts or attaches on
+  launch, and enables automatic recovery if the daemon stops while GTK is open.
 - `daemon-id.json`: persistent daemon identity.
 - `execution.json`: local tabs and their creation times, pane topology,
   directories, checkpoint references, and the tab/pane ID allocation counter.
@@ -68,7 +69,7 @@ State lives under `$XDG_CONFIG_HOME/gmux/`, normally `~/.config/gmux/`:
   presentation and assignments, selection, split proportions, and window defaults.
 - `connections.json`: client-owned local alias, remote names, addresses,
   authentication file paths, and pinned identities.
-- `hosting.json`: daemon-owned TCP listener settings.
+- `remote-access.json`: daemon-owned TCP listener settings.
 - `scrollback/`: daemon-owned history checkpoints.
 - `daemon.log`: startup and runtime errors.
 
@@ -149,7 +150,7 @@ running GTK app and do not accept `--connection`. Tab and pane focus can select
 a connection. `focus` accepts one target at a time. CLI close and quit commands
 act immediately; GUI actions ask for confirmation when affected panes are busy.
 
-`list` and `daemon-info` include `daemon`, the persistent identity. Each listed
+`list` and `status` include `daemon`, the persistent identity. Each listed
 tab and pane has a `reference` containing that identity and its numeric `id`.
 Each tab's `created_at` is measured in microseconds since the Unix epoch.
 Layout command replies also include `daemon` alongside their numeric result IDs.

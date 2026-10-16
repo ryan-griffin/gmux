@@ -17,7 +17,7 @@ pub struct Remote {
     pub address: String,
     pub authentication: Authentication,
     pub daemon: DaemonId,
-    pub kind: MachineKind,
+    pub machine_kind: MachineKind,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +44,7 @@ impl Catalog {
             .map(|r| Machine {
                 name: r.name.clone(),
                 daemon: r.daemon,
-                kind: r.kind,
+                machine_kind: r.machine_kind,
             })
             .collect()
     }
@@ -82,9 +82,9 @@ impl Catalog {
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
 enum Request {
     ConnectionList,
-    HostingGet,
-    HostingSet {
-        hosting: network::Hosting,
+    RemoteAccessGet,
+    RemoteAccessSet {
+        remote_access: network::RemoteAccess,
     },
     ConnectionAdd {
         name: Option<String>,
@@ -98,14 +98,14 @@ enum Request {
         name: Option<Option<String>>,
         address: Option<String>,
         authentication: Option<Authentication>,
-        hosting: Option<network::Hosting>,
+        remote_access: Option<network::RemoteAccess>,
     },
     ConnectionRemove {
         connection: String,
         daemon: Option<DaemonId>,
     },
-    LocalStart,
-    LocalStop,
+    LocalDaemonStart,
+    LocalDaemonStop,
     #[serde(rename = "_connection-call")]
     ConnectionCall {
         connection: String,
@@ -126,10 +126,10 @@ pub fn handles(method: &str) -> bool {
             | "connection-add"
             | "connection-edit"
             | "connection-remove"
-            | "hosting-get"
-            | "hosting-set"
-            | "local-start"
-            | "local-stop"
+            | "remote-access-get"
+            | "remote-access-set"
+            | "local-daemon-start"
+            | "local-daemon-stop"
             | "_connection-call"
     )
 }
@@ -173,24 +173,27 @@ pub fn call_at(
     let result = match serde_json::from_value::<Request>(body)? {
         Request::ConnectionList => {
             let catalog = Catalog::load()?;
-            let mut result = hosting_status(cancellation)?;
+            let mut result = remote_access_status(cancellation)?;
             result["local"]["name"] = json!(catalog.local_name());
             result["hostname"] = json!(crate::model::hostname());
             result["remotes"] = json!(catalog.remotes);
             result
         }
-        Request::HostingGet => hosting_status(cancellation)?,
-        Request::HostingSet { hosting } => {
-            set_hosting(&hosting, cancellation)?;
-            json!({"hosting":hosting})
+        Request::RemoteAccessGet => remote_access_status(cancellation)?,
+        Request::RemoteAccessSet { remote_access } => {
+            set_remote_access(&remote_access, cancellation)?;
+            json!({"remote_access":remote_access})
         }
-        Request::LocalStart => {
+        Request::LocalDaemonStart => {
             crate::local::ensure_daemon(cancellation)?;
-            let mut state = call(&ipc::Endpoint::local(), json!({"method":"hosting-get"}))?;
+            let mut state = call(
+                &ipc::Endpoint::local(),
+                json!({"method":"remote-access-get"}),
+            )?;
             state["local"]["name"] = json!(Catalog::load()?.local_name());
             state
         }
-        Request::LocalStop => ipc::Endpoint::local().stop(cancellation)?,
+        Request::LocalDaemonStop => ipc::Endpoint::local().stop(cancellation)?,
         Request::ConnectionAdd {
             name,
             address,
@@ -263,7 +266,7 @@ pub fn call_at(
                     address,
                     authentication,
                     daemon: client.daemon,
-                    kind: client.machine_kind,
+                    machine_kind: client.machine_kind,
                 });
                 Ok(json!({"name":name,"daemon":client.daemon}))
             })?
@@ -274,13 +277,13 @@ pub fn call_at(
             name,
             address,
             authentication,
-            hosting,
+            remote_access,
         } => {
             if connection == "local" || Catalog::load()?.is_local(&connection) {
                 anyhow::ensure!(daemon.is_none(), "Remote connection identity changed");
                 anyhow::ensure!(
                     address.is_none() && authentication.is_none(),
-                    "Use hosting settings to configure incoming connections to the local daemon"
+                    "Use remote access settings to configure incoming connections to the local daemon"
                 );
                 let mut result = json!({"ok":true});
                 if let Some(name) = name {
@@ -303,24 +306,24 @@ pub fn call_at(
                         || {
                             // Both inputs and the catalog's file write are prepared
                             // before changing the daemon; publish the name last.
-                            if let Some(hosting) = &hosting {
-                                set_hosting(hosting, cancellation)?;
+                            if let Some(remote_access) = &remote_access {
+                                set_remote_access(remote_access, cancellation)?;
                             }
                             Ok(())
                         },
                     )?;
                     result["name"] = json!(name);
-                } else if let Some(hosting) = &hosting {
-                    set_hosting(hosting, cancellation)?;
+                } else if let Some(remote_access) = &remote_access {
+                    set_remote_access(remote_access, cancellation)?;
                 }
-                if let Some(hosting) = hosting {
-                    result["hosting"] = serde_json::to_value(hosting)?;
+                if let Some(remote_access) = remote_access {
+                    result["remote_access"] = serde_json::to_value(remote_access)?;
                 }
                 result
             } else {
                 anyhow::ensure!(
-                    hosting.is_none(),
-                    "Hosting settings belong to the local connection"
+                    remote_access.is_none(),
+                    "Remote access settings belong to the local connection"
                 );
                 let original = Catalog::load()?.remote(&connection, daemon)?.clone();
                 let mut remote = original.clone();
@@ -348,7 +351,7 @@ pub fn call_at(
                         Some(remote.daemon),
                         cancellation,
                     )?;
-                    remote.kind = client.machine_kind;
+                    remote.machine_kind = client.machine_kind;
                 }
                 if let Some(c) = cancellation {
                     c.check()?;
@@ -399,40 +402,40 @@ pub fn call_at(
     Ok(result)
 }
 
-fn hosting_status(cancellation: Option<&ipc::Cancellation>) -> anyhow::Result<Value> {
+fn remote_access_status(cancellation: Option<&ipc::Cancellation>) -> anyhow::Result<Value> {
     let current = ipc::call_if_running(
         &ipc::socket_path(),
-        json!({"method":"hosting-get"}),
+        json!({"method":"remote-access-get"}),
         cancellation,
     )?;
     let running = current.is_some();
     let mut result = match current {
         Some(value) => value,
         None => json!({
-            "hosting":storage::load::<network::Hosting>("hosting.json")?,
-            "listen":null,"hosting_error":null,
-            "local":{"name":crate::model::hostname(),"kind":MachineKind::local(),"daemon":null}
+            "remote_access":storage::load::<network::RemoteAccess>("remote-access.json")?,
+            "bound_address":null,"remote_access_error":null,
+            "local":{"name":crate::model::hostname(),"machine_kind":MachineKind::local(),"daemon":null}
         }),
     };
     result["running"] = json!(running);
     Ok(result)
 }
 
-fn set_hosting(
-    hosting: &network::Hosting,
+fn set_remote_access(
+    remote_access: &network::RemoteAccess,
     cancellation: Option<&ipc::Cancellation>,
 ) -> anyhow::Result<()> {
-    if hosting.enabled {
-        hosting.authentication.token()?;
+    if remote_access.enabled {
+        remote_access.authentication.token()?;
     }
     if ipc::call_if_running(
         &ipc::socket_path(),
-        json!({"method":"hosting-set","hosting":hosting}),
+        json!({"method":"remote-access-set","remote_access":remote_access}),
         cancellation,
     )?
     .is_none()
     {
-        storage::save("hosting.json", hosting)?;
+        storage::save("remote-access.json", remote_access)?;
     }
     Ok(())
 }

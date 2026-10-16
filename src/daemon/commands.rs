@@ -270,7 +270,7 @@ impl Daemon {
                 tab.custom_name = true;
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
-            Command::RemoveTabName { tab } => {
+            Command::ResetName { tab } => {
                 let tab = self
                     .state
                     .tabs
@@ -298,17 +298,16 @@ impl Daemon {
             Request::Internal(InternalRequest::Hello) => Ok(
                 json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_client::model::MachineKind::local(),"hostname":model::hostname(),"home_directory":model::home(),"quitting":self.quitting}),
             ),
-            Request::Public(PublicRequest::DaemonInfo) => Ok(json!({
+            Request::Public(PublicRequest::Status) => Ok(json!({
                 "version": transport::VERSION,
                 "daemon": self.id,
                 "hostname": model::hostname(),
                 "home_directory": model::home(),
                 "machine_kind": model::MachineKind::local(),
-                "listen": self.hosting.address(),
+                "bound_address": self.remote_access.bound_address(),
                 "pid": std::process::id(),
-                "attached": self.frontends.values().any(|f| f.attached && !f.remote),
-                "frontends": self.frontends.values().filter(|f| f.attached && !f.remote).count(),
-                "remote_frontends": self.frontends.values().filter(|f| f.attached && f.remote).count(),
+                "local_clients": self.frontends.values().filter(|f| f.attached && !f.remote).count(),
+                "remote_clients": self.frontends.values().filter(|f| f.attached && f.remote).count(),
                 "panes": self.sessions.len(),
                 "uptime_seconds": self.started.elapsed().as_secs(),
                 "snapshots": self.snapshots,
@@ -368,7 +367,7 @@ impl Daemon {
                 let id = self.resolve_pane(pane)?;
                 Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
             }
-            Request::Public(PublicRequest::Quit) => {
+            Request::Public(PublicRequest::Stop) => {
                 let checkpoint = self.prepare_checkpoint();
                 let warning = match checkpoint {
                     Ok(checkpoint) => {
@@ -396,7 +395,7 @@ impl Daemon {
                 if paste {
                     session.send_text(&text, enter)?;
                 } else {
-                    session.send(text.as_bytes())?;
+                    session.send_with_enter(text.as_bytes(), enter)?;
                 }
                 Ok(json!({"ok":true}))
             }
@@ -431,10 +430,8 @@ impl Daemon {
         };
         match request {
             ExecutionRequest::List => self.list(),
-            ExecutionRequest::DaemonInfo => {
-                self.control(Request::Public(PublicRequest::DaemonInfo))
-            }
-            ExecutionRequest::Quit => self.control(Request::Public(PublicRequest::Quit)),
+            ExecutionRequest::Status => self.control(Request::Public(PublicRequest::Status)),
+            ExecutionRequest::Stop => self.control(Request::Public(PublicRequest::Stop)),
             ExecutionRequest::State => {
                 self.refresh_state();
                 Ok(serde_json::to_value(self.execution_state())?)

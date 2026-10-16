@@ -125,7 +125,7 @@ impl View {
                 .build();
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             let icon = gtk::Image::builder()
-                .icon_name(super::machine::icon_name(machine.kind))
+                .icon_name(super::machine::icon_name(machine.machine_kind))
                 .pixel_size(16)
                 .accessible_role(gtk::AccessibleRole::Presentation)
                 .build();

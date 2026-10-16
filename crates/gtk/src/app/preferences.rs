@@ -9,9 +9,16 @@ use std::{
 pub(super) struct AppPreferences {
     pub settings: Rc<RefCell<Settings>>,
     writer: SettingsWriter,
+    pending: RefCell<Option<PendingPreferenceSave>>,
     desktop: Option<gio::Settings>,
     desktop_handler: RefCell<Option<glib::SignalHandlerId>>,
     source: RefCell<Option<glib::SourceId>>,
+}
+
+struct PendingPreferenceSave {
+    local_daemon_enabled: bool,
+    dirty: bool,
+    callback: Box<dyn FnOnce(anyhow::Result<()>)>,
 }
 
 impl AppPreferences {
@@ -26,6 +33,7 @@ impl AppPreferences {
         let preferences = Rc::new(Self {
             settings: Rc::new(RefCell::new(settings)),
             writer: SettingsWriter::new(wake.clone()),
+            pending: RefCell::new(None),
             desktop,
             desktop_handler: RefCell::new(None),
             source: RefCell::new(None),
@@ -40,11 +48,15 @@ impl AppPreferences {
                 let Some(preferences) = weak.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
-                for error in preferences.writer.errors.try_iter() {
-                    if let Some(ui) = windows.upgrade().and_then(|owner| owner.active()) {
-                        ui.message(&error);
-                    } else {
-                        eprintln!("Could not save preferences: {error}");
+                for (confirmed, result) in preferences.writer.results.try_iter() {
+                    if confirmed {
+                        preferences.finish_save(result);
+                    } else if let Err(error) = result {
+                        if let Some(ui) = windows.upgrade().and_then(|owner| owner.active()) {
+                            ui.message(&error);
+                        } else {
+                            eprintln!("{error}");
+                        }
                     }
                 }
                 glib::ControlFlow::Continue
@@ -70,6 +82,45 @@ impl AppPreferences {
         }
         Ok(preferences)
     }
+
+    fn persist(&self) {
+        if let Some(pending) = self.pending.borrow_mut().as_mut() {
+            // A later snapshot must include the outcome of the confirmed save.
+            pending.dirty = true;
+        } else {
+            self.writer.persist(self.settings.borrow().clone(), false);
+        }
+    }
+
+    pub(super) fn save_local_daemon_enabled(
+        &self,
+        enabled: bool,
+        callback: impl FnOnce(anyhow::Result<()>) + 'static,
+    ) {
+        if self.pending.borrow().is_some() {
+            callback(Err(anyhow::anyhow!("The local connection is changing")));
+            return;
+        }
+        let mut settings = self.settings.borrow().clone();
+        settings.local_daemon_enabled = enabled;
+        *self.pending.borrow_mut() = Some(PendingPreferenceSave {
+            local_daemon_enabled: enabled,
+            dirty: false,
+            callback: Box::new(callback),
+        });
+        self.writer.persist(settings, true);
+    }
+
+    fn finish_save(&self, result: Result<(), String>) {
+        let pending = self.pending.borrow_mut().take().unwrap();
+        if result.is_ok() {
+            self.settings.borrow_mut().local_daemon_enabled = pending.local_daemon_enabled;
+        }
+        if pending.dirty {
+            self.persist();
+        }
+        (pending.callback)(result.map_err(anyhow::Error::msg));
+    }
 }
 
 impl Drop for AppPreferences {
@@ -82,18 +133,39 @@ impl Drop for AppPreferences {
         {
             desktop.disconnect(handler);
         }
+        if let Some(pending) = self.pending.get_mut().take()
+            && pending.dirty
+        {
+            // The main loop may stop before the save completes. Flush other
+            // preference changes with its outcome before the writer shuts down.
+            for (confirmed, result) in &self.writer.results {
+                if confirmed {
+                    if result.is_ok() {
+                        self.settings.borrow_mut().local_daemon_enabled =
+                            pending.local_daemon_enabled;
+                    }
+                    self.writer.persist(self.settings.borrow().clone(), false);
+                }
+                if let Err(error) = result {
+                    eprintln!("{error}");
+                }
+                if confirmed {
+                    break;
+                }
+            }
+        }
     }
 }
 
 #[derive(Default)]
 struct PendingSettings {
-    snapshot: Option<Settings>,
+    snapshot: Option<(Settings, bool)>,
     closed: bool,
 }
 
 struct SettingsWriter {
     pending: Arc<(Mutex<PendingSettings>, Condvar)>,
-    errors: mpsc::Receiver<String>,
+    results: mpsc::Receiver<(bool, Result<(), String>)>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -101,10 +173,10 @@ impl SettingsWriter {
     fn new(wake: ipc::Wake) -> Self {
         let pending = Arc::new((Mutex::new(PendingSettings::default()), Condvar::new()));
         let writing = pending.clone();
-        let (errors, receiver) = mpsc::channel();
+        let (results, receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
             loop {
-                let settings = {
+                let (settings, confirmed) = {
                     let (lock, ready) = &*writing;
                     let mut pending = lock.lock().unwrap();
                     while pending.snapshot.is_none() && !pending.closed {
@@ -115,26 +187,26 @@ impl SettingsWriter {
                     };
                     settings
                 };
-                if let Err(error) = storage::save("settings.json", &settings) {
-                    let _ = errors.send(error.to_string());
+                let result = storage::save("settings.json", &settings)
+                    .map_err(|error| format!("Could not save preferences: {error}"));
+                if confirmed || result.is_err() {
+                    let _ = results.send((confirmed, result));
                     wake.notify();
                 }
             }
         });
         Self {
             pending,
-            errors: receiver,
+            results: receiver,
             worker: Some(worker),
         }
     }
-    fn persist(&self, settings: Settings) -> anyhow::Result<()> {
+    fn persist(&self, settings: Settings, confirmed: bool) {
         let (lock, ready) = &*self.pending;
         let mut pending = lock.lock().unwrap();
-        anyhow::ensure!(!pending.closed, "Preferences writer is closed");
         // Keep the in-flight save and only the latest pending snapshot.
-        pending.snapshot = Some(settings);
+        pending.snapshot = Some((settings, confirmed));
         ready.notify_one();
-        Ok(())
     }
 }
 
@@ -147,8 +219,10 @@ impl Drop for SettingsWriter {
         if self.worker.take().unwrap().join().is_err() {
             eprintln!("Preferences writer stopped unexpectedly");
         }
-        for error in self.errors.try_iter() {
-            eprintln!("Could not save preferences: {error}");
+        for (_, result) in self.results.try_iter() {
+            if let Err(error) = result {
+                eprintln!("{error}");
+            }
         }
     }
 }
@@ -366,9 +440,8 @@ impl Ui {
     pub(super) fn persist_settings(&self) {
         if let Some(owner) = self.owner.upgrade()
             && let Some(preferences) = owner.preferences.borrow().as_ref()
-            && let Err(error) = preferences.writer.persist(self.settings.borrow().clone())
         {
-            self.message(&error.to_string());
+            preferences.persist();
         }
     }
     pub(super) fn redraw_terminals(&self) {

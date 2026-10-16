@@ -82,7 +82,7 @@ pub fn pane_directories<'de, D: serde::Deserializer<'de>>(
 pub struct Machine {
     pub name: String,
     pub daemon: DaemonId,
-    pub kind: MachineKind,
+    pub machine_kind: MachineKind,
 }
 
 pub fn validate_ids(tab: u64, ids: Vec<u64>) -> anyhow::Result<()> {

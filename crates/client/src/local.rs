@@ -27,7 +27,7 @@ pub(crate) fn stop(
         std::io::Error::last_os_error()
     );
     let process = unsafe { OwnedFd::from_raw_fd(fd) };
-    let reply = endpoint.execute(&crate::control::ExecutionRequest::Quit, cancellation)?;
+    let reply = endpoint.execute(&crate::control::ExecutionRequest::Stop, cancellation)?;
     let deadline = Instant::now() + crate::network::CONTROL_TIMEOUT;
     loop {
         if let Some(cancellation) = cancellation {

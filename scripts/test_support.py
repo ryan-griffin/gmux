@@ -21,7 +21,7 @@ def rpc(socket_path, method, /, *, timeout=21, check=True, client=True, env=None
         if check:
             assert "error" not in reply, reply
         return reply
-    client_methods = {"new", "split", "close", "close-tab", "rename", "remove-tab-name", "list", "read", "send",
+    client_methods = {"new", "split", "close", "close-tab", "rename", "reset-name", "list", "read", "send",
         "workspace-add", "workspace-edit", "workspace-remove", "move", "focus", "filter", "windows", "new-window",
         "detach", "renderer-info", "search-tabs", "screenshot", "resize", "action", "_state", "_command",
         "_desktop-save", "_desktop-tab"}
@@ -257,7 +257,7 @@ class AppFixture:
         self.processes = []
 
     def set_settings(self, settings):
-        self.settings_path.write_text(json.dumps({"local_execution": True, **settings}))
+        self.settings_path.write_text(json.dumps({"local_daemon_enabled": True, **settings}))
 
     def start(self, binary, *args, **kwargs):
         process = subprocess.Popen([str(binary), *map(str, args)], env=self.env, **kwargs)
@@ -266,7 +266,7 @@ class AppFixture:
 
     def start_app(self, binary, *args, **kwargs):
         process = self.start(binary, *args, **kwargs)
-        wait_for(lambda: process.poll() is not None or self.rpc("daemon-info")["attached"],
+        wait_for(lambda: process.poll() is not None or self.rpc("status")["local_clients"],
                  message="Application did not attach to its daemon")
         assert process.poll() is None, "Application exited before attaching to its daemon"
         wait_for(lambda: self.rpc("renderer-info")["gtk"], message="Application did not construct its window")

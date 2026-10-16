@@ -268,7 +268,7 @@ impl SessionManager {
             serde_json::from_value(self.endpoint.call(InternalRequest::State)?)?;
         self.validate_state(&reply)?;
         self.install_metadata(&reply.metadata, reply.revision);
-        Ok(reply.session)
+        Ok(reply.execution)
     }
     pub fn validate_state(&self, reply: &crate::control::CommandReply) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -349,7 +349,7 @@ impl SessionManager {
             return;
         };
         let mut session = session.borrow_mut();
-        let sequence = session.meta.unread;
+        let sequence = session.meta.unread_sequence;
         session.read_through = session.read_through.max(sequence);
         drop(session);
         self.pending_reads.insert(id, sequence);
@@ -585,7 +585,7 @@ impl RemoteSession {
         self.meta.exited
     }
     pub fn unread(&self) -> bool {
-        self.meta.unread > self.read_through
+        self.meta.unread_sequence > self.read_through
     }
     pub fn busy(&self) -> bool {
         self.meta.busy
@@ -900,7 +900,7 @@ mod tests {
                 title: "shell".into(),
                 size: (2, 2),
                 exited: false,
-                unread: 0,
+                unread_sequence: 0,
                 busy: false,
                 modes: [false; 2],
             },
@@ -955,8 +955,8 @@ mod tests {
         current.title = "older stream state".into();
         manager.install_metadata(&[current.clone()], 1);
         let state = serde_json::from_value(serde_json::json!({
-            "daemon":manager.daemon,"home_directory":"/tmp","machine_kind":"unknown","machine_name":"host", "revision":1,
-            "result":{"ok":true},"session":{"last_id":1,"tabs":[],"scrollback":{}},"metadata":[current]
+            "daemon":manager.daemon,"home_directory":"/tmp","machine_kind":"unknown","hostname":"host", "revision":1,
+            "result":{"ok":true},"execution":{"last_id":1,"tabs":[],"scrollback":{}},"metadata":[current]
         })).unwrap();
         sender
             .send(Ok(Packet {
@@ -1109,11 +1109,11 @@ mod tests {
                 state: Some(crate::control::CommandReply {
                     home_directory: "/home/test".into(),
                     machine_kind: crate::model::MachineKind::Unknown,
-                    machine_name: "test-host".into(),
+                    hostname: "test-host".into(),
                     daemon,
                     revision: 1,
                     result: crate::control::CommandOutput::Done { ok: true }.into(),
-                    session: ExecutionState::default(),
+                    execution: ExecutionState::default(),
                     metadata: vec![],
                 }),
                 meta: session.borrow().meta.clone(),
@@ -1459,13 +1459,13 @@ mod tests {
     #[test]
     fn acknowledging_an_alert_ignores_old_packets_and_keeps_new_alerts() {
         let (mut manager, sender, session) = manager();
-        session.borrow_mut().meta.unread = 7;
+        session.borrow_mut().meta.unread_sequence = 7;
         assert!(session.borrow().unread());
         manager.mark_read(1);
         assert!(!session.borrow().unread());
         for (sequence, expected) in [(7, false), (0, false), (8, true)] {
             let mut meta = session.borrow().meta.clone();
-            meta.unread = sequence;
+            meta.unread_sequence = sequence;
             sender
                 .send(Ok(Packet {
                     header: Header {
@@ -1502,7 +1502,7 @@ mod tests {
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
-        session.borrow_mut().meta.unread = 7;
+        session.borrow_mut().meta.unread_sequence = 7;
         manager.mark_read(1);
         assert!(!session.borrow().unread());
         assert_eq!(wire(receiver.try_recv().unwrap())["method"], "input");

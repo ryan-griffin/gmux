@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    pub local_execution: bool,
+    pub local_daemon_enabled: bool,
     pub use_system_font: bool,
     #[serde(skip)]
     pub system_font: String,
@@ -20,7 +20,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            local_execution: false,
+            local_daemon_enabled: false,
             use_system_font: true,
             system_font: "Monospace 11".into(),
             font: "Monospace".into(),

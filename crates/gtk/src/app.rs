@@ -153,6 +153,7 @@ struct Windows {
     next_id: Cell<u64>,
     server: RefCell<Option<ipc::Server>>,
     source: RefCell<Option<glib::SourceId>>,
+    local: local::LocalDaemon,
 }
 impl Windows {
     fn active(&self) -> Option<Rc<Ui>> {
@@ -219,6 +220,7 @@ impl Windows {
             preferred,
         )?;
         self.windows.borrow_mut().push(ui.clone());
+        self.ensure_local();
         ui.window.present();
         Ok(ui)
     }
@@ -365,6 +367,7 @@ pub fn run(
         next_id: Cell::new(0),
         server: RefCell::new(None),
         source: RefCell::new(None),
+        local: local::LocalDaemon::default(),
     });
     let startup_error = Rc::new(RefCell::new(None));
     let activate_owner = Rc::downgrade(&owner);

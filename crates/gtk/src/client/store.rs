@@ -381,7 +381,7 @@ impl Store {
             })?);
         }
         let reply = call(body)?;
-        if reply.get("session").is_some() {
+        if reply.get("execution").is_some() {
             // Forward the daemon's JSON untouched. The window applies its current
             // organization after deserializing execution exactly once.
             Ok(json!({"kind":"execution","reply":reply}))

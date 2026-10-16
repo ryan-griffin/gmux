@@ -185,6 +185,10 @@ impl TerminalSession {
     }
 
     pub(crate) fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.send_with_enter(bytes, false)
+    }
+
+    pub(crate) fn send_with_enter(&self, bytes: &[u8], enter: bool) -> anyhow::Result<()> {
         anyhow::ensure!(!self.exited, "This terminal's process has exited");
         let pty = self
             .pty
@@ -192,19 +196,20 @@ impl TerminalSession {
             .ok_or_else(|| anyhow::anyhow!("Session is closed"))?;
         let mut pending = pty.pending.borrow_mut();
         anyhow::ensure!(
-            pending.len() + bytes.len() <= 2 * gmux_client::transport::MAX_PASTE,
+            pending.len() + bytes.len() + usize::from(enter)
+                <= 2 * gmux_client::transport::MAX_PASTE,
             "Terminal input queue is full"
         );
         pending.extend(bytes);
+        if enter {
+            pending.push_back(b'\r');
+        }
         Ok(())
     }
 
     pub(crate) fn send_text(&mut self, text: &str, enter: bool) -> anyhow::Result<()> {
-        let mut bytes = self.paste(text, false)?;
-        if enter {
-            bytes.push(b'\r');
-        }
-        self.send(&bytes)
+        let bytes = self.paste(text, false)?;
+        self.send_with_enter(&bytes, enter)
     }
 
     pub(crate) fn poll(&mut self) -> SessionUpdate {

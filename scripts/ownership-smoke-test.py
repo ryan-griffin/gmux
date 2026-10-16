@@ -35,7 +35,7 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         with socket.socket(socket.AF_UNIX) as wrong:
             wrong.settimeout(3)
             wrong.connect(a.env["GMUX_SOCKET"] + ".stream")
-            wrong.sendall((json.dumps(dict(method="attach", version=18, daemon=other)) + "\n").encode())
+            wrong.sendall((json.dumps(dict(method="attach", version=20, daemon=other)) + "\n").encode())
             assert wrong.recv(4) == b"", "An attach for another daemon must disconnect"
 
     with scenario("daemon rejects organization and presentation without touching execution"):
@@ -48,8 +48,8 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         assert path.read_bytes() == before
         state = a.rpc("_state")
         assert "desktop" not in state and "catalog" not in state
-        assert "width" not in state["session"] and "filter" not in state["session"]
-        assert all("workspace" not in tab and "active" not in tab for tab in state["session"]["tabs"])
+        assert "width" not in state["execution"] and "filter" not in state["execution"]
+        assert all("workspace" not in tab and "active" not in tab for tab in state["execution"]["tabs"])
         assert invalid_client.read_text() == "{invalid client state"
         assert a.settings_path.read_text() == "invalid preferences"
         assert not (a.config / "desktop.json").exists() and not (a.config / "workspaces.json").exists()
@@ -58,16 +58,16 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         transient = a.rpc("new")
         greatest = a.rpc("split",pane=transient["pane"])["pane"]
         a.rpc("close-tab",tab=transient["tab"])
-        a.rpc("quit")
+        a.rpc("stop")
         assert first.wait(timeout=8) == 0
         first = start(a,log)
         assert a.rpc("_hello")["daemon"] == identity
-        assert a.rpc("daemon-info")["panes"] == 1
+        assert a.rpc("status")["panes"] == 1
         replacement = a.rpc("new")
         assert replacement["tab"] > greatest and replacement["pane"] > greatest
-        a.rpc("quit")
+        a.rpc("stop")
         assert first.wait(timeout=8) == 0
-        assert second.poll() is None and b.rpc("daemon-info")["panes"] == 1
+        assert second.poll() is None and b.rpc("status")["panes"] == 1
         assert invalid_client.read_text() == "{invalid client state"
 
 print("PASS: daemon execution ownership, client file isolation, identities, stale attach rejection, and durable IDs")

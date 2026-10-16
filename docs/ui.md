@@ -73,20 +73,24 @@ confirmation when their affected panes have busy processes.
 
 Manage Connections uses the same dialog layout as Manage Workspaces, with an Add
 Connection row, the local connection labeled This Computer, then saved remote
-connections with status and reconnect controls. Rows that open pages end with a
-right arrow. The local entry remains available when its daemon is stopped or
-local execution is disabled. The Local Connection dialog includes its name,
-Local Execution setting, Start Daemon or Stop Daemon action, and incoming
-connection settings. Local Execution defaults to off. Enabling it and saving
-starts or attaches to the local daemon and remembers the choice for later launches.
-Disabling it disconnects GTK without stopping the daemon or its jobs. Stop Daemon
-asks for confirmation and stops local terminals while keeping the app open. Use Hostname restores the default name when saved. Allow Remote
+connections with status and reconnect controls. The local entry remains available
+when its daemon is stopped or local execution is disabled. The Local Connection
+dialog includes its name, a Local Daemon toggle with the subtitle Run terminals on this computer,
+and a separate Remote Access group. The toggle defaults to
+off and stays temporary until Save. Cancel discards the draft. The daemon state
+changes after the preference is saved to disk. If saving fails, the editor keeps
+the draft and displays the error. Saving it on starts or attaches to the daemon,
+remembers the choice for future launches, and restarts
+the daemon if it stops. Saving it off asks for confirmation, stops local
+terminals, and cancels recovery while keeping the app and remote connections open.
+Canceling the confirmation keeps the draft open and leaves the saved settings and
+daemon unchanged. Use Hostname restores the default name when saved. Allow Remote
 Connections enables a listener on the chosen IP and port. Authentication can be
 None or Token; Token uses matching token contents on both computers. These
-connections need a private network or an encrypted tunnel. Save applies and persists
-the settings. Disabling hosting disconnects
-incoming clients and leaves terminals running. Hosting settings can be saved
-while the daemon is stopped. They do not enable local execution.
+connections need a private network or an encrypted tunnel. Save applies and
+persists the settings. Disabling remote access disconnects incoming clients and
+leaves terminals running. Remote access settings can be saved while the daemon
+is stopped. They do not enable local execution.
 
 The empty page distinguishes No Connections, Connecting, and Not Connected and
 offers Manage Connections when no daemon is connected. Workspace organization
@@ -99,10 +103,8 @@ opens the editor directly without opening the manager. Editors have Cancel and a
 suggested Save or Add action in the header, which stays visible while longer forms
 scroll. Saving or removing closes the editor and updates any open manager.
 Cancel and Escape close only the editor and discard unsaved changes.
-The manager's Close button dismisses the list. Removal and Stop Daemon rows open
-confirmations whose affirmative buttons use the destructive style. The local
-Start/Stop action is disabled while the form has unsaved changes, so starting
-cannot discard a draft or silently use different settings.
+The manager's Close button dismisses the list. Removal and saving Local Daemon off
+open confirmations whose affirmative buttons use the destructive style.
 Workspace editors have a directory row for each configured
 connection. Use Home Directory resets a row to `~`. Only the local directory row
 has a folder picker; remote rows accept paths on the remote computer. Remote

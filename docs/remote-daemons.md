@@ -18,9 +18,9 @@ connection settings. To accept TCP clients, configure incoming access and choose
 authentication explicitly, before starting or while the daemon is running:
 
 ```sh
-gmux connection edit local --allow-remote true --listen 100.64.0.10:7331 --auth none
+gmux connection edit local --remote-access true --listen-address 100.64.0.10:7331 --auth none
 # Or use the same token file contents on the server and client:
-gmux connection edit local --allow-remote true --listen 0.0.0.0:7331 --auth token --token-file ~/.config/gmux/token
+gmux connection edit local --remote-access true --listen-address 0.0.0.0:7331 --auth token --token-file ~/.config/gmux/token
 ```
 
 TCP is not encrypted. Use a private network or an encrypted tunnel, such as
@@ -107,16 +107,17 @@ paths on the destination. Local execution follows its separate saved preference.
 The GTK executable links the client library without PTYs or libghostty. It can
 run without the `gmux` executable when local execution is not requested.
 
-Manage Connections always includes one **This Computer** entry. Open it, enable
-**Local Execution**, and Save to start or attach to the local daemon. GTK remembers
-this choice and starts or attaches on later launches. Turning the setting off
-disconnects all GTK windows while leaving the daemon and its jobs running.
-**Start Daemon** also enables local execution; **Stop Daemon…** terminates local
-execution and disables the setting, keeping GTK and remote connections open.
+Manage Connections always includes one **This Computer** entry. Its **Local Daemon**
+toggle stays temporary until Save; Cancel discards it. Saving it on starts or
+attaches in every GTK window, remembers the choice for later launches, and
+restarts the daemon if it stops. Failed starts retry with backoff. Saving it off
+asks for confirmation, cancels recovery, and stops local terminals while keeping
+GTK and remote connections open. Canceling the confirmation keeps the draft open
+and leaves the saved settings and daemon unchanged.
 
 **Allow Remote Connections**, the listening address, and authentication control
 incoming TCP access separately. They can be saved while local execution is off
-without starting a daemon. Enabling hosting takes effect when the daemon starts.
+without starting a daemon. Enabling remote access takes effect when the daemon starts.
 Unix sockets remain accessible only to their owning user.
 
 Manage Connections edits the client catalog and shows live connection status.
@@ -149,7 +150,7 @@ Files live under `$XDG_CONFIG_HOME/gmux/`, normally `~/.config/gmux/`:
 
 - `connections.json` belongs to clients. It contains the local display alias and
   named remote addresses, credential file paths, machine kinds, and pinned identities.
-- `hosting.json` belongs to the daemon. It contains its saved TCP listener settings.
+- `remote-access.json` belongs to the daemon. It contains its saved TCP listener settings.
 - `clients/gtk/state.json` contains GTK workspace organization and presentation.
 - `daemon-id.json`, `execution.json`, and `scrollback/` belong to local execution.
 
@@ -158,8 +159,10 @@ remain untouched. A daemon never loads the client catalog or GTK state, so damag
 client settings cannot prevent local execution from starting.
 
 `gmux connection list` includes this computer, saved remotes, local daemon status,
-and hosting settings, even when no daemon is running. Rename the local entry or
-restore its hostname with:
+and remote access settings, even when no daemon is running. `remote_access` holds
+the saved configuration; `running` reports the local daemon's current state and
+`bound_address` reports its active TCP listener, or null. Rename the local entry
+or restore its hostname with:
 
 ```sh
 gmux connection edit local --name desktop
@@ -170,19 +173,19 @@ Edit the local connection to configure incoming access:
 
 ```sh
 gmux connection list
-gmux connection edit local --allow-remote true --listen 100.64.0.10:7331 --auth none
-gmux connection edit local --allow-remote false
+gmux connection edit local --remote-access true --listen-address 100.64.0.10:7331 --auth none
+gmux connection edit local --remote-access false
 ```
 
 Enabling remote access requires an explicit `--auth`. Unspecified settings keep
-their saved values. Use `--listen` for the local listener and `--address` for a
+their saved values. Use `--listen-address` for the local listener and `--address` for a
 saved remote destination. Authentication applies to incoming clients when editing
 local, and to the destination daemon when editing a remote connection.
 
-Hosting edits persist separately from outgoing connections and work while the
+Remote access edits persist separately from outgoing connections and work while the
 daemon is stopped. They do not start local execution. A running daemon applies
 them immediately; a stopped daemon uses them on its next `serve`. Disabling
-hosting or rotating its token disconnects existing TCP clients without stopping
+remote access or rotating its token disconnects existing TCP clients without stopping
 terminals. `gmux serve` always reads these saved settings. If the TCP listener
 cannot start, local execution remains available and `gmux connection list` reports
 the error so the settings can be corrected.
@@ -202,8 +205,8 @@ It is never invoked by remote operations or catalog loading.
 Both transports expose the same execution model and viewport protocol. TCP adds
 a versioned authentication handshake and requires explicit targets. Incoming
 clients cannot access outgoing client configuration, workspace state, or local
-hosting administration. Local daemon hosting administration uses `hosting-get`
-and `hosting-set` on the Unix control socket. The GTK `.ui` socket separately
+remote access administration. Local daemon remote access administration uses `remote-access-get`
+and `remote-access-set` on the Unix control socket. The GTK `.ui` socket separately
 handles workspace and window operations.
 
 See [daemon API](daemon-api.md) for execution requests, authentication handshakes,

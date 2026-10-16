@@ -9,7 +9,7 @@ use std::{
 mod requests;
 pub use requests::{PasteOptions, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 18;
+pub const VERSION: u32 = 20;
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 16 * 1024 * 1024;
@@ -23,7 +23,7 @@ pub struct Metadata {
     pub size: (u16, u16),
     pub exited: bool,
     /// Sequence of the most recent unread alert; zero after acknowledgement.
-    pub unread: u64,
+    pub unread_sequence: u64,
     pub busy: bool,
     pub modes: [bool; 2],
 }
@@ -194,7 +194,7 @@ mod tests {
                     title: "shell".into(),
                     size: (2, 3),
                     exited: false,
-                    unread: 0,
+                    unread_sequence: 0,
                     busy: false,
                     modes: [false, true],
                 },

@@ -41,7 +41,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         assert launcher.wait(timeout=8) == 0
         windows = wait_for(lambda: (windows if len(windows := fixture.rpc("windows")["windows"]) == 2 else None))
         second = next(w["id"] for w in windows if w["id"] != first)
-        wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+        wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
         assert [t["id"] for t in state(first)["tabs"]] == [t["id"] for t in state(second)["tabs"]] == [tab]
         fixture.rpc("action", window=second, name="new-window")
         windows = wait_for(lambda: (windows if len(windows := fixture.rpc("windows")["windows"]) == 3 else None))
@@ -51,7 +51,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         assert app.poll() is None
 
     with scenario("desktop New Window action opens another window over existing sessions"):
-        daemon_pid = fixture.rpc("daemon-info")["pid"]
+        daemon_pid = fixture.rpc("status")["pid"]
         # Use the built executable and private fixture state for the same GIO
         # action launch GNOME uses from its icon menu and on middle-click.
         launch_env = dict(fixture.env, PATH=str(cargo_binary("gmux-gtk").parent) + os.pathsep + fixture.env["PATH"])
@@ -63,15 +63,15 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
             desktop.launch_action("new-window", Gio.AppLaunchContext())
             windows = wait_for(lambda: (windows if len(windows := fixture.rpc("windows")["windows"]) == 3 else None))
         third = next(w["id"] for w in windows if w["id"] not in (first, second))
-        wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 3)
-        assert fixture.rpc("daemon-info")["pid"] == daemon_pid
+        wait_for(lambda: fixture.rpc("status")["local_clients"] == 3)
+        assert fixture.rpc("status")["pid"] == daemon_pid
         for window in (first, second, third):
             view = state(window)
             assert [t["id"] for t in view["tabs"]] == [tab]
             assert [p["id"] for p in view["tabs"][0]["panes"]] == [pane]
         fixture.rpc("detach", window=third)
         wait_for(lambda: len(fixture.rpc("windows")["windows"]) == 2)
-        wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+        wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
         assert app.poll() is None
 
     with scenario("shared tabs and workspaces preserve each window's UI choices"):
@@ -136,7 +136,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         fixture.rpc("rename", window=first, tab=other["tab"], name="Background custom")
         for window in (first, second):
             wait_for(lambda: next(t for t in state(window)["tabs"] if t["id"] == other["tab"])["name"] == "Background custom")
-        fixture.rpc("remove-tab-name", window=first, tab=other["tab"])
+        fixture.rpc("reset-name", window=first, tab=other["tab"])
         for window, identifier in ((first, other["pane"]), (second, split["pane"])):
             wait_for(lambda: next(t for t in state(window)["tabs"] if t["id"] == other["tab"])["name"] == titles[identifier])
             assert state(window)["active_tab"] == tab, "Clearing a background name changed selection"
@@ -156,7 +156,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
             assert "error" in fixture.rpc(method, client=False, check=False, **params), method
         raw = fixture.rpc("_state", client=False)
         assert "catalog" not in raw and "desktop" not in raw
-        assert "filter" not in raw["session"] and all("workspace" not in t for t in raw["session"]["tabs"])
+        assert "filter" not in raw["execution"] and all("workspace" not in t for t in raw["execution"]["tabs"])
         assert execution.read_bytes() == before
 
     with scenario("batched daemon changes keep tab order consistent in every window"):
@@ -195,9 +195,9 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
     with scenario("closed windows release client workers and subscriptions"):
         def cycle():
             created = fixture.rpc("new-window")["window"]
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 3)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 3)
             fixture.rpc("detach", window=created)
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 2)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
         for _ in range(2): cycle()
         time.sleep(0.1)
         before = resources()
@@ -212,7 +212,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         (artifacts / "client-window-resources.json").write_text(json.dumps(dict(before=before, after_eight_cycles=after_warmup, after_sixteen_cycles=after), indent=2) + "\n")
 
     with scenario("closing one window leaves the other window and all shells alive"):
-        daemon_pid = fixture.rpc("daemon-info")["pid"]
+        daemon_pid = fixture.rpc("status")["pid"]
         fixture.rpc("focus", window=second, pane=pane)
         fixture.rpc("focus", window=first, pane=pane)
         wait_for(lambda: fixture.rpc("renderer-info", window=first, pane=pane)["window_active"])
@@ -245,20 +245,20 @@ app.run()
             wait_for(lambda: not any(w["active"] for w in fixture.rpc("windows")["windows"]))
             assert cover.poll() is None, "The focus cover exited"
             fixture.rpc("detach", window=first)
-            wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
+            wait_for(lambda: fixture.rpc("status")["local_clients"] == 1)
             wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == survivor_grid,
                      message="Closing the size owner did not apply the unfocused survivor's cached grid")
         finally:
             stop_process(cover)
         wait_for(lambda: len(fixture.rpc("windows")["windows"]) == 1)
-        wait_for(lambda: fixture.rpc("daemon-info")["frontends"] == 1)
-        assert app.poll() is None and fixture.rpc("daemon-info")["pid"] == daemon_pid
+        wait_for(lambda: fixture.rpc("status")["local_clients"] == 1)
+        assert app.poll() is None and fixture.rpc("status")["pid"] == daemon_pid
         fixture.rpc("send", window=second, pane=pane, text="printf 'SECOND_WINDOW_INPUT\\n'", paste=True, enter=True)
         wait_for(lambda: "SECOND_WINDOW_INPUT" in fixture.rpc("read", window=second, pane=pane)["text"])
         fixture.rpc("detach", window=second)
         assert app.wait(timeout=8) == 0
-        wait_for(lambda: not fixture.rpc("daemon-info")["attached"])
-        assert fixture.rpc("daemon-info")["pid"] == daemon_pid
+        wait_for(lambda: not fixture.rpc("status")["local_clients"])
+        assert fixture.rpc("status")["pid"] == daemon_pid
         assert len(fixture.rpc("list")["tabs"]) == 2
 
     with scenario("an explicit startup directory selects a new tab in the saved workspace"):

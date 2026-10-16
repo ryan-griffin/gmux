@@ -530,6 +530,9 @@ impl Ui {
                     ui.refresh_connections_ui();
                     ui.connection_menu
                         .refresh_availability(&ui.sessions.borrow());
+                    if let Some(owner) = ui.owner.upgrade() {
+                        owner.recover_local();
+                    }
                 }
                 if updates_git_changed {
                     ui.update_branches();
@@ -556,13 +559,6 @@ impl Ui {
             });
         *ui.update_source.borrow_mut() = Some(source);
         ui.sessions.borrow_mut().connect_remotes();
-        if ui.settings.borrow().local_execution {
-            ui.start_local(|ui, result| {
-                if let Err(error) = result {
-                    ui.message(&error.to_string());
-                }
-            });
-        }
         Ok(ui)
     }
     pub(super) fn open_initial_directory(self: &Rc<Self>) {
@@ -608,7 +604,7 @@ impl Ui {
                     .is_some_and(|id| sessions.connected(id))
             };
             if local_connected {
-                ui.request(json!({"method":"local-stop"}), move |ui, result| {
+                ui.request(json!({"method":"local-daemon-stop"}), move |ui, result| {
                     let success = result.is_ok();
                     let _ = reply.try_send(
                         result.unwrap_or_else(|error| json!({"error":error.to_string()})),
@@ -723,7 +719,7 @@ impl Ui {
                     | Command::Close { pane: Some(id) }
                     | Command::Rename { tab: id, .. }
                     | Command::CloseTab { tab: id }
-                    | Command::RemoveTabName { tab: id }
+                    | Command::ResetName { tab: id }
                     | Command::Move { tab: Some(id), .. } => ui
                         .sessions
                         .borrow()
@@ -846,7 +842,7 @@ fn terminal_menu_button() -> gtk::MenuButton {
     tab.append(Some("Re_name Tab…"), Some("win.rename"));
     let remove_name = gio::MenuItem::new(
         Some("Use _Automatic Tab Name"),
-        Some("win.remove-active-tab-name"),
+        Some("win.reset-active-tab-name"),
     );
     remove_name.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
     tab.append_item(&remove_name);

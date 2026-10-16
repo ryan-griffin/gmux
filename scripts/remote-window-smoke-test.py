@@ -22,9 +22,9 @@ artifacts.mkdir(exist_ok=True)
 
 
 def start(fixture, log, address="127.0.0.1:0"):
-    command(fixture, "connection", "edit", "local", "--allow-remote", "true", "--listen", address, "--auth", "none")
+    command(fixture, "connection", "edit", "local", "--remote-access", "true", "--listen-address", address, "--auth", "none")
     process = fixture.start(daemon, "serve", stdout=log, stderr=log)
-    wait_for(lambda: fixture.rpc("daemon-info")["pid"] == process.pid)
+    wait_for(lambda: fixture.rpc("status")["pid"] == process.pid)
     return process
 
 
@@ -46,28 +46,36 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
     server_process,other_process=(start(fixture,log) for fixture in (server,other))
     original = server.rpc("new", name="Server")
     second = other.rpc("new", name="Other")
-    command(receiver, "connection", "add", server.rpc("daemon-info")["listen"], "--name", "server", "--auth", "none")
-    command(receiver, "connection", "add", other.rpc("daemon-info")["listen"], "--name", "other", "--auth", "none")
+    command(receiver, "connection", "add", server.rpc("status")["bound_address"], "--name", "server", "--auth", "none")
+    command(receiver, "connection", "add", other.rpc("status")["bound_address"], "--name", "other", "--auth", "none")
     # Tab management also works directly when no GUI is open.
     command(receiver, "rename", "--tab", original["tab"], "Before GUI", "--connection", "server")
     assert server.rpc("list")["tabs"][0]["name"] == "Before GUI"
     command(receiver, "reset-name", "--tab", original["tab"], "--connection", "server")
-    assert not server.rpc("_state")["session"]["tabs"][0]["custom_name"]
+    assert not server.rpc("_state")["execution"]["tabs"][0]["custom_name"]
     command(receiver, "rename", "--tab", original["tab"], "Server", "--connection", "server")
     temporary = command(receiver, "new", "--connection", "server")
     command(receiver, "close-tab", "--tab", temporary["tab"], "--connection", "server")
     assert [tab["id"] for tab in server.rpc("list")["tabs"]] == [original["tab"]]
+    with scenario("GTK CLI RPC preserves JSON and reports JSON target fields without a running app"):
+        request = json.dumps(dict(method="read", pane=original["pane"]))
+        assert isinstance(command(server, "rpc", request)["text"], str)
+        assert isinstance(command(receiver, "--connection", "server", "rpc", request)["text"], str)
+        for method, field in (("read", "pane"), ("move", "tab")):
+            error = command(receiver, "--connection", "server", "rpc", json.dumps(dict(method=method)), check=False)
+            assert f"explicit {field} field" in error and f"--{field}" not in error, error
     # No sibling daemon executable and no native terminal library are available to this client.
     standalone = receiver.path / "client-only/gmux-gtk"
     standalone.parent.mkdir()
     shutil.copy2(cli, standalone)
     linkage = subprocess.check_output(["ldd", str(standalone)], text=True)
     assert "libghostty" not in linkage, linkage
-    receiver.set_settings(dict(local_execution=False))
+    receiver.set_settings(dict(local_daemon_enabled=False))
     app = receiver.start(standalone, "--connection", "server", stdout=log, stderr=log)
     wait_for(lambda: receiver.rpc("renderer-info")["gtk"])
     wait_for(lambda: len(receiver.rpc("list")["tabs"]) == 2)
     assert {t["connection"] for t in receiver.rpc("list")["tabs"]} == {"server", "other"}
+    assert isinstance(command(receiver, "rpc", json.dumps(dict(method="read", pane=original["pane"])))["text"], str)
     assert "absolute" in command(receiver, "new", "--directory", "relative", check=False)
     created = command(receiver, "new", "--directory", "~/project")
     assert next(tab for tab in server.rpc("list")["tabs"] if tab["id"] == created["tab"])["panes"][0]["directory"] == str(remote_home / "project")
@@ -169,7 +177,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
     pa, pb, pc = (start(f, log) for f in (a, b, c))
     assert "running GTK app" in command(a, "quit", check=False)
     assert pa.poll() is None, "GTK quit without a window stopped the daemon"
-    addresses = [f.rpc("daemon-info")["listen"] for f in (a, b, c)]
+    addresses = [f.rpc("status")["bound_address"] for f in (a, b, c)]
     local_name = a.rpc("connection-list")["local"]["name"]
     identities = [f.rpc("_hello")["daemon"] for f in (a, b, c)]
     branches = ["local-branch", "server-branch", "other-branch"]
@@ -212,7 +220,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         launcher = a.start(cli, "--connection", "server", stdout=log, stderr=log)
         assert launcher.wait(timeout=8) == 0
         assert view()["daemon"] == identities[1]
-        remote_execution = b.rpc("_state")["session"]
+        remote_execution = b.rpc("_state")["execution"]
         command(a, "rename", "--connection", "local", "--tab", own[0]["tab"], "Explicit local")
         assert a.rpc("list", client=False)["tabs"][0]["name"] == "Explicit local"
         created_local = command(a, "new", "--connection", "local", "--directory", str(a.path))
@@ -229,7 +237,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         command(a, "move", "--workspace", workspace, env=inherited)
         assert tab(identities[0], own[0]["tab"])["workspace"] == workspace
         a.rpc("workspace-remove", workspace=workspace)
-        assert b.rpc("_state")["session"] == remote_execution
+        assert b.rpc("_state")["execution"] == remote_execution
         command(a, "rename", "--connection", "local", "--tab", own[0]["tab"], "Local")
         launcher = a.start(cli, "--connection", "local", stdout=log, stderr=log)
         assert launcher.wait(timeout=8) == 0
@@ -247,7 +255,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
                 if other != index:
                     assert tab(identities[other], own[other]["tab"])["name"] == original_names[other]
             command(a, "reset-name", "--tab", target, "--connection", connection)
-            assert not fixture.rpc("_state", client=False)["session"]["tabs"][0]["custom_name"]
+            assert not fixture.rpc("_state", client=False)["execution"]["tabs"][0]["custom_name"]
             wait_for(lambda: tab(identities[index], target)["name"] != "CLI renamed")
             command(a, "rename", "--tab", target, original_names[index], "--connection", connection)
             wait_for(lambda: tab(identities[index], target)["name"] == original_names[index])
@@ -264,7 +272,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         wait_for(lambda: references(second) == references())
         for index, fixture in enumerate((a, b, c)):
             wait_for(lambda: tab(identities[index], own[index]["tab"], second)["branch"] == branches[index])
-            info = fixture.rpc("daemon-info")
+            info = fixture.rpc("status")
             assert info["git_subscribers"] == 2 and info["git"]["workers"] == 2
         subprocess.run(["git", "-C", str(b.path), "symbolic-ref", "HEAD", "refs/heads/remote-updated"],
                        check=True, capture_output=True)
@@ -286,7 +294,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         b.rpc("close", pane=split["pane"])
         a.rpc("detach", window=second)
         for fixture in (a, b, c):
-            wait_for(lambda: fixture.rpc("daemon-info")["git_subscribers"] == 1)
+            wait_for(lambda: fixture.rpc("status")["git_subscribers"] == 1)
 
     with scenario("tabs created by other clients appear first in every receiving window without changing selection"):
         observer = a.rpc("new-window")["window"]
@@ -311,14 +319,14 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
     with scenario("removing a definition detaches its rows and preserves its execution"):
         command(a, "connection", "remove", "other")
         wait_for(lambda: len(view()["tabs"]) == 2)
-        wait_for(lambda: c.rpc("daemon-info")["remote_frontends"] == 0)
+        wait_for(lambda: c.rpc("status")["remote_clients"] == 0)
         assert c.rpc("list")["tabs"][0]["id"] == own[2]["tab"]
         command(a, "connection", "add", addresses[2], "--name", "other", "--auth", "none")
         wait_for(lambda: len(view()["tabs"]) == 3)
 
     with scenario("explicit remote commands never infer local targets or ignore a connection selector"):
         a.rpc("focus", pane=own[0]["pane"])
-        before = [f.rpc("_state", client=False)["session"] for f in (a, b, c)]
+        before = [f.rpc("_state", client=False)["execution"] for f in (a, b, c)]
         for method, params in [
             ("split", {}), ("close", {}), ("move", {"workspace": None}),
             ("read", {"pane": own[1]["pane"]}),
@@ -331,7 +339,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
                 env=dict(a.env, GMUX_PANE=str(own[0]["pane"])),
                 text=True, capture_output=True, timeout=10)
             assert result.returncode != 0, result.stdout
-        assert [f.rpc("_state", client=False)["session"] for f in (a, b, c)] == before
+        assert [f.rpc("_state", client=False)["execution"] for f in (a, b, c)] == before
         split = command(a, "--connection", "server", "split", "--pane", own[1]["pane"])
         assert split["daemon"] == identities[1]
         command(a, "--connection", "server", "close", "--pane", split["pane"])
@@ -346,8 +354,8 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         created = dict(tab=selected["id"], pane=selected["active_pane"])
         assert selected["reference"]["daemon"] == identities[1]
         assert selected["panes"][0]["directory"] == str(Path(b.env["HOME"])), "New Tab inherited the selected pane's directory"
-        assert len(a.rpc("_state", client=False)["session"]["tabs"]) == 1
-        assert len(b.rpc("_state")["session"]["tabs"]) == 2
+        assert len(a.rpc("_state", client=False)["execution"]["tabs"]) == 1
+        assert len(b.rpc("_state")["execution"]["tabs"]) == 2
         a.rpc("send", text="printf '\\nREMOTE_UI_INPUT\\n'", paste=True, enter=True)
         wait_for(lambda: "REMOTE_UI_INPUT" in b.rpc("read", pane=created["pane"])["text"])
         wait_for(lambda: "REMOTE_UI_INPUT" in a.rpc("read")["text"], message="Remote viewport did not reach GTK")
@@ -402,7 +410,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         a.rpc("_desktop-save", desktop=delayed["desktop"], revision=0)
         persisted = next(t for t in a.rpc("_state")["desktop"]["tabs"] if t["reference"] == dict(daemon=identities[1], id=added["tab"]))
         assert persisted["workspace"] == workspace, "A delayed window save removed a newer assignment"
-        assert next(t for t in b.rpc("_state")["session"]["tabs"] if t["id"] == added["tab"]).get("workspace") is None
+        assert next(t for t in b.rpc("_state")["execution"]["tabs"] if t["id"] == added["tab"]).get("workspace") is None
         assert "catalog" not in b.rpc("_state")
         a.rpc("filter", value="all")
         a.rpc("search-tabs", query="other")
@@ -419,7 +427,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
             if t["reference"] == dict(daemon=identities[1], id=created_cli["tab"])), None))
         wait_for(lambda: tab(identities[1], created_cli["tab"])["workspace"] == workspace)
         assert routed_tab["panes"][0]["directory"] == str(b.path)
-        assert next(t for t in b.rpc("_state")["session"]["tabs"] if t["id"] == created_cli["tab"]).get("workspace") is None
+        assert next(t for t in b.rpc("_state")["execution"]["tabs"] if t["id"] == created_cli["tab"]).get("workspace") is None
         b.rpc("close", pane=created_cli["pane"])
         wait_for(lambda: all(t["reference"] != dict(daemon=identities[1], id=created_cli["tab"]) for t in view()["tabs"]))
         a.rpc("workspace-edit", workspace=workspace, name="Mixed", directories={identities[0]: str(a.path)})
@@ -502,8 +510,8 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
                     pass
         finally:
             os.kill(pb.pid, signal.SIGCONT)
-        wait_for(lambda: b.rpc("daemon-info")["remote_frontends"] == 1)
-        wait_for(lambda: c.rpc("daemon-info")["remote_frontends"] == 1)
+        wait_for(lambda: b.rpc("status")["remote_clients"] == 1)
+        wait_for(lambda: c.rpc("status")["remote_clients"] == 1)
         # The daemon may finish a rename it already accepted before frontend cancellation.
         a.rpc("rename", connection="server", tab=added["tab"], name="Remote after resume")
 
@@ -511,7 +519,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         second = a.rpc("new-window")["window"]
         wait_for(lambda: len(view(second)["tabs"]) == len(view()["tabs"]))
         for f in (b, c):
-            wait_for(lambda: f.rpc("daemon-info")["remote_frontends"] == 2)
+            wait_for(lambda: f.rpc("status")["remote_clients"] == 2)
         a.rpc("focus", window=first, connection="other", pane=own[2]["pane"])
         a.rpc("focus", window=second, connection="server", pane=added["pane"])
         assert view()["active_reference"]["daemon"] == identities[2]
@@ -533,7 +541,7 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
             wait_for(lambda: tab(identities[1], added["tab"], window)["connection"] == "renamed")
             assert tab(identities[1], added["tab"], window)["workspace"] == workspace
         assert [view(window)["active_reference"] for window in (first, second)] == selections
-        assert b.rpc("daemon-info")["remote_frontends"] == 2
+        assert b.rpc("status")["remote_clients"] == 2
         a.rpc("send", window=second, text="printf '\\nMULTI_WINDOW_REMOTE_EDIT\\n'", paste=True, enter=True)
         wait_for(lambda: "MULTI_WINDOW_REMOTE_EDIT" in b.rpc("read", pane=added["pane"])["text"].splitlines())
         command(a, "connection", "edit", "renamed", "--name", "server")
@@ -542,11 +550,11 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         a.rpc("detach", window=first)
         wait_for(lambda: len(a.rpc("windows")["windows"]) == 1)
         for f in (b, c):
-            wait_for(lambda: f.rpc("daemon-info")["remote_frontends"] == 1)
+            wait_for(lambda: f.rpc("status")["remote_clients"] == 1)
         a.rpc("detach", window=second)
         assert app.wait(timeout=10) == 0
         for f in (b, c):
-            wait_for(lambda: f.rpc("daemon-info")["remote_frontends"] == 0)
+            wait_for(lambda: f.rpc("status")["remote_clients"] == 0)
         assert "error" in a.rpc("focus", connection="server", pane=added["pane"], check=False)
         saved = json.loads((a.config / "clients/gtk/state.json").read_text())["desktop"]
         assert len({(t["reference"]["daemon"], t["reference"]["id"]) for t in saved["tabs"]}) == len(saved["tabs"])
@@ -557,24 +565,24 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         assert tab(identities[1], added["tab"])["workspace"] == workspace
 
     with scenario("window creation rejects disconnected streams before starting remote shells"):
-        before = b.rpc("_state")["session"]
-        hosting = b.rpc("connection-list")["hosting"]
-        hosting["enabled"] = False
-        b.rpc("connection-edit", connection="local", hosting=hosting)
+        before = b.rpc("_state")["execution"]
+        remote_access = b.rpc("connection-list")["remote_access"]
+        remote_access["enabled"] = False
+        b.rpc("connection-edit", connection="local", remote_access=remote_access)
         wait_for(lambda: not tab(identities[1], added["tab"])["connected"])
-        hosting.update(enabled=True, address=addresses[1])
-        b.rpc("connection-edit", connection="local", hosting=hosting)
+        remote_access.update(enabled=True, listen_address=addresses[1])
+        b.rpc("connection-edit", connection="local", remote_access=remote_access)
         # Control is reachable again, but this window still needs an explicit reconnect.
         for args in (("new",), ("split", "--pane", str(added["pane"]))):
             result = subprocess.run([str(cli), "--connection", "server", *args], env=a.env,
                                     text=True, capture_output=True, timeout=10)
             assert result.returncode != 0 and "Reconnect in Manage Connections" in result.stderr, result
-        assert b.rpc("_state")["session"] == before, "A rejected creation started a remote shell"
+        assert b.rpc("_state")["execution"] == before, "A rejected creation started a remote shell"
         assert not tab(identities[1], added["tab"])["connected"]
 
     with scenario("disconnection preserves organization and reopening reconnects the host"):
         original_times = {t["id"]: t["created_at"] for t in b.rpc("list")["tabs"]}
-        b.rpc("quit")
+        b.rpc("stop")
         assert pb.wait(timeout=10) == 0
         wait_for(lambda: not tab(identities[1], added["tab"])["connected"])
         assert tab(identities[1], added["tab"])["branch"] == ""
@@ -603,21 +611,23 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         timestamps = [t["created_at"] for t in view()["tabs"]]
         assert timestamps == sorted(timestamps, reverse=True), "Reconnecting must preserve creation order"
 
-    with scenario("stopping the local daemon leaves GTK and remote jobs running"):
+    with scenario("an enabled local daemon restarts while GTK and remote jobs keep running"):
         marker = c.path / "job-pid"
         c.rpc("send", pane=own[2]["pane"], text="sleep 120 & echo $! > " + shlex.quote(str(marker)), paste=True, enter=True)
         wait_for(lambda: marker.is_file())
         pid = int(marker.read_text())
-        a.rpc("quit")
+        local_pid = a.rpc("status")["pid"]
+        a.rpc("stop")
         assert pa.wait(timeout=10) == 0
         assert app.poll() is None
-        wait_for(lambda: all(not t["connected"] for t in view()["tabs"]
+        wait_for(lambda: a.rpc("status")["pid"] != local_pid)
+        wait_for(lambda: all(t["connected"] for t in view()["tabs"]
                              if t["reference"]["daemon"] == identities[0]))
         a.rpc("detach")
         assert app.wait(timeout=10) == 0
         assert pc.poll() is None and pb.poll() is None
         assert Path(f"/proc/{pid}").exists()
         for f in (b, c):
-            wait_for(lambda: f.rpc("daemon-info")["remote_frontends"] == 0)
+            wait_for(lambda: f.rpc("status")["remote_clients"] == 0)
 
 print("PASS: native tabs across connections, filters, ownership, routing, reconnect, and local Quit")

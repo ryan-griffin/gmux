@@ -28,7 +28,7 @@ class History:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(8)
         self.socket.connect(str(fixture.path / "socket.stream"))
-        self.send("attach", version=18, daemon=fixture.rpc("_hello")["daemon"])
+        self.send("attach", version=20, daemon=fixture.rpc("_hello")["daemon"])
         self.send("subscribe", panes=[pane])
 
     def send(self, method, **params):
@@ -96,7 +96,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
 
     def start():
         daemon = fixture.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
-        wait_for(lambda: fixture.rpc("daemon-info"))
+        wait_for(lambda: fixture.rpc("status"))
         assert daemon.poll() is None
         return daemon
 
@@ -104,7 +104,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         return fixture.rpc("send", pane=pane, text=text, paste=True, enter=True)
 
     def stop(daemon):
-        result = fixture.rpc("quit")
+        result = fixture.rpc("stop")
         assert result["ok"] and not result.get("warning"), result
         assert daemon.wait(timeout=8) == 0
 
@@ -140,7 +140,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
             for start in starts:
                 assert all(cell[1:] == (fg, bg, flags) for cell in cells[start:start + len(marker)]), marker
 
-    with scenario("Quit restores tabs and history into new shells"):
+    with scenario("Stop restores tabs and history into new shells"):
         daemon = start()
         pane = fixture.rpc("new", directory=str(root))["pane"]
         ready(pane)
@@ -180,11 +180,11 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             with ThreadPoolExecutor() as pool:
-                pending = pool.submit(fixture.rpc, "quit")
+                pending = pool.submit(fixture.rpc, "stop")
                 wait_for(lambda: fixture.rpc("_hello")["quitting"])
                 send(pane, "printf 'OUTPUT_DURING_CHECKPOINT\\n'")
                 wait_for(lambda: "OUTPUT_DURING_CHECKPOINT" in fixture.rpc("read", pane=pane)["text"])
-                assert not pending.done(), "Quit replied before the durable layout commit"
+                assert not pending.done(), "Stop replied before the durable layout commit"
                 fcntl.flock(lock, fcntl.LOCK_UN)
                 result = pending.result(timeout=8)
                 assert result["ok"] and not result.get("warning"), result
@@ -292,7 +292,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
 
     with scenario("snapshot directory failure still saves the layout and quits"):
         cache = fixture.config / "scrollback"
-        # The prior Quit left one referenced snapshot; replace the cache with
+        # The prior Stop left one referenced snapshot; replace the cache with
         # a file to simulate an unavailable snapshot destination.
         for path in cache.iterdir():
             path.unlink()
@@ -300,7 +300,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         cache.write_text("unavailable")
         daemon = start()
         ready(new_pane)
-        result = fixture.rpc("quit")
+        result = fixture.rpc("stop")
         assert result["ok"] and result.get("warning"), result
         assert daemon.wait(timeout=8) == 0
         saved = json.loads(session_path.read_text())
@@ -310,4 +310,4 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         ready(new_pane)
         stop(daemon)
 
-print("PASS: durable Quit/SIGTERM colored history, exact indexed/RGB cells and attributes, resets without prompt bleed, new shell PIDs and input, Unicode wraps, snapshot permissions, disk backpressure, version/CRC/truncation/oversize recovery, startup recovery, and deleted-pane cleanup")
+print("PASS: durable Stop/SIGTERM colored history, exact indexed/RGB cells and attributes, resets without prompt bleed, new shell PIDs and input, Unicode wraps, snapshot permissions, disk backpressure, version/CRC/truncation/oversize recovery, startup recovery, and deleted-pane cleanup")

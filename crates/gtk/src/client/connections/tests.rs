@@ -28,7 +28,7 @@ impl Fixture {
                         Machine {
                             daemon,
                             name: format!("host-{index}"),
-                            kind: MachineKind::Server,
+                            machine_kind: MachineKind::Server,
                         },
                         wake.clone(),
                     ),
@@ -84,11 +84,11 @@ impl Fixture {
         execution::CommandReply {
             daemon: machine.daemon,
             home_directory: format!("/home/host-{host}").into(),
-            machine_name: machine.name.clone(),
-            machine_kind: machine.kind,
+            hostname: machine.name.clone(),
+            machine_kind: machine.machine_kind,
             revision,
             result: execution::CommandOutput::Done { ok: true }.into(),
-            session: crate::model::ExecutionState {
+            execution: crate::model::ExecutionState {
                 tabs,
                 last_id,
                 ..Default::default()
@@ -112,7 +112,7 @@ fn directory_labels_use_each_daemons_home_without_changing_paths_or_trusting_sta
     let mut remote = f.execution(1, 1, 2);
     remote.home_directory = "/root".into();
     remote.machine_kind = MachineKind::VirtualMachine;
-    remote.session.tabs[0]
+    remote.execution.tabs[0]
         .directories
         .insert(2, "/root/project".into());
     let reply = f.hub.project_execution(remote).unwrap();
@@ -197,7 +197,7 @@ fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_sta
             Connection::from_session(manager, f.hub.wake.clone());
         let with_metadata = |mut reply: execution::CommandReply, title: &str| {
             reply.metadata = reply
-                .session
+                .execution
                 .tabs
                 .iter()
                 .flat_map(|tab| tab.layout.ids())
@@ -750,7 +750,7 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
 
         // Even a stale reply with a higher ID cannot confirm that the tab closed.
         let mut stale = f.execution(host, 0, 0);
-        stale.session.last_id = 100;
+        stale.execution.last_id = 100;
         let delayed = f.hub.project_execution(stale).unwrap();
         let desktop = f.hub.desktop(&delayed.session);
         f.hub
@@ -780,7 +780,7 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
         assert_eq!(assignment(&f.hub.store), Some(Some(workspace)));
 
         let mut closed = f.execution(host, 1, 3);
-        closed.session.last_id = 6;
+        closed.execution.last_id = 6;
         let closed = f.hub.project_execution(closed).unwrap();
         let desktop = f.hub.desktop(&closed.session);
         f.hub
@@ -796,7 +796,7 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
 fn creation_times_merge_remote_imports_and_external_tabs_without_saved_order_overrides() {
     let mut f = Fixture::new(3);
     let mut local = f.execution(0, 3, 1);
-    for (tab, created_at) in local.session.tabs.iter_mut().zip([100, 300, 500]) {
+    for (tab, created_at) in local.execution.tabs.iter_mut().zip([100, 300, 500]) {
         tab.created_at = created_at;
     }
     let reply = f.hub.project_execution(local).unwrap();
@@ -807,12 +807,12 @@ fn creation_times_merge_remote_imports_and_external_tabs_without_saved_order_ove
         .unwrap();
 
     let mut remote = f.execution(1, 2, 1);
-    for (tab, created_at) in remote.session.tabs.iter_mut().zip([200, 400]) {
+    for (tab, created_at) in remote.execution.tabs.iter_mut().zip([200, 400]) {
         tab.created_at = created_at;
     }
     f.hub.project_execution(remote).unwrap();
     let mut other = f.execution(2, 1, 1);
-    other.session.tabs[0].created_at = 350;
+    other.execution.tabs[0].created_at = 350;
     let reply = f.hub.project_execution(other).unwrap();
     let reference = |host, id| TabRef {
         daemon: f.ids[host],
@@ -839,14 +839,14 @@ fn creation_times_merge_remote_imports_and_external_tabs_without_saved_order_ove
     // Consecutive discoveries on different hosts must precede saved tabs even
     // before the receiving window has saved either discovery.
     let mut remote = f.execution(1, 3, 2);
-    for (tab, created_at) in remote.session.tabs.iter_mut().zip([200, 400, 600]) {
+    for (tab, created_at) in remote.execution.tabs.iter_mut().zip([200, 400, 600]) {
         tab.created_at = created_at;
     }
-    let reconnect = remote.session.clone();
+    let reconnect = remote.execution.clone();
     let reply = f.hub.project_execution(remote).unwrap();
     assert_eq!(references(&f.hub, &reply)[0], reference(1, 7));
     let mut other = f.execution(2, 2, 2);
-    for (tab, created_at) in other.session.tabs.iter_mut().zip([350, 700]) {
+    for (tab, created_at) in other.execution.tabs.iter_mut().zip([350, 700]) {
         tab.created_at = created_at;
     }
     let reply = f.hub.project_execution(other).unwrap();
@@ -863,7 +863,7 @@ fn creation_times_merge_remote_imports_and_external_tabs_without_saved_order_ove
         .unwrap();
     f.hub.origins.get_mut(&f.ids[1]).unwrap().state = Session::default();
     let mut remote = f.execution(1, 3, 3);
-    remote.session = reconnect;
+    remote.execution = reconnect;
     let reply = f.hub.project_execution(remote).unwrap();
     assert_eq!(references(&f.hub, &reply), expected);
 

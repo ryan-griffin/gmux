@@ -55,7 +55,7 @@ pub enum Command {
         tab: u64,
         name: String,
     },
-    RemoveTabName {
+    ResetName {
         tab: u64,
     },
 }
@@ -102,7 +102,7 @@ pub enum InternalRequest {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum PublicRequest {
-    DaemonInfo,
+    Status,
     Quit,
     List,
     Read {
@@ -266,7 +266,7 @@ impl Command {
             Self::Close { pane } => Execution::Close { pane },
             Self::CloseTab { tab } => Execution::CloseTab { tab },
             Self::Rename { tab, name } => Execution::Rename { tab, name },
-            Self::RemoveTabName { tab } => Execution::RemoveTabName { tab },
+            Self::ResetName { tab } => Execution::ResetName { tab },
             organization => return Err(organization),
         })
     }
@@ -282,7 +282,7 @@ impl Command {
                 | "workspace-remove"
                 | "move"
                 | "rename"
-                | "remove-tab-name"
+                | "reset-name"
         )
     }
 }

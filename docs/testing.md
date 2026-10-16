@@ -43,7 +43,7 @@ and disk backpressure without blocking snapshots.
 
 The remote suite checks authentication, pinned identity, execution isolation,
 direct CLI and independent viewport clients without a local daemon, atomic catalog
-edits, offline renaming, hosting persistence, and daemon independence from corrupt
+edits, offline renaming, remote access persistence, and daemon independence from corrupt
 client settings. The native remote-window suite also runs a GTK binary without a
 sibling daemon executable, exercises workspace organization across remotes, removes
 all connections, and verifies that quitting leaves remote execution running.
@@ -62,7 +62,7 @@ pane or tab targets and cannot fall back to the selected local tab.
 The remotes-ui suite operates native GTK menus and dialogs through AT-SPI. It
 checks authentication choices, failed additions and edits, prefilled editors,
 Save and Cancel, editor dialogs over their managers, direct workspace creation from
-menus and the command palette, workspace list updates, live local hosting,
+menus and the command palette, workspace list updates, live local remote access,
 token file selection, live catalog updates, reconnect, and
 removal preserving remote execution. The plus menu lists local and remote
 connections under a New Tab via Connection heading. Local and remote creation
@@ -108,8 +108,11 @@ The native suites need PyGObject and these installed components:
 - `gtk4-rendernode-tool` for rendering checks.
 
 The `local-execution` native suite checks daemon-free startup, offline workspaces
-and hosting settings, explicit local startup, disconnecting without stopping jobs,
-stopping and restarting local execution alongside remotes, and the saved preference.
+and remote access settings, draft local toggle changes, Save and Cancel, preference
+write failures, responsive saves under a held file lock, concurrent preference
+changes, confirmation cancellation,
+automatic recovery after normal shutdown and crashes, bounded startup retries,
+and local daemon shutdown alongside remote connections.
 Existing execution-focused fixtures explicitly enable local execution.
 
 The fixture starts a 1280 × 960 headless Mutter monitor with XWayland disabled.

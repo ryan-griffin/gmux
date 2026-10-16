@@ -93,15 +93,18 @@ impl Ui {
     }
     pub(super) fn stop_daemon(self: &Rc<Self>) {
         self.save_session();
-        self.request(json!({"method":"local-stop"}), |ui, result| match result {
-            Ok(value) => {
-                if let Some(warning) = value["warning"].as_str() {
-                    eprintln!("{warning}");
+        self.request(
+            json!({"method":"local-daemon-stop"}),
+            |ui, result| match result {
+                Ok(value) => {
+                    if let Some(warning) = value["warning"].as_str() {
+                        eprintln!("{warning}");
+                    }
+                    ui.app.quit();
                 }
-                ui.app.quit();
-            }
-            Err(error) => ui.message(&error.to_string()),
-        });
+                Err(error) => ui.message(&error.to_string()),
+            },
+        );
     }
     pub(super) fn detach_frontend(self: &Rc<Self>) {
         if self.detaching.replace(true) {

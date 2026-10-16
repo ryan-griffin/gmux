@@ -578,7 +578,7 @@ impl Daemon {
                     title: String::new(),
                     size: (80, 24),
                     exited: false,
-                    unread: 0,
+                    unread_sequence: 0,
                     busy: false,
                     modes: [false; 2],
                 },

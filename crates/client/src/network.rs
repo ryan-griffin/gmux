@@ -68,16 +68,16 @@ impl Credentials {
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Hosting {
+pub struct RemoteAccess {
     pub enabled: bool,
-    pub address: SocketAddr,
+    pub listen_address: SocketAddr,
     pub authentication: Authentication,
 }
-impl Default for Hosting {
+impl Default for RemoteAccess {
     fn default() -> Self {
         Self {
             enabled: false,
-            address: SocketAddr::from(([127, 0, 0, 1], 7331)),
+            listen_address: SocketAddr::from(([127, 0, 0, 1], 7331)),
             authentication: Authentication::None,
         }
     }
@@ -379,7 +379,7 @@ impl Client {
                 "Remote connection identity changed"
             );
         }
-        if matches!(request, ExecutionRequest::Quit) {
+        if matches!(request, ExecutionRequest::Stop) {
             let mut trailing = [0u8; 1];
             anyhow::ensure!(
                 self.reader.read(&mut trailing)? == 0,

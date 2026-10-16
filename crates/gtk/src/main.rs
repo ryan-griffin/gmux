@@ -223,8 +223,8 @@ fn workspace_directories(
     Ok(directories)
 }
 use crate::client::ipc::call;
-fn print_response(response: serde_json::Value) -> anyhow::Result<()> {
-    if let Some(text) = response.get("text").and_then(|v| v.as_str()) {
+fn print_response(response: serde_json::Value, plain_text: bool) -> anyhow::Result<()> {
+    if plain_text && let Some(text) = response.get("text").and_then(|v| v.as_str()) {
         println!("{text}");
     } else {
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -277,6 +277,8 @@ fn main() -> anyhow::Result<()> {
         cli.connection = Some("local".into());
     }
     if let Some(command) = cli.command {
+        let plain_text = matches!(&command, Command::Read { .. });
+        let rpc = matches!(&command, Command::Rpc { .. });
         anyhow::ensure!(
             cli.connection.is_none()
                 || !matches!(
@@ -383,9 +385,7 @@ fn main() -> anyhow::Result<()> {
             Command::Rename { tab, name } => {
                 serde_json::to_value(LayoutCommand::Rename { tab, name })?
             }
-            Command::ResetName { tab } => {
-                serde_json::to_value(LayoutCommand::RemoveTabName { tab })?
-            }
+            Command::ResetName { tab } => serde_json::to_value(LayoutCommand::ResetName { tab })?,
             Command::Screenshot { path } => serde_json::to_value(PublicRequest::Screenshot {
                 path: std::path::absolute(path)?,
             })?,
@@ -405,7 +405,11 @@ fn main() -> anyhow::Result<()> {
                         request["method"].as_str(),
                         Some("split" | "close" | "send" | "read" | "notify")
                     ) || request["pane"].as_u64().is_some(),
-                    "Remote pane commands require an explicit --pane"
+                    if rpc {
+                        "Remote pane requests require an explicit pane field"
+                    } else {
+                        "Remote pane commands require an explicit --pane"
+                    }
                 );
                 {
                     if let Some(("move", args)) = matches.subcommand()
@@ -415,7 +419,11 @@ fn main() -> anyhow::Result<()> {
                     }
                     anyhow::ensure!(
                         request["method"] != "move" || request["tab"].as_u64().is_some(),
-                        "Moving a remote tab requires an explicit --tab"
+                        if rpc {
+                            "Moving a remote tab requires an explicit tab field"
+                        } else {
+                            "Moving a remote tab requires an explicit --tab"
+                        }
                     );
                     anyhow::ensure!(
                         !matches!(
@@ -431,7 +439,7 @@ fn main() -> anyhow::Result<()> {
             {
                 request["connection"] = serde_json::json!(connection);
                 let response = call(request)?;
-                print_response(response)?;
+                print_response(response, plain_text)?;
                 return Ok(());
             }
             if connection == "local" {
@@ -442,7 +450,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             call(request)?
         };
-        print_response(response)?;
+        print_response(response, plain_text)?;
         return Ok(());
     }
     if launch_in_running_app(&cli)? {

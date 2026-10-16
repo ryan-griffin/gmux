@@ -33,16 +33,16 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         fixture.env["HOME"] = str(home)
     token = secured.path / "token"
     token.write_text("a" * 64 + "\n")
-    server.rpc("connection-edit", connection="local", hosting=dict(
-        enabled=True, address="127.0.0.1:0", authentication=dict(mode="none")))
-    secured.rpc("connection-edit", connection="local", hosting=dict(
-        enabled=True, address="127.0.0.1:0", authentication=dict(mode="token", file=str(token))))
+    server.rpc("connection-edit", connection="local", remote_access=dict(
+        enabled=True, listen_address="127.0.0.1:0", authentication=dict(mode="none")))
+    secured.rpc("connection-edit", connection="local", remote_access=dict(
+        enabled=True, listen_address="127.0.0.1:0", authentication=dict(mode="token", file=str(token))))
     local.start(daemon, "serve", cwd=local.path, stdout=log, stderr=log)
     remote = server.start(daemon, "serve", stdout=log, stderr=log)
     secured.start(daemon, "serve", stdout=log, stderr=log)
-    address = wait_for(lambda: server.rpc("daemon-info")["listen"])
-    secure_address = wait_for(lambda: secured.rpc("daemon-info")["listen"])
-    kinds = {fixture: fixture.rpc("daemon-info")["machine_kind"] for fixture in (local, server, secured)}
+    address = wait_for(lambda: server.rpc("status")["bound_address"])
+    secure_address = wait_for(lambda: secured.rpc("status")["bound_address"])
+    kinds = {fixture: fixture.rpc("status")["machine_kind"] for fixture in (local, server, secured)}
     kind_labels = dict(unknown="Computer", desktop="Desktop", laptop="Laptop", convertible="Convertible",
                        server="Server", tablet="Tablet", phone="Phone", container="Container",
                        watch="Watch", embedded="Embedded Computer",
@@ -275,13 +275,13 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert "local_name" not in json.loads((local.config / "connections.json").read_text())
         local.rpc("filter", value="all")
 
-    with scenario("the local editor saves live hosting and Cancel returns to the same manager"):
+    with scenario("the local editor saves live remote access and Cancel returns to the same manager"):
         open_manager()
         click(hostname, "list item")
         widget("Local Connection", "dialog")
         assert not find("Back", "button")
         save_enabled(False)
-        original_address = local.rpc("connection-list")["hosting"]["address"]
+        original_address = local.rpc("connection-list")["remote_access"]["listen_address"]
         click("Allow Remote Connections", "switch")
         save_enabled(True)
         fill("Listening Address", "invalid")
@@ -304,9 +304,9 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         fill("Listening Address", "127.0.0.1:0")
         click("Save", "button")
         widget("Connections", "dialog")
-        assert local.rpc("connection-list")["hosting"]["enabled"]
+        assert local.rpc("connection-list")["remote_access"]["enabled"]
         assert "local_name" not in json.loads((local.config / "connections.json").read_text()), "Saving default settings pinned the hostname"
-        listening = local.rpc("daemon-info")["listen"]
+        listening = local.rpc("status")["bound_address"]
         with socket.create_connection(("127.0.0.1", int(listening.rsplit(":", 1)[1])), timeout=4) as peer:
             peer.sendall((json.dumps(dict(version=local.rpc("_hello")["version"], channel="control")) + "\n").encode())
             reader = peer.makefile("rb")
@@ -316,10 +316,10 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
             save_enabled(True)
             click("Save", "button")
             widget("Connections", "dialog")
-            assert reader.readline() == b"", "Disabling hosting retained an authenticated connection"
+            assert reader.readline() == b"", "Disabling remote access retained an authenticated connection"
             reader.close()
-        assert local.rpc("daemon-info")["listen"] is None
-        assert not local.rpc("connection-list")["hosting"]["enabled"]
+        assert local.rpc("status")["bound_address"] is None
+        assert not local.rpc("connection-list")["remote_access"]["enabled"]
         click(hostname, "list item")
         assert not widget("Allow Remote Connections", "switch").get_state_set().contains(Atspi.StateType.CHECKED)
         key(Gdk.KEY_Escape)
@@ -407,7 +407,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         wait_accessible(lambda: not find("Add Connection", "dialog"))
         open_manager()
         widget("secured", "list item")
-        wait_for(lambda: secured.rpc("daemon-info")["remote_frontends"] == 1)
+        wait_for(lambda: secured.rpc("status")["remote_clients"] == 1)
         screenshot("machines.png")
         key(Gdk.KEY_Escape)
         wait_accessible(lambda: not find("Connections", "dialog"))
@@ -503,7 +503,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         wait_accessible(lambda: not find("Workspaces", "dialog"))
         saved = next(r for r in local.rpc("connection-list")["remotes"] if r["name"] == "secured")
         assert saved["authentication"] == {"mode": "token", "file": str(token)}
-        assert saved["kind"] == kinds[secured]
+        assert saved["machine_kind"] == kinds[secured]
 
     with scenario("clicking a remote opens an editor dialog and Cancel preserves its saved settings"):
         catalog = (local.config / "connections.json").read_bytes()
@@ -561,7 +561,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert after["filter"] == before["filter"]
         assert next(t for t in after["tabs"] if t["reference"] == after["active_reference"])["workspace"] == workspace
         assert "desktop" not in server.rpc("_state")
-        assert server.rpc("daemon-info")["remote_frontends"] == 1
+        assert server.rpc("status")["remote_clients"] == 1
         local.rpc("send", text="printf '\\nEDITED_REMOTE_INPUT\\n'", paste=True, enter=True)
         wait_for(lambda: "EDITED_REMOTE_INPUT" in server.rpc("read", pane=pane)["text"].splitlines())
         open_manager()
@@ -647,8 +647,8 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert created["machine_kind"] == kinds[secured]
         widget(kind_labels[kinds[secured]], "image")
         assert local.rpc("list")["filter"] == {"workspace": workspace}
-        assert len(local.rpc("_state", client=False)["session"]["tabs"]) == 1, "Remote creation spawned a local terminal"
-        host_tab = secured.rpc("_state")["session"]["tabs"][0]
+        assert len(local.rpc("_state", client=False)["execution"]["tabs"]) == 1, "Remote creation spawned a local terminal"
+        host_tab = secured.rpc("_state")["execution"]["tabs"][0]
         assert "workspace" not in host_tab, "The remote inherited a receiver-only workspace"
         assert secured.rpc("list")["tabs"][0]["panes"][0]["directory"] == str(Path(secured.env["HOME"]))
 
@@ -674,7 +674,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         local.rpc("send", text="cd " + shlex.quote(local.env["HOME"]), paste=True, enter=True)
         wait_for(lambda: selected_remote()["panes"][0]["directory"] == local.env["HOME"])
         wait_accessible(lambda: path_label(local.env["HOME"]))
-        local.rpc("remove-tab-name", connection="secured", tab=reference["id"])
+        local.rpc("reset-name", connection="secured", tab=reference["id"])
 
     with scenario("remote creation ignores the selected remote tab's working directory"):
         local.rpc("send", text="cd " + shlex.quote(str(secured.path)), paste=True, enter=True)
@@ -815,7 +815,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert created["machine_kind"] == kinds[local]
         widget(kind_labels[kinds[local]], "image")
         screenshot("machine-icons-tabs.png")
-        assert len(local.rpc("_state", client=False)["session"]["tabs"]) == 2
+        assert len(local.rpc("_state", client=False)["execution"]["tabs"]) == 2
         assert len(secured.rpc("list")["tabs"]) == 2
 
     with scenario("the connection menu uses the local name and keeps the selected workspace"):
@@ -833,11 +833,11 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert created["workspace"] == workspace
         assert created["panes"][0]["directory"] == str(local.path)
         assert local.rpc("list")["filter"] == {"workspace": workspace}
-        assert len(local.rpc("_state", client=False)["session"]["tabs"]) == 3
+        assert len(local.rpc("_state", client=False)["execution"]["tabs"]) == 3
         assert len(secured.rpc("list")["tabs"]) == 2
         local.rpc("close", pane=created["active_pane"])
         local.rpc("connection-edit", connection="local", name=None)
-        wait_for(lambda: len(local.rpc("_state", client=False)["session"]["tabs"]) == 2)
+        wait_for(lambda: len(local.rpc("_state", client=False)["execution"]["tabs"]) == 2)
 
     with scenario("the local connection choice uses home in All Tabs regardless of the selected remote tab"):
         local.rpc("filter", value="all")
@@ -853,7 +853,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert local.rpc("list")["filter"] == "all"
         assert len(server.rpc("list")["tabs"]) == server_tabs
         local.rpc("close", pane=created["active_pane"])
-        wait_for(lambda: len(local.rpc("_state", client=False)["session"]["tabs"]) == 2)
+        wait_for(lambda: len(local.rpc("_state", client=False)["execution"]["tabs"]) == 2)
 
     with scenario("the filter menu only offers workspaces and removed creation actions stay unavailable"):
         click("Tab Filter", "toggle button")
@@ -923,10 +923,10 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         remote.wait(timeout=8)
         reconnect = widget("Reconnect to server", "button")
         wait_accessible(lambda: reconnect.get_state_set().contains(Atspi.StateType.SENSITIVE))
-        server.rpc("connection-edit", connection="local", hosting=dict(
-            enabled=True, address=address, authentication=dict(mode="none")))
+        server.rpc("connection-edit", connection="local", remote_access=dict(
+            enabled=True, listen_address=address, authentication=dict(mode="none")))
         server.start(daemon, "serve", stdout=log, stderr=log)
-        wait_for(lambda: server.rpc("daemon-info")["listen"] == address)
+        wait_for(lambda: server.rpc("status")["bound_address"] == address)
         click("Reconnect to server", "button")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
         wait_accessible(lambda: not reconnect.get_state_set().contains(Atspi.StateType.SENSITIVE))
@@ -1009,7 +1009,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         creation_menu(disconnected=("server", "secured"), submenu=True)
         key(Gdk.KEY_Escape)
         server.start(daemon, "serve", stdout=log, stderr=log)
-        wait_for(lambda: server.rpc("daemon-info")["listen"] == address)
+        wait_for(lambda: server.rpc("status")["bound_address"] == address)
         open_manager()
         click("Reconnect to server", "button")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))

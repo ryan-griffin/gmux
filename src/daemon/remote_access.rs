@@ -9,78 +9,80 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Default)]
-pub(super) struct Hosting {
-    config: network::Hosting,
+pub(super) struct RemoteAccess {
+    config: network::RemoteAccess,
     server: Option<server::Server>,
     error: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
 enum Request {
-    HostingGet,
-    HostingSet { hosting: network::Hosting },
+    RemoteAccessGet,
+    RemoteAccessSet {
+        remote_access: network::RemoteAccess,
+    },
 }
-impl Hosting {
+impl RemoteAccess {
     pub fn start(daemon: DaemonId) -> anyhow::Result<Self> {
-        let mut hosting = Self {
-            config: storage::load("hosting.json")?,
+        let mut remote_access = Self {
+            config: storage::load("remote-access.json")?,
             ..Default::default()
         };
-        if hosting.config.enabled {
+        if remote_access.config.enabled {
             match server::Server::start(
                 server::Listen {
-                    address: hosting.config.address,
-                    authentication: hosting.config.authentication.clone(),
+                    address: remote_access.config.listen_address,
+                    authentication: remote_access.config.authentication.clone(),
                 },
                 ipc::socket_path(),
                 daemon,
             ) {
-                Ok(server) => hosting.server = Some(server),
-                Err(error) => hosting.error = Some(error.to_string()),
+                Ok(server) => remote_access.server = Some(server),
+                Err(error) => remote_access.error = Some(error.to_string()),
             }
         }
-        Ok(hosting)
+        Ok(remote_access)
     }
-    pub fn address(&self) -> Option<std::net::SocketAddr> {
+    pub fn bound_address(&self) -> Option<std::net::SocketAddr> {
         self.server.as_ref().map(|s| s.address)
     }
     pub fn handles(method: &str) -> bool {
-        matches!(method, "hosting-get" | "hosting-set")
+        matches!(method, "remote-access-get" | "remote-access-set")
     }
     pub fn call(&mut self, daemon: DaemonId, body: Value) -> anyhow::Result<Value> {
         match serde_json::from_value(body)? {
-            Request::HostingGet => Ok(
-                json!({"local":{"name":model::hostname(),"daemon":daemon,"kind":model::MachineKind::local()},"hostname":model::hostname(),"hosting":self.config,"hosting_error":self.error,"listen":self.address()}),
+            Request::RemoteAccessGet => Ok(
+                json!({"local":{"name":model::hostname(),"daemon":daemon,"machine_kind":model::MachineKind::local()},"hostname":model::hostname(),"remote_access":self.config,"remote_access_error":self.error,"bound_address":self.bound_address()}),
             ),
-            Request::HostingSet { hosting } => {
-                let token = if hosting.enabled {
-                    hosting.authentication.token()?
+            Request::RemoteAccessSet { remote_access } => {
+                let token = if remote_access.enabled {
+                    remote_access.authentication.token()?
                 } else {
                     None
                 };
-                let prepared = if hosting.enabled
+                let prepared = if remote_access.enabled
                     && (self.server.is_none()
-                        || (self.config.address != hosting.address
-                            && self.address() != Some(hosting.address)))
+                        || (self.config.listen_address != remote_access.listen_address
+                            && self.bound_address() != Some(remote_access.listen_address)))
                 {
                     Some(server::Server::prepare(server::Listen {
-                        address: hosting.address,
-                        authentication: hosting.authentication.clone(),
+                        address: remote_access.listen_address,
+                        authentication: remote_access.authentication.clone(),
                     })?)
                 } else {
                     None
                 };
-                storage::save("hosting.json", &hosting)?;
+                storage::save("remote-access.json", &remote_access)?;
                 if let Some(prepared) = prepared {
                     self.server = Some(prepared.start(ipc::socket_path(), daemon));
-                } else if !hosting.enabled {
+                } else if !remote_access.enabled {
                     self.server = None;
                 } else if let Some(server) = &self.server
                     && !server.token_matches(&token)
                 {
                     server.set_token(token);
                 }
-                self.config = hosting;
+                self.config = remote_access;
                 self.error = None;
                 Ok(json!({"ok":true,"daemon":daemon}))
             }

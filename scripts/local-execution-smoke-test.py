@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Exercise GTK's opt-in local execution alongside direct remote connections."""
+"""Exercise the saved local daemon toggle and automatic recovery alongside remotes."""
+import fcntl
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import shlex
 import time
 
 import gi
@@ -13,7 +16,7 @@ from gi.repository import Atspi, Gdk
 
 from cargo_test_support import cargo_binary
 from daemon_test_support import stop_daemon
-from test_support import AppFixture, AccessibilityFixture, descendants, scenario, wait_accessible, wait_for
+from test_support import AppFixture, AccessibilityFixture, assert_stays, descendants, scenario, wait_accessible, wait_for
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
@@ -76,7 +79,10 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
     def editor():
         manager()
         click(local.rpc("connection-list")["local"]["name"], "list item")
-        widget("Local Execution", "switch")
+        widget("Local Daemon", "switch")
+        assert not find("Execution", "label")
+        assert not find("Start Daemon", "button")
+        assert not find("Stop Daemon…", "button")
 
     def close_manager():
         dialog = widget("Connections", "dialog")
@@ -90,10 +96,21 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         click("Save", "button")
         manager_page()
 
+    def saved_enabled():
+        return local.settings_path.exists() and json.loads(local.settings_path.read_text())["local_daemon_enabled"]
+
     def no_execution_files():
         assert not Path(local.env["GMUX_SOCKET"]).exists()
         assert not (local.config / "daemon-id.json").exists()
         assert not (local.config / "execution.json").exists()
+
+    def failed_preferences_save(enabled):
+        wait_accessible(lambda: next((obj for obj in objects()
+                        if obj.get_role_name() == "label"
+                        and obj.get_name().startswith("Could not save preferences:")), None))
+        widget("Local Connection", "dialog")
+        assert widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED) == enabled
+        assert widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
 
     with scenario("fresh GTK starts without a daemon and workspaces work without connections"):
         widget("No Connections", "label")
@@ -109,145 +126,251 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
             cpu_ticks=sum(map(int, after[13:15])) - sum(map(int, before[13:15])),
             memory=[line for line in status if line.startswith(("VmRSS:", "Threads:"))]), indent=2) + "\n")
 
-    with scenario("local settings and hosting can be saved without starting execution"):
+    with scenario("local settings and remote access can be saved without starting execution"):
         editor()
         click("Allow Remote Connections", "switch")
         entry = widget("Listening Address", "text")
         assert Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(), "127.0.0.1:0")
         save()
-        assert local.rpc("connection-list")["hosting"]["enabled"]
+        assert local.rpc("connection-list")["remote_access"]["enabled"]
         assert local.rpc("connection-list")["local"]["daemon"] is None
         no_execution_files()
 
-    with scenario("runtime actions preserve drafts until Save or Cancel"):
+    with scenario("Cancel discards the local toggle together with the other fields"):
         editor()
-        start = widget("Start Daemon", "button")
-        assert start.get_state_set().contains(Atspi.StateType.SENSITIVE)
-        original = local.rpc("connection-list")["local"]["name"]
+        original_name = local.rpc("connection-list")["local"]["name"]
         entry = widget("Name", "text")
         assert Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(), "unsaved-name")
-        wait_accessible(lambda: not start.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        click("Local Daemon", "switch")
+        assert widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.SENSITIVE)
+        assert widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
         no_execution_files()
+        assert not saved_enabled()
         click("Cancel", "button")
         manager_page()
-        assert local.rpc("connection-list")["local"]["name"] == original
+        assert local.rpc("connection-list")["local"]["name"] == original_name
+        assert not saved_enabled()
+        no_execution_files()
         editor()
-        start = widget("Start Daemon", "button")
-        entry = widget("Listening Address", "text")
-        assert Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(), "invalid")
-        wait_accessible(lambda: not start.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        assert not widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED)
+        assert not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
+        click("Local Daemon", "switch")
+        click("Local Daemon", "switch")
         assert not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
         click("Cancel", "button")
         manager_page()
 
-    with scenario("enabling local execution starts it and remotes connect independently"):
+    with scenario("invalid connection settings do not enable or start the local daemon"):
         editor()
-        click("Local Execution", "switch")
-        save()
-        wait_for(lambda: local.rpc("daemon-info")["attached"])
+        entry = widget("Name", "text")
+        assert Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(), "invalid/name")
+        click("Local Daemon", "switch")
+        click("Save", "button")
+        widget("Connection name must contain 1 to 64 letters, digits, dots, hyphens, or underscores", "label")
+        widget("Local Connection", "dialog")
+        assert not saved_enabled()
+        no_execution_files()
+        assert local.rpc("connection-list")["local"]["name"] == original_name
+        click("Cancel", "button")
+        manager_page()
+
+    settings_lock = local.settings_path.with_name(".settings.json.lock")
+    with scenario("a preferences write failure preserves the draft and leaves the daemon disabled"):
+        editor()
+        click("Local Daemon", "switch")
+        assert not saved_enabled()
+        no_execution_files()
+        before = local.settings_path.read_bytes() if local.settings_path.exists() else None
+        settings_lock.unlink(missing_ok=True)
+        settings_lock.mkdir()
+        try:
+            click("Save", "button")
+            failed_preferences_save(True)
+            assert not saved_enabled()
+            assert (local.settings_path.read_bytes() if local.settings_path.exists() else None) == before
+            no_execution_files()
+            assert not local.rpc("connection-list")["running"]
+        finally:
+            settings_lock.rmdir()
+
+    with scenario("Save waits for durable preferences while keeping the UI responsive"):
+        with settings_lock.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            click("Save", "button")
+            widget("Saving…", "button")
+            assert not saved_enabled()
+            no_execution_files()
+            # Another window can change shared preferences while the write waits.
+            other_window = local.rpc("new-window")["window"]
+            sidebar = local.rpc("list", window=other_window)["sidebar_visible"]
+            local.rpc("action", window=other_window, name="sidebar")
+            assert local.rpc("list", window=other_window)["sidebar_visible"] != sidebar
+            widget("Saving…", "button")
+            widget("Local Connection", "dialog")
+            no_execution_files()
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        manager_page()
+        wait_for(lambda: local.rpc("status")["local_clients"])
+        wait_for(saved_enabled)
+        wait_for(lambda: json.loads(local.settings_path.read_text())["show_sidebar"] != sidebar)
+        local.rpc("detach", window=other_window)
+        wait_for(lambda: len(local.rpc("windows")["windows"]) == 1)
         local_id = local.rpc("_hello", client=False)["daemon"]
         original = local.rpc("new", name="Local job", workspace=workspace)
-        server.rpc("connection-edit", connection="local", hosting=dict(
-            enabled=True, address="127.0.0.1:0", authentication=dict(mode="none")))
+        server.rpc("connection-edit", connection="local", remote_access=dict(
+            enabled=True, listen_address="127.0.0.1:0", authentication=dict(mode="none")))
         server.start(daemon, "serve", stdout=log, stderr=log)
-        address = wait_for(lambda: server.rpc("daemon-info")["listen"])
+        address = wait_for(lambda: server.rpc("status")["bound_address"])
         remote = server.rpc("new", name="Remote job")
         local.rpc("connection-add", name="server", address=address, authentication={"mode": "none"})
         wait_for(lambda: len(local.rpc("list")["tabs"]) == 2)
 
-    with scenario("local daemon loss keeps every window and remote connection open"):
+    with scenario("stopped and crashed daemons restart automatically across every window"):
         close_manager()
         first_window = local.rpc("windows")["windows"][0]["id"]
         second_window = local.rpc("new-window")["window"]
-        wait_for(lambda: local.rpc("daemon-info")["frontends"] == 2)
-        wait_for(lambda: len(local.rpc("list", window=second_window)["tabs"]) == 2)
-        stop_daemon(local.env["GMUX_SOCKET"])
-        for window in (first_window, second_window):
-            wait_for(lambda: any(tab["reference"]["daemon"] == local_id and not tab["connected"]
-                                 for tab in local.rpc("list", window=window)["tabs"]))
-        assert app.poll() is None
-        assert server.rpc("list")["tabs"][0]["id"] == remote["tab"]
+        wait_for(lambda: local.rpc("status")["local_clients"] == 2)
         editor()
-        click("Start Daemon")
+        click("Local Daemon", "switch")
+        assert saved_enabled()
+        for crash in (False, True):
+            pid = local.rpc("status")["pid"]
+            if crash:
+                os.kill(pid, signal.SIGKILL)
+            else:
+                stop_daemon(local.env["GMUX_SOCKET"])
+            wait_for(lambda: local.rpc("status")["pid"] != pid)
+            wait_for(lambda: local.rpc("status")["local_clients"] == 2)
+            assert local.rpc("_hello", client=False)["daemon"] == local_id
+            for window in (first_window, second_window):
+                wait_for(lambda: all(tab["connected"] for tab in local.rpc("list", window=window)["tabs"]))
+                assert len(local.rpc("list", window=window)["tabs"]) == 2
+            assert app.poll() is None
+            assert server.rpc("list")["tabs"][0]["id"] == remote["tab"]
+            assert saved_enabled()
+            assert not widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED)
+        click("Cancel", "button")
         manager_page()
-        wait_for(lambda: local.rpc("daemon-info")["frontends"] == 2)
+        close_manager()
 
-    with scenario("disabling local execution leaves its daemon and jobs running"):
+    with scenario("canceling a stop confirmation preserves every draft and the saved daemon state"):
         editor()
-        click("Local Execution", "switch")
-        save()
-        wait_for(lambda: local.rpc("daemon-info")["attached"] == 0)
-        assert local.rpc("list", client=False)["tabs"][0]["id"] == original["tab"]
-        wait_for(lambda: [tab["name"] for tab in local.rpc("list")["tabs"]] == ["Remote job"])
-        assert app.poll() is None
+        original_name = local.rpc("connection-list")["local"]["name"]
+        entry = widget("Name", "text")
+        assert Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(), "unsaved-stop-name")
+        click("Local Daemon", "switch")
+        assert not find("Stop Daemon", "button")
+        assert local.rpc("status")["local_clients"] == 2
+        click("Save", "button")
+        widget("Stop Daemon", "button")
+        key(Gdk.KEY_Escape)
+        widget("Save", "button")
+        widget("Local Connection", "dialog")
+        assert not widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED)
+        assert Atspi.Text.get_text(widget("Name", "text").get_text_iface(), 0, -1) == "unsaved-stop-name"
+        assert local.rpc("connection-list")["local"]["name"] == original_name
+        assert saved_enabled()
+        assert local.rpc("status")["local_clients"] == 2
+        assert Atspi.EditableText.set_text_contents(widget("Name", "text").get_editable_text_iface(), original_name)
+
+    with scenario("a preferences write failure leaves the daemon enabled and recovery active"):
+        before = local.settings_path.read_bytes()
+        pid = local.rpc("status")["pid"]
+        settings_lock.unlink()
+        settings_lock.mkdir()
+        try:
+            click("Save", "button")
+            click("Stop Daemon", "button")
+            failed_preferences_save(False)
+            assert saved_enabled()
+            assert local.settings_path.read_bytes() == before
+            assert local.rpc("status")["pid"] == pid
+            assert local.rpc("status")["local_clients"] == 2
+            os.kill(pid, signal.SIGKILL)
+            wait_for(lambda: local.rpc("status")["pid"] != pid)
+            wait_for(lambda: local.rpc("status")["local_clients"] == 2)
+            assert saved_enabled()
+        finally:
+            settings_lock.rmdir()
+
+    with scenario("retrying Save after repairing preferences stops the daemon"):
+        click("Save", "button")
+        click("Stop Daemon", "button")
+        manager_page()
+        wait_for(lambda: not Path(local.env["GMUX_SOCKET"]).exists())
+        wait_for(lambda: not saved_enabled())
         for window in (first_window, second_window):
-            assert [tab["name"] for tab in local.rpc("list", window=window)["tabs"]] == ["Remote job"]
+            wait_for(lambda: [tab["name"] for tab in local.rpc("list", window=window)["tabs"]] == ["Remote job"])
+        assert_stays(lambda: not Path(local.env["GMUX_SOCKET"]).exists(), 2,
+                     message="A disabled local daemon restarted")
+        editor()
+        click("Local Daemon", "switch")
+        assert not saved_enabled()
+        assert not Path(local.env["GMUX_SOCKET"]).exists()
+        click("Cancel", "button")
+        manager_page()
+        assert not saved_enabled()
+        editor()
+        assert not widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED)
+        click("Local Daemon", "switch")
+        save()
+        wait_for(lambda: local.rpc("status")["local_clients"] == 2)
         close_manager()
         local.rpc("detach", window=second_window)
         wait_for(lambda: len(local.rpc("windows")["windows"]) == 1)
 
-    with scenario("stopping the local daemon keeps GTK and remote terminals open"):
-        editor()
-        click("Stop Daemon…")
-        click("Stop Daemon", "button")
-        wait_for(lambda: not Path(local.env["GMUX_SOCKET"]).exists())
-        manager_page()
-        assert app.poll() is None
-        assert server.rpc("list")["tabs"][0]["id"] == remote["tab"]
-        assert [tab["name"] for tab in local.rpc("list")["tabs"]] == ["Remote job"]
-
-    with scenario("starting again restores local identity and the saved preference survives reopening"):
-        editor()
-        click("Start Daemon")
-        manager_page()
-        wait_for(lambda: local.rpc("daemon-info")["attached"])
+    with scenario("the saved toggle restores the local connection on app launch"):
         assert local.rpc("_hello", client=False)["daemon"] == local_id
         wait_for(lambda: len(local.rpc("list")["tabs"]) == 2)
         assert next(tab for tab in local.rpc("list")["tabs"]
                     if tab["reference"]["daemon"] == local_id)["workspace"] == workspace
-        wait_for(lambda: json.loads(local.settings_path.read_text())["local_execution"])
-        if find("Connections", "dialog"):
-            close_manager()
         local.rpc("detach")
         app.wait(timeout=8)
         stop_daemon(local.env["GMUX_SOCKET"])
         app = local.start(gtk, stdout=log, stderr=log)
-        wait_for(lambda: local.rpc("daemon-info")["attached"])
+        wait_for(lambda: local.rpc("status")["local_clients"])
         assert local.rpc("_hello", client=False)["daemon"] == local_id
         wait_for(lambda: len(local.rpc("list")["tabs"]) == 2)
 
-    with scenario("an existing local daemon stays unused when local execution is disabled"):
+    with scenario("a disabled local connection stays off on new windows and later launches"):
         editor()
-        click("Local Execution", "switch")
-        save()
-        wait_for(lambda: local.rpc("daemon-info")["attached"] == 0)
-        if find("Connections", "dialog"):
-            close_manager()
+        click("Local Daemon", "switch")
+        click("Save", "button")
+        click("Stop Daemon", "button")
+        wait_for(lambda: not Path(local.env["GMUX_SOCKET"]).exists())
+        manager_page()
+        close_manager()
+        extra = local.rpc("new-window")["window"]
+        wait_for(lambda: len(local.rpc("list", window=extra)["tabs"]) == 1)
+        assert_stays(lambda: not Path(local.env["GMUX_SOCKET"]).exists(), 2,
+                     message="Opening a window enabled the local daemon")
+        local.rpc("detach", window=extra)
+        wait_for(lambda: len(local.rpc("windows")["windows"]) == 1)
         local.rpc("detach")
         app.wait(timeout=8)
+        local.start(daemon, "serve", stdout=log, stderr=log)
+        wait_for(lambda: local.rpc("status")["pid"])
         app = local.start(gtk, "--connection", "local", stdout=log, stderr=log)
         wait_for(lambda: local.rpc("renderer-info", check=False).get("gtk"))
         wait_for(lambda: [tab["name"] for tab in local.rpc("list")["tabs"]] == ["Remote job"])
-        assert local.rpc("daemon-info")["attached"] == 0
+        assert local.rpc("status")["local_clients"] == 0
         assert local.rpc("_state")["daemon"] is None
         assert "error" in local.rpc("new", check=False)
         close_remote = local.start(gtk, "close-tab", "--connection", "server", "--tab", str(remote["tab"]), stdout=log, stderr=log)
         assert close_remote.wait(timeout=8) == 0
         wait_for(lambda: local.rpc("list")["tabs"] == [])
-        server.rpc("quit")
+        server.rpc("stop")
         widget("Not Connected", "label")
         widget("Manage Connections…", "button")
-        if find("Connections", "dialog"):
-            close_manager()
         quit_client = local.start(gtk, "quit", stdout=log, stderr=log)
         assert quit_client.wait(timeout=8) == 0
         app.wait(timeout=8)
-        assert local.rpc("daemon-info")["attached"] == 0
+        assert local.rpc("status")["local_clients"] == 0
 
     with scenario("closing GTK cancels a configuration read from a stalled unused local daemon"):
         app = local.start(gtk, stdout=log, stderr=log)
         wait_for(lambda: local.rpc("renderer-info", check=False).get("gtk"))
-        pid = local.rpc("daemon-info")["pid"]
+        pid = local.rpc("status")["pid"]
         os.kill(pid, signal.SIGSTOP)
         try:
             local.rpc("action", name="manage-connections")
@@ -260,5 +383,78 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         finally:
             os.kill(pid, signal.SIGCONT)
 
+    with scenario("quitting GTK flushes preference changes made while Save is pending"):
+        app = local.start(gtk, stdout=log, stderr=log)
+        wait_for(lambda: local.rpc("renderer-info", check=False).get("gtk"))
+        editor()
+        click("Local Daemon", "switch")
+        sidebar = local.rpc("list")["sidebar_visible"]
+        with settings_lock.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            click("Save", "button")
+            widget("Saving…", "button")
+            local.rpc("action", name="sidebar")
+            assert local.rpc("list")["sidebar_visible"] != sidebar
+            quit_client = local.start(gtk, "quit", stdout=log, stderr=log)
+            assert quit_client.wait(timeout=8) == 0
+            wait_for(lambda: not Path(local.env["GMUX_SOCKET"] + ".ui").exists())
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        assert app.wait(timeout=8) == 0
+        settings = json.loads(local.settings_path.read_text())
+        assert settings["local_daemon_enabled"]
+        assert settings["show_sidebar"] != sidebar
 
-print("PASS: optional local execution, offline configuration, independent remotes, and daemon lifecycle")
+
+with scenario("closing the initiating window leaves recovery available to other windows"), \
+        (artifacts / "local-recovery-window-smoke.log").open("w") as log, AppFixture() as retry:
+    client = retry.path / "client/gmux-gtk"
+    client.parent.mkdir()
+    shutil.copy2(gtk, client)
+    started = retry.path / "starting-pid"
+    executable = client.with_name("gmux")
+    executable.write_text("#!/bin/sh\necho $$ > " + shlex.quote(str(started)) + "\nexec sleep 60\n")
+    executable.chmod(0o700)
+    app = retry.start(client, stdout=log, stderr=log)
+    wait_for(started.exists)
+    pending_pid = int(started.read_text())
+    try:
+        first = retry.rpc("windows")["windows"][0]["id"]
+        second = retry.rpc("new-window")["window"]
+        executable.unlink()
+        executable.symlink_to(daemon)
+        retry.rpc("detach", window=first)
+        wait_for(lambda: len(retry.rpc("windows")["windows"]) == 1)
+        wait_for(lambda: retry.rpc("status")["local_clients"])
+        retry.rpc("new", window=second, name="Recovered")
+        retry.rpc("detach", window=second)
+        assert app.wait(timeout=8) == 0
+    finally:
+        if Path(f"/proc/{pending_pid}").exists():
+            os.kill(pending_pid, signal.SIGTERM)
+
+with scenario("failed startup backs off and recovers when the daemon becomes available"), \
+        (artifacts / "local-recovery-smoke.log").open("w") as log, AppFixture() as retry:
+    client = retry.path / "client/gmux-gtk"
+    client.parent.mkdir()
+    shutil.copy2(gtk, client)
+    attempts = retry.path / "attempts"
+    executable = client.with_name("gmux")
+    executable.write_text("#!/bin/sh\necho attempt >> " + shlex.quote(str(attempts)) + "\nexit 1\n")
+    executable.chmod(0o700)
+    app = retry.start(client, stdout=log, stderr=log)
+    count = lambda: len(attempts.read_text().splitlines()) if attempts.exists() else 0
+    wait_for(lambda: count() >= 3)
+    assert count() == 3, "Failed startup retried without backoff"
+    before = Path(f"/proc/{app.pid}/stat").read_text().split()
+    assert_stays(lambda: count() == 3, 1, message="Failed startup retried too quickly")
+    after = Path(f"/proc/{app.pid}/stat").read_text().split()
+    (artifacts / "local-recovery-idle.json").write_text(json.dumps(dict(
+        attempts=count(), cpu_ticks=sum(map(int, after[13:15])) - sum(map(int, before[13:15]))), indent=2) + "\n")
+    executable.unlink()
+    executable.symlink_to(daemon)
+    wait_for(lambda: retry.rpc("status")["local_clients"])
+    assert app.poll() is None
+    retry.rpc("detach")
+    assert app.wait(timeout=8) == 0
+
+print("PASS: the saved local daemon toggle, automatic restart, bounded retry, offline settings, and remotes")

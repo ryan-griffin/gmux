@@ -89,11 +89,11 @@ def reconnect_and_empty_restore(fixture, log):
     fixture.rpc("split", pane=first["active_pane"], down=True)
     fixture.rpc("new", name="Saved tab", directory=str(fixture.path))
     expected = fixture.rpc("list")
-    daemon_pid = fixture.rpc("daemon-info")["pid"]
+    daemon_pid = fixture.rpc("status")["pid"]
     fixture.rpc("detach")
     assert app.wait(timeout=8) == 0
-    assert fixture.rpc("daemon-info")["pid"] == daemon_pid
-    assert not fixture.rpc("daemon-info")["attached"]
+    assert fixture.rpc("status")["pid"] == daemon_pid
+    assert not fixture.rpc("status")["local_clients"]
     fixture.start_app(binary, cwd=root, stdout=log, stderr=log)
     restored = fixture.rpc("list")
     assert restored["active_tab"] == expected["active_tab"]

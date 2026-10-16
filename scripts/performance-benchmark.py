@@ -91,7 +91,7 @@ try:
         config = temp / "config/gmux"
         config.mkdir(parents=True)
         (config / "clients/gtk").mkdir(parents=True, exist_ok=True)
-        (config / "clients/gtk/settings.json").write_text(json.dumps(dict(local_execution=True, appearance="dark",
+        (config / "clients/gtk/settings.json").write_text(json.dumps(dict(local_daemon_enabled=True, appearance="dark",
             desktop_notifications=False, use_system_font=False, font="Monospace", font_size=12)))
         rcfile = temp / "bashrc"
         rcfile.write_text("PS1='GMUX_BENCH> '\nPROMPT_COMMAND=''\nstty -echo\n")
@@ -109,9 +109,9 @@ try:
                 return socket_rpc(env["GMUX_SOCKET"], method, **params)
 
             app = subprocess.Popen([str(args.binary)], env=env, stdout=log, stderr=log)
-            wait_for(lambda: rpc("daemon-info")["attached"])
+            wait_for(lambda: rpc("status")["local_clients"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
-            daemon_pid = rpc("daemon-info")["pid"]
+            daemon_pid = rpc("status")["pid"]
             first = rpc("new", name="Benchmark", directory=str(temp))
             right = rpc("split", pane=first["pane"])["pane"]
             lower_left = rpc("split", pane=first["pane"], down=True)["pane"]
@@ -239,7 +239,7 @@ try:
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
             report["scenarios"].append(measure_resources("detached_three_busy_panes", False))
             control.write_text("idle")
             time.sleep(1)
