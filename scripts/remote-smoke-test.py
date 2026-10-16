@@ -71,6 +71,11 @@ with (artifacts / "remote-smoke.log").open("w") as log, \
 
         assert command(settings, "connection", "list")["running"] is False
         assert "required" in command(settings, "connection", "edit", "local", "--remote-access", "true", check=False)
+        command(settings, "connection", "edit", "local", "--listen-address", "127.0.0.1")
+        assert command(settings, "connection", "list")["remote_access"]["listen_address"] == "127.0.0.1:7331"
+        command(settings, "rpc", json.dumps(dict(method="remote-access-set", remote_access=dict(
+            enabled=False, listen_address="::1", authentication=dict(mode="none")))))
+        assert command(settings, "connection", "list")["remote_access"]["listen_address"] == "[::1]:7331"
         command(settings, "connection", "edit", "local", "--listen-address", "127.0.0.1:0")
         assert command(settings, "connection", "list")["remote_access"]["enabled"] is False
         # Incoming settings do not depend on the outgoing connection catalog.

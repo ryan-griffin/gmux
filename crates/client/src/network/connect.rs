@@ -17,6 +17,7 @@ pub(super) fn resolve(
     deadline: Instant,
     cancellation: Option<&Cancellation>,
 ) -> anyhow::Result<Vec<SocketAddr>> {
+    let address = super::with_default_port(address);
     if let Ok(address) = address.parse() {
         return Ok(vec![address]);
     }
@@ -44,7 +45,7 @@ pub(super) fn resolve(
     });
     let (sender, receiver) = mpsc::sync_channel(1);
     lookups
-        .try_send((address.to_owned(), sender))
+        .try_send((address.into_owned(), sender))
         .map_err(|_| anyhow::anyhow!("Name resolution queue is full"))?;
     wait_for_lookup(receiver, deadline, cancellation)
 }
@@ -171,6 +172,35 @@ pub(super) fn connect(
 mod tests {
     use super::*;
     use std::{net::TcpListener, os::fd::AsRawFd};
+
+    #[test]
+    fn remote_addresses_default_the_port_for_hostnames_and_ip_addresses() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (input, expected) in [
+            ("127.0.0.1", "127.0.0.1:7331"),
+            ("::1", "[::1]:7331"),
+            ("[::1]", "[::1]:7331"),
+            ("fe80::1%3", "[fe80::1%3]:7331"),
+            ("127.0.0.1:8400", "127.0.0.1:8400"),
+            ("[::1]:8400", "[::1]:8400"),
+        ] {
+            assert_eq!(
+                resolve(input, deadline, None).unwrap(),
+                [expected.parse().unwrap()]
+            );
+        }
+        for (input, port) in [
+            ("localhost", super::super::DEFAULT_PORT),
+            ("localhost:8400", 8400),
+        ] {
+            let addresses = resolve(input, deadline, None).unwrap();
+            assert!(!addresses.is_empty());
+            assert!(addresses.iter().all(|address| address.port() == port));
+        }
+        for input in ["127.0.0.1:", "[::1]:", "localhost:65536"] {
+            assert!(resolve(input, deadline, None).is_err(), "Accepted {input}");
+        }
+    }
 
     #[test]
     fn resolution_and_connection_support_ipv4_and_ipv6() {

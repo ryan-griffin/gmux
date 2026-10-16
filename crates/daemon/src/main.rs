@@ -110,7 +110,7 @@ enum ConnectionCommand {
     List,
     /// Add a remote connection, verifying its identity and authentication.
     Add {
-        /// Daemon address in HOST:PORT form.
+        /// Daemon hostname or IP address. The port defaults to 7331.
         address: String,
         /// Connection name; defaults to the daemon's hostname.
         #[arg(long)]
@@ -135,14 +135,14 @@ enum ConnectionCommand {
         /// Use this computer's hostname for the local connection.
         #[arg(long, conflicts_with = "new_name")]
         use_hostname: bool,
-        /// Change a remote connection's address, preserving its daemon identity.
+        /// Change a remote address, preserving its daemon identity. The port defaults to 7331.
         #[arg(long)]
         address: Option<String>,
         /// Allow incoming TCP connections locally. Disabling leaves terminals running.
         #[arg(long, value_name = "BOOL")]
         remote_access: Option<bool>,
-        /// Incoming TCP listening address for the local connection.
-        #[arg(long)]
+        /// Incoming listening IP address. The port defaults to 7331.
+        #[arg(long, value_parser = network::parse_listen_address)]
         listen_address: Option<SocketAddr>,
         /// Authentication for the remote daemon, or incoming clients when editing local.
         #[arg(long, value_enum, required_if_eq("remote_access", "true"))]

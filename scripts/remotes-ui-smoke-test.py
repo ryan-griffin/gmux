@@ -282,10 +282,13 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         assert not find("Back", "button")
         save_enabled(False)
         original_address = local.rpc("connection-list")["remote_access"]["listen_address"]
+        assert Atspi.Text.get_text(widget("Listening Address", "text").get_text_iface(), 0, -1) == "127.0.0.1"
         click("Allow Remote Connections", "switch")
         save_enabled(True)
         fill("Listening Address", "invalid")
         save_enabled(False)
+        fill("Listening Address", "127.0.0.1")
+        save_enabled(True)
         fill("Listening Address", original_address)
         save_enabled(True)
         choose_authentication(True)
@@ -312,6 +315,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
             reader = peer.makefile("rb")
             assert json.loads(reader.readline())["daemon"] == local_id
             click(hostname, "list item")
+            assert Atspi.Text.get_text(widget("Listening Address", "text").get_text_iface(), 0, -1) == "127.0.0.1:0"
             click("Allow Remote Connections", "switch")
             save_enabled(True)
             click("Save", "button")

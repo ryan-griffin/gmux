@@ -73,6 +73,10 @@ and window actions. It is not part of the daemon API.
 
 ## Direct TCP connections
 
+Rust client address arguments accept a hostname or IP address with an optional
+port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
+`server:8400` or `[::1]:8400` to override it.
+
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
 handshake. The current protocol version is 20:
 
@@ -143,7 +147,9 @@ the local control socket. The `remote_access` object contains `enabled`,
 edited while the daemon is running or stopped. `bound_address` reports the
 actual listener address, or null when no listener is running;
 `remote_access_error` reports a listener startup failure. The configured
-`listen_address` can use port zero to request an available port.
+`listen_address` accepts an IP address with an optional port, defaulting to
+`7331`. An explicit port zero requests an available port. Replies and saved
+settings include the resolved port.
 
 Saved outgoing connections belong to the client library and use no daemon API.
 Incoming TCP connections address only the serving daemon, including its shutdown

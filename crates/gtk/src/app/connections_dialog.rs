@@ -2,7 +2,10 @@
 use super::management::{error_label, show_error};
 use super::*;
 use connections::ConnectionStatus;
-use gmux_client::{model::DaemonId, network::Authentication};
+use gmux_client::{
+    model::DaemonId,
+    network::{self, Authentication},
+};
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 struct RemoteDefinition {
@@ -34,6 +37,19 @@ struct RemoteRow {
     status: gtk::Label,
     reconnect: gtk::Button,
 }
+
+fn display_address(address: &str) -> &str {
+    match address.rsplit_once(':') {
+        Some((host, port))
+            if port.parse::<u16>() == Ok(network::DEFAULT_PORT)
+                && (!host.contains(':') || host.starts_with('[')) =>
+        {
+            host
+        }
+        _ => address,
+    }
+}
+
 pub(super) struct ConnectionControls {
     dialog: adw::Dialog,
     group: adw::PreferencesGroup,
@@ -193,7 +209,7 @@ impl ConnectionControls {
         for remote in list.remotes {
             let row = adw::ActionRow::builder()
                 .title(&remote.name)
-                .subtitle(&remote.address)
+                .subtitle(display_address(&remote.address))
                 .subtitle_lines(1)
                 .use_markup(false)
                 .activatable(true)
@@ -341,8 +357,11 @@ impl Ui {
         view.add_top_bar(&header);
         let page = adw::PreferencesPage::new();
         let connection = adw::PreferencesGroup::builder()
-            .description(if editing { "Enter the remote address, including its port" }
-                else { "Enter the remote address, including its port. Leave the name empty to use its hostname" })
+            .description(if editing {
+                format!("Enter a hostname or IP address. The default port is {}", network::DEFAULT_PORT)
+            } else {
+                format!("Enter a hostname or IP address. The default port is {}. Leave the name empty to use its hostname", network::DEFAULT_PORT)
+            })
             .build();
         let name = adw::EntryRow::builder()
             .title("Name")
@@ -364,7 +383,7 @@ impl Ui {
         );
         if let Some(remote) = &remote {
             name.set_text(&remote.name);
-            address.set_text(&remote.address);
+            address.set_text(display_address(&remote.address));
         }
         page.add(&credentials);
         let error = error_label();
@@ -447,7 +466,7 @@ impl Ui {
                 let token = token.text();
                 let changed = original.as_ref().is_none_or(|remote| {
                     name.trim() != remote.name
-                        || address.trim() != remote.address
+                        || network::with_default_port(address.trim()).as_ref() != remote.address
                         || authentication_changed(&remote.authentication, auth.selected(), &token)
                 });
                 submit.set_sensitive(
@@ -593,7 +612,7 @@ impl Ui {
         page.add(&local_group);
         let access_group = adw::PreferencesGroup::builder()
             .title("Remote Access")
-            .description("Control how other computers connect when the local daemon is running")
+            .description(format!("Control how other computers connect when the local daemon is running. The default port is {}", network::DEFAULT_PORT))
             .build();
         let enabled = adw::SwitchRow::builder()
             .title("Allow Remote Connections")
@@ -601,7 +620,7 @@ impl Ui {
             .build();
         let address = adw::EntryRow::builder()
             .title("Listening Address")
-            .text(remote_access.listen_address.to_string())
+            .text(display_address(&remote_access.listen_address.to_string()))
             .activates_default(true)
             .build();
         access_group.add(&enabled);
@@ -654,7 +673,7 @@ impl Ui {
                 reset.set_sensitive(name.trim() != default_name);
                 address.set_sensitive(enabled.is_active());
                 credentials.set_sensitive(enabled.is_active());
-                let address = address.text().trim().parse::<std::net::SocketAddr>().ok();
+                let address = network::parse_listen_address(address.text().trim()).ok();
                 let token = token.text();
                 let changed = execution.is_active() != original_execution
                     || name.trim() != original_name
@@ -753,7 +772,7 @@ impl Ui {
             };
             let remote_access = gmux_client::network::RemoteAccess {
                 enabled: enabled.is_active(),
-                listen_address: address.text().trim().parse().unwrap_or(original_address),
+                listen_address: network::parse_listen_address(address.text().trim()).unwrap_or(original_address),
                 authentication,
             };
             let execution = local_connection.is_active();

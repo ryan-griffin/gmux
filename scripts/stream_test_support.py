@@ -15,8 +15,18 @@ class Client:
             if remote["authentication"]["mode"] == "token":
                 token = Path(remote["authentication"]["file"]).read_text().rstrip("\r\n")
         self.pane = pane
-        self.socket = (socket.create_connection((address.rsplit(":", 1)[0], int(address.rsplit(":", 1)[1])), 6)
-                       if address else socket.socket(socket.AF_UNIX))
+        if address:
+            if address.startswith("["):
+                host, _, suffix = address[1:].partition("]")
+                port = int(suffix[1:]) if suffix else 7331
+            elif address.count(":") == 1:
+                host, port = address.rsplit(":", 1)
+                port = int(port)
+            else:
+                host, port = address, 7331
+            self.socket = socket.create_connection((host, port), 6)
+        else:
+            self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(6)
         if address:
             self.socket.sendall((json.dumps(dict(version=20, channel="stream", token=token)) + "\n").encode())

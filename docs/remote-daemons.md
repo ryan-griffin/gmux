@@ -18,10 +18,18 @@ connection settings. To accept TCP clients, configure incoming access and choose
 authentication explicitly, before starting or while the daemon is running:
 
 ```sh
-gmux connection edit local --remote-access true --listen-address 100.64.0.10:7331 --auth none
+gmux connection edit local --remote-access true --listen-address 100.64.0.10 --auth none
 # Or use the same token file contents on the server and client:
-gmux connection edit local --remote-access true --listen-address 0.0.0.0:7331 --auth token --token-file ~/.config/gmux/token
+gmux connection edit local --remote-access true --listen-address 0.0.0.0 --auth token --token-file ~/.config/gmux/token
 ```
+
+Listener and destination addresses use TCP port `7331` when no port is specified.
+Remote destinations accept hostnames or IP addresses, such as `server` or
+`100.64.0.10`. Override the port with `server:8400` or `100.64.0.10:8400`.
+IPv6 addresses can be bare or bracketed without a port; use `[::1]:8400`
+to specify a port. Listener addresses must be IP addresses.
+Saved addresses include the port in JSON. The connection dialogs hide port `7331`
+and show custom ports.
 
 TCP is not encrypted. Use a private network or an encrypted tunnel, such as
 Tailscale or an SSH tunnel. Token authentication controls access; it does not
@@ -53,7 +61,7 @@ daemon.
 Add a named connection on the client machine, then select it with `--connection`:
 
 ```sh
-gmux connection add 100.64.0.10:7331 --name server --auth none
+gmux connection add 100.64.0.10 --name server --auth none
 gmux connection list
 gmux --connection server list
 gmux --connection server new --name build --directory /srv/project
@@ -174,7 +182,7 @@ Edit the local connection to configure incoming access:
 
 ```sh
 gmux connection list
-gmux connection edit local --remote-access true --listen-address 100.64.0.10:7331 --auth none
+gmux connection edit local --remote-access true --listen-address 100.64.0.10 --auth none
 gmux connection edit local --remote-access false
 ```
 

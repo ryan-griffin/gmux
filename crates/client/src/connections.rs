@@ -14,11 +14,20 @@ pub const MAX_REMOTES: usize = 32;
 #[serde(deny_unknown_fields)]
 pub struct Remote {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_address")]
     pub address: String,
     pub authentication: Authentication,
     pub daemon: DaemonId,
     pub machine_kind: MachineKind,
 }
+
+fn deserialize_address<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let address = String::deserialize(deserializer)?;
+    Ok(network::with_default_port(&address).into_owned())
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
@@ -213,6 +222,7 @@ pub fn call_at(
             address,
             authentication,
         } => {
+            let address = network::with_default_port(&address).into_owned();
             validate_address(&address)?;
             if let Some(name) = &name {
                 validate_name(name)?;
@@ -349,7 +359,7 @@ pub fn call_at(
                     })?;
                 }
                 if let Some(a) = address {
-                    remote.address = a;
+                    remote.address = network::with_default_port(&a).into_owned();
                 }
                 if let Some(a) = authentication {
                     remote.authentication = a;
@@ -557,6 +567,35 @@ impl Drop for Watch {
         self.stop.notify();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_remote_addresses_include_ports_and_preserve_hostnames() {
+        let daemon = DaemonId::generate().unwrap();
+        for (input, expected) in [
+            ("server.example", "server.example:7331"),
+            ("127.0.0.1", "127.0.0.1:7331"),
+            ("::1", "[::1]:7331"),
+            ("[::1]", "[::1]:7331"),
+            ("fe80::1%3", "[fe80::1%3]:7331"),
+            ("::7331", "[::7331]:7331"),
+            ("server.example:8400", "server.example:8400"),
+            ("127.0.0.1:8400", "127.0.0.1:8400"),
+            ("[::1]:8400", "[::1]:8400"),
+        ] {
+            let remote: Remote = serde_json::from_value(json!({
+                "name":"server", "address":input, "authentication":{"mode":"none"},
+                "daemon":daemon, "machine_kind":"unknown"
+            }))
+            .unwrap();
+            assert_eq!(remote.address, expected);
+            assert_eq!(serde_json::to_value(remote).unwrap()["address"], expected);
         }
     }
 }

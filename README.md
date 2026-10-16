@@ -127,7 +127,7 @@ without `--connection`; `gmux --connection NAME stop` stops a particular daemon.
 Serve a machine's terminals over a private network such as Tailscale:
 
 ```sh
-gmux connection edit local --remote-access true --listen-address 100.64.0.10:7331 --auth none
+gmux connection edit local --remote-access true --listen-address 100.64.0.10 --auth none
 gmux serve --background
 ```
 
@@ -135,13 +135,17 @@ Add a connection on the client machine and manage its terminals, with no local
 daemon required:
 
 ```sh
-gmux connection add 100.64.0.10:7331 --name server --auth none
+gmux connection add 100.64.0.10 --name server --auth none
 gmux connection list
 gmux --connection server new --directory /srv/my-app
 gmux --connection server list
 gmux --connection server send 'cargo test' --pane 2 --enter
 gmux --connection server read --pane 2
 ```
+
+Addresses use TCP port `7331` by default. Specify `server:8400` or
+`100.64.0.10:8400` to use a different port. For IPv6, use `::1` or `[::1]`,
+and `[::1]:8400` to specify a port.
 
 `gmux connection` manages the same entries as **Manage Connections…** in GTK.
 Use `edit` and `remove` to update saved connections. Use `--connection NAME` in
