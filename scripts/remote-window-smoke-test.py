@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check GTK tabs across connections, workspace ownership, routing, and detach."""
+import fcntl
 import json
 import os
 import signal
@@ -169,6 +170,36 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
     assert not (receiver.config / "execution.json").exists()
     assert not (receiver.config / "daemon.log").exists()
     assert (receiver.config / "clients/gtk/state.json").exists()
+
+
+with scenario("initial directories wait for the enabled local daemon while remotes connect"), \
+        (artifacts / "remote-startup-routing-smoke.log").open("w") as log, \
+        AppFixture(dict(desktop_notifications=False), env={"GTK_A11Y": "none"}) as receiver, \
+        AppFixture() as server:
+    start(server, log)
+    original = server.rpc("new", name="Existing remote")
+    command(receiver, "connection", "add", server.rpc("status")["bound_address"],
+            "--name", "server", "--auth", "none")
+    with Path(receiver.env["GMUX_SOCKET"] + ".lock").open("a") as lock:
+        # Keep local startup pending until a remote stream and a catalog edit
+        # have both been observed by the window.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        app = receiver.start(cli, "--directory", "/tmp", stdout=log, stderr=log)
+        wait_for(lambda: any(tab["connected"] for tab in receiver.rpc("list")["tabs"]))
+        assert receiver.rpc("list")["daemon"] is None, "Local startup selected a remote default"
+        command(receiver, "connection", "edit", "server", "--name", "renamed")
+        wait_for(lambda: any(tab["connection"] == "renamed" for tab in receiver.rpc("list")["tabs"]))
+        assert receiver.rpc("list")["daemon"] is None, "A catalog refresh selected a remote default"
+        assert [tab["id"] for tab in server.rpc("list")["tabs"]] == [original["tab"]]
+    local = wait_for(lambda: receiver.rpc("status"))
+    wait_for(lambda: len(receiver.rpc("list")["tabs"]) == 2)
+    listing = receiver.rpc("list")
+    assert listing["daemon"] == local["daemon"]
+    created = next(tab for tab in listing["tabs"] if tab["reference"]["daemon"] == local["daemon"])
+    assert created["panes"][0]["directory"] == "/tmp"
+    assert [tab["id"] for tab in server.rpc("list")["tabs"]] == [original["tab"]]
+    receiver.rpc("detach")
+    assert app.wait(timeout=10) == 0
 
 
 with (artifacts / "remote-window-smoke.log").open("w") as log, \

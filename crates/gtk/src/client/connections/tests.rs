@@ -39,6 +39,7 @@ impl Fixture {
         let hub = Connections {
             primary: Some(local),
             local: Some(local),
+            local_enabled: true,
             preferred: None,
             definitions: Vec::new(),
             watcher: gmux_client::connections::Watch::new(wake.clone()).unwrap(),

@@ -49,6 +49,7 @@ impl Origin {
 pub struct Connections {
     primary: Option<DaemonId>,
     local: Option<DaemonId>,
+    local_enabled: bool,
     preferred: Option<String>,
     definitions: Vec<gmux_client::connections::Remote>,
     watcher: gmux_client::connections::Watch,
@@ -105,6 +106,7 @@ impl Connections {
     pub fn new(
         wake: ipc::Wake,
         store: Arc<Store>,
+        local_enabled: bool,
         preferred: Option<String>,
     ) -> anyhow::Result<(Self, CommandReply)> {
         // Observe edits made while loading the initial catalog, too.
@@ -115,6 +117,7 @@ impl Connections {
         let primary = match preferred.as_deref() {
             Some("local") => None,
             Some(name) => Some(catalog.remote(name, None)?.daemon),
+            None if local_enabled => None,
             None => catalog.remotes.first().map(|remote| remote.daemon),
         };
         let origins = catalog
@@ -125,6 +128,7 @@ impl Connections {
         let mut hub = Self {
             primary,
             local: None,
+            local_enabled,
             preferred,
             definitions: catalog.remotes,
             watcher,
@@ -153,6 +157,7 @@ impl Connections {
         if self.local.is_some_and(|id| id != daemon) {
             self.disable_local();
         }
+        self.local_enabled = true;
         self.local = Some(daemon);
         self.origins
             .entry(daemon)
@@ -165,18 +170,23 @@ impl Connections {
         self.connect(daemon);
     }
     pub fn disable_local(&mut self) {
+        self.local_enabled = false;
         if let Some(id) = self.local.take() {
             self.origins.remove(&id);
             if self.primary == Some(id) {
-                self.primary = self.fallback_daemon();
+                self.primary = None;
             }
+        }
+        if self.primary.is_none() {
+            self.primary = self.fallback_daemon();
         }
         self.status_changed = true;
         self.revision += 1;
         self.wake.notify();
     }
     fn fallback_daemon(&self) -> Option<DaemonId> {
-        if self.preferred.as_deref() == Some("local") {
+        // An enabled local daemon may still be starting and have no identity yet.
+        if self.local_enabled || self.preferred.as_deref() == Some("local") {
             self.local
         } else {
             self.local

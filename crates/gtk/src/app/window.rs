@@ -20,8 +20,12 @@ impl Ui {
             .as_ref()
             .unwrap()
             .clone();
-        let (sessions, initial) =
-            connections::Connections::new(wake.clone(), store.clone(), preferred)?;
+        let (sessions, initial) = connections::Connections::new(
+            wake.clone(),
+            store.clone(),
+            settings.borrow().local_daemon_enabled,
+            preferred,
+        )?;
         let catalog = initial.catalog;
         let session = initial.session;
         let window = adw::ApplicationWindow::builder()
