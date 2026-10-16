@@ -33,11 +33,21 @@ impl Authentication {
         match self {
             Self::None => Ok(None),
             Self::Token { file } => {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Open before checking the type so replacing the path cannot
+                // make a FIFO block setup or cancellation. Symlinks to regular
+                // token files remain valid.
+                let input = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(file)
+                    .with_context(|| format!("Could not read token file {}", file.display()))?;
+                anyhow::ensure!(
+                    input.metadata()?.is_file(),
+                    "Token file must be a regular file"
+                );
                 let mut token = String::new();
-                std::fs::File::open(file)
-                    .with_context(|| format!("Could not read token file {}", file.display()))?
-                    .take(1027)
-                    .read_to_string(&mut token)?;
+                input.take(1027).read_to_string(&mut token)?;
                 anyhow::ensure!(token.len() <= 1026, "Token file is too large");
                 let token = token.trim_end_matches(['\r', '\n']);
                 anyhow::ensure!(
@@ -435,6 +445,50 @@ mod tests {
         io::Cursor,
         net::{Shutdown, TcpListener},
     };
+
+    #[test]
+    fn token_files_follow_regular_symlinks_and_reject_fifos_without_waiting() {
+        use std::{os::unix::fs::OpenOptionsExt, sync::mpsc};
+        let directory =
+            std::env::temp_dir().join(format!("gmux-token-file-{}", DaemonId::generate().unwrap()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("token");
+        let token = "0123456789abcdef0123456789abcdef";
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        for file in [path, link] {
+            assert_eq!(
+                Authentication::Token { file }.token().unwrap().as_deref(),
+                Some(token)
+            );
+        }
+        let fifo = directory.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = mpsc::channel();
+        let file = fifo.clone();
+        let worker = std::thread::spawn(move || {
+            sender.send(Authentication::Token { file }.token()).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a regressed blocking read before failing the test.
+            let mut writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo)
+                .unwrap();
+            writer.write_all(token.as_bytes()).unwrap();
+        }
+        worker.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let error = result
+            .expect("Token loading waited for a FIFO writer")
+            .unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+    }
 
     #[test]
     fn credentials_can_be_supplied_from_memory_without_a_token_file() {

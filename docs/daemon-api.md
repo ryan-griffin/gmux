@@ -150,7 +150,8 @@ Incoming TCP connections address only the serving daemon, including its shutdown
 operation. They cannot manage remote access or client state. Client lifecycle
 helpers `local-daemon-start` and `local-daemon-stop` start or attach to the local
 daemon and wait for its shutdown, respectively. They are handled by the client
-library and cannot be sent directly to a daemon.
+library and cannot be sent directly to a daemon. `local-daemon-stop` also succeeds
+when no daemon is running, so local execution can be disabled after a failed start.
 
 ## Terminal streams
 

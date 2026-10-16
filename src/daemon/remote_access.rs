@@ -250,15 +250,30 @@ mod tests {
             .set(
                 network::RemoteAccess {
                     enabled: true,
-                    listen_address: "127.0.0.1:0".parse().unwrap(),
+                    // Allocate across all interfaces so another address cannot
+                    // already own the port when we later widen the listener.
+                    listen_address: "0.0.0.0:0".parse().unwrap(),
                     authentication: network::Authentication::None,
                 },
                 daemon,
                 |_| Ok(()),
             )
             .unwrap();
+        let address = std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            state.status().bound_address.unwrap().port(),
+        ));
+        state
+            .set(
+                network::RemoteAccess {
+                    listen_address: address,
+                    ..state.config.clone()
+                },
+                daemon,
+                |_| Ok(()),
+            )
+            .unwrap();
         let original = state.config.clone();
-        let address = state.status().bound_address.unwrap();
         let connect = || {
             network::connect(
                 &address.to_string(),
@@ -289,7 +304,7 @@ mod tests {
                     anyhow::bail!("disk write failed")
                 })
                 .unwrap_err();
-            assert_eq!(saved, !occupied);
+            assert_eq!(saved, !occupied, "Listener replacement failed: {error:#}");
             assert!(if occupied {
                 error
                     .downcast_ref::<std::io::Error>()

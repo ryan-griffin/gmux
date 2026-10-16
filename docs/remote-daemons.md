@@ -27,7 +27,8 @@ TCP is not encrypted. Use a private network or an encrypted tunnel, such as
 Tailscale or an SSH tunnel. Token authentication controls access; it does not
 provide transport encryption. Token files contain 32 to 1024 bytes without
 whitespace, optionally followed by a newline. Configuration stores file paths,
-never token contents.
+never token contents. Token files must be regular files; symlinks to regular files
+are accepted.
 
 `gmux serve` runs in the foreground. Add `--background` to detach it and return
 once it is ready:

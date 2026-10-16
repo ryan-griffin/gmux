@@ -16,7 +16,7 @@ from gi.repository import Atspi, Gdk
 
 from cargo_test_support import cargo_binary
 from daemon_test_support import stop_daemon
-from test_support import AppFixture, AccessibilityFixture, assert_stays, descendants, scenario, wait_accessible, wait_for
+from test_support import AppFixture, AccessibilityFixture, assert_stays, create_tab_when_connected, descendants, scenario, wait_accessible, wait_for
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
@@ -425,7 +425,7 @@ with scenario("closing the initiating window leaves recovery available to other 
         retry.rpc("detach", window=first)
         wait_for(lambda: len(retry.rpc("windows")["windows"]) == 1)
         wait_for(lambda: retry.rpc("status")["local_clients"])
-        retry.rpc("new", window=second, name="Recovered")
+        create_tab_when_connected(retry.env["GMUX_SOCKET"], window=second, name="Recovered")
         retry.rpc("detach", window=second)
         assert app.wait(timeout=8) == 0
     finally:
@@ -455,6 +455,33 @@ with scenario("failed startup backs off and recovers when the daemon becomes ava
     wait_for(lambda: retry.rpc("status")["local_clients"])
     assert app.poll() is None
     retry.rpc("detach")
+    assert app.wait(timeout=8) == 0
+
+with scenario("a failing local daemon can be disabled without starting another process"), \
+        (artifacts / "local-disable-failed-start-smoke.log").open("w") as log, \
+        AppFixture(env={"GTK_A11Y": "atspi"}) as local, AccessibilityFixture(), WaylandInput() as native:
+    client = local.path / "client/gmux-gtk"
+    client.parent.mkdir()
+    shutil.copy2(gtk, client)
+    attempts = local.path / "attempts"
+    executable = client.with_name("gmux")
+    executable.write_text("#!/bin/sh\necho attempt >> " + shlex.quote(str(attempts)) + "\nexit 1\n")
+    executable.chmod(0o700)
+    app = local.start(client, stdout=log, stderr=log)
+    count = lambda: len(attempts.read_text().splitlines()) if attempts.exists() else 0
+    wait_for(lambda: count() >= 2)
+    editor()
+    click("Local Daemon", "switch")
+    click("Save", "button")
+    click("Stop Daemon", "button")
+    manager_page()
+    assert not saved_enabled()
+    stopped_attempts = count()
+    assert_stays(lambda: count() == stopped_attempts, 3,
+                 message="Disabling the local daemon did not cancel startup retries")
+    assert not Path(local.env["GMUX_SOCKET"]).exists()
+    close_manager()
+    local.rpc("detach")
     assert app.wait(timeout=8) == 0
 
 print("PASS: the saved local daemon toggle, automatic restart, bounded retry, offline settings, and remotes")

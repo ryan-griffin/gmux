@@ -67,6 +67,18 @@ def assert_stays(predicate, duration, *, message):
         time.sleep(0.025)
 
 
+def create_tab_when_connected(socket_path, **params):
+    """Wait for client setup, which finishes after its daemon-side attachment."""
+    def create():
+        result = rpc(socket_path, "new", check=False, **params)
+        if "error" in result:
+            assert "disconnected or connecting" in result["error"], result
+            return None
+        return result
+
+    return wait_for(create, exceptions=(), message="The client did not finish connecting")
+
+
 def descendants(element):
     element.clear_cache()
     yield element

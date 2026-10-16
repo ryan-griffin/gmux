@@ -114,7 +114,7 @@ and remote access settings, draft local toggle changes, Save and Cancel, prefere
 write failures, responsive saves under a held file lock, concurrent preference
 changes, confirmation cancellation,
 automatic recovery after normal shutdown and crashes, bounded startup retries,
-and local daemon shutdown alongside remote connections.
+disabling local execution after a failed start, and shutdown alongside remote connections.
 Existing execution-focused fixtures explicitly enable local execution.
 
 The fixture starts a 1280 × 960 headless Mutter monitor with XWayland disabled.

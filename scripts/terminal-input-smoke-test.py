@@ -6,7 +6,7 @@ headless Mutter compositor with XWayland disabled and a private PipeWire server.
 """
 import json
 from functools import partial
-from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport
+from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport, create_tab_when_connected
 import os
 from pathlib import Path
 from test_support import AccessibilityFixture
@@ -62,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             app = subprocess.Popen([str(cargo_binary("gmux-gtk"))],
                 env=dict(env, GMUX_SOCKET=proxy.proxy_path), stdout=log, stderr=log)
             wait_for(lambda: rpc("status")["local_clients"])
-            pane = rpc("new", name="Native Wayland input")["pane"]
+            pane = create_tab_when_connected(env["GMUX_SOCKET"], name="Native Wayland input")["pane"]
             terminal = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
                 if obj.get_process_id() == app.pid and obj.get_role_name() == "terminal"), None))
             assert terminal.get_role_name() == "terminal"

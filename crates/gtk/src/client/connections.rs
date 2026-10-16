@@ -107,7 +107,10 @@ impl Connections {
         store: Arc<Store>,
         preferred: Option<String>,
     ) -> anyhow::Result<(Self, CommandReply)> {
+        // Observe edits made while loading the initial catalog, too.
+        let watcher = gmux_client::connections::Watch::new(wake.clone())?;
         let catalog = gmux_client::connections::Catalog::load()?;
+        let subscription = store.subscribe(wake.clone());
         let (organization, client_revision) = store.snapshot();
         let primary = match preferred.as_deref() {
             Some("local") => None,
@@ -124,10 +127,10 @@ impl Connections {
             local: None,
             preferred,
             definitions: catalog.remotes,
-            watcher: gmux_client::connections::Watch::new(wake.clone())?,
+            watcher,
             store: store.clone(),
             client_revision,
-            _subscription: store.subscribe(wake.clone()),
+            _subscription: subscription,
             origins,
             handles: Handles::default(),
             revision: 0,

@@ -317,7 +317,14 @@ impl Daemon {
             self.git_dirty = true;
             return Ok(());
         }
-        let id = match self.resolve_pane(pane) {
+        let target = if frontend.remote && pane.is_none() {
+            Err(anyhow::anyhow!(
+                "Remote pane commands require an explicit pane"
+            ))
+        } else {
+            self.resolve_pane(pane)
+        };
+        let id = match target {
             Ok(id) => id,
             Err(error) => {
                 frontend.paste = None;

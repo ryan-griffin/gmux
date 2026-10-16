@@ -181,16 +181,30 @@ impl SessionManager {
         daemon: crate::model::DaemonId,
         socket: impl Into<ipc::Stream>,
     ) -> anyhow::Result<Self> {
-        let socket = socket.into();
-        let mut writer = socket.try_clone()?;
+        let mut socket = socket.into();
+        Self::attach_stream(&mut socket, daemon)?;
+        Self::from_attached_stream(endpoint, wake, daemon, socket)
+    }
+    pub(crate) fn attach_stream(
+        socket: &mut ipc::Stream,
+        daemon: crate::model::DaemonId,
+    ) -> anyhow::Result<()> {
         transport::command(
-            &mut writer,
+            socket,
             &StreamRequest::connection(StreamCommand::Attach {
                 version: transport::VERSION,
                 daemon,
                 remote: false,
             }),
-        )?;
+        )
+    }
+    pub(crate) fn from_attached_stream(
+        endpoint: ipc::Endpoint,
+        wake: ipc::Wake,
+        daemon: crate::model::DaemonId,
+        socket: ipc::Stream,
+    ) -> anyhow::Result<Self> {
+        let mut writer = socket.try_clone()?;
         let reader = socket.try_clone()?;
         let (commands, queue) = mpsc::sync_channel::<Outgoing>(128);
         let pending_bytes = Arc::new(AtomicUsize::new(0));

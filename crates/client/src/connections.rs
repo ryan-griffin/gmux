@@ -193,7 +193,21 @@ pub fn call_at(
             state["local"]["name"] = json!(Catalog::load()?.local_name());
             state
         }
-        Request::LocalDaemonStop => ipc::Endpoint::local().stop(cancellation)?,
+        Request::LocalDaemonStop => {
+            // Disabling local execution must also work during startup backoff,
+            // when there is no daemon to stop. Do not start one to disable it.
+            if ipc::call_if_running(
+                &ipc::socket_path(),
+                crate::control::InternalRequest::Hello,
+                cancellation,
+            )?
+            .is_some()
+            {
+                ipc::Endpoint::local().stop(cancellation)?
+            } else {
+                json!({"ok":true})
+            }
+        }
         Request::ConnectionAdd {
             name,
             address,

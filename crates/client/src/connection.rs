@@ -100,7 +100,10 @@ impl Connection {
         let wake = self.wake.clone();
         std::thread::spawn(move || {
             let result = (|| {
-                let socket = endpoint.connect_stream_cancellable(&cancellation)?;
+                let mut socket = endpoint.connect_stream_cancellable(&cancellation)?;
+                // Attach within the stream's handshake deadline, independently
+                // of how long the separate control request takes to reply.
+                SessionManager::attach_stream(&mut socket, daemon)?;
                 let state = endpoint.state(Some(&cancellation))?;
                 anyhow::ensure!(state.daemon == daemon, "Remote connection identity changed");
                 Ok((socket, state))
@@ -143,7 +146,7 @@ impl Connection {
             }
             self.changed = true;
             match result.and_then(|(stream, state)| {
-                let mut manager = SessionManager::from_stream(
+                let mut manager = SessionManager::from_attached_stream(
                     self.endpoint.clone(),
                     self.wake.clone(),
                     self.daemon,
@@ -189,6 +192,56 @@ impl Drop for Connection {
 mod tests {
     use super::*;
     use std::{io::Read, os::unix::net::UnixStream};
+
+    #[test]
+    fn stream_attachment_does_not_wait_for_the_control_state_reply() {
+        use std::{
+            io::{BufRead, BufReader},
+            os::unix::net::UnixListener,
+            time::Duration,
+        };
+        let daemon = DaemonId::generate().unwrap();
+        let directory = std::env::temp_dir().join(format!("gmux-connect-order-{daemon}"));
+        let control = directory.join("control");
+        let stream = directory.join("stream");
+        let server = ipc::Server::start_at(control.clone(), ipc::Wake::new().unwrap()).unwrap();
+        let listener = UnixListener::bind(&stream).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut line = String::new();
+            let attached = BufReader::new(&socket).read_line(&mut line).is_ok()
+                && serde_json::from_str::<serde_json::Value>(&line).unwrap()["method"] == "attach";
+            // A control response can wait on the remote machine. The stream
+            // must already be attached while the request is outstanding.
+            let request = server
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            request.reply.send(serde_json::json!({
+                "daemon":daemon,"home_directory":"/tmp","machine_kind":"unknown","hostname":"host", "revision":0,
+                "result":{"ok":true},"execution":{"last_id":0,"tabs":[],"scrollback":{}},"metadata":[]
+            })).unwrap();
+            sender.send(attached).unwrap();
+        });
+        let mut connection = Connection::new(
+            daemon,
+            ipc::Endpoint::unix(control, stream),
+            ipc::Wake::new().unwrap(),
+        );
+        connection.connect();
+        let attached = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        connection.cancel();
+        worker.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            attached,
+            "The control request delayed the stream attachment"
+        );
+    }
 
     #[test]
     fn retries_ignore_late_completions_and_release_their_streams() {

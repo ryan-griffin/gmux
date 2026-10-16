@@ -57,6 +57,7 @@ with (artifacts / "remote-smoke.log").open("w") as log, \
         listing = command(client, "connection", "list")
         assert listing["local"]["daemon"] is None and listing["running"] is False
         assert listing["remotes"] == []
+        assert command(client, "rpc", json.dumps(dict(method="local-daemon-stop")))["ok"]
         hostname = listing["hostname"]
         command(client, "connection", "edit", "local", "--name", "desktop")
         assert command(client, "connection", "list")["local"]["name"] == "desktop"
@@ -184,9 +185,16 @@ with (artifacts / "remote-smoke.log").open("w") as log, \
         stream.until(lambda header: header["frame"] is not None)
         assert server.rpc("status")["remote_clients"] == 1
         assert not server.rpc("status")["local_clients"]
+        # A sole pane is still not an implicit target for a remote stream.
+        for target in ({}, {"pane": None}):
+            request = dict(method="paste", text="printf 'MISSING_REMOTE_PANE\\n'", enter=True, **target)
+            stream.socket.sendall((json.dumps(request) + "\n").encode())
+            rejected = stream.until(lambda header: header["error"] and "explicit pane" in header["error"])
+            assert rejected["meta"]["id"] == pane
         stream.send("paste", text="printf 'VIEWPORT_CLIENT_OK\\n'", clipboard=False, enter=True)
         # The independent protocol client uses the same daemon execution as the CLI.
         wait_for(lambda: "VIEWPORT_CLIENT_OK" in command(client, "--connection", "server", "read", "--pane", pane)["text"])
+        assert "MISSING_REMOTE_PANE" not in command(client, "--connection", "server", "read", "--pane", pane)["text"]
         stream.close()
         wait_for(lambda: server.rpc("status")["remote_clients"] == 0)
         no_local_daemon(client)

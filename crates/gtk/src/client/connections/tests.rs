@@ -325,6 +325,14 @@ fn abandoned_connection_setup_releases_sockets_in_both_phases_and_retries_cleanl
                 );
                 let mut control = if waiting_for_state {
                     writeln!(stream, "{hello}").unwrap();
+                    line.clear();
+                    BufReader::with_capacity(1, &stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&line).unwrap()["method"],
+                        "attach"
+                    );
                     let (mut socket, _) = listener.accept().unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(2)))
