@@ -32,8 +32,9 @@ cargo clippy --locked -p gmux-core -p gmux-client --all-targets -- -D warnings
 
 The serve suite checks background startup readiness, detached standard I/O,
 concurrent launch races, duplicate rejection, saved incoming settings, relative
-token paths, live correction, and startup failure reporting. It records startup
-time, idle CPU, and resident memory under `artifacts/`.
+token paths, live correction, same-port listener edits, responsive terminal streams
+under a held remote-access settings lock, and startup failure reporting. It records
+startup time, idle CPU, and resident memory under `artifacts/`.
 
 The ownership suite runs two daemons to check qualified references, identity
 across restarts, rejection of client organization requests, invalid client files
@@ -63,8 +64,9 @@ The remotes-ui suite operates native GTK menus and dialogs through AT-SPI. It
 checks authentication choices, failed additions and edits, prefilled editors,
 Save and Cancel, editor dialogs over their managers, direct workspace creation from
 menus and the command palette, workspace list updates, live local remote access,
-token file selection, live catalog updates, reconnect, and
-removal preserving remote execution. The plus menu lists local and remote
+token file selection, live catalog updates, terminal input and output after address
+and credential edits, reconnect, and removal preserving remote execution.
+The plus menu lists local and remote
 connections under a New Tab via Connection heading. Local and remote creation
 inherit the workspace filter. Tests
 check workspace-only filtering and the absence of other creation actions.

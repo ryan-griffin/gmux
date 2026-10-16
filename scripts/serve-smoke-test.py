@@ -6,9 +6,11 @@ from pathlib import Path
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from cargo_test_support import cargo_binary
 from daemon_test_support import stop_daemon
+from stream_test_support import Client
 from test_support import AppFixture, scenario
 
 binary = cargo_binary("gmux")
@@ -158,6 +160,48 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         incoming(fixture, "--listen-address", "127.0.0.1:0")
         assert fixture.rpc("status")["pid"] == running
         assert fixture.rpc("status")["bound_address"]
+
+    with scenario("remote access saves leave status and terminal streams responsive under a held file lock"):
+        pane = fixture.rpc("list")["tabs"][0]["panes"][0]["id"]
+        stream = Client(fixture, pane)
+        stream.until(lambda header: header["frame"] is not None)
+        current = fixture.rpc("remote-access-get")
+        settings = dict(current["remote_access"], enabled=False)
+        latencies = []
+        with ThreadPoolExecutor() as pool, (fixture.config / ".remote-access.json.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            pending = pool.submit(fixture.rpc, "remote-access-set", remote_access=settings)
+            try:
+                time.sleep(.1)
+                assert not pending.done(), "The update bypassed the settings writer lock"
+                for _ in range(5):
+                    started = time.monotonic()
+                    assert fixture.rpc("status", timeout=1)["pid"] == running
+                    assert fixture.rpc("remote-access-get", timeout=1) == current
+                    latencies.append((time.monotonic() - started) * 1000)
+                started = time.monotonic()
+                stream.send("paste", text="printf '\\nSETTINGS_LOCK_INPUT_OK\\n'", enter=True)
+                stream.output("SETTINGS_LOCK_INPUT_OK")
+                viewport_ms = (time.monotonic() - started) * 1000
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                stream.close()
+            assert pending.result(timeout=5)["ok"]
+        assert fixture.rpc("status")["bound_address"] is None
+        (artifacts / "remote-access-responsiveness.json").write_text(json.dumps(dict(
+            status_and_settings_ms=latencies, viewport_input_ms=viewport_ms), indent=2) + "\n")
+
+    with scenario("live listener edits switch between loopback and wildcard addresses on the same port"):
+        incoming(fixture, "--remote-access", "true", "--listen-address", "127.0.0.1:0", "--auth", "none")
+        address = fixture.rpc("status")["bound_address"]
+        port = address.rsplit(":", 1)[1]
+        for destination in (f"0.0.0.0:{port}", address):
+            incoming(fixture, "--listen-address", destination)
+            assert fixture.rpc("status")["bound_address"] == destination
+            assert fixture.rpc("remote-access-get")["remote_access"]["listen_address"] == destination
+            connected = Client(fixture, pane, address=address)
+            connected.until(lambda header: header["frame"] is not None)
+            connected.close()
 
     with scenario("the daemon validates saved execution and reports startup failure in its log"):
         stop_daemon(fixture.env["GMUX_SOCKET"])

@@ -266,11 +266,7 @@ pub fn run() -> anyhow::Result<()> {
             };
             let method = request.body["method"].as_str().unwrap_or("");
             if remote_access::RemoteAccess::handles(method) {
-                let result = daemon
-                    .remote_access
-                    .call(daemon.id, request.body)
-                    .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                let _ = request.reply.try_send(result);
+                daemon.remote_access.handle(daemon.id, request);
                 continue;
             }
             let Some(request) = ControlRequest::decode(request) else {

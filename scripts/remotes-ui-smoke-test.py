@@ -574,6 +574,12 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         fill("Address", changed_address)
         click("Save", "button")
         wait_accessible(lambda: not find("Edit Connection", "dialog"))
+        # Read the displayed viewport and send through its retained terminal widget.
+        # A fresh control connection alone would hide a stale stream attachment.
+        server.rpc("send", pane=pane, text="printf '\\nADDRESS_EDIT_OUTPUT_OK\\n'", enter=True)
+        wait_for(lambda: "ADDRESS_EDIT_OUTPUT_OK" in local.rpc("read")["text"].splitlines())
+        local.rpc("send", text="printf '\\nADDRESS_EDIT_INPUT_OK\\n'", paste=True, enter=True)
+        wait_for(lambda: "ADDRESS_EDIT_INPUT_OK" in server.rpc("read", pane=pane)["text"].splitlines())
         local.rpc("move", workspace=None)
         local.rpc("connection-edit", connection="build-box", name="server", address=address)
         wait_for(lambda: any(t["connection"] == "server" for t in local.rpc("list")["tabs"]))
@@ -651,6 +657,13 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         host_tab = secured.rpc("_state")["execution"]["tabs"][0]
         assert "workspace" not in host_tab, "The remote inherited a receiver-only workspace"
         assert secured.rpc("list")["tabs"][0]["panes"][0]["directory"] == str(Path(secured.env["HOME"]))
+
+    with scenario("credential file edits reattach an existing remote terminal"):
+        local.rpc("connection-edit", connection="secured", authentication={"mode": "token", "file": str(token)})
+        secured.rpc("send", pane=secure_pane, text="printf '\\nCREDENTIAL_EDIT_OUTPUT_OK\\n'", enter=True)
+        wait_for(lambda: "CREDENTIAL_EDIT_OUTPUT_OK" in local.rpc("read")["text"].splitlines())
+        local.rpc("send", text="printf '\\nCREDENTIAL_EDIT_INPUT_OK\\n'", paste=True, enter=True)
+        wait_for(lambda: "CREDENTIAL_EDIT_INPUT_OK" in secured.rpc("read", pane=secure_pane)["text"].splitlines())
 
     with scenario("remote path labels abbreviate the remote home and preserve raw paths"):
         reference = selected_remote()["reference"]

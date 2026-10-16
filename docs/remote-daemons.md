@@ -185,8 +185,11 @@ local, and to the destination daemon when editing a remote connection.
 Remote access edits persist separately from outgoing connections and work while the
 daemon is stopped. They do not start local execution. A running daemon applies
 them immediately; a stopped daemon uses them on its next `serve`. Disabling
-remote access or rotating its token disconnects existing TCP clients without stopping
-terminals. `gmux serve` always reads these saved settings. If the TCP listener
+remote access, changing its listening address, or rotating its token disconnects
+existing TCP clients without stopping terminals. Address edits can keep the same
+port when switching between loopback and wildcard interfaces. Failed edits preserve
+the saved settings and restore the previous listener and its connected clients.
+`gmux serve` always reads these saved settings. If the TCP listener
 cannot start, local execution remains available and `gmux connection list` reports
 the error so the settings can be corrected.
 

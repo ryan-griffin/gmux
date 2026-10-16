@@ -4,8 +4,8 @@ use gmux_client::{
     ipc,
     model::DaemonId,
     network::{
-        Authentication, Channel, ConnectionInfo, Handshake, MAX_HANDSHAKE, MAX_REPLY, MAX_REQUEST,
-        TIMEOUT, TimedStream, read_json, write_json,
+        Channel, ConnectionInfo, Handshake, MAX_HANDSHAKE, MAX_REPLY, MAX_REQUEST, TIMEOUT,
+        TimedStream, read_json, write_json,
     },
     transport,
 };
@@ -16,23 +16,26 @@ use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 
-pub(super) struct Listen {
-    pub address: SocketAddr,
-    pub authentication: Authentication,
+struct Clients {
+    sockets: Mutex<HashMap<u64, TcpStream>>,
+    token: Mutex<Option<String>>,
+    next: AtomicU64,
 }
 
 /// Listener shutdown also interrupts idle authenticated connections.
 pub struct Server {
     stop: ipc::Wake,
-    sockets: Arc<Mutex<HashMap<u64, TcpStream>>>,
+    clients: Arc<Clients>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub address: SocketAddr,
-    token: Arc<Mutex<Option<String>>>,
 }
 pub struct PreparedServer {
     listener: TcpListener,
@@ -41,14 +44,9 @@ pub struct PreparedServer {
     address: SocketAddr,
 }
 impl Server {
-    pub fn start(config: Listen, control: PathBuf, daemon: DaemonId) -> anyhow::Result<Self> {
-        Ok(Self::prepare(config)?.start(control, daemon))
-    }
-    pub fn prepare(config: Listen) -> anyhow::Result<PreparedServer> {
-        let token = config.authentication.token()?;
-        let listener = TcpListener::bind(config.address)?;
+    pub fn prepare(address: SocketAddr, token: Option<String>) -> anyhow::Result<PreparedServer> {
+        let listener = bind(address)?;
         let address = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
         let stop = ipc::Wake::new()?;
         Ok(PreparedServer {
             listener,
@@ -57,15 +55,37 @@ impl Server {
             address,
         })
     }
+    /// Release the listening address while retaining authenticated clients for rollback.
+    pub fn pause(&mut self) {
+        self.stop.notify();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+    pub fn resume(&mut self, control: PathBuf, daemon: DaemonId) -> anyhow::Result<()> {
+        let listener = bind(self.address)?;
+        self.stop.drain();
+        self.thread = Some(accept(
+            listener,
+            self.stop.clone(),
+            self.clients.clone(),
+            control,
+            daemon,
+        ));
+        Ok(())
+    }
+    pub fn listening(&self) -> bool {
+        self.thread.is_some()
+    }
     pub fn set_token(&self, token: Option<String>) {
-        let sockets = self.sockets.lock().unwrap();
-        *self.token.lock().unwrap() = token;
+        let sockets = self.clients.sockets.lock().unwrap();
+        *self.clients.token.lock().unwrap() = token;
         for socket in sockets.values() {
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
     pub fn token_matches(&self, token: &Option<String>) -> bool {
-        *self.token.lock().unwrap() == *token
+        *self.clients.token.lock().unwrap() == *token
     }
 }
 impl PreparedServer {
@@ -76,76 +96,84 @@ impl PreparedServer {
             token,
             address,
         } = self;
-        let stopping = stop.clone();
-        let sockets = Arc::new(Mutex::new(HashMap::<u64, TcpStream>::new()));
-        let active = sockets.clone();
-        let token = Arc::new(Mutex::new(token));
-        let credentials = token.clone();
-        let thread = std::thread::spawn(move || {
-            let mut next = 0u64;
-            let mut fds = [
-                libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stopping.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            loop {
-                let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                if fds[1].revents != 0 {
-                    break;
-                }
-                if result < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                let Ok((stream, _)) = listener.accept() else {
-                    continue;
-                };
-                let deadline = Instant::now() + TIMEOUT;
-                let mut sockets = active.lock().unwrap();
-                if sockets.len() >= 32 {
-                    continue;
-                }
-                let Ok(copy) = stream.try_clone() else {
-                    continue;
-                };
-                next += 1;
-                let id = next;
-                sockets.insert(id, copy);
-                let token = credentials.lock().unwrap().clone();
-                drop(sockets);
-                let active = active.clone();
-                let control = control.clone();
-                std::thread::spawn(move || {
-                    let _ = serve(stream, &control, daemon, token.as_deref(), deadline);
-                    active.lock().unwrap().remove(&id);
-                });
-            }
+        let clients = Arc::new(Clients {
+            sockets: Mutex::new(HashMap::new()),
+            token: Mutex::new(token),
+            next: AtomicU64::new(0),
         });
+        let thread = accept(listener, stop.clone(), clients.clone(), control, daemon);
         Server {
             stop,
-            sockets,
+            clients,
             thread: Some(thread),
             address,
-            token,
         }
     }
 }
+fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind(address)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+fn accept(
+    listener: TcpListener,
+    stopping: ipc::Wake,
+    clients: Arc<Clients>,
+    control: PathBuf,
+    daemon: DaemonId,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut fds = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stopping.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if fds[1].revents != 0 {
+                break;
+            }
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            let Ok((stream, _)) = listener.accept() else {
+                continue;
+            };
+            let deadline = Instant::now() + TIMEOUT;
+            let mut sockets = clients.sockets.lock().unwrap();
+            if sockets.len() >= 32 {
+                continue;
+            }
+            let Ok(copy) = stream.try_clone() else {
+                continue;
+            };
+            let id = clients.next.fetch_add(1, Ordering::Relaxed) + 1;
+            sockets.insert(id, copy);
+            let token = clients.token.lock().unwrap().clone();
+            drop(sockets);
+            let active = clients.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let _ = serve(stream, &control, daemon, token.as_deref(), deadline);
+                active.sockets.lock().unwrap().remove(&id);
+            });
+        }
+    })
+}
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stop.notify();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        for socket in self.sockets.lock().unwrap().values() {
+        self.pause();
+        for socket in self.clients.sockets.lock().unwrap().values() {
             let _ = socket.shutdown(Shutdown::Both);
         }
     }

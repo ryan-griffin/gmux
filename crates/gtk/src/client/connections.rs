@@ -347,7 +347,14 @@ impl Connections {
             return;
         };
         origin.link.set_endpoint(endpoint);
-        self.status_changed |= origin.link.connect();
+        if origin.link.connect() {
+            // Every attempt creates a new session manager. Existing terminal
+            // widgets must attach to it, including after a catalog edit cancels
+            // the old link before poll can observe its disconnection.
+            self.attached
+                .retain(|handle| self.handles.references[handle].0 != id);
+            self.status_changed = true;
+        }
     }
     /// Combine an execution snapshot with this client's organization and other connections.
     #[cfg(test)]
