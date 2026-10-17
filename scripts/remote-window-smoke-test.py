@@ -283,7 +283,8 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
             for method, target in (("split", "pane"), ("close", "pane"), ("move", "tab")):
                 error = command(a, method, "--connection", connection, check=False, env=clean_env)
                 assert f"Specify a {target} on the selected connection" in error, error
-                error = a.rpc(method, connection=connection, workspace=None, check=False)
+                params = {"workspace": None} if method == "move" else {}
+                error = a.rpc(method, connection=connection, check=False, **params)
                 assert f"Specify a {target} on the selected connection" in error["error"], error
         assert [fixture.rpc("_state", client=False)["execution"] for fixture in (a, b, c)] == before
         assert all(item["workspace"] is None for item in view()["tabs"])

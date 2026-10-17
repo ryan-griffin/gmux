@@ -76,24 +76,17 @@ impl Ui {
         destination: Option<model::DaemonId>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>) + 'static,
     ) {
-        if matches!(
-            &command,
-            Command::Split { pane: None, .. } | Command::Close { pane: None }
-        ) && self.active_pane().is_none()
-        {
-            callback(self, Err(anyhow::anyhow!("No active terminal")));
-            return;
-        }
         // Resolve implicit targets in this window before crossing the daemon boundary.
         match &mut command {
             Command::New { workspace, .. } if workspace.is_none() => {
                 *workspace = Some(self.selected_workspace());
             }
             Command::Split { pane, .. } | Command::Close { pane } if pane.is_none() => {
-                *pane = self.active_pane().map(|pane| pane.id);
-            }
-            Command::Move { tab, .. } if tab.is_none() => {
-                *tab = Some(self.active.get());
+                let Some(active) = self.active_pane() else {
+                    callback(self, Err(anyhow::anyhow!("No active terminal")));
+                    return;
+                };
+                *pane = Some(active.id);
             }
             _ => (),
         }
@@ -144,18 +137,9 @@ impl Ui {
                     return;
                 }
             };
-            let assignment =
-                route
-                    .assign
-                    .and_then(|(target, workspace)| match reply.result.output {
-                        crate::client::control::CommandOutput::New { tab, .. } => {
-                            Some((tab, workspace))
-                        }
-                        crate::client::control::CommandOutput::Workspace { workspace } => {
-                            target.map(|tab| (tab, Some(workspace)))
-                        }
-                        _ => None,
-                    });
+            let assignment = route
+                .assign
+                .and_then(|assignment| assignment.resolve(&reply.result.output));
             if let Some((target, workspace)) = assignment
                 && let Some(saved) = reply.session.tabs.iter().find(|t| t.id == target)
             {

@@ -702,13 +702,7 @@ impl Ui {
             };
             ui.command_on(command, destination, move |ui, result| {
                 let response = result
-                    .and_then(|result| {
-                        let mut value = serde_json::to_value(result)?;
-                        ui.sessions
-                            .borrow()
-                            .external_result(&mut value, destination);
-                        Ok(value)
-                    })
+                    .and_then(|result| ui.sessions.borrow().external_result(result, destination))
                     .unwrap_or_else(|e| json!({"error":e.to_string()}));
                 let _ = reply.try_send(response);
             });

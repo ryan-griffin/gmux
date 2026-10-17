@@ -70,7 +70,24 @@ pub struct Connections {
 pub struct Route {
     pub destination: Option<DaemonId>,
     pub body: Value,
-    pub assign: Option<(Option<u64>, Option<u64>)>,
+    pub assign: Option<Assignment>,
+}
+pub enum Assignment {
+    CreatedTab { workspace: Option<u64> },
+    CreatedWorkspace { tab: u64 },
+}
+impl Assignment {
+    pub fn resolve(self, output: &CommandOutput) -> Option<(u64, Option<u64>)> {
+        match (self, output) {
+            (Self::CreatedTab { workspace }, CommandOutput::New { tab, .. }) => {
+                Some((*tab, workspace))
+            }
+            (Self::CreatedWorkspace { tab }, CommandOutput::Workspace { workspace }) => {
+                Some((tab, Some(*workspace)))
+            }
+            _ => None,
+        }
+    }
 }
 #[derive(Default)]
 struct Handles {
@@ -984,18 +1001,27 @@ impl Connections {
         }
         Ok(destination)
     }
-    pub fn external_result(&self, value: &mut Value, mut daemon: Option<DaemonId>) {
-        if let Some(id) = value["tab"].as_u64() {
-            let r = self.tab_ref(id);
-            daemon = Some(r.daemon);
-            value["tab"] = json!(r.id);
+    pub fn external_result(
+        &self,
+        mut result: CommandResult,
+        mut daemon: Option<DaemonId>,
+    ) -> anyhow::Result<Value> {
+        let pane = match &mut result.output {
+            CommandOutput::New { tab, pane, .. } => {
+                *tab = self.tab_ref(*tab).id;
+                Some(pane)
+            }
+            CommandOutput::Split { pane } => Some(pane),
+            CommandOutput::Workspace { .. } | CommandOutput::Done { .. } => None,
+        };
+        if let Some(pane) = pane {
+            let reference = self.pane_ref(*pane);
+            *pane = reference.id;
+            daemon = Some(reference.daemon);
         }
-        if let Some(id) = value["pane"].as_u64() {
-            let r = self.pane_ref(id);
-            daemon = Some(r.daemon);
-            value["pane"] = json!(r.id);
-        }
+        let mut value = serde_json::to_value(result)?;
         value["daemon"] = json!(daemon);
+        Ok(value)
     }
     fn wrap(&self, daemon: DaemonId, value: Value) -> anyhow::Result<Value> {
         if super::backend::organization_request(&value) {
@@ -1036,7 +1062,7 @@ impl Connections {
                     })?,
                     directory.take(),
                 )?;
-                assign = Some((None, workspace));
+                assign = Some(Assignment::CreatedTab { workspace });
             }
             Command::Split { pane: Some(id), .. } | Command::Close { pane: Some(id) } => {
                 let r = self.checked_ref(*id)?;
@@ -1050,17 +1076,13 @@ impl Connections {
                 daemon = Some(r.daemon);
                 *tab = r.id;
             }
-            Command::WorkspaceAdd { tab: Some(id), .. } => {
-                assign = Some((Some(*id), None));
-                if let Command::WorkspaceAdd { tab, .. } = &mut command {
-                    *tab = None;
-                }
+            Command::WorkspaceAdd { tab, .. } => {
+                assign = tab.take().map(|tab| Assignment::CreatedWorkspace { tab });
                 daemon = self.primary;
             }
             Command::WorkspaceEdit { .. }
             | Command::WorkspaceRemove { .. }
-            | Command::Move { .. }
-            | Command::WorkspaceAdd { .. } => daemon = self.primary,
+            | Command::Move { .. } => daemon = self.primary,
             _ => (),
         }
         let body = match command.into_execution() {
