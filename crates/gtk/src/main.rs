@@ -13,9 +13,10 @@ mod settings;
 mod terminal;
 mod terminal_canvas;
 
-use crate::client::control::{Command as LayoutCommand, PublicRequest};
+use crate::client::control::{Command as LayoutCommand, PaneRequest, PublicRequest, TabCommand};
 use crate::client::model;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use gmux_client::control::pane_method;
 use gmux_client::ipc;
 use gmux_client::theme;
 use std::path::PathBuf;
@@ -267,7 +268,7 @@ fn main() -> anyhow::Result<()> {
     if cli.connection.is_none()
         && let Some((name, args)) = matches.subcommand()
         && match name {
-            "split" | "close" | "send" | "read" | "notify" => {
+            name if pane_method(name) => {
                 args.value_source("pane") == Some(clap::parser::ValueSource::EnvVariable)
             }
             "move" => args.value_source("tab") == Some(clap::parser::ValueSource::EnvVariable),
@@ -358,17 +359,17 @@ fn main() -> anyhow::Result<()> {
                 serde_json::to_value(LayoutCommand::Move { tab, workspace })?
             }
             Command::Split { pane, down } => {
-                serde_json::to_value(LayoutCommand::Split { pane, down })?
+                serde_json::to_value(TabCommand::Split { pane, down })?
             }
-            Command::Send { text, pane, enter } => serde_json::to_value(PublicRequest::Send {
+            Command::Send { text, pane, enter } => serde_json::to_value(PaneRequest::Send {
                 text,
                 pane,
                 paste: true,
                 enter,
             })?,
-            Command::Read { pane } => serde_json::to_value(PublicRequest::Read { pane })?,
+            Command::Read { pane } => serde_json::to_value(PaneRequest::Read { pane })?,
             Command::Notify { message, pane } => {
-                serde_json::to_value(PublicRequest::Notify { message, pane })?
+                serde_json::to_value(PaneRequest::Notify { message, pane })?
             }
             Command::Focus {
                 tab,
@@ -380,12 +381,12 @@ fn main() -> anyhow::Result<()> {
                 workspace,
                 pane,
             })?,
-            Command::Close { pane } => serde_json::to_value(LayoutCommand::Close { pane })?,
-            Command::CloseTab { tab } => serde_json::to_value(LayoutCommand::CloseTab { tab })?,
+            Command::Close { pane } => serde_json::to_value(TabCommand::Close { pane })?,
+            Command::CloseTab { tab } => serde_json::to_value(TabCommand::CloseTab { tab })?,
             Command::Rename { tab, name } => {
-                serde_json::to_value(LayoutCommand::Rename { tab, name })?
+                serde_json::to_value(TabCommand::Rename { tab, name })?
             }
-            Command::ResetName { tab } => serde_json::to_value(LayoutCommand::ResetName { tab })?,
+            Command::ResetName { tab } => serde_json::to_value(TabCommand::ResetName { tab })?,
             Command::Screenshot { path } => serde_json::to_value(PublicRequest::Screenshot {
                 path: std::path::absolute(path)?,
             })?,
@@ -395,16 +396,14 @@ fn main() -> anyhow::Result<()> {
             if connection != "local" {
                 // A local shell's numeric pane environment must not target a remote pane.
                 if let Some((name, args)) = matches.subcommand()
-                    && matches!(name, "split" | "close" | "send" | "read" | "notify")
+                    && pane_method(name)
                     && args.value_source("pane") != Some(clap::parser::ValueSource::CommandLine)
                 {
                     request["pane"] = serde_json::Value::Null;
                 }
                 anyhow::ensure!(
-                    !matches!(
-                        request["method"].as_str(),
-                        Some("split" | "close" | "send" | "read" | "notify")
-                    ) || request["pane"].as_u64().is_some(),
+                    !request["method"].as_str().is_some_and(pane_method)
+                        || request["pane"].as_u64().is_some(),
                     if rpc {
                         "Remote pane requests require an explicit pane field"
                     } else {
@@ -426,10 +425,9 @@ fn main() -> anyhow::Result<()> {
                         }
                     );
                     anyhow::ensure!(
-                        !matches!(
-                            request["method"].as_str(),
-                            Some("workspace-add" | "workspace-edit" | "workspace-remove")
-                        ),
+                        !request["method"]
+                            .as_str()
+                            .is_some_and(LayoutCommand::workspace_method),
                         "Workspace commands control the GTK app; omit --connection"
                     );
                 }

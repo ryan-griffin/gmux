@@ -407,9 +407,7 @@ impl Ui {
         let remove = editing.then(|| management::remove_action(&page, "Remove Connection…"));
         if let (Some(remove), Some(remote)) = (remove, remote.as_ref()) {
             let weak = Rc::downgrade(self);
-            let close = dialog.downgrade();
-            let view = view.downgrade();
-            let error = error.downgrade();
+            let editor = management::EditorRequest::new(&dialog, &view, &submit, &error);
             let name = remote.name.clone();
             let daemon = remote.daemon;
             remove.connect_activated(move |_| {
@@ -424,31 +422,14 @@ impl Ui {
                 confirmation.set_default_response(Some("cancel"));
                 confirmation.set_close_response("cancel");
                 let weak = weak.clone();
-                let close = close.clone();
-                let view = view.clone();
-                let error = error.clone();
+                let editor = editor.clone();
                 let name = name.clone();
                 confirmation.connect_response(Some("remove"), move |_, _| {
-                    let (Some(ui), Some(dialog), Some(view)) =
-                        (weak.upgrade(), close.upgrade(), view.upgrade())
-                    else { return };
-                    if let Some(error) = error.upgrade() { error.set_visible(false); }
-                    dialog.set_can_close(false);
-                    view.set_sensitive(false);
-                    let close = close.clone();
-                    let view = view.downgrade();
-                    let error = error.clone();
+                    let Some(ui) = weak.upgrade() else { return };
+                    editor.begin(None);
+                    let editor = editor.clone();
                     ui.request(json!({"method":"connection-remove", "connection":name,"daemon":daemon}), move |_, result| {
-                        if let Some(dialog) = close.upgrade() { dialog.set_can_close(true); }
-                        if let Some(view) = view.upgrade() { view.set_sensitive(true); }
-                        match result {
-                            Ok(_) => {
-                                if let Some(dialog) = close.upgrade() { dialog.close(); }
-                            }
-                            Err(message) => {
-                                if let Some(error) = error.upgrade() { show_error(&error, message); }
-                            }
-                        }
+                        editor.finish(result.map(|_| ()));
                     });
                 });
                 confirmation.present(Some(&ui.window));

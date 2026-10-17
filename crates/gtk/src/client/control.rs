@@ -1,5 +1,6 @@
 //! Organization and navigation requests served by execution clients.
 use crate::client::model::{DaemonId, Session, WorkspaceCatalog};
+pub use gmux_client::control::{PaneRequest, TabCommand};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -18,17 +19,6 @@ pub enum Command {
             skip_serializing_if = "Option::is_none"
         )]
         workspace: Option<Option<u64>>,
-    },
-    Split {
-        pane: Option<u64>,
-        #[serde(default)]
-        down: bool,
-    },
-    Close {
-        pane: Option<u64>,
-    },
-    CloseTab {
-        tab: u64,
     },
     WorkspaceAdd {
         name: String,
@@ -51,13 +41,8 @@ pub enum Command {
         #[serde(deserialize_with = "Option::deserialize")]
         workspace: Option<u64>,
     },
-    Rename {
-        tab: u64,
-        name: String,
-    },
-    ResetName {
-        tab: u64,
-    },
+    #[serde(untagged)]
+    Tab(TabCommand),
 }
 
 // Missing means inherit the current filter; explicit null means unassigned.
@@ -105,21 +90,6 @@ pub enum PublicRequest {
     Status,
     Quit,
     List,
-    Read {
-        pane: Option<u64>,
-    },
-    Send {
-        pane: Option<u64>,
-        text: String,
-        #[serde(default)]
-        paste: bool,
-        #[serde(default)]
-        enter: bool,
-    },
-    Notify {
-        pane: Option<u64>,
-        message: String,
-    },
     Launch {
         connection: Option<String>,
         directory: Option<PathBuf>,
@@ -156,6 +126,8 @@ pub enum PublicRequest {
     Action {
         name: String,
     },
+    #[serde(untagged)]
+    Pane(PaneRequest),
 }
 
 pub enum Request {
@@ -164,17 +136,55 @@ pub enum Request {
     Public(PublicRequest),
 }
 impl Request {
-    pub fn decode(value: serde_json::Value) -> anyhow::Result<Self> {
+    pub fn decode(mut value: serde_json::Value) -> anyhow::Result<Self> {
         let method = value["method"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
         Ok(if Command::supports(method) {
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("window");
+                fields.remove("connection");
+            }
             Self::Layout(serde_json::from_value(value)?)
         } else if method.starts_with('_') {
             Self::Internal(serde_json::from_value(value)?)
         } else {
             Self::Public(serde_json::from_value(value)?)
         })
+    }
+    pub fn uses_ui(&self) -> bool {
+        matches!(
+            self,
+            Self::Layout(_)
+                | Self::Internal(
+                    InternalRequest::State
+                        | InternalRequest::DesktopSave { .. }
+                        | InternalRequest::DesktopTab { .. }
+                )
+        ) || matches!(self, Self::Public(request) if !matches!(request, PublicRequest::Status))
+    }
+    pub fn ui_requirement(&self) -> Option<&'static str> {
+        match self {
+            Self::Layout(
+                Command::WorkspaceAdd { .. }
+                | Command::WorkspaceEdit { .. }
+                | Command::WorkspaceRemove { .. }
+                | Command::Move { .. }
+                | Command::New {
+                    workspace: Some(Some(_)),
+                    ..
+                },
+            ) => Some("Workspace organization requires a running GTK app"),
+            Self::Layout(_)
+            | Self::Public(PublicRequest::List | PublicRequest::Status | PublicRequest::Pane(_)) => {
+                None
+            }
+            Self::Public(_)
+            | Self::Internal(
+                InternalRequest::DesktopSave { .. } | InternalRequest::DesktopTab { .. },
+            ) => Some("Command requires a running GTK app"),
+            Self::Internal(_) => None,
+        }
     }
 }
 
@@ -213,8 +223,6 @@ impl From<CommandOutput> for CommandResult {
 }
 
 /// Worker results keep execution separate from GTK organization until the window combines them.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum BackendReply {
     Execution {
         reply: gmux_client::control::CommandReply,
@@ -222,6 +230,16 @@ pub enum BackendReply {
     Organization {
         result: CommandResult,
     },
+    Value(serde_json::Value),
+}
+impl BackendReply {
+    pub fn into_value(self) -> anyhow::Result<serde_json::Value> {
+        Ok(match self {
+            Self::Execution { reply } => serde_json::to_value(reply)?,
+            Self::Organization { result } => serde_json::json!({"result":result}),
+            Self::Value(value) => value,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,27 +280,19 @@ impl Command {
             Self::New {
                 directory, name, ..
             } => Execution::New { directory, name },
-            Self::Split { pane, down } => Execution::Split { pane, down },
-            Self::Close { pane } => Execution::Close { pane },
-            Self::CloseTab { tab } => Execution::CloseTab { tab },
-            Self::Rename { tab, name } => Execution::Rename { tab, name },
-            Self::ResetName { tab } => Execution::ResetName { tab },
+            Self::Tab(command) => Execution::Tab(command),
             organization => return Err(organization),
         })
     }
     pub fn supports(method: &str) -> bool {
+        gmux_client::control::Command::supports(method)
+            || Self::workspace_method(method)
+            || method == "move"
+    }
+    pub fn workspace_method(method: &str) -> bool {
         matches!(
             method,
-            "new"
-                | "split"
-                | "close"
-                | "close-tab"
-                | "workspace-add"
-                | "workspace-edit"
-                | "workspace-remove"
-                | "move"
-                | "rename"
-                | "reset-name"
+            "workspace-add" | "workspace-edit" | "workspace-remove"
         )
     }
 }

@@ -1,6 +1,7 @@
 //! Ordered organization work and independent execution queues outside the UI thread.
 use super::{
     Store,
+    control::{BackendReply, Command},
     model::{DaemonId, DesktopState},
 };
 use gmux_client::ipc;
@@ -12,7 +13,7 @@ use std::{
 };
 
 struct Worker {
-    client: ipc::Client,
+    client: ipc::Client<BackendReply>,
     cancellation: ipc::Cancellation,
     execution: bool,
 }
@@ -46,6 +47,8 @@ impl Worker {
         self.cancellation.cancel();
         if self.execution {
             self.client.cancel_requests();
+        } else {
+            self.client.close();
         }
     }
 }
@@ -66,7 +69,7 @@ pub struct Backend {
     next: Cell<u64>,
     outstanding: Cell<usize>,
     closed: Cell<bool>,
-    ready: RefCell<Vec<(u64, anyhow::Result<Value>)>>,
+    retired: RefCell<Vec<Worker>>,
 }
 impl Backend {
     pub fn new(
@@ -92,7 +95,7 @@ impl Backend {
             next: Cell::new(1),
             outstanding: Cell::new(0),
             closed: Cell::new(false),
-            ready: RefCell::new(Vec::new()),
+            retired: RefCell::new(Vec::new()),
         }
     }
     pub fn set_local(&self, local: Option<DaemonId>) {
@@ -150,15 +153,21 @@ impl Backend {
         let store = self.store.clone();
         self.organization.client.update_with("desktop", move || {
             store.save_desktop(desktop, revision)?;
-            Ok(serde_json::json!({"ok":true}))
+            Ok(BackendReply::Value(serde_json::json!({"ok":true})))
         })
     }
-    pub fn replies(&self) -> Vec<(u64, anyhow::Result<Value>)> {
-        let mut replies = std::mem::take(&mut *self.ready.borrow_mut());
-        replies.extend(self.organization.client.replies());
+    pub fn replies(&self) -> Vec<(u64, anyhow::Result<BackendReply>)> {
+        let mut replies: Vec<_> = self.organization.client.replies().collect();
         for worker in self.workers.borrow().values() {
             replies.extend(worker.client.replies());
         }
+        self.retired.borrow_mut().retain(|worker| {
+            // Check before draining so the final reply cannot arrive between
+            // the drain and dropping the receiver.
+            let finished = worker.client.is_finished();
+            replies.extend(worker.client.replies());
+            !finished
+        });
         self.outstanding
             .set(self.outstanding.get() - replies.iter().filter(|(id, _)| *id != 0).count());
         replies
@@ -171,11 +180,10 @@ impl Backend {
             .extract_if(|lane, _| matches!(lane, Lane::Execution(id) if !retained(*id)))
             .map(|(_, worker)| worker)
             .collect();
-        for mut worker in removed {
+        for worker in &removed {
             worker.stop();
-            worker.client.join();
-            self.ready.borrow_mut().extend(worker.client.replies());
         }
+        self.retired.borrow_mut().extend(removed);
     }
     /// Stop execution requests and interrupt socket waits; organization edits and saves still flush.
     pub fn shutdown(&self) {
@@ -186,6 +194,15 @@ impl Backend {
         for worker in self.workers.borrow().values() {
             worker.stop();
         }
+    }
+    pub fn is_finished(&self) -> bool {
+        self.organization.client.is_finished()
+            && self
+                .workers
+                .borrow()
+                .values()
+                .chain(self.retired.borrow().iter())
+                .all(|worker| worker.client.is_finished())
     }
 }
 impl Drop for Backend {
@@ -198,10 +215,9 @@ pub(super) fn organization_request(body: &Value) -> bool {
         body["method"].as_str(),
         Some("_desktop-save" | "_desktop-tab")
     ) || body["method"] == "_command"
-        && matches!(
-            body["command"]["method"].as_str(),
-            Some("workspace-add" | "workspace-edit" | "workspace-remove")
-        )
+        && body["command"]["method"]
+            .as_str()
+            .is_some_and(Command::workspace_method)
 }
 
 #[cfg(test)]

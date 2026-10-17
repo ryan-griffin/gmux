@@ -408,7 +408,10 @@ fn pruning_preserves_disconnected_execution_and_references_until_views_release_t
     assert!(f.hub.handles.references.is_empty());
     assert!(
         f.hub
-            .route_command(Command::CloseTab { tab: local }, Some(f.ids[0]))
+            .route_command(
+                Command::Tab(TabCommand::CloseTab { tab: local }),
+                Some(f.ids[0])
+            )
             .is_err()
     );
     assert!(
@@ -428,7 +431,7 @@ fn routing_rejects_removed_connections_while_their_views_still_hold_handles() {
     f.hub.origins.remove(&remote);
     // Presentation and pending callbacks can keep these handles past removal.
     for command in [
-        Command::CloseTab { tab },
+        Command::Tab(TabCommand::CloseTab { tab }),
         Command::New {
             directory_base: None,
             directory: None,
@@ -541,7 +544,7 @@ fn prepared_remote_commands_keep_their_identity_when_names_are_reassigned() {
     let tab = f.hub.lookup(original, 1).unwrap();
     let route = f
         .hub
-        .route_command(Command::CloseTab { tab }, Some(original))
+        .route_command(Command::Tab(TabCommand::CloseTab { tab }), Some(original))
         .unwrap();
     assert_eq!(
         f.hub.route_body(route.body.clone()).unwrap().0,

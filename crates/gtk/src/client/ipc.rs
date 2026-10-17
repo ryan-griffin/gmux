@@ -1,72 +1,38 @@
 //! Route client actions to the client-owned socket, independently of the daemon.
+use super::control::Request;
 use gmux_client::ipc;
 use serde_json::Value;
+
+fn client_request(body: &Value) -> anyhow::Result<Option<Request>> {
+    match Request::decode(body.clone()) {
+        Ok(request) => Ok(Some(request)),
+        Err(error) => {
+            if gmux_client::control::Request::decode(body.clone()).is_ok() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
 
 pub fn call(body: impl serde::Serialize) -> anyhow::Result<Value> {
     let mut body = serde_json::to_value(body)?;
     let method = body["method"].as_str().unwrap_or("").to_owned();
-    let client = matches!(
-        method.as_str(),
-        "quit"
-            | "_state"
-            | "new"
-            | "split"
-            | "close"
-            | "close-tab"
-            | "rename"
-            | "reset-name"
-            | "list"
-            | "read"
-            | "send"
-            | "notify"
-            | "launch"
-            | "workspace-add"
-            | "workspace-edit"
-            | "workspace-remove"
-            | "move"
-            | "focus"
-            | "filter"
-            | "windows"
-            | "new-window"
-            | "detach"
-            | "renderer-info"
-            | "search-tabs"
-            | "screenshot"
-            | "resize"
-            | "action"
-            | "_desktop-save"
-            | "_desktop-tab"
-    );
+    // Configuration requests own their connection field. It is not an
+    // execution selector and must reach the configuration handler intact.
+    if gmux_client::connections::handles(&method) {
+        return gmux_client::connections::call(body);
+    }
+    let decoded = client_request(&body)?;
+    let client = decoded.as_ref().is_some_and(Request::uses_ui);
     let path = ipc::companion_path(".ui");
     if client && let Some(reply) = ipc::call_if_running(&path, &body, None)? {
         return Ok(reply);
     }
-    if matches!(
-        method.as_str(),
-        "workspace-add" | "workspace-edit" | "workspace-remove" | "move"
-    ) {
-        anyhow::bail!("Workspace organization requires a running GTK app");
+    if let Some(message) = decoded.as_ref().and_then(Request::ui_requirement) {
+        anyhow::bail!(message);
     }
-    anyhow::ensure!(
-        !matches!(
-            method.as_str(),
-            "quit"
-                | "launch"
-                | "focus"
-                | "screenshot"
-                | "windows"
-                | "new-window"
-                | "detach"
-                | "renderer-info"
-                | "search-tabs"
-                | "resize"
-                | "action"
-                | "filter"
-                | "_desktop-save"
-                | "_desktop-tab"
-        ),
-        "Command requires a running GTK app"
-    );
     let endpoint = if let Some(connection) = body
         .as_object_mut()
         .and_then(|body| body.remove("connection"))
@@ -83,13 +49,9 @@ pub fn call(body: impl serde::Serialize) -> anyhow::Result<Value> {
         None
     };
     if method == "new" {
-        let mut command: super::control::Command = serde_json::from_value(body)?;
-        if let super::control::Command::New { workspace, .. } = &command {
-            anyhow::ensure!(
-                !matches!(workspace, Some(Some(_))),
-                "Workspace organization requires a running GTK app"
-            );
-        }
+        let Some(Request::Layout(mut command)) = decoded else {
+            anyhow::bail!("Invalid new tab request");
+        };
         command.resolve_directory(endpoint.is_none())?;
         body = serde_json::to_value(
             command
@@ -101,4 +63,27 @@ pub fn call(body: impl serde::Serialize) -> anyhow::Result<Value> {
         return endpoint.call(body);
     }
     gmux_client::connections::call(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn malformed_client_requests_fail_before_daemon_fallback() {
+        for body in [
+            json!({"method":"send", "text":false}),
+            json!({"method":"split", "pane":"invalid"}),
+            json!({"method":"resize", "width":false, "height":600}),
+        ] {
+            assert!(client_request(&body).is_err());
+        }
+        assert!(client_request(&json!({"method":"stop"})).unwrap().is_none());
+        assert!(
+            client_request(&json!({"method":"read"}))
+                .unwrap()
+                .is_some_and(|request| request.uses_ui())
+        );
+    }
 }

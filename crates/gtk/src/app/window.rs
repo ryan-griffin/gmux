@@ -259,12 +259,12 @@ impl Ui {
             revision: Cell::new(initial.revision),
             restore_selection: Cell::new(None),
             detaching: Cell::new(false),
-            backend: crate::client::backend::Backend::new(
+            backend: Rc::new(crate::client::backend::Backend::new(
                 ipc::Endpoint::local(),
                 wake.clone(),
                 store,
                 None,
-            ),
+            )),
             pending: RefCell::new(HashMap::new()),
             command_count: Cell::new(0),
             creation_serial: Cell::new(0),
@@ -641,9 +641,11 @@ impl Ui {
                         name: None,
                         workspace: Some(ui.selected_workspace()),
                     }),
-                    "split-right" | "split-down" => ui.active_pane().map(|pane| Command::Split {
-                        pane: Some(pane.id),
-                        down: name == "split-down",
+                    "split-right" | "split-down" => ui.active_pane().map(|pane| {
+                        Command::Tab(TabCommand::Split {
+                            pane: Some(pane.id),
+                            down: name == "split-down",
+                        })
                     }),
                     _ => None,
                 }
@@ -664,22 +666,19 @@ impl Ui {
         }
         if let Request::Internal(body) = request {
             ui.save_session();
-            ui.request(body, move |ui, result| {
-                let result = result.and_then(|value| {
-                    if matches!(value["kind"].as_str(), Some("execution" | "organization")) {
-                        let raw: BackendReply = serde_json::from_value(value)?;
-                        // Socket replies keep daemon IDs. Only the window's view
-                        // translates them to handles shared across connections.
-                        let response = match &raw {
-                            BackendReply::Execution { reply } => serde_json::to_value(reply)?,
-                            BackendReply::Organization { result } => json!({"result":result}),
-                        };
-                        let state = ui.sessions.borrow_mut().project(raw)?;
-                        ui.apply_backend(state, false, backend::Selection::capture(ui))?;
-                        Ok(response)
-                    } else {
-                        Ok(value)
+            ui.request_reply(body, move |ui, result| {
+                let result = result.and_then(|raw| {
+                    if let BackendReply::Value(value) = raw {
+                        return Ok(value);
                     }
+                    let response = match &raw {
+                        BackendReply::Execution { reply } => serde_json::to_value(reply)?,
+                        BackendReply::Organization { result } => json!({"result":result}),
+                        BackendReply::Value(_) => unreachable!(),
+                    };
+                    let state = ui.sessions.borrow_mut().project(raw)?;
+                    ui.apply_backend(state, false, backend::Selection::capture(ui))?;
+                    Ok(response)
                 });
                 let _ = reply.try_send(result.unwrap_or_else(|e| json!({"error":e.to_string()})));
             });
@@ -708,7 +707,8 @@ impl Ui {
             });
             return;
         }
-        if let Request::Public(PublicRequest::Notify { pane, message }) = request {
+        if let Request::Public(PublicRequest::Pane(PaneRequest::Notify { pane, message })) = request
+        {
             let target = pane
                 .map(|id| ui.sessions.borrow().default_handle(id))
                 .transpose()
@@ -730,7 +730,7 @@ impl Ui {
             );
             return;
         }
-        if let Request::Public(PublicRequest::Read { pane }) = request {
+        if let Request::Public(PublicRequest::Pane(PaneRequest::Read { pane })) = request {
             let pane = match pane
                 .map(|id| ui.sessions.borrow().default_handle(id))
                 .transpose()

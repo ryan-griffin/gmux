@@ -86,6 +86,9 @@ python3 scripts/check.py --native --skip-build --only renderer multi-window
 
 `--only` selects suites by filename without `-smoke-test.py`; use `smoke` for
 `smoke-test.py`. Rust checks still run unless `--skip-build` is set.
+Use `--skip-smoke` to run Rust, build, and linkage checks without smoke suites.
+CI runs the headless smoke suites once, then checks the full workspace and
+verifies that its daemon artifact matches the headless build.
 That option uses executable paths recorded by the previous runner build in
 `artifacts/cargo-build.jsonl`. Rerun without it after source or build-config changes.
 Direct smoke scripts build their executables through Cargo unless given an

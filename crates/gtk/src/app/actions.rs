@@ -308,11 +308,14 @@ impl Ui {
         {
             return;
         }
-        self.command(Command::ResetName { tab: id }, |ui, result| {
-            if let Err(error) = result {
-                ui.message(&error.to_string());
-            }
-        });
+        self.command(
+            Command::Tab(TabCommand::ResetName { tab: id }),
+            |ui, result| {
+                if let Err(error) = result {
+                    ui.message(&error.to_string());
+                }
+            },
+        );
     }
 }
 

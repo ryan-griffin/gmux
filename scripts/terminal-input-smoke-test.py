@@ -73,6 +73,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             assert rpc("renderer-info")["display"] == "GdkWaylandDisplay"
             rpc("screenshot", path=str(artifacts / "terminal-input-initial.png"))
 
+            # Raw and paste requests must both submit Enter through GTK and the daemon.
+            for client in (True, False):
+                for paste in (False, True):
+                    marker = temp / f"send-enter-{client}-{paste}"
+                    rpc("send", pane=pane, text=f"touch {shlex.quote(str(marker))}",
+                        paste=paste, enter=True, client=client)
+                    wait_for(marker.is_file)
+
             # Capture actual GTK events in Kitty mode, including a release
             # while the other side of the same modifier is still held.
             keyboard_probe = temp / "keyboard.py"

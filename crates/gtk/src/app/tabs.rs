@@ -495,10 +495,10 @@ impl Ui {
     }
     pub(super) fn split_pane(self: &Rc<Self>, id: u64, down: bool) {
         self.command(
-            Command::Split {
+            Command::Tab(TabCommand::Split {
                 pane: Some(id),
                 down,
-            },
+            }),
             |ui, result| {
                 if let Err(e) = result {
                     ui.message(&e.to_string());

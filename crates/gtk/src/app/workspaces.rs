@@ -553,9 +553,7 @@ impl Ui {
         validate();
         if let (Some(remove), Some(existing)) = (remove, existing.as_ref()) {
             let weak = Rc::downgrade(self);
-            let close = dialog.downgrade();
-            let view = view.downgrade();
-            let error = error.downgrade();
+            let editor = management::EditorRequest::new(&dialog, &view, &save, &error);
             let id = existing.id;
             let name = existing.name.clone();
             remove.connect_activated(move |_| {
@@ -571,44 +569,15 @@ impl Ui {
                 confirmation.set_default_response(Some("cancel"));
                 confirmation.set_close_response("cancel");
                 let weak = weak.clone();
-                let close = close.clone();
-                let view = view.clone();
-                let error = error.clone();
+                let editor = editor.clone();
                 confirmation.connect_response(Some("remove"), move |_, _| {
-                    let (Some(ui), Some(dialog), Some(view)) =
-                        (weak.upgrade(), close.upgrade(), view.upgrade())
-                    else {
-                        return;
-                    };
-                    if let Some(error) = error.upgrade() {
-                        error.set_visible(false);
-                    }
-                    dialog.set_can_close(false);
-                    view.set_sensitive(false);
-                    let close = close.clone();
-                    let view = view.downgrade();
-                    let error = error.clone();
+                    let Some(ui) = weak.upgrade() else { return };
+                    editor.begin(None);
+                    let editor = editor.clone();
                     ui.command(
                         Command::WorkspaceRemove { workspace: id },
                         move |_, result| {
-                            if let Some(dialog) = close.upgrade() {
-                                dialog.set_can_close(true);
-                            }
-                            if let Some(view) = view.upgrade() {
-                                view.set_sensitive(true);
-                            }
-                            match result {
-                                Ok(_) => {
-                                    if let Some(dialog) = close.upgrade() {
-                                        dialog.close();
-                                    }
-                                }
-                                Err(message) => {
-                                    if let Some(error) = error.upgrade() {
-                                        show_error(&error, message);
-                                    }
-                                }
-                            }
+                            editor.finish(result.map(|_| ()));
                         },
                     );
                 });
@@ -739,11 +708,14 @@ impl Ui {
     }
     fn confirm_close_tab(self: &Rc<Self>, id: u64, busy: bool) {
         let close = move |ui: &Rc<Self>| {
-            ui.command(Command::CloseTab { tab: id }, |ui, result| {
-                if let Err(e) = result {
-                    ui.message(&e.to_string());
-                }
-            });
+            ui.command(
+                Command::Tab(TabCommand::CloseTab { tab: id }),
+                |ui, result| {
+                    if let Err(e) = result {
+                        ui.message(&e.to_string());
+                    }
+                },
+            );
         };
         if !busy {
             close(self);

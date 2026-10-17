@@ -65,6 +65,18 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
         for method, field in (("read", "pane"), ("move", "tab")):
             error = command(receiver, "--connection", "server", "rpc", json.dumps(dict(method=method)), check=False)
             assert f"explicit {field} field" in error and f"--{field}" not in error, error
+    with scenario("GTK CLI RPC preserves connection targets for configuration and direct calls"):
+        def configuration(method, **fields):
+            return command(receiver, "rpc", json.dumps(dict(method=method, **fields)))
+
+        configuration("connection-edit", connection="local", name="desktop")
+        assert configuration("connection-list")["local"]["name"] == "desktop"
+        assert configuration("_connection-call", connection="server", request=dict(method="status"))["daemon"] == original["daemon"]
+        configuration("connection-edit", connection="other", name="temporary")
+        configuration("connection-remove", connection="temporary")
+        assert [remote["name"] for remote in configuration("connection-list")["remotes"]] == ["server"]
+        configuration("connection-add", name="other", address=other.rpc("status")["bound_address"], authentication=dict(mode="none"))
+        configuration("connection-edit", connection="local", name=None)
     # No sibling daemon executable and no native terminal library are available to this client.
     standalone = receiver.path / "client-only/gmux-gtk"
     standalone.parent.mkdir()

@@ -1,7 +1,10 @@
 //! Client-local streams, qualified handles, and command routing across daemons.
 use super::{
     Snapshot, Store, Subscription,
-    control::{BackendReply, Command, CommandOutput, CommandReply, CommandResult, InternalRequest},
+    control::{
+        BackendReply, Command, CommandOutput, CommandReply, CommandResult, InternalRequest,
+        TabCommand,
+    },
     model::{
         DaemonId, DesktopState, DesktopTab, ExecutionState, Layout, Machine, MachineKind, PaneRef,
         Session, TabRef, TabState,
@@ -407,6 +410,7 @@ impl Connections {
                 self.ingest_execution(reply)?
             }
             BackendReply::Organization { result } => result,
+            BackendReply::Value(_) => anyhow::bail!("Expected an execution or organization reply"),
         };
         Ok(self.combined(result))
     }
@@ -958,7 +962,8 @@ impl Connections {
             Ok::<_, anyhow::Error>((handle, reference.daemon))
         };
         match command {
-            Command::Split { pane, .. } | Command::Close { pane } => {
+            Command::Tab(TabCommand::Split { pane, .. })
+            | Command::Tab(TabCommand::Close { pane }) => {
                 let (handle, daemon) = target(*pane, active_pane, "pane")?;
                 *pane = Some(handle);
                 destination = Some(daemon);
@@ -968,9 +973,9 @@ impl Connections {
                 *tab = Some(handle);
                 destination = Some(daemon);
             }
-            Command::Rename { tab: id, .. }
-            | Command::CloseTab { tab: id }
-            | Command::ResetName { tab: id } => {
+            Command::Tab(TabCommand::Rename { tab: id, .. })
+            | Command::Tab(TabCommand::CloseTab { tab: id })
+            | Command::Tab(TabCommand::ResetName { tab: id }) => {
                 let (handle, daemon) = target(Some(*id), None, "tab")?;
                 *id = handle;
                 destination = Some(daemon);
@@ -1034,7 +1039,10 @@ impl Connections {
         let mut daemon = destination;
         command.resolve_directory(daemon.is_some() && daemon == self.local)?;
         let mut assign = None;
-        let creates_pane = matches!(command, Command::New { .. } | Command::Split { .. });
+        let creates_pane = matches!(
+            command,
+            Command::New { .. } | Command::Tab(TabCommand::Split { .. })
+        );
         match &mut command {
             Command::New {
                 workspace,
@@ -1053,14 +1061,15 @@ impl Connections {
                 )?;
                 assign = Some(Assignment::CreatedTab { workspace });
             }
-            Command::Split { pane: Some(id), .. } | Command::Close { pane: Some(id) } => {
+            Command::Tab(TabCommand::Split { pane: Some(id), .. })
+            | Command::Tab(TabCommand::Close { pane: Some(id) }) => {
                 let r = self.checked_ref(*id)?;
                 daemon = Some(r.daemon);
                 *id = r.id;
             }
-            Command::CloseTab { tab }
-            | Command::Rename { tab, .. }
-            | Command::ResetName { tab } => {
+            Command::Tab(TabCommand::CloseTab { tab })
+            | Command::Tab(TabCommand::Rename { tab, .. })
+            | Command::Tab(TabCommand::ResetName { tab }) => {
                 let r = self.checked_ref(*tab)?;
                 daemon = Some(r.daemon);
                 *tab = r.id;

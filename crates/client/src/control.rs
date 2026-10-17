@@ -3,6 +3,11 @@ use crate::{model::ExecutionState, transport::Metadata};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Public commands whose CLI pane selector can be inherited from GMUX_PANE.
+pub fn pane_method(method: &str) -> bool {
+    matches!(method, "split" | "close" | "send" | "read" | "notify")
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ExecutionRequest {
@@ -78,6 +83,14 @@ pub enum Command {
         directory: Option<PathBuf>,
         name: Option<String>,
     },
+    #[serde(untagged)]
+    Tab(TabCommand),
+}
+
+/// Commands that act on an existing tab or one of its panes.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum TabCommand {
     Split {
         pane: Option<u64>,
         #[serde(default)]
@@ -125,6 +138,14 @@ pub enum PublicRequest {
     Status,
     Stop,
     List,
+    #[serde(untagged)]
+    Pane(PaneRequest),
+}
+
+/// Input and inspection requests with the same options in every client.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "kebab-case")]
+pub enum PaneRequest {
     Read {
         pane: Option<u64>,
     },
@@ -149,6 +170,15 @@ pub enum Request {
     Public(PublicRequest),
 }
 impl Request {
+    pub fn returns_snapshot(&self) -> bool {
+        match self {
+            Self::Internal(InternalRequest::Command { .. } | InternalRequest::State) => true,
+            Self::Execution(request) | Self::Internal(InternalRequest::Execution { request }) => {
+                matches!(request, ExecutionRequest::State) || request.changes_layout()
+            }
+            _ => false,
+        }
+    }
     /// Normalize control requests, resolving and validating pane targets through
     /// the destination's policy. The boolean selects a public command result
     /// rather than a full execution snapshot.
@@ -159,16 +189,7 @@ impl Request {
         let mut command = |command: Command| -> anyhow::Result<ExecutionRequest> {
             Ok(match command {
                 Command::New { directory, name } => ExecutionRequest::New { directory, name },
-                Command::Split { pane: id, down } => ExecutionRequest::Split {
-                    pane: resolve_pane(id)?,
-                    down,
-                },
-                Command::Close { pane: id } => ExecutionRequest::Close {
-                    pane: resolve_pane(id)?,
-                },
-                Command::CloseTab { tab } => ExecutionRequest::CloseTab { tab },
-                Command::Rename { tab, name } => ExecutionRequest::Rename { tab, name },
-                Command::ResetName { tab } => ExecutionRequest::ResetName { tab },
+                Command::Tab(command) => command.into_execution(&mut resolve_pane)?,
             })
         };
         Ok(match self {
@@ -226,33 +247,9 @@ impl Request {
             Self::Public(PublicRequest::Status) => (ExecutionRequest::Status, false),
             Self::Public(PublicRequest::Stop) => (ExecutionRequest::Stop, false),
             Self::Public(PublicRequest::List) => (ExecutionRequest::List, false),
-            Self::Public(PublicRequest::Read { pane: id }) => (
-                ExecutionRequest::Read {
-                    pane: resolve_pane(id)?,
-                },
-                false,
-            ),
-            Self::Public(PublicRequest::Send {
-                pane: id,
-                text,
-                paste,
-                enter,
-            }) => (
-                ExecutionRequest::Send {
-                    pane: resolve_pane(id)?,
-                    text,
-                    paste,
-                    enter,
-                },
-                false,
-            ),
-            Self::Public(PublicRequest::Notify { pane: id, message }) => (
-                ExecutionRequest::Notify {
-                    pane: resolve_pane(id)?,
-                    message,
-                },
-                false,
-            ),
+            Self::Public(PublicRequest::Pane(request)) => {
+                (request.into_execution(resolve_pane)?, false)
+            }
         })
     }
     pub fn decode(value: serde_json::Value) -> anyhow::Result<Self> {
@@ -337,10 +334,60 @@ impl CommandOutcome {
 
 impl Command {
     pub fn supports(method: &str) -> bool {
+        method == "new" || TabCommand::supports(method)
+    }
+}
+impl TabCommand {
+    pub fn supports(method: &str) -> bool {
         matches!(
             method,
-            "new" | "split" | "close" | "close-tab" | "rename" | "reset-name"
+            "split" | "close" | "close-tab" | "rename" | "reset-name"
         )
+    }
+    pub fn into_execution(
+        self,
+        mut resolve_pane: impl FnMut(Option<u64>) -> anyhow::Result<u64>,
+    ) -> anyhow::Result<ExecutionRequest> {
+        Ok(match self {
+            Self::Split { pane, down } => ExecutionRequest::Split {
+                pane: resolve_pane(pane)?,
+                down,
+            },
+            Self::Close { pane } => ExecutionRequest::Close {
+                pane: resolve_pane(pane)?,
+            },
+            Self::CloseTab { tab } => ExecutionRequest::CloseTab { tab },
+            Self::Rename { tab, name } => ExecutionRequest::Rename { tab, name },
+            Self::ResetName { tab } => ExecutionRequest::ResetName { tab },
+        })
+    }
+}
+
+impl PaneRequest {
+    pub fn into_execution(
+        self,
+        mut resolve_pane: impl FnMut(Option<u64>) -> anyhow::Result<u64>,
+    ) -> anyhow::Result<ExecutionRequest> {
+        Ok(match self {
+            Self::Read { pane } => ExecutionRequest::Read {
+                pane: resolve_pane(pane)?,
+            },
+            Self::Send {
+                pane,
+                text,
+                paste,
+                enter,
+            } => ExecutionRequest::Send {
+                pane: resolve_pane(pane)?,
+                text,
+                paste,
+                enter,
+            },
+            Self::Notify { pane, message } => ExecutionRequest::Notify {
+                pane: resolve_pane(pane)?,
+                message,
+            },
+        })
     }
 }
 

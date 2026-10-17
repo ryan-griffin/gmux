@@ -330,7 +330,7 @@ impl Store {
 
     /// Execute on a request worker. Client-only requests never reach the daemon socket.
     #[cfg(test)]
-    pub fn call(&self, endpoint: &ipc::Endpoint, body: Value) -> anyhow::Result<Value> {
+    pub fn call(&self, endpoint: &ipc::Endpoint, body: Value) -> anyhow::Result<BackendReply> {
         self.call_inner(endpoint, body, None, None)
     }
     pub fn call_cancellable(
@@ -339,7 +339,7 @@ impl Store {
         local: impl Into<Option<DaemonId>>,
         body: Value,
         cancellation: &ipc::Cancellation,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<BackendReply> {
         self.call_inner(endpoint, body, local.into(), Some(cancellation))
     }
     fn call_inner(
@@ -348,7 +348,7 @@ impl Store {
         mut body: Value,
         local: Option<DaemonId>,
         cancellation: Option<&ipc::Cancellation>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<BackendReply> {
         let call =
             |request: Value| gmux_client::connections::call_at(endpoint, request, cancellation);
         let method = body["method"].as_str().unwrap_or("").to_owned();
@@ -358,35 +358,35 @@ impl Store {
                     .as_u64()
                     .ok_or_else(|| anyhow::anyhow!("Desktop save requires a revision"))?;
                 self.save_desktop(serde_json::from_value(body["desktop"].take())?, revision)?;
-                return Ok(json!({"ok":true}));
+                return Ok(BackendReply::Value(json!({"ok":true})));
             }
             "_desktop-tab" => Some(self.assign(serde_json::from_value(body["tab"].take())?)?),
-            "_command"
-                if matches!(
-                    body["command"]["method"].as_str(),
-                    Some("workspace-add" | "workspace-edit" | "workspace-remove")
-                ) =>
-            {
-                Some(self.command_at(
-                    local,
-                    local,
-                    serde_json::from_value(body["command"].take())?,
-                )?)
-            }
+            "_command" if super::backend::organization_request(&body) => Some(self.command_at(
+                local,
+                local,
+                serde_json::from_value(body["command"].take())?,
+            )?),
             _ => None,
         };
         if let Some(output) = output {
-            return Ok(serde_json::to_value(BackendReply::Organization {
+            return Ok(BackendReply::Organization {
                 result: output.into(),
-            })?);
+            });
         }
-        let reply = call(body)?;
-        if reply.get("execution").is_some() {
-            // Forward the daemon's JSON untouched. The window applies its current
-            // organization after deserializing execution exactly once.
-            Ok(json!({"kind":"execution","reply":reply}))
+        let request = if method == "_connection-call" {
+            &body["request"]
         } else {
-            Ok(reply)
+            &body
+        };
+        let snapshot = execution::Request::decode(request.clone())
+            .is_ok_and(|request| request.returns_snapshot());
+        let reply = call(body)?;
+        if snapshot {
+            Ok(BackendReply::Execution {
+                reply: serde_json::from_value(reply)?,
+            })
+        } else {
+            Ok(BackendReply::Value(reply))
         }
     }
 }

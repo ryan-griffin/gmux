@@ -34,6 +34,15 @@ impl Ui {
         body: impl serde::Serialize,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<Value>) + 'static,
     ) {
+        self.request_reply(body, move |ui, result| {
+            callback(ui, result.and_then(BackendReply::into_value));
+        });
+    }
+    pub(super) fn request_reply(
+        self: &Rc<Self>,
+        body: impl serde::Serialize,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<BackendReply>) + 'static,
+    ) {
         let routed = serde_json::to_value(body).and_then(|body| {
             self.sessions
                 .borrow()
@@ -53,7 +62,7 @@ impl Ui {
         self: &Rc<Self>,
         destination: Option<model::DaemonId>,
         body: Value,
-        callback: impl FnOnce(&Rc<Self>, anyhow::Result<Value>) + 'static,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<BackendReply>) + 'static,
     ) {
         match self.backend.request(destination, body) {
             Ok(id) => {
@@ -81,7 +90,10 @@ impl Ui {
             Command::New { workspace, .. } if workspace.is_none() => {
                 *workspace = Some(self.selected_workspace());
             }
-            Command::Split { pane, .. } | Command::Close { pane } if pane.is_none() => {
+            Command::Tab(TabCommand::Split { pane, .. })
+            | Command::Tab(TabCommand::Close { pane })
+                if pane.is_none() =>
+            {
                 let Some(active) = self.active_pane() else {
                     callback(self, Err(anyhow::anyhow!("No active terminal")));
                     return;
@@ -90,7 +102,10 @@ impl Ui {
             }
             _ => (),
         }
-        let reveal = matches!(command, Command::New { .. } | Command::Split { .. });
+        let reveal = matches!(
+            command,
+            Command::New { .. } | Command::Tab(TabCommand::Split { .. })
+        );
         if let Command::Move { tab, workspace } = command {
             let id = tab.unwrap_or(self.active.get());
             let session = self.view_session();
@@ -99,10 +114,9 @@ impl Ui {
                 return;
             };
             let tab = self.sessions.borrow().desktop_tab(saved, workspace);
-            self.request(InternalRequest::DesktopTab { tab }, move |ui, result| {
+            self.request_reply(InternalRequest::DesktopTab { tab }, move |ui, result| {
                 let result = result.and_then(|v| {
-                    let raw = serde_json::from_value(v)?;
-                    let reply = ui.sessions.borrow_mut().project(raw)?;
+                    let reply = ui.sessions.borrow_mut().project(v)?;
                     ui.apply_backend(reply, false, Selection::capture(ui))
                 });
                 callback(ui, result);
@@ -125,10 +139,7 @@ impl Ui {
         self.save_session();
         self.command_count.set(self.command_count.get() + 1);
         self.submit_request(route.destination, route.body, move |ui, result| {
-            let projected = result.and_then(|value| {
-                let raw = serde_json::from_value(value)?;
-                ui.sessions.borrow_mut().project(raw)
-            });
+            let projected = result.and_then(|value| ui.sessions.borrow_mut().project(value));
             let reply = match projected {
                 Ok(reply) => reply,
                 Err(error) => {
@@ -152,10 +163,9 @@ impl Ui {
                 {
                     *assigned = workspace;
                 }
-                ui.request(InternalRequest::DesktopTab { tab }, move |ui, result| {
+                ui.request_reply(InternalRequest::DesktopTab { tab }, move |ui, result| {
                     let result = result.and_then(|value| {
-                        let raw = serde_json::from_value(value)?;
-                        let mut reply = ui.sessions.borrow_mut().project(raw)?;
+                        let mut reply = ui.sessions.borrow_mut().project(value)?;
                         reply.result = output;
                         Ok(reply)
                     });
@@ -554,12 +564,12 @@ impl Ui {
                 self.set_filter(filter);
                 Ok(json!({"ok": true}))
             }
-            PublicRequest::Send {
+            PublicRequest::Pane(PaneRequest::Send {
                 pane,
                 text,
                 paste,
                 enter,
-            } => {
+            }) => {
                 let id = pane
                     .map(|id| self.sessions.borrow().default_handle(id))
                     .transpose()?;
@@ -567,7 +577,7 @@ impl Ui {
                 if paste {
                     pane.send_text(&text, enter)?;
                 } else {
-                    pane.send(text.as_bytes())?;
+                    pane.send_with_enter(text.as_bytes(), enter)?;
                 }
                 Ok(json!({"ok":true}))
             }

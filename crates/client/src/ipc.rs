@@ -615,34 +615,44 @@ fn call_on(
     result
 }
 
-enum Operation {
+enum Operation<R> {
     Request(Value),
-    Update(Box<dyn FnOnce() -> anyhow::Result<Value> + Send>),
+    Update(Box<dyn FnOnce() -> anyhow::Result<R> + Send>),
 }
-struct Job {
+struct Job<R> {
     id: u64,
-    operation: Operation,
+    operation: Operation<R>,
     coalesce: Option<&'static str>,
 }
-#[derive(Default)]
-struct Jobs {
-    queue: std::collections::VecDeque<Job>,
+struct Jobs<R> {
+    queue: std::collections::VecDeque<Job<R>>,
     closed: bool,
     cancel_requests: bool,
 }
-pub struct Client {
-    jobs: Arc<(Mutex<Jobs>, Condvar)>,
-    replies: mpsc::Receiver<(u64, anyhow::Result<Value>)>,
+impl<R> Default for Jobs<R> {
+    fn default() -> Self {
+        Self {
+            queue: Default::default(),
+            closed: false,
+            cancel_requests: false,
+        }
+    }
+}
+pub struct Client<R: Send + 'static = Value> {
+    jobs: Arc<(Mutex<Jobs<R>>, Condvar)>,
+    replies: mpsc::Receiver<(u64, anyhow::Result<R>)>,
     next: std::cell::Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
-impl Client {
+impl Client<Value> {
     fn for_endpoint(endpoint: Endpoint, wake: Wake) -> Self {
         Self::with_handler(wake, move |request| endpoint.call(request))
     }
+}
+impl<R: Send + 'static> Client<R> {
     pub fn with_handler(
         wake: Wake,
-        handler: impl Fn(Value) -> anyhow::Result<Value> + Send + 'static,
+        handler: impl Fn(Value) -> anyhow::Result<R> + Send + 'static,
     ) -> Self {
         let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
         let worker = jobs.clone();
@@ -713,7 +723,7 @@ impl Client {
     pub fn update_with(
         &self,
         key: &'static str,
-        update: impl FnOnce() -> anyhow::Result<Value> + Send + 'static,
+        update: impl FnOnce() -> anyhow::Result<R> + Send + 'static,
     ) -> anyhow::Result<()> {
         self.enqueue(Job {
             id: 0,
@@ -721,7 +731,7 @@ impl Client {
             coalesce: Some(key),
         })
     }
-    fn enqueue(&self, job: Job) -> anyhow::Result<()> {
+    fn enqueue(&self, job: Job<R>) -> anyhow::Result<()> {
         let (lock, ready) = &*self.jobs;
         let mut jobs = lock.lock().unwrap();
         anyhow::ensure!(!jobs.closed, "Request worker is closed");
@@ -739,7 +749,7 @@ impl Client {
         ready.notify_one();
         Ok(())
     }
-    pub fn replies(&self) -> impl Iterator<Item = (u64, anyhow::Result<Value>)> + '_ {
+    pub fn replies(&self) -> impl Iterator<Item = (u64, anyhow::Result<R>)> + '_ {
         self.replies.try_iter()
     }
     /// Cancel queued explicit requests, while flushing automatic updates.
@@ -751,16 +761,25 @@ impl Client {
         jobs.closed = true;
         ready.notify_one();
     }
-    pub fn join(&mut self) {
+    /// Finish queued work and stop accepting requests without waiting for the worker.
+    pub fn close(&self) {
         let (lock, ready) = &*self.jobs;
         lock.lock().unwrap().closed = true;
         ready.notify_one();
+    }
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
+    }
+    pub fn join(&mut self) {
+        self.close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
-impl Drop for Client {
+impl<R: Send + 'static> Drop for Client<R> {
     fn drop(&mut self) {
         self.join();
     }

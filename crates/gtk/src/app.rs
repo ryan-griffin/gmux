@@ -1,6 +1,9 @@
 use crate::client::{
     connections,
-    control::{Command, CommandReply, CommandResult, InternalRequest, PublicRequest, Request},
+    control::{
+        BackendReply, Command, CommandReply, CommandResult, InternalRequest, PaneRequest,
+        PublicRequest, Request, TabCommand,
+    },
 };
 use crate::{
     commands::{COMMANDS, Query},
@@ -118,7 +121,7 @@ pub struct Ui {
     id: u64,
     revision: Cell<u64>,
     detaching: Cell<bool>,
-    backend: crate::client::backend::Backend,
+    backend: Rc<crate::client::backend::Backend>,
     pending: RefCell<HashMap<u64, BackendCallback>>,
     command_count: Cell<usize>,
     creation_serial: Cell<u64>,
@@ -127,7 +130,7 @@ pub struct Ui {
     update_source: RefCell<Option<glib::SourceId>>,
     theme_handler: RefCell<Option<glib::SignalHandlerId>>,
 }
-type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<Value>)>;
+type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<BackendReply>)>;
 
 impl Drop for Ui {
     fn drop(&mut self) {
@@ -150,12 +153,41 @@ struct Windows {
     preferences: RefCell<Option<Rc<AppPreferences>>>,
     organization: RefCell<Option<std::sync::Arc<crate::client::Store>>>,
     windows: RefCell<Vec<Rc<Ui>>>,
+    retired: RefCell<Vec<Rc<crate::client::backend::Backend>>>,
+    retire_source: RefCell<Option<glib::SourceId>>,
     next_id: Cell<u64>,
     server: RefCell<Option<ipc::Server>>,
     source: RefCell<Option<glib::SourceId>>,
     local: local::LocalDaemon,
 }
 impl Windows {
+    fn retire_backend(self: &Rc<Self>, backend: Rc<crate::client::backend::Backend>) {
+        self.retired.borrow_mut().push(backend);
+        if self.retire_source.borrow().is_some() {
+            return;
+        }
+        // Keep queued saves alive after a window closes. Join only finished
+        // workers here; remaining work is flushed when the application exits.
+        let weak = Rc::downgrade(self);
+        *self.retire_source.borrow_mut() = Some(glib::timeout_add_local(
+            Duration::from_millis(50),
+            move || {
+                let Some(owner) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                owner
+                    .retired
+                    .borrow_mut()
+                    .retain(|backend| !backend.is_finished());
+                if owner.retired.borrow().is_empty() {
+                    owner.retire_source.borrow_mut().take();
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            },
+        ));
+    }
     fn active(&self) -> Option<Rc<Ui>> {
         let windows = self.windows.borrow();
         windows
@@ -316,6 +348,9 @@ impl Windows {
 }
 impl Drop for Windows {
     fn drop(&mut self) {
+        if let Some(source) = self.retire_source.get_mut().take() {
+            source.remove();
+        }
         if let Some(source) = self.source.get_mut().take() {
             source.remove();
         }
@@ -364,6 +399,8 @@ pub fn run(
         preferences: RefCell::new(None),
         organization: RefCell::new(None),
         windows: RefCell::new(Vec::new()),
+        retired: RefCell::new(Vec::new()),
+        retire_source: RefCell::new(None),
         next_id: Cell::new(0),
         server: RefCell::new(None),
         source: RefCell::new(None),

@@ -148,8 +148,8 @@ edited while the daemon is running or stopped. `bound_address` reports the
 actual listener address, or null when no listener is running;
 `remote_access_error` reports a listener startup failure. The configured
 `listen_address` accepts an IP address with an optional port, defaulting to
-`7331`. An explicit port zero requests an available port. Replies and saved
-settings include the resolved port.
+`7331`. An explicit port zero requests an available port on each start. Saved
+settings retain zero; `bound_address` reports the assigned port.
 
 Saved outgoing connections belong to the client library and use no daemon API.
 Incoming TCP connections address only the serving daemon, including its shutdown

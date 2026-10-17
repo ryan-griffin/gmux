@@ -615,9 +615,15 @@ impl RemoteSession {
         }
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.command(StreamCommand::Input {
-            bytes: bytes.to_vec(),
-        })
+        self.send_with_enter(bytes, false)
+    }
+    pub fn send_with_enter(&self, bytes: &[u8], enter: bool) -> anyhow::Result<()> {
+        let mut input = Vec::with_capacity(bytes.len() + usize::from(enter));
+        input.extend_from_slice(bytes);
+        if enter {
+            input.push(b'\r');
+        }
+        self.command(StreamCommand::Input { bytes: input })
     }
     pub fn send_text(&self, text: &str, enter: bool) -> anyhow::Result<()> {
         self.command(StreamCommand::Paste {

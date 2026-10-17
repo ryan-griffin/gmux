@@ -13,11 +13,14 @@ impl Ui {
     }
     pub(super) fn confirm_close(self: &Rc<Self>, id: u64, busy: bool) {
         if !busy {
-            self.command(Command::Close { pane: Some(id) }, |ui, result| {
-                if let Err(e) = result {
-                    ui.message(&e.to_string());
-                }
-            });
+            self.command(
+                Command::Tab(TabCommand::Close { pane: Some(id) }),
+                |ui, result| {
+                    if let Err(e) = result {
+                        ui.message(&e.to_string());
+                    }
+                },
+            );
             return;
         }
         let dialog = adw::AlertDialog::builder()
@@ -32,11 +35,14 @@ impl Ui {
         let weak = Rc::downgrade(self);
         dialog.connect_response(Some("close"), move |_, _| {
             if let Some(ui) = weak.upgrade() {
-                ui.command(Command::Close { pane: Some(id) }, |ui, result| {
-                    if let Err(e) = result {
-                        ui.message(&e.to_string());
-                    }
-                });
+                ui.command(
+                    Command::Tab(TabCommand::Close { pane: Some(id) }),
+                    |ui, result| {
+                        if let Err(e) = result {
+                            ui.message(&e.to_string());
+                        }
+                    },
+                );
             }
         });
         dialog.present(Some(&self.window));
@@ -111,8 +117,7 @@ impl Ui {
             return;
         }
         self.save_session();
-        // The organization worker flushes its queued save when the window drops.
-        // Detaching must not wait for a daemon that may be unreachable.
+        // The application retains pending saves after this window closes.
         self.close_window();
     }
     pub(super) fn close_window(&self) {
@@ -120,6 +125,7 @@ impl Ui {
         self.sessions.borrow_mut().clear();
         self.window.destroy();
         if let Some(owner) = self.owner.upgrade() {
+            owner.retire_backend(self.backend.clone());
             owner.windows.borrow_mut().retain(|ui| ui.id != self.id);
         }
     }
@@ -191,7 +197,7 @@ impl Ui {
                 }
                 let close = close.clone();
                 ui.command(
-                    Command::Rename { tab: id, name },
+                    Command::Tab(TabCommand::Rename { tab: id, name }),
                     move |ui, result| match result {
                         Ok(_) => {
                             if let Some(dialog) = close.upgrade() {

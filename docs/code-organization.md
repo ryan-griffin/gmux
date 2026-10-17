@@ -73,8 +73,10 @@ the daemon validates and restores its own saved execution.
 `branch/service.rs` shares requested Git metadata across clients, and
 `branch/watches.rs` tracks repository changes on the owning machine.
 
-`crates/client/src/control.rs` defines execution requests and replies. `ipc.rs`
-handles Unix sockets, direct TCP endpoints, cancellation, and request workers.
+`crates/client/src/control.rs` defines execution requests and replies, including
+tab commands and pane requests shared with GTK. GTK adds workspace and window
+operations. `ipc.rs` handles Unix sockets, direct TCP endpoints, cancellation,
+and request workers.
 `transport.rs` and `transport/requests.rs` encode viewport packets and stream commands.
 `network.rs` contains client TCP authentication and bounded I/O. In core,
 `src/daemon/network.rs` accepts incoming TCP connections and forwards execution
@@ -108,9 +110,14 @@ and chooses tab order. It uses the client library for connections and execution.
 Workspace operations never cross the execution protocol.
 
 Request workers return daemon execution replies or GTK organization results.
+Worker channels carry typed replies; execution snapshots are deserialized before
+reaching GTK. Other control responses retain their JSON values.
 The window applies its current organization when combining replies. Remote
 connection edits use the selected daemon's queue and carry its pinned identity;
 removal uses the configuration queue so it can cancel a stalled edit.
+Closing a window cancels execution requests and leaves its pending organization
+saves with the application. Finished workers are reclaimed without blocking GTK;
+application exit waits for remaining saves.
 
 Clients prune handles after reconciling views and finishing outstanding commands.
 A burst of stream snapshots produces one combined GTK view per poll. Cached

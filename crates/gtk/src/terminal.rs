@@ -407,6 +407,9 @@ impl Terminal {
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         self.session.borrow().send(bytes)
     }
+    pub fn send_with_enter(&self, bytes: &[u8], enter: bool) -> anyhow::Result<()> {
+        self.session.borrow().send_with_enter(bytes, enter)
+    }
     fn key_input(&self, name: &str, cp: u32, mods: u16, release: bool, text: &str) {
         if let Err(error) = self.session.borrow().key(name, cp, mods, release, text) {
             self.show_status(&error.to_string());

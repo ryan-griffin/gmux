@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check native window creation, shared layouts, local navigation, and detach."""
 import os
+import fcntl
 import json
 import time
 from pathlib import Path
@@ -191,6 +192,24 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
             fixture.rpc("workspace-remove", workspace=identifier)
         for window in (first, second):
             wait_for(lambda: len(state(window)["tabs"]) == 2)
+
+    with scenario("closing a window with a blocked state save keeps other windows responsive"):
+        closing = fixture.rpc("new-window")["window"]
+        wait_for(lambda: fixture.rpc("status")["local_clients"] == 3)
+        lock_path = fixture.config / "clients/gtk/.state.json.lock"
+        with lock_path.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fixture.rpc("detach", window=closing)
+            wait_for(lambda: len(fixture.rpc("windows", timeout=1)["windows"]) == 2)
+            before = time.monotonic()
+            sidebar = state(second)["sidebar_visible"]
+            fixture.rpc("action", window=second, name="sidebar", timeout=1)
+            assert fixture.rpc("list", window=second, timeout=1)["sidebar_visible"] != sidebar
+            (artifacts / "window-close-blocked-save.json").write_text(json.dumps(dict(
+                other_window_response_ms=(time.monotonic() - before) * 1000), indent=2) + "\n")
+        # Let the queued save finish, including the work held by the closed window.
+        workspace = fixture.rpc("workspace-add", name="After blocked save")["workspace"]
+        fixture.rpc("workspace-remove", workspace=workspace)
 
     with scenario("closed windows release client workers and subscriptions"):
         def cycle():

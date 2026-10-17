@@ -70,7 +70,7 @@ impl Drop for Fixture {
 fn remote(name: &str) -> Value {
     json!({"method":"_state", "test_destination":name})
 }
-fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<Value>)> {
+fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<BackendReply>)> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut replies = Vec::new();
     while replies.iter().filter(|(id, _)| *id != 0).count() < count {
@@ -82,6 +82,41 @@ fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<Value>)>
         std::thread::sleep(Duration::from_millis(1));
     }
     replies
+}
+
+#[test]
+fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
+    let f = Fixture::new();
+    let backend = f.backend();
+    backend
+        .request(f.local, json!({"method":"status"}))
+        .unwrap();
+    f.incoming()
+        .reply
+        .send(json!({"execution":"diagnostic"}))
+        .unwrap();
+    let replies = collect(&backend, 1);
+    assert!(
+        matches!(&replies[0].1, Ok(BackendReply::Value(value)) if value["execution"] == "diagnostic")
+    );
+
+    backend
+        .request(f.local, json!({"method":"_state"}))
+        .unwrap();
+    f.incoming().reply.send(json!({"execution":{}})).unwrap();
+    assert!(
+        collect(&backend, 1)[0].1.is_err(),
+        "Malformed snapshots must fail on the worker"
+    );
+
+    backend
+        .request(f.local, json!({"method":"_state"}))
+        .unwrap();
+    f.answer(f.incoming(), f.local);
+    let replies = collect(&backend, 1);
+    assert!(
+        matches!(&replies[0].1, Ok(BackendReply::Execution { reply }) if reply.daemon == f.local)
+    );
 }
 
 #[test]
@@ -222,7 +257,7 @@ fn removing_a_connection_cancels_its_requests_and_shutdown_flushes_the_latest_sa
     assert!(
         replies
             .iter()
-            .all(|(_, result)| result.as_ref().unwrap_err().to_string() == "Request canceled")
+            .all(|(_, result)| result.as_ref().err().unwrap().to_string() == "Request canceled")
     );
     assert!(backend.workers.borrow().is_empty());
     assert!(
@@ -296,7 +331,7 @@ fn removing_the_default_remote_cancels_its_execution_queue() {
     assert!(before.elapsed() < Duration::from_secs(1));
     assert_eq!(replies[0].0, request);
     assert_eq!(
-        replies[0].1.as_ref().unwrap_err().to_string(),
+        replies[0].1.as_ref().err().unwrap().to_string(),
         "Request canceled"
     );
     assert!(backend.workers.borrow().is_empty());

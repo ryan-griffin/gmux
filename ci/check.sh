@@ -38,7 +38,9 @@ artifacts = compiler_artifacts(Path("artifacts/cargo-build-headless.jsonl").read
 daemon = Path(artifacts["debug/bin/gmux"])
 Path("artifacts/daemon-headless.sha256").write_text(hashlib.sha256(daemon.read_bytes()).hexdigest())
 PY
-python3 scripts/check.py
+# The headless pass already exercised this same daemon. Check the full workspace
+# and its GTK linkage without repeating those smoke suites.
+python3 scripts/check.py --skip-smoke
 python3 - <<'PY'
 from pathlib import Path
 import hashlib

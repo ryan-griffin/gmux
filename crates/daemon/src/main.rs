@@ -2,7 +2,7 @@ use clap::{
     Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
 };
 use gmux_client::{
-    control::{Command as TerminalCommand, PublicRequest},
+    control::{Command as TerminalCommand, PaneRequest, PublicRequest, TabCommand, pane_method},
     ipc, network,
 };
 use serde_json::{Value, json};
@@ -267,7 +267,7 @@ fn run() -> anyhow::Result<()> {
     }
     if remote
         && let Some((name, args)) = matches.subcommand()
-        && matches!(name, "split" | "close" | "send" | "read" | "notify")
+        && pane_method(name)
     {
         anyhow::ensure!(
             args.value_source("pane") == Some(ValueSource::CommandLine),
@@ -290,24 +290,20 @@ fn run() -> anyhow::Result<()> {
                     .transpose()?
             },
         })?,
-        Command::Split { pane, down } => {
-            serde_json::to_value(TerminalCommand::Split { pane, down })?
-        }
-        Command::Close { pane } => serde_json::to_value(TerminalCommand::Close { pane })?,
-        Command::CloseTab { tab } => serde_json::to_value(TerminalCommand::CloseTab { tab })?,
-        Command::Rename { tab, name } => {
-            serde_json::to_value(TerminalCommand::Rename { tab, name })?
-        }
-        Command::ResetName { tab } => serde_json::to_value(TerminalCommand::ResetName { tab })?,
-        Command::Send { text, pane, enter } => serde_json::to_value(PublicRequest::Send {
+        Command::Split { pane, down } => serde_json::to_value(TabCommand::Split { pane, down })?,
+        Command::Close { pane } => serde_json::to_value(TabCommand::Close { pane })?,
+        Command::CloseTab { tab } => serde_json::to_value(TabCommand::CloseTab { tab })?,
+        Command::Rename { tab, name } => serde_json::to_value(TabCommand::Rename { tab, name })?,
+        Command::ResetName { tab } => serde_json::to_value(TabCommand::ResetName { tab })?,
+        Command::Send { text, pane, enter } => serde_json::to_value(PaneRequest::Send {
             pane,
             text,
             paste: true,
             enter,
         })?,
-        Command::Read { pane } => serde_json::to_value(PublicRequest::Read { pane })?,
+        Command::Read { pane } => serde_json::to_value(PaneRequest::Read { pane })?,
         Command::Notify { message, pane } => {
-            serde_json::to_value(PublicRequest::Notify { pane, message })?
+            serde_json::to_value(PaneRequest::Notify { pane, message })?
         }
         Command::Stop => serde_json::to_value(PublicRequest::Stop)?,
         Command::Rpc { request } => serde_json::from_str(&request)?,
