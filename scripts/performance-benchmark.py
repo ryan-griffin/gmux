@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure release frontend/daemon CPU, RSS, and native Wayland input latency.
 
-Run python3 scripts/performance-benchmark.py --binary target/release/gmux
+Run python3 scripts/performance-benchmark.py --binary target/release/gmux-gtk
 --output artifacts/performance.json. Starts an isolated headless Mutter compositor
 with XWayland disabled, a private PipeWire server, settings, sockets, and shells.
 """
@@ -14,13 +14,13 @@ from pathlib import Path
 from cargo_test_support import cargo_binary
 import platform
 import shlex
-import socket
 import statistics
 import subprocess
 import tempfile
 import time
 
 from daemon_test_support import stop_daemon
+from test_support import rpc as socket_rpc
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -32,7 +32,7 @@ parser.add_argument("--renderer", choices=["vulkan", "gl", "cairo"], default="vu
 args = parser.parse_args()
 assert args.seconds >= 1 and args.samples >= 5
 ensure_wayland_session()
-args.binary = args.binary.resolve() if args.binary else cargo_binary("gmux", profile="release")
+args.binary = args.binary.resolve() if args.binary else cargo_binary("gmux-gtk", profile="release")
 args.output = args.output.resolve()
 args.output.parent.mkdir(parents=True, exist_ok=True)
 clock_ticks = os.sysconf("SC_CLK_TCK")
@@ -90,7 +90,8 @@ try:
         temp = Path(directory)
         config = temp / "config/gmux"
         config.mkdir(parents=True)
-        (config / "settings.json").write_text(json.dumps(dict(appearance="dark",
+        (config / "clients/gtk").mkdir(parents=True, exist_ok=True)
+        (config / "clients/gtk/settings.json").write_text(json.dumps(dict(local_daemon_enabled=True, appearance="dark",
             desktop_notifications=False, use_system_font=False, font="Monospace", font_size=12)))
         rcfile = temp / "bashrc"
         rcfile.write_text("PS1='GMUX_BENCH> '\nPROMPT_COMMAND=''\nstty -echo\n")
@@ -105,18 +106,12 @@ try:
                    SHELL=str(shell), GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
         with args.output.with_suffix(".log").open("w") as log, WaylandInput() as native:
             def rpc(method, **params):
-                with socket.socket(socket.AF_UNIX) as connection:
-                    connection.settimeout(6)
-                    connection.connect(env["GMUX_SOCKET"])
-                    connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
-                    result = json.loads(connection.makefile("rb").readline())
-                    assert "error" not in result, result
-                    return result
+                return socket_rpc(env["GMUX_SOCKET"], method, **params)
 
             app = subprocess.Popen([str(args.binary)], env=env, stdout=log, stderr=log)
-            wait_for(lambda: rpc("daemon-info")["attached"])
+            wait_for(lambda: rpc("status")["local_clients"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
-            daemon_pid = rpc("daemon-info")["pid"]
+            daemon_pid = rpc("status")["pid"]
             first = rpc("new", name="Benchmark", directory=str(temp))
             right = rpc("split", pane=first["pane"])["pane"]
             lower_left = rpc("split", pane=first["pane"], down=True)["pane"]
@@ -144,7 +139,7 @@ try:
             wait_for(lambda: rpc("renderer-info")["window_active"])
             report = dict(binary=str(args.binary), date=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 binary_sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest(),
-                daemon_sha256=hashlib.sha256(args.binary.with_name("gmux-daemon").read_bytes()).hexdigest(),
+                daemon_sha256=hashlib.sha256(args.binary.with_name("gmux").read_bytes()).hexdigest(),
                 cpu_model=next(line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")),
                 kernel=platform.release(), gtk=subprocess.check_output(["pkg-config", "--modversion", "gtk4"], text=True).strip(),
                 renderer=renderer, gtk_debug=env.get("GDK_DEBUG", ""),
@@ -244,7 +239,7 @@ try:
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
             report["scenarios"].append(measure_resources("detached_three_busy_panes", False))
             control.write_text("idle")
             time.sleep(1)

@@ -1,6 +1,6 @@
 //! Optional, bounded Ghostty checkpoints owned by the daemon's saved layout.
-use crate::{model::Session, storage};
 use anyhow::Context;
+use gmux_client::{model::ExecutionState, storage};
 use std::{
     collections::HashSet, fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::Path,
 };
@@ -14,13 +14,13 @@ const SOURCE: &str = env!("GMUX_GHOSTTY_REVISION");
 const HEADER: usize = 8 + 4 + 40 + 8 + 8;
 
 pub(crate) struct Checkpoint {
-    pub(crate) session: Session,
+    pub(crate) session: ExecutionState,
     pub(crate) panes: Vec<(u64, Vec<u8>)>,
     pub(crate) warnings: Vec<String>,
 }
 impl Checkpoint {
     pub(crate) fn new(
-        mut session: Session,
+        mut session: ExecutionState,
         panes: Vec<(u64, Vec<u8>)>,
         warnings: Vec<String>,
     ) -> anyhow::Result<Self> {
@@ -41,7 +41,7 @@ impl Checkpoint {
     // Called only by the ordered disk worker. Layout publication is the commit
     // point. A crash before it leaves the previous layout and snapshots usable.
     pub(crate) fn write(self) -> anyhow::Result<()> {
-        storage::with_state_lock("session.json", |path| self.write_locked(path))
+        storage::with_state_lock("execution.json", |path| self.write_locked(path))
     }
 
     fn write_locked(mut self, path: &Path) -> anyhow::Result<()> {
@@ -49,7 +49,7 @@ impl Checkpoint {
         let directory = path.parent().unwrap().join("scrollback");
         // Reclaim interrupted publications before adding another generation.
         // A damaged layout must still remain untouched, as for normal saves.
-        let committed: Session = storage::load_at(path)?;
+        let committed: ExecutionState = storage::load_at(path)?;
         let ready = prune_at(&committed, &directory).and_then(|()| {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -190,20 +190,20 @@ fn load_at(id: u64, name: &str, path: &Path, max_bytes: usize) -> anyhow::Result
     Ok(bytes)
 }
 
-pub(crate) fn save_session(session: &Session) -> anyhow::Result<()> {
-    storage::with_state_lock("session.json", |path| {
+pub(crate) fn save_execution(session: &ExecutionState) -> anyhow::Result<()> {
+    storage::with_state_lock("execution.json", |path| {
         storage::save_locked_at(path, session)?;
         prune_at(session, &path.parent().unwrap().join("scrollback"))
     })
 }
 
 pub(crate) fn prune_committed() -> anyhow::Result<()> {
-    storage::with_state_lock("session.json", |path| {
+    storage::with_state_lock("execution.json", |path| {
         let session = storage::load_at(path)?;
         prune_at(&session, &path.parent().unwrap().join("scrollback"))
     })
 }
-fn prune_at(session: &Session, directory: &Path) -> anyhow::Result<()> {
+fn prune_at(session: &ExecutionState, directory: &Path) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -255,7 +255,7 @@ fn temporary_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Layout, SavedTab};
+    use gmux_client::model::{ExecutionTab, PaneTree};
     use std::collections::HashMap;
 
     fn test_directory() -> std::path::PathBuf {
@@ -271,25 +271,24 @@ mod tests {
         directory
     }
 
-    fn saved_pane() -> Session {
-        Session {
-            tabs: vec![SavedTab {
+    fn saved_pane() -> ExecutionState {
+        ExecutionState {
+            tabs: vec![ExecutionTab {
                 id: 1,
-                layout: Layout::Pane(2),
-                active: 2,
+                created_at: 1,
+                layout: PaneTree::Pane(2),
                 name: String::new(),
                 custom_name: false,
-                workspace: None,
                 directories: HashMap::new(),
             }],
-            ..Session::default()
+            ..ExecutionState::default()
         }
     }
 
     #[test]
     fn concurrent_checkpoints_keep_committed_history_and_preserve_damaged_layouts() {
         let directory = test_directory();
-        let path = directory.join("session.json");
+        let path = directory.join("execution.json");
         let cache = directory.join("scrollback");
         std::thread::scope(|scope| {
             for writer in 0..4 {
@@ -301,7 +300,7 @@ mod tests {
                             Checkpoint::new(saved_pane(), vec![(2, vec![writer])], vec![]).unwrap();
                         storage::with_lock_at(path, || checkpoint.write_locked(path)).unwrap();
                         storage::with_lock_at(path, || {
-                            let committed: Session = storage::load_at(path)?;
+                            let committed: ExecutionState = storage::load_at(path)?;
                             prune_at(&committed, cache)?;
                             let name = &committed.scrollback[&2];
                             let bytes = load_at(2, name, &cache.join(name), MAX_PANE_BYTES)?;
@@ -341,7 +340,7 @@ mod tests {
         assert!(encode(2, &vec![0; MAX_PANE_BYTES + 1]).is_err());
         assert!(
             Checkpoint::new(
-                Session::default(),
+                ExecutionState::default(),
                 (1..=MAX_PANES as u64 + 1).map(|id| (id, vec![])).collect(),
                 vec![]
             )
@@ -361,7 +360,7 @@ mod tests {
         }
         std::fs::write(directory.join("unrelated"), b"keep").unwrap();
         std::fs::write(directory.join(&temporary), b"incomplete write").unwrap();
-        let session = Session {
+        let session = ExecutionState {
             scrollback: HashMap::from([(2, live.clone()), (3, deleted.clone())]),
             ..saved_pane()
         };
@@ -378,7 +377,7 @@ mod tests {
         assert!(
             load_at(
                 2,
-                "../../session.json",
+                "../../execution.json",
                 &directory.join(&live),
                 MAX_PANE_BYTES
             )

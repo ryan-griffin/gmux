@@ -1,4 +1,4 @@
-use crate::model;
+use gmux_client::model;
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

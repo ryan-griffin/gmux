@@ -1,20 +1,9 @@
 #![deny(deprecated)]
 
-pub mod control;
+mod branch;
 pub mod daemon;
 mod engine;
-mod incoming;
-pub mod ipc;
-pub mod model;
 mod persistence;
-pub mod remote;
 mod scrollback;
-pub mod search;
-pub mod session;
-pub mod storage;
-pub mod theme;
+mod session;
 mod title;
-mod transport;
-pub mod viewport;
-
-pub use engine::{Cell, Frame, Scrollback};

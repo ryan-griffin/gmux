@@ -1,4 +1,4 @@
-use crate::{model::CursorStyle, theme::Theme};
+use gmux_client::{model::CursorStyle, theme::Theme};
 use std::{
     ffi::{CString, c_void},
     ptr::NonNull,
@@ -9,7 +9,7 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/ghostty_bridge.rs"));
 }
 use ffi::*;
-pub use ffi::{Cell, Frame, Scrollback};
+use ffi::{Cell, Frame};
 
 // Accept only the pinned cell formatter's rendition operations. Validate the
 // whole UTF-8 stream before touching the fresh terminal, including controls in
@@ -54,26 +54,6 @@ fn validate_history_replay(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            text: [0; 64],
-            fg: [0; 3],
-            bg: [0; 3],
-            flags: 0,
-        }
-    }
-}
-impl Cell {
-    /// Compare stored glyphs and wide-cell continuation, ignoring rendition.
-    pub fn text_eq(&self, other: &Self) -> bool {
-        self.text == other.text && (self.flags ^ other.flags) & 64 == 0
-    }
-    pub fn text(&self) -> &str {
-        let end = self.text.iter().position(|&x| x == 0).unwrap_or(64);
-        std::str::from_utf8(&self.text[..end]).unwrap_or("\u{fffd}")
-    }
-}
 #[derive(Default)]
 struct Events {
     replies: Vec<u8>,
@@ -107,7 +87,7 @@ pub struct Engine {
     pub frame: Frame,
     pub cells: Vec<Cell>,
     size: (u16, u16),
-    find: crate::search::HistorySearch,
+    find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
 }
 
@@ -116,10 +96,30 @@ pub(crate) struct EngineView {
     raw: NonNull<GmuxView>,
     held_frame: Frame,
     held_cells: Vec<Cell>,
-    find: crate::search::HistorySearch,
+    find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
 }
 impl EngineView {
+    pub(crate) fn set_theme(&mut self, theme: &Theme) {
+        unsafe {
+            gmux_engine_view_theme(
+                self.raw.as_ptr(),
+                theme.background.as_ptr(),
+                theme.foreground.as_ptr(),
+                theme.cursor.as_ptr(),
+                theme.palette.as_ptr().cast(),
+                theme.dark,
+            )
+        }
+    }
+    pub(crate) fn set_cursor_style(&mut self, style: CursorStyle) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_view_cursor_style(self.raw.as_ptr(), style as u8) };
+        anyhow::ensure!(
+            result == 0,
+            "Ghostty view cursor style update failed ({result})"
+        );
+        Ok(())
+    }
     pub(crate) fn find_pending(&self) -> bool {
         self.find.pending || self.find.dirty
     }
@@ -130,37 +130,27 @@ impl EngineView {
         self.find.restart();
     }
 }
-/// Plain text for the displayed grid, with wide-cell continuations omitted.
-pub(crate) fn viewport_text(frame: Frame, cells: &[Cell]) -> String {
-    let mut text = String::with_capacity(cells.len());
-    for (index, row) in cells.chunks(frame.cols as usize).enumerate() {
-        if index > 0 {
-            text.push('\n');
-        }
-        let start = text.len();
-        for cell in row {
-            if cell.flags & 64 != 0 {
-                continue;
-            }
-            let glyph = cell.text();
-            text.push_str(if glyph.is_empty() { " " } else { glyph });
-        }
-        text.truncate(start + text[start..].trim_end().len());
-    }
-    text.truncate(text.trim_end().len());
-    text
-}
+use gmux_client::cells::viewport_text;
 impl Drop for EngineView {
     fn drop(&mut self) {
         unsafe { gmux_engine_view_free(self.raw.as_ptr()) }
     }
 }
 impl Engine {
+    pub(crate) fn use_view_appearance(&mut self, view: &EngineView) -> anyhow::Result<()> {
+        let result =
+            unsafe { gmux_engine_use_view_appearance(self.raw.as_ptr(), view.raw.as_ptr()) };
+        anyhow::ensure!(
+            result == 0,
+            "Ghostty view appearance update failed ({result})"
+        );
+        Ok(())
+    }
     pub(crate) fn new_view(&self) -> anyhow::Result<EngineView> {
         Ok(EngineView {
             raw: NonNull::new(unsafe { gmux_engine_view_new(self.raw.as_ptr()) })
                 .ok_or_else(|| anyhow::anyhow!("Could not create terminal view"))?,
-            find: crate::search::HistorySearch::default(),
+            find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
             held_frame: Frame::default(),
             held_cells: Vec::new(),
@@ -252,7 +242,7 @@ impl Engine {
             "Invalid Ghostty snapshot or history exceeds restore budget"
         );
         anyhow::ensure!(
-            crate::viewport::valid(cols as u64, rows as u64),
+            gmux_client::viewport::valid(cols as u64, rows as u64),
             "Invalid snapshot dimensions"
         );
         validate_history_replay(&text)?;
@@ -284,7 +274,7 @@ impl Engine {
             frame: Frame::default(),
             cells: vec![Cell::default(); 80 * 24],
             size: (80, 24),
-            find: crate::search::HistorySearch::default(),
+            find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
         };
         engine.set_theme(&Theme::adwaita(true))?;
@@ -385,7 +375,7 @@ impl Engine {
         }
         true
     }
-    pub fn find_state(&self) -> crate::search::FindState {
+    pub fn find_state(&self) -> gmux_client::search::FindState {
         self.find
             .state(self.frame.scrollback.offset, self.cells.len())
     }
@@ -424,7 +414,7 @@ impl Engine {
         let result =
             unsafe { gmux_engine_copy(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut written) };
         anyhow::ensure!(
-            result >= 0 && written <= crate::transport::MAX_PASTE,
+            result >= 0 && written <= gmux_client::transport::MAX_PASTE,
             "Selection is too large to copy"
         );
         let mut bytes = vec![0; written];
@@ -1545,6 +1535,108 @@ mod tests {
     }
 
     #[test]
+    fn view_appearance_preserves_program_overrides_and_shared_query_defaults() {
+        let mut e = Engine::new().unwrap();
+        e.resize(20, 3, 0, 0).unwrap();
+        let dark = Theme::adwaita(true);
+        let light = Theme::adwaita(false);
+        let mut first = e.new_view().unwrap();
+        let mut second = e.new_view().unwrap();
+        first.set_theme(&dark);
+        first.set_cursor_style(CursorStyle::Bar).unwrap();
+        second.set_theme(&light);
+        second.set_cursor_style(CursorStyle::Underline).unwrap();
+        e.write(b"A\x1b[34mB\x1b[0m\x1b[38;2;1;2;3mC\x1b[0m\x1b[?2031h");
+        e.take_events();
+        for _ in 0..3 {
+            for (view, theme, style) in [
+                (&mut first, dark, CursorStyle::Bar),
+                (&mut second, light, CursorStyle::Underline),
+            ] {
+                e.with_view(view, |e| {
+                    e.snapshot().unwrap();
+                    assert_eq!(e.frame.background, theme.background);
+                    assert_eq!(e.cells[0].fg, theme.foreground);
+                    assert_eq!(e.cells[1].fg, theme.palette[4]);
+                    assert_eq!(e.cells[2].fg, [1, 2, 3]);
+                    assert_eq!(e.frame.cursor_style, style as u8);
+                });
+            }
+        }
+        assert!(
+            e.take_events().0.is_empty(),
+            "Rendering must not change program color-scheme reports"
+        );
+        e.write(b"\x1b[?996n");
+        assert_eq!(e.take_events().0, b"\x1b[?997;1n");
+
+        // An override equal to one theme's default must remain an override in the other.
+        e.write(b"\x1b]10;#ffffff\x07\x1b]11;#112233\x07\x1b]4;4;#1e78e4\x07\x1b[2 q");
+        for view in [&mut first, &mut second] {
+            e.with_view(view, |e| {
+                e.snapshot().unwrap();
+                assert_eq!(e.frame.background, [0x11, 0x22, 0x33]);
+                assert_eq!(e.cells[0].fg, [255; 3]);
+                assert_eq!(e.cells[1].fg, dark.palette[4]);
+                assert_eq!(e.frame.cursor_style, CursorStyle::Block as u8);
+            });
+        }
+        e.write(b"\x1b]110\x07\x1b]111\x07\x1b]104;4\x07\x1b[0 q");
+        for (view, theme, style) in [
+            (&mut first, dark, CursorStyle::Bar),
+            (&mut second, light, CursorStyle::Underline),
+        ] {
+            e.with_view(view, |e| {
+                e.snapshot().unwrap();
+                assert_eq!(e.frame.background, theme.background);
+                assert_eq!(e.cells[0].fg, theme.foreground);
+                assert_eq!(e.cells[1].fg, theme.palette[4]);
+                assert_eq!(e.frame.cursor_style, style as u8);
+            });
+        }
+        e.use_view_appearance(&second).unwrap();
+        assert_eq!(e.take_events().0, b"\x1b[?997;2n");
+        e.snapshot().unwrap();
+        assert_eq!(e.frame.background, light.background);
+        e.with_view(&mut first, |e| {
+            e.snapshot().unwrap();
+            assert_eq!(e.frame.background, dark.background);
+        });
+        e.write(b"\x1b[?996n");
+        assert_eq!(e.take_events().0, b"\x1b[?997;2n");
+    }
+
+    #[test]
+    fn synchronized_output_retains_each_views_appearance() {
+        let mut e = Engine::new().unwrap();
+        e.resize(20, 3, 0, 0).unwrap();
+        let mut first = e.new_view().unwrap();
+        let mut second = e.new_view().unwrap();
+        let dark = Theme::adwaita(true);
+        let light = Theme::adwaita(false);
+        second.set_theme(&light);
+        e.write(b"OLD");
+        e.write(b"\x1b[?2026h\rNEW");
+        for (view, theme) in [(&mut first, dark), (&mut second, light)] {
+            e.with_view(view, |e| {
+                e.snapshot().unwrap();
+                assert_eq!(e.frame.background, theme.background);
+                assert_eq!(e.cells[0].fg, theme.foreground);
+                assert_eq!(e.cells[0].text(), "O");
+            });
+        }
+        e.write(b"\x1b[?2026l");
+        for (view, theme) in [(&mut first, dark), (&mut second, light)] {
+            e.with_view(view, |e| {
+                e.snapshot().unwrap();
+                assert_eq!(e.frame.background, theme.background);
+                assert_eq!(e.cells[0].fg, theme.foreground);
+                assert_eq!(e.cells[0].text(), "N");
+            });
+        }
+    }
+
+    #[test]
     fn cursor_defaults_update_live_and_survive_application_overrides_and_resets() {
         let mut e = Engine::new().unwrap();
         e.snapshot().unwrap();
@@ -1617,3 +1709,6 @@ mod tests {
         assert_eq!(engine.frame.background, theme.background);
     }
 }
+
+#[cfg(test)]
+mod search_tests;

@@ -2,15 +2,15 @@
 <component type="desktop-application">
   <id>dev.gmux.Gmux</id>
   <name>Gmux</name>
-  <summary>Organize terminals into workspaces</summary>
+  <summary>Persistent local and remote terminals</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <description>
-    <p>Gmux is a terminal for GNOME built with Rust, libadwaita, and libghostty-vt. Keep tabs in a flat sidebar, filter by workspace, split terminal panes, and see notifications when a task needs attention.</p>
+    <p>Gmux is a terminal for GNOME with persistent tabs and split panes. Local and remote connections share a searchable sidebar. Organize tabs into workspaces, keep terminals running when a window closes, and reconnect to the same sessions later.</p>
     <p>A local command-line interface lets shell scripts create tabs and workspaces, send commands, and report task completion.</p>
   </description>
   <launchable type="desktop-id">dev.gmux.Gmux.desktop</launchable>
-  <provides><binary>gmux</binary></provides>
+  <provides><binary>gmux-gtk</binary></provides>
   <content_rating type="oars-1.1"/>
   <supports><control>keyboard</control><control>pointing</control></supports>
   <releases><release version="0.1.0" date="2026-09-30"/></releases>

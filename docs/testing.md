@@ -7,13 +7,20 @@ build, or set `GHOSTTY_PREFIX` to a build of the same source revision.
 ```sh
 ./scripts/bootstrap-ghostty.sh
 python3 scripts/check.py
-python3 scripts/check.py --native
 ```
 
-The runner checks formatting, Rust tests, Clippy, builds, and four headless smoke
-suites. `--native` adds five desktop suites in a private Wayland session.
-Rust tests cover terminal parsing, search, layout changes, transport limits,
-state writes, and scheduling. Integration suites exercise real PTYs and GTK.
+The runner checks formatting, Rust tests, Clippy, builds, linkage, and headless
+smoke suites. Add `--headless` to build and test only `gmux-core`, `gmux-client`,
+and `gmux`, without GTK, libadwaita, GLib, or `glib-compile-resources`.
+Add `--native` to include desktop suites in a private Wayland session.
+`--headless` and `--native` cannot be combined.
+
+Check execution and the client library without a toolkit:
+
+```sh
+cargo test --locked -p gmux-core -p gmux-client --lib
+cargo clippy --locked -p gmux-core -p gmux-client --all-targets -- -D warnings
+```
 
 ## Select checks
 
@@ -24,15 +31,16 @@ python3 scripts/check.py --native --skip-build --only renderer multi-window
 ```
 
 `--only` selects suites by filename without `-smoke-test.py`; use `smoke` for
-`smoke-test.py`. Rust checks still run unless `--skip-build` is set.
-That option uses executable paths recorded by the previous runner build in
-`artifacts/cargo-build.jsonl`. Rerun without it after source or build-config changes.
-Direct smoke scripts build their executables through Cargo unless given an
-explicit binary path. Cargo handles target directories and build configuration.
+`smoke-test.py`. Desktop suites require `--native`.
 
-Headless suites cover daemon lifecycle, shared clients, input backpressure and
-UTF-8 paste, and durable history. Desktop suites cover application workflows,
-multiple windows, native input and clipboard, notifications, and rendering.
+`--skip-build` skips Rust checks and reuses executable paths recorded by the
+previous runner build in `artifacts/cargo-build.jsonl`, or
+`artifacts/cargo-build-headless.jsonl` for `--headless`. Use the same `--headless`
+setting as that build. Rebuild after source or build-configuration changes.
+Running a smoke script directly builds its executables through Cargo unless
+given explicit binary paths.
+
+`--skip-smoke` runs Rust, build, and linkage checks without smoke suites.
 
 ## Native prerequisites
 
@@ -54,9 +62,10 @@ Use `GSK_RENDERER=vulkan`, `gl`, or `cairo` to select a rendering backend.
 
 ## CI and failures
 
-GitHub Actions runs the headless checks in the Fedora container pinned in
-`.github/workflows/check.yml`, using the development Rust toolchain from
-`rust-toolchain.toml`. It does not run desktop checks.
+GitHub Actions uses the Fedora container pinned in `.github/workflows/check.yml`
+and the development Rust toolchain from `rust-toolchain.toml`. CI runs the
+headless smoke suites once, then checks the full workspace and verifies that its
+daemon artifact matches the headless build. It does not run native desktop suites.
 `ci/install-deps.sh` and `ci/check.sh` provide the same steps for a container run.
 
 Logs, screenshots, and renderer reports go under the Git-ignored `artifacts/`

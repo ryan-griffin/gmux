@@ -1,0 +1,14 @@
+[package]
+name = "gmux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Persistent terminal daemon and management CLI"
+license = "MIT"
+
+[dependencies]
+gmux-client = { path = "../client" }
+gmux-core = { path = "../.." }
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1"
+serde_json = "1"

@@ -1,11 +1,13 @@
 //! Headless owner of PTYs, terminal engines, and the reconnectable live layout.
 use crate::{
-    Cell, Frame,
-    control::{Command, CommandOutput, CommandResult},
-    ipc,
-    model::{self, Layout, SavedTab, Session, Settings, TabFilter, WorkspaceCatalog},
     persistence::{Save, Worker},
     session::TerminalSession,
+};
+use gmux_client::{
+    Cell, Frame,
+    control::{CommandOutput, CommandResult},
+    ipc,
+    model::{self, CursorStyle, DaemonId, ExecutionState, ExecutionTab, PaneRef, PaneTree, TabRef},
     storage,
     theme::Theme,
     transport::{self, Header, Metadata, Packet},
@@ -23,14 +25,16 @@ use std::{
         },
     },
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod commands;
 mod event_loop;
 mod frontend;
+mod network;
+mod remote_access;
 
-use commands::{ControlRequest, PendingControl, PreparedSave};
+use commands::{ControlRequest, PendingControl};
 pub use event_loop::run;
 use frontend::Frontend;
 
@@ -78,9 +82,19 @@ fn reserve_id_range(last_id: &mut u64, count: u64) -> anyhow::Result<u64> {
     Ok(first)
 }
 
+fn creation_timestamp(previous: u64, now: SystemTime) -> u64 {
+    let micros = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    (micros.min(u64::MAX as u128) as u64).max(previous.saturating_add(1))
+}
+
 struct Daemon {
     sessions: HashMap<u64, TerminalSession>,
-    state: Session,
+    id: DaemonId,
+    remote_access: remote_access::RemoteAccess,
+    state: ExecutionState,
     frontends: HashMap<u64, Frontend>,
     next_frontend: u64,
     revision: u64,
@@ -89,27 +103,59 @@ struct Daemon {
     errors: HashMap<u64, String>,
     unread: HashMap<u64, u64>,
     alert_sequence: u64,
-    last_id: u64,
     quitting: bool,
     snapshots: u64,
     sent_rows: u64,
     started: Instant,
-    pending_write: Option<PreparedSave>,
+    pending_write: Option<Save>,
     checkpointed: bool,
+    git: Option<crate::branch::Service>,
+    git_dirty: bool,
 }
 impl Daemon {
+    fn sync_git(&mut self, wake: &ipc::Wake) {
+        if !std::mem::take(&mut self.git_dirty) {
+            return;
+        }
+        let wanted: HashMap<_, _> = self
+            .frontends
+            .values()
+            .filter(|frontend| frontend.attached)
+            .flat_map(|frontend| &frontend.git_panes)
+            .filter_map(|id| {
+                self.sessions
+                    .get(id)
+                    .map(|session| (*id, session.directory().to_path_buf()))
+            })
+            .collect();
+        if wanted.is_empty() {
+            self.git = None;
+        } else {
+            self.git
+                .get_or_insert_with(|| crate::branch::Service::new(wake.clone()))
+                .sync(wanted);
+        }
+    }
     fn new() -> anyhow::Result<Self> {
-        let settings = storage::load::<Settings>("settings.json")?;
-        let saved = storage::load::<Session>("session.json")?;
+        let mut execution = storage::load::<ExecutionState>("execution.json")?;
+        let id = crate::persistence::daemon_id()?;
+        let scrollback = std::mem::take(&mut execution.scrollback);
+        let last_id = execution
+            .tabs
+            .iter()
+            .flat_map(|tab| std::iter::once(tab.id).chain(tab.layout.ids()))
+            .filter(|id| *id < u64::MAX)
+            .chain(std::iter::once(execution.last_id))
+            .max()
+            .unwrap_or(0);
+        let saved = execution;
         let mut daemon = Self {
             sessions: HashMap::new(),
-            state: Session {
-                width: saved.width,
-                height: saved.height,
-                maximized: saved.maximized,
-                filter: saved.filter,
-                active: saved.active,
-                ..Session::default()
+            id,
+            remote_access: Default::default(),
+            state: ExecutionState {
+                last_id,
+                ..Default::default()
             },
             frontends: HashMap::new(),
             next_frontend: 0,
@@ -119,41 +165,24 @@ impl Daemon {
             errors: HashMap::new(),
             unread: HashMap::new(),
             alert_sequence: 0,
-            last_id: 0,
             quitting: false,
             snapshots: 0,
             sent_rows: 0,
             started: Instant::now(),
             pending_write: None,
             checkpointed: false,
+            git: None,
+            git_dirty: false,
         };
-        let catalog = storage::load_catalog()?;
-        if let TabFilter::Workspace(id) = daemon.state.filter
-            && !catalog
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.id == id)
-        {
-            daemon.state.filter = TabFilter::All;
-        }
-        let mut used: HashSet<_> = catalog.workspaces.iter().map(|w| w.id).collect();
+        let mut used = HashSet::new();
         let mut history_bytes = 0;
         let mut history_panes = 0;
-        for mut tab in saved.tabs {
+        for tab in saved.tabs {
             if let Err(e) = tab.validate() {
                 eprintln!("Skipping invalid saved tab: {e}");
                 continue;
             }
-            tab.workspace = tab.workspace.filter(|id| {
-                catalog
-                    .workspaces
-                    .iter()
-                    .any(|workspace| workspace.id == *id)
-            });
             let ids = tab.layout.ids();
-            if !ids.contains(&tab.active) {
-                tab.active = ids[0];
-            }
             if used.contains(&tab.id) || ids.iter().any(|id| used.contains(id)) {
                 eprintln!("Skipping duplicate saved IDs");
                 continue;
@@ -167,7 +196,7 @@ impl Daemon {
                         .filter(|p| p.is_dir())
                         .cloned()
                         .unwrap_or_else(model::home);
-                    let history = saved.scrollback.get(id).and_then(|name| {
+                    let history = scrollback.get(id).and_then(|name| {
                         if history_panes >= crate::scrollback::MAX_PANES {
                             eprintln!(
                                 "Skipping scrollback for pane {id}: restore pane limit reached"
@@ -194,12 +223,12 @@ impl Daemon {
                         *id,
                         tab.id,
                         directory,
-                        settings.cursor_style,
-                        &Theme::adwaita(settings.appearance != "light"),
+                        CursorStyle::default(),
+                        &Theme::adwaita(true),
                         history.as_deref(),
                     )?;
                     if history.is_some()
-                        && let Some(name) = saved.scrollback.get(id)
+                        && let Some(name) = scrollback.get(id)
                     {
                         daemon.state.scrollback.insert(*id, name.clone());
                     }
@@ -219,22 +248,24 @@ impl Daemon {
             used.extend(ids);
             daemon.state.tabs.push(tab);
         }
-        daemon.last_id = used.into_iter().max().unwrap_or(0);
+        daemon.state.last_id = daemon
+            .state
+            .last_id
+            .max(used.into_iter().max().unwrap_or(0));
         daemon
             .state
             .scrollback
             .retain(|id, _| daemon.sessions.contains_key(id));
-        daemon.select_visible();
         Ok(daemon)
     }
-    fn metadata(session: &TerminalSession, unread: u64) -> Metadata {
+    fn metadata(session: &TerminalSession, unread_sequence: u64) -> Metadata {
         Metadata {
             id: session.id(),
             directory: session.directory().to_path_buf(),
             title: session.title(),
             size: session.size(),
             exited: session.exited(),
-            unread,
+            unread_sequence,
             busy: session.busy(),
             modes: [session.mode(0), session.mode(1004)],
         }
@@ -249,65 +280,18 @@ impl Daemon {
     }
     fn resolve_pane(&self, pane: Option<u64>) -> anyhow::Result<u64> {
         let id = pane
-            .or_else(|| {
-                self.state
-                    .tabs
-                    .iter()
-                    .find(|t| t.id == self.state.active)
-                    .map(|t| t.active)
-            })
-            .ok_or_else(|| anyhow::anyhow!("No active terminal"))?;
+            .or_else(|| (self.sessions.len() == 1).then(|| *self.sessions.keys().next().unwrap()))
+            .ok_or_else(|| anyhow::anyhow!("Specify a pane when more than one terminal exists"))?;
         anyhow::ensure!(self.sessions.contains_key(&id), "Pane {id} does not exist");
         Ok(id)
     }
     fn reserve_ids(&mut self, count: u64) -> anyhow::Result<u64> {
         // Closed panes can still appear in queued packets and command replies.
-        // Keep their IDs reserved until this daemon stops, across all ID types.
-        self.last_id = storage::load_catalog()?
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.id)
-            .chain(std::iter::once(self.last_id))
-            .max()
-            .unwrap_or(0);
-        reserve_id_range(&mut self.last_id, count)
-    }
-    fn select_visible(&mut self) {
-        if !self
-            .state
-            .tabs
-            .iter()
-            .any(|tab| tab.id == self.state.active && self.state.filter.matches(tab.workspace))
-        {
-            self.state.active = self
-                .state
-                .tabs
-                .iter()
-                .find(|tab| self.state.filter.matches(tab.workspace))
-                .map(|tab| tab.id)
-                .unwrap_or(0);
-        }
-    }
-    fn focus_tab(&mut self, id: u64) -> anyhow::Result<()> {
-        let tab = self
-            .state
-            .tabs
-            .iter()
-            .find(|tab| tab.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Tab {id} does not exist"))?;
-        if !self.state.filter.matches(tab.workspace) {
-            self.state.filter = TabFilter::All;
-        }
-        self.state.active = id;
-        Ok(())
+        // Persist the high-water mark across restarts, too.
+        reserve_id_range(&mut self.state.last_id, count)
     }
     fn close(&mut self, id: u64) {
-        let active_index = self
-            .state
-            .tabs
-            .iter()
-            .filter(|tab| self.state.filter.matches(tab.workspace))
-            .position(|tab| tab.id == self.state.active);
+        self.git_dirty |= self.git.is_some();
         self.sessions.remove(&id);
         self.state.scrollback.remove(&id);
         self.unread.remove(&id);
@@ -315,6 +299,8 @@ impl Daemon {
         self.errors.remove(&id);
         self.changed.remove(&id);
         for frontend in self.frontends.values_mut() {
+            frontend.git_panes.remove(&id);
+            frontend.git_sent.remove(&id);
             frontend.visible.remove(&id);
             frontend.views.remove(&id);
             frontend.clipboard.remove(&id);
@@ -342,39 +328,10 @@ impl Daemon {
             let Some(layout) = tab.layout.clone().remove(id) else {
                 return false;
             };
-            if tab.active == id {
-                let old = tab.layout.ids();
-                let index = old.iter().position(|pane| *pane == id).unwrap_or(0);
-                let remaining = layout.ids();
-                tab.active = remaining[index.min(remaining.len() - 1)];
-            }
             tab.layout = layout;
             tab.directories.remove(&id);
             true
         });
-        if !self
-            .state
-            .tabs
-            .iter()
-            .any(|tab| tab.id == self.state.active)
-        {
-            let visible: Vec<_> = self
-                .state
-                .tabs
-                .iter()
-                .filter(|tab| self.state.filter.matches(tab.workspace))
-                .map(|tab| tab.id)
-                .collect();
-            self.state.active = visible
-                .get(
-                    active_index
-                        .unwrap_or(0)
-                        .min(visible.len().saturating_sub(1)),
-                )
-                .copied()
-                .unwrap_or(0);
-        }
-        self.select_visible();
     }
     fn refresh_state(&mut self) {
         for tab in &mut self.state.tabs {
@@ -387,25 +344,35 @@ impl Daemon {
             }
         }
     }
-    fn shared_state(&self) -> anyhow::Result<crate::control::CommandReply> {
-        Ok(crate::control::CommandReply {
-            revision: self.revision,
-            result: CommandOutput::Done { ok: true }.into(),
-            session: self.state.clone(),
-            catalog: storage::load_catalog()?,
-            metadata: self
-                .sessions
-                .iter()
-                .map(|(&id, s)| Self::metadata(s, self.unread.get(&id).copied().unwrap_or(0)))
-                .collect(),
-        })
-    }
-    fn session_snapshot(&mut self) -> Session {
+    fn execution_snapshot(&mut self) -> ExecutionState {
         self.refresh_state();
         self.state.clone()
     }
-    fn prepare_session_save(&mut self) {
-        self.pending_write = Some(PreparedSave::Session(self.session_snapshot()));
+    fn execution_state(&self) -> gmux_client::control::CommandReply {
+        let mut execution = self.state.clone();
+        execution.scrollback.clear();
+        gmux_client::control::CommandReply {
+            daemon: self.id,
+            home_directory: model::home(),
+            machine_kind: model::MachineKind::local(),
+            hostname: model::hostname().into(),
+            revision: self.revision,
+            result: CommandOutput::Done { ok: true }.into(),
+            execution,
+            metadata: self
+                .sessions
+                .iter()
+                .map(|(&id, session)| {
+                    Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))
+                })
+                .collect(),
+        }
+    }
+    fn state_save(&mut self) -> Save {
+        Save::Execution(self.execution_snapshot())
+    }
+    fn prepare_state_save(&mut self) {
+        self.pending_write = Some(self.state_save());
     }
 
     fn prepare_checkpoint(&mut self) -> anyhow::Result<crate::scrollback::Checkpoint> {
@@ -437,7 +404,7 @@ impl Daemon {
                 Err(error) => warnings.push(format!("Pane {id}: {error}")),
             }
         }
-        crate::scrollback::Checkpoint::new(self.session_snapshot(), panes, warnings)
+        crate::scrollback::Checkpoint::new(self.execution_snapshot(), panes, warnings)
     }
 }
 
@@ -462,6 +429,17 @@ mod tests {
         );
         assert_eq!(reserve_id_range(&mut last, 1).unwrap(), u64::MAX - 1);
         assert!(reserve_id_range(&mut last, 1).is_err());
+    }
+
+    #[test]
+    fn creation_timestamps_increase_when_the_clock_repeats_or_moves_backwards() {
+        let now = UNIX_EPOCH + Duration::from_micros(900);
+        assert_eq!(creation_timestamp(0, now), 900);
+        assert_eq!(creation_timestamp(900, now), 901);
+        assert_eq!(
+            creation_timestamp(901, now - Duration::from_micros(100)),
+            902
+        );
     }
 
     #[test]
@@ -491,6 +469,7 @@ mod tests {
         queue.push("\x01".repeat(MAX_NOTIFICATION_BYTES));
         let packet = Packet {
             header: Header {
+                git: None,
                 state: None,
                 meta: Metadata {
                     id: 1,
@@ -498,7 +477,7 @@ mod tests {
                     title: "shell".into(),
                     size: (512, 256),
                     exited: false,
-                    unread: 1,
+                    unread_sequence: 1,
                     busy: false,
                     modes: [false; 2],
                 },
@@ -511,18 +490,18 @@ mod tests {
                 rows: (0..256).collect(),
                 notifications: queue.messages.into_iter().collect(),
                 error: None,
-                find: Some(crate::search::FindState {
+                find: Some(gmux_client::search::FindState {
                     current: 1,
-                    total: crate::viewport::MAX_CELLS,
+                    total: gmux_client::viewport::MAX_CELLS,
                     pending: false,
-                    highlights: (0..crate::viewport::MAX_CELLS)
+                    highlights: (0..gmux_client::viewport::MAX_CELLS)
                         .map(|i| (i, i + 1, 1))
                         .collect(),
                 }),
                 selection: None,
                 copy: None,
             },
-            cells: vec![Cell::default(); crate::viewport::MAX_CELLS],
+            cells: vec![Cell::default(); gmux_client::viewport::MAX_CELLS],
         };
         packet.encode_into(&mut Vec::new()).unwrap();
     }
@@ -568,6 +547,7 @@ mod tests {
             cell.text[0] = text;
             Packet {
                 header: Header {
+                    git: None,
                     state: None,
                     meta: Metadata {
                         id: 1,
@@ -575,7 +555,7 @@ mod tests {
                         title: "shell".into(),
                         size: (80, 24),
                         exited: false,
-                        unread: 0,
+                        unread_sequence: 0,
                         busy: false,
                         modes: [false; 2],
                     },
