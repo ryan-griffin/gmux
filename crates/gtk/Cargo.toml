@@ -1,0 +1,37 @@
+[package]
+name = "gmux-gtk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+default-run = "gmux-gtk"
+description = "GTK client for the Gmux terminal daemon"
+license = "MIT"
+
+[[bin]]
+name = "gmux-gtk"
+path = "src/main.rs"
+
+[dependencies]
+gmux-client = { path = "../client" }
+adw = { package = "libadwaita", version = "0.9.2", features = ["v1_9"] }
+gtk = { package = "gtk4", version = "0.11.5", features = ["v4_22"] }
+glib = "0.22"
+glib-unix = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+# Renderer module tests run in the application target.
+[[example]]
+name = "renderer-benchmark"
+test = false
+
+[[example]]
+name = "renderer-check"
+test = false
+
+[[example]]
+name = "accessible-terminal-benchmark"
+test = false

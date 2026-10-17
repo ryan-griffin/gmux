@@ -17,7 +17,7 @@ pub fn run() -> anyhow::Result<()> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(());
+            return Err(gmux_client::local::DaemonAlreadyRunning.into());
         }
         return Err(error.into());
     }
@@ -58,8 +58,9 @@ pub fn run() -> anyhow::Result<()> {
     }
     let _cleanup = SocketCleanup(stream_path);
     let mut daemon = Daemon::new()?;
+    daemon.remote_access = remote_access::RemoteAccess::start(daemon.id)?;
     let mut persistence = Worker::new(wake.clone());
-    // Optional cache cleanup must not rewrite session.json during startup.
+    // Optional cache cleanup must not rewrite execution.json during startup.
     persistence.submit(Save::Prune, false)?;
     let mut saving: Option<PendingControl> = None;
     let mut controls = VecDeque::new();
@@ -97,6 +98,19 @@ pub fn run() -> anyhow::Result<()> {
                 revents: 0,
             },
         ]);
+        let git_index = daemon
+            .git
+            .as_ref()
+            .and_then(crate::branch::Service::fd)
+            .map(|fd| {
+                let index = fds.len();
+                fds.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                index
+            });
         frontend_indices.clear();
         for (&id, frontend) in &daemon.frontends {
             let index = fds.len();
@@ -138,6 +152,10 @@ pub fn run() -> anyhow::Result<()> {
             attached.then_some(next_metadata),
             pending.then_some(next_frame),
             held.then_some(now + Duration::from_millis(100)),
+            daemon
+                .git
+                .as_ref()
+                .and_then(crate::branch::Service::next_retry),
         ]
         .into_iter()
         .flatten()
@@ -174,10 +192,7 @@ pub fn run() -> anyhow::Result<()> {
         }
         for (id, result) in persistence.results() {
             if saving.as_ref().is_some_and(|pending| pending.id == id) {
-                saving = saving
-                    .take()
-                    .unwrap()
-                    .complete(&mut daemon, &persistence, result);
+                saving.take().unwrap().complete(&mut daemon, result);
             } else if let Err(error) = result {
                 eprintln!("Could not save layout: {error}");
             }
@@ -241,6 +256,7 @@ pub fn run() -> anyhow::Result<()> {
             if connected {
                 daemon.frontends.insert(id, frontend);
             } else {
+                daemon.git_dirty = true;
                 daemon.resize_sessions(None);
             }
         }
@@ -249,31 +265,19 @@ pub fn run() -> anyhow::Result<()> {
                 break;
             };
             let method = request.body["method"].as_str().unwrap_or("");
-            if !method.starts_with('_')
-                && method != "quit"
-                && method != "daemon-info"
-                && method != "notify"
-                && daemon.frontends.values().any(|f| f.attached)
-                && ipc::companion_path(".ui").exists()
-            {
-                // Forward UI actions on a worker so the owner can service backend requests
-                // made by that action and keep draining terminal output.
-                std::thread::spawn(move || {
-                    let response = ipc::call_at(&ipc::companion_path(".ui"), request.body)
-                        .unwrap_or_else(|e| json!({"error":e.to_string()}));
-                    let _ = request.reply.try_send(response);
-                });
+            if remote_access::RemoteAccess::handles(method) {
+                daemon.remote_access.handle(daemon.id, request);
+                continue;
+            }
+            let Some(request) = ControlRequest::decode(request) else {
+                continue;
+            };
+            if saving.is_some() && request.body.mutates_state() {
+                controls.push_back(request);
             } else {
-                let Some(request) = ControlRequest::decode(request) else {
-                    continue;
-                };
-                if saving.is_some() && request.body.mutates_state() {
-                    controls.push_back(request);
-                } else {
-                    let pending = PendingControl::start(request, &mut daemon, &persistence);
-                    if pending.is_some() {
-                        saving = pending;
-                    }
+                let pending = PendingControl::start(request, &mut daemon, &persistence);
+                if pending.is_some() {
+                    saving = pending;
                 }
             }
         }
@@ -307,6 +311,7 @@ pub fn run() -> anyhow::Result<()> {
                 continue;
             };
             let update = session.poll();
+            daemon.git_dirty |= update.directory_changed && daemon.git.is_some();
             if update.changed {
                 daemon.changed.insert(id);
             }
@@ -325,7 +330,16 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         if metadata_due {
+            daemon.git_dirty |= daemon.git.is_some();
             next_metadata = Instant::now() + Duration::from_secs(1);
+        }
+        daemon.sync_git(&wake);
+        if let Some(git) = &mut daemon.git
+            && (fds[1].revents != 0
+                || git_index.is_some_and(|index| fds[index].revents != 0)
+                || git.next_retry().is_some_and(|at| Instant::now() >= at))
+        {
+            git.poll();
         }
         if (Instant::now() >= next_frame && daemon.updates_pending())
             || metadata_due
@@ -345,9 +359,10 @@ pub fn run() -> anyhow::Result<()> {
         if layout_changed {
             daemon.revision += 1;
         }
+        daemon.sync_git(&wake);
         if layout_changed
             && !daemon.quitting
-            && let Err(error) = persistence.submit(Save::Session(daemon.session_snapshot()), true)
+            && let Err(error) = persistence.submit(daemon.state_save(), true)
         {
             eprintln!("Could not save layout after process exit: {error}");
         }
@@ -365,9 +380,7 @@ pub fn run() -> anyhow::Result<()> {
             }
             Err(error) => {
                 eprintln!("Could not capture scrollback during shutdown: {error}");
-                if let Err(error) =
-                    persistence.submit(Save::Session(daemon.session_snapshot()), false)
-                {
+                if let Err(error) = persistence.submit(daemon.state_save(), false) {
                     eprintln!("Could not save layout during shutdown: {error}");
                 }
             }

@@ -21,6 +21,7 @@ import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--native", action="store_true")
+parser.add_argument("--headless", action="store_true")
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
@@ -30,13 +31,18 @@ artifacts.mkdir(exist_ok=True)
 wait_for = partial(shared_wait_for, exceptions=(OSError, ValueError, KeyError))
 
 
-with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
+with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
     temp = Path(directory)
     shell = temp / "shell"
     shell.write_text("#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
     shell.chmod(0o700)
     env = dict(os.environ, GMUX_SOCKET=str(temp / "socket"),
-               XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell), HISTFILE=str(temp / "bash_history"))
+               XDG_CONFIG_HOME=str(temp / "config"), SHELL=str(shell), HISTFILE=str(temp / "bash_history"),
+               GTK_A11Y="none")
+    if args.native:
+        settings = temp / "config/gmux/clients/gtk/settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps(dict(local_daemon_enabled=True)))
     log = (artifacts / "daemon-smoke.log").open("w")
     daemon = None
     app = None
@@ -45,9 +51,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
     def rpc(method, **params):
         return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
+    def cli(*arguments, text=False):
+        result = subprocess.check_output([str(cargo_binary("gmux")), *map(str, arguments)],
+                                         env=dict(env, DISPLAY="", WAYLAND_DISPLAY=""), text=True)
+        return result if text else json.loads(result)
+
     def start_daemon():
         # Prove the backend has no display requirement even during native checks.
-        process = subprocess.Popen([str(cargo_binary("gmux-daemon"))],
+        process = subprocess.Popen([str(cargo_binary("gmux")), "serve"],
                                    env=dict(env, DISPLAY="", WAYLAND_DISPLAY=""),
                                    stdout=log, stderr=log)
         wait_for(lambda: (temp / "socket.stream").exists())
@@ -102,25 +113,44 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         raise AssertionError("No matching copy reply")
 
     try:
+        if args.headless:
+            result = subprocess.run([str(cargo_binary("gmux"))],
+                                    env=dict(env, DISPLAY="", WAYLAND_DISPLAY=""),
+                                    capture_output=True, text=True, timeout=5)
+            assert result.returncode == 0 and "Usage: gmux" in result.stdout, result
+            assert not (temp / "socket").exists(), "Launching the headless CLI must not start a daemon"
         daemon = start_daemon()
-        duplicate = subprocess.Popen([str(cargo_binary("gmux-daemon"))], env=env, stdout=log, stderr=log)
-        assert duplicate.wait(timeout=5) == 0, "Concurrent launch must leave the existing daemon alive"
-        assert rpc("daemon-info")["pid"] == daemon.pid
-        first = rpc("new", directory=str(root))
+        duplicate = subprocess.run([str(cargo_binary("gmux")), "serve"], env=env,
+                                   capture_output=True, text=True, timeout=5)
+        assert duplicate.returncode != 0 and "already running or starting" in duplicate.stderr, duplicate
+        assert rpc("status")["pid"] == daemon.pid
+        first = cli("new", "--directory", root)
         pane = first["pane"]
-        workspace = rpc("workspace-new", name="Background project", directory=str(root))["workspace"]
-        empty_workspace = rpc("workspace-new", name="Empty project", directory=str(root))["workspace"]
-        rpc("move", tab=first["tab"], workspace=workspace)
-        rpc("focus", workspace=empty_workspace)
-        assert rpc("list")["active_tab"] is None, "An empty workspace must have no active pane"
-        rpc("focus", workspace=workspace)
-        assert rpc("list")["active_tab"] == first["tab"]
+        assert cli("status")["pid"] == daemon.pid
+        # A daemon command must keep its meaning even while a client socket exists.
+        with socket.socket(socket.AF_UNIX) as client_socket:
+            client_socket.bind(str(temp / "socket.ui"))
+            client_socket.listen()
+            client_socket.setblocking(False)
+            cli("rename", "--tab", first["tab"], "Shared terminal")
+            assert cli("list")["tabs"][0]["name"] == "Shared terminal"
+            cli("reset-name", "--tab", first["tab"])
+            disposable = cli("new", "--name", "Disposable")
+            cli("close-tab", "--tab", disposable["tab"])
+            assert len(cli("list")["tabs"]) == 1
+            try:
+                client_socket.accept()
+            except BlockingIOError:
+                pass
+            else:
+                raise AssertionError("The daemon CLI connected to a frontend socket")
+        (temp / "socket.ui").unlink()
         wait_for(lambda: rpc("list")["tabs"][0]["panes"][0]["title"])
         time.sleep(0.1)
-        send(pane, "printf '\\033[2J\\033[HHEADLESS_READY'")
-        wait_for(lambda: "HEADLESS_READY" in rpc("read", pane=pane)["text"])
-        assert rpc("daemon-info")["snapshots"] == 0, "Detached output must not extract viewports"
-        pid = rpc("daemon-info")["pid"]
+        cli("send", "--pane", pane, "printf '\\033[2J\\033[HHEADLESS_READY'", "--enter")
+        wait_for(lambda: "HEADLESS_READY" in cli("read", "--pane", pane, text=True))
+        assert rpc("status")["snapshots"] == 0, "Detached output must not extract viewports"
+        pid = rpc("status")["pid"]
         before = ticks(pid)
         time.sleep(1.1)
         idle_ticks = ticks(pid) - before
@@ -129,7 +159,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=7)
+        command("attach", version=20, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header
@@ -160,11 +190,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         assert header["rows"] == [2], f"Expected one changed row, received {header['rows']}"
 
         hidden = rpc("split", pane=pane)["pane"]
-        count = rpc("daemon-info")["snapshots"]
+        count = rpc("status")["snapshots"]
         send(hidden, "for i in $(seq 1 300); do printf 'hidden %s\\n' \"$i\"; done")
         wait_for(lambda: "hidden 300" in rpc("read", pane=hidden)["text"])
         time.sleep(0.1)
-        assert rpc("daemon-info")["snapshots"] == count, "Hidden output must not extract a render snapshot"
+        assert rpc("status")["snapshots"] == count, "Hidden output must not extract a render snapshot"
         command("subscribe", panes=[hidden])
         header, cells = screen(hidden)
         assert len(header["rows"]) == header["frame"]["rows"], "New subscription must resync every row"
@@ -179,7 +209,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         assert header["frame"]["scrollback"]["offset"] == 12
         stream.close()
         stream = None
-        wait_for(lambda: not rpc("daemon-info")["attached"])
+        wait_for(lambda: not rpc("status")["local_clients"])
 
         # Raw terminal status query must receive a reply without a frontend.
         reply_file = temp / "reply"
@@ -191,9 +221,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
 
         if args.native:
             def start_app():
-                process = subprocess.Popen([str(cargo_binary("gmux"))], env=env, stdout=log, stderr=log)
-                wait_for(lambda: (temp / "socket.ui").exists() and rpc("daemon-info")["attached"])
+                process = subprocess.Popen([str(cargo_binary("gmux-gtk"))], env=env, stdout=log, stderr=log)
+                wait_for(lambda: (temp / "socket.ui").exists() and rpc("status")["local_clients"])
                 wait_for(lambda: rpc("renderer-info")["gtk"])
+                listed = rpc("list")
+                identity = rpc("_hello")["daemon"]
+                assert listed["daemon"] == identity
+                assert listed["tabs"][0]["reference"] == dict(daemon=identity, id=first["tab"])
+                assert listed["tabs"][0]["panes"][0]["reference"] == dict(daemon=identity, id=pane)
                 return process
 
             app = start_app()
@@ -206,9 +241,9 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
+            wait_for(lambda: not rpc("status")["local_clients"])
             wait_for(progress.exists)
-            assert rpc("daemon-info")["pid"] == pid
+            assert rpc("status")["pid"] == pid
             assert "BACKGROUND_CONTINUED" in rpc("read", pane=pane)["text"]
             app = start_app()
             assert [p["id"] for p in rpc("list")["tabs"][0]["panes"]] == [pane, hidden]
@@ -220,54 +255,53 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
             app.kill()
             app.wait(timeout=8)
             app = None
-            wait_for(lambda: not rpc("daemon-info")["attached"])
-            send(pane, "printf 'AFTER_FRONTEND_CRASH\\n'")
+            wait_for(lambda: not rpc("status")["local_clients"])
+            assert Path(env["GMUX_SOCKET"] + ".ui").exists(), "Exercise a stale frontend socket"
+            cli("send", "printf 'AFTER_FRONTEND_CRASH\\n'", "--pane", pane, "--enter")
             wait_for(lambda: "AFTER_FRONTEND_CRASH" in rpc("read", pane=pane)["text"])
             app = start_app()
             running_pid = temp / "running.pid"
             send(hidden, f"sleep 30 & echo $! > {shlex.quote(str(running_pid))}; fg")
             wait_for(running_pid.exists)
             command_pid = running_pid.read_text().strip()
-            rpc("quit")
+            cli("stop")
             assert daemon.wait(timeout=8) == 0
             daemon = None
+            assert app.poll() is None, "Stopping execution must leave the client open"
+            wait_for(lambda: rpc("renderer-info")["gtk"])
+            wait_for(lambda: rpc("status")["pid"] != pid and rpc("status")["local_clients"])
+            rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None
+            cli("stop")
             wait_for(lambda: not Path(f"/proc/{command_pid}").exists())
             wait_for(lambda: not Path(f"/proc/{original_pid.strip()}").exists())
         else:
-            rpc("quit")
+            cli("stop")
             assert daemon.wait(timeout=8) == 0
             daemon = None
         assert not (temp / "socket").exists() and not (temp / "socket.stream").exists()
 
         # Stopping the backend preserves the layout, then starts fresh shells.
-        session_path = temp / "config/gmux/session.json"
+        session_path = temp / "config/gmux/execution.json"
         saved = json.loads(session_path.read_text())
-        saved["active"] = 999999
-        saved["filter"] = {"workspace": 999999}
-        saved["tabs"].append(dict(
-            id=999997, name="Deleted workspace", custom_name=True,
-            workspace=999999, layout={"Pane": 999998},
-            directories={"999998": str(root)}, active=999998,
-        ))
-        for tab in saved["tabs"]:
-            tab["active"] = 999999
+        identity = json.loads((temp / "config/gmux/daemon-id.json").read_text())
+        saved["tabs"].append(dict(id=999997, created_at=1, name="Restored", custom_name=True,
+            layout={"Pane":999998}, directories={"999998":str(root)}))
         saved_bytes = json.dumps(saved).encode()
         session_path.write_bytes(saved_bytes)
         daemon = start_daemon()
         restored = rpc("list")
+        assert {t["id"]: t["created_at"] for t in restored["tabs"]} == {
+            t["id"]: t["created_at"] for t in saved["tabs"]
+        }, "Daemon restart must retain creation times"
         assert [p["id"] for p in restored["tabs"][0]["panes"]] == [pane, hidden]
-        assert restored["filter"] == "all", "Recover a saved filter whose workspace no longer exists"
-        assert restored["active_tab"] == restored["tabs"][0]["id"], "Recover a stale saved active tab"
-        assert restored["tabs"][0]["active_pane"] == pane, "Recover a stale saved active pane"
-        assert restored["tabs"][0]["workspace"] == workspace, "Keep membership in an existing workspace"
-        assert next(tab for tab in restored["tabs"] if tab["id"] == 999997)["workspace"] is None, "Move a restored tab from a deleted workspace to Unassigned"
-        assert session_path.read_bytes() == saved_bytes, "Loading must not rewrite the saved session"
+        assert session_path.read_bytes() == saved_bytes, "Loading must not rewrite execution state"
+        assert rpc("_hello")["daemon"] == identity, "Daemon identity must survive restart"
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=7)
+        command("attach", version=20, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[hidden])
         screen(hidden)
         command("scroll-to", pane=hidden, row=0, serial=99)
@@ -281,28 +315,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-daemon-") as directory:
         restored_split = rpc("split", pane=pane)["pane"]
         assert restored_split > 999998, "New pane IDs must exceed every restored tab and pane ID"
         rpc("close", pane=restored_split)
-        rpc("send", text="printf 'RESTORED_FOCUS_READY\\n'", paste=True, enter=True)
-        wait_for(lambda: "RESTORED_FOCUS_READY" in rpc("read")["text"])
+        rpc("send", pane=pane, text="printf 'RESTORED_FOCUS_READY\\n'", paste=True, enter=True)
+        wait_for(lambda: "RESTORED_FOCUS_READY" in rpc("read", pane=pane)["text"])
         daemon.terminate()
         assert daemon.wait(timeout=8) == 0
         daemon = None
         assert not (temp / "socket").exists(), "SIGTERM must clean up the socket"
 
-        # A valid empty workspace remains selected even with other restored tabs.
-        saved = json.loads(session_path.read_text())
-        saved["filter"] = {"workspace": empty_workspace}
-        saved_bytes = json.dumps(saved).encode()
-        session_path.write_bytes(saved_bytes)
-        daemon = start_daemon()
-        restored = rpc("list")
-        assert restored["filter"] == {"workspace": empty_workspace}, "Keep a valid saved empty workspace filter"
-        assert restored["active_tab"] is None and restored["tabs"], "An empty workspace must not select another restored tab"
-        assert all(not tab["visible"] for tab in restored["tabs"])
-        assert session_path.read_bytes() == saved_bytes, "Loading must not rewrite a valid empty workspace filter"
-        daemon.terminate()
-        assert daemon.wait(timeout=8) == 0
-        daemon = None
-        print(f"PASS: headless PTYs, background workspaces and focus, {idle_ticks} idle CPU ticks, one-row packets, ordered copy with absent and blank selections, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Quit/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and daemon Quit closing the frontend" if args.native else ""))
+        print(f"PASS: headless PTYs, {idle_ticks} idle CPU ticks, one-row packets, ordered copy with absent and blank selections, hidden-pane parsing without snapshots, subscription resync, retained scrollback, terminal replies, clean Stop/SIGTERM, and layout restore" + (", native close/reopen with identical shell PID, continued commands, frontend crash recovery, and an open client after daemon Stop" if args.native else ""))
     finally:
         if stream:
             stream.close()

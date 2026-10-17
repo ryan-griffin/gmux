@@ -5,15 +5,17 @@ libadwaita, and libghostty-vt.
 
 Gmux has workspaces, split panes, a searchable tab sidebar, Git branch labels,
 and notifications for background commands. Terminal sessions keep running when
-you close the window.
+you close the window. Connect to local or remote machines, or use the standalone
+daemon and CLI without a desktop.
 
 This project is pre-alpha. Saved data formats may change between builds.
 
 ## Build and run
 
-Requires Linux, Rust 1.99+, GTK 4.22+, libadwaita 1.9+, a C compiler, libclang,
-pkg-config, `glib-compile-resources`, curl, and Python 3.12+.
-The checked-in Rust toolchain file selects the development compiler with rustup.
+Requires Linux, Rust 1.99+, a C compiler, libclang, pkg-config, curl, and Python
+3.12+. The GNOME client also requires GTK 4.22+, libadwaita 1.9+, and
+`glib-compile-resources`. The checked-in Rust toolchain file selects the
+development compiler with rustup.
 
 ```sh
 ./scripts/run.sh
@@ -22,9 +24,16 @@ The checked-in Rust toolchain file selects the development compiler with rustup.
 
 The first run downloads Zig and builds the pinned Ghostty library in `.deps/`.
 To install in `~/.local`, run `./scripts/install.sh`. Pass a different prefix as
-its first argument.
+its first argument. Launch the installed app with `gmux-gtk`.
+
+For the daemon and CLI alone, install with `./scripts/install.sh --headless` and
+start it with `gmux serve --background`. See [remote daemons](docs/remote-daemons.md)
+for connection setup and authentication.
 
 ## Use
+
+In **Manage Connections…**, open **This Computer**, turn on **Local Daemon**, and
+Save to run terminals locally. You can also add remote connections there.
 
 Create tabs with the plus button and split panes through Terminal Actions.
 Manage workspaces through the main menu. Use the command palette or Keyboard
@@ -41,16 +50,16 @@ Shortcuts dialog to find other actions.
 | Find | Ctrl+Shift+F |
 | Command palette | Ctrl+Shift+P |
 
-Closing a window leaves its terminals running. Reopen Gmux to reconnect, or use
-**Quit Gmux**, Ctrl+Shift+Q, or `gmux quit` to stop all terminals. After a daemon
-restart, Gmux restores the saved layout and text history with fresh shells.
-Commands and jobs do not resume.
+Closing a window leaves its terminals running. Reopen Gmux to reconnect.
+**Quit Gmux** or Ctrl+Shift+Q stops the app's connected local daemon and its
+terminals. Remote terminals keep running. After a daemon restart, Gmux restores
+the saved layout and text history with fresh shells. Commands and jobs do not resume.
 
 Settings and saved layouts live in `~/.config/gmux/`, or `$XDG_CONFIG_HOME/gmux/`.
 
 ## Shell automation
 
-With Gmux running, its CLI can create panes, send input, and deliver alerts:
+With the daemon running, its CLI can create panes, send input, and deliver alerts:
 
 ```sh
 gmux list
@@ -60,8 +69,8 @@ gmux send 'cargo test' --enter
 gmux notify 'Tests finished'
 ```
 
-Run `gmux --help` for all commands. Pane commands use the calling shell's pane,
-or the active pane when called outside Gmux. They also work with the window closed.
+Run `gmux --help` for commands. Pane commands use the calling shell's pane;
+otherwise pass `--pane` to choose one. Use `gmux-gtk` for workspace and window actions.
 
 ## Development
 

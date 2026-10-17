@@ -1,7 +1,6 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[derive(Debug)]
@@ -34,7 +33,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
     // uses Cargo's target, so the declarations and layout assertions also work
     // when building on one supported architecture for the other. Use the C
     // compiler's flags too, including ABI options and target header paths.
-    bindgen::Builder::default()
+    let bindings = bindgen::Builder::default()
         .header("src/ghostty_bridge.h")
         .clang_args(
             build
@@ -51,17 +50,32 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .derive_debug(false)
         .derive_partialeq(true)
         .derive_eq(true)
-        .rust_target(bindgen::RustTarget::stable(85, 0).unwrap())
         .rust_edition(bindgen::RustEdition::Edition2024)
-        // With Rust 1.77+, bindgen emits const assertions for size, alignment,
+        // Bindgen emits const assertions for size, alignment,
         // and every member offset. They run in all builds, including cross builds.
         .layout_tests(true)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .parse_callbacks(Box::new(BridgeCallbacks))
         .generate()
-        .expect("Could not generate the Gmux C/Rust ABI declarations")
-        .write_to_file(out_dir.join("ghostty_bridge.rs"))
-        .expect("Could not write the Gmux C/Rust ABI declarations");
+        .expect("Could not generate the Gmux C/Rust ABI declarations");
+    let generated = bindings.to_string();
+    // Keep bindgen's C-derived size, alignment, and field-offset assertions, but
+    // use the client library's values at the FFI boundary. The client needs no C build.
+    let mut declarations = generated.clone();
+    for name in ["Cell", "Frame", "Scrollback"] {
+        let marker = format!("pub struct {name} {{");
+        let start = declarations
+            .find(&marker)
+            .expect("Missing viewport ABI type");
+        let end = start + declarations[start..].find("\n}").unwrap() + 2;
+        let attributes = declarations[..start].rfind("#[repr(C)]").unwrap();
+        declarations.replace_range(attributes..end, "");
+    }
+    std::fs::write(
+        out_dir.join("ghostty_bridge.rs"),
+        format!("pub use gmux_client::{{Cell,Frame,Scrollback}};\n{declarations}"),
+    )
+    .expect("Could not write ABI bindings");
 }
 
 fn main() {
@@ -80,23 +94,6 @@ fn main() {
         .expect("Ghostty source revision is missing");
     assert!(revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()));
     println!("cargo:rustc-env=GMUX_GHOSTTY_REVISION={revision}");
-    println!("cargo:rerun-if-changed=data/gmux.gresource.xml");
-    println!("cargo:rerun-if-changed=data/dev.gmux.Gmux.svg");
-    println!("cargo:rerun-if-changed=data/dev.gmux.Gmux-symbolic.svg");
-    println!("cargo:rerun-if-changed=data/icons/branch-symbolic.svg");
-    let resources = PathBuf::from(env::var("OUT_DIR").unwrap()).join("gmux.gresource");
-    let status = Command::new("glib-compile-resources")
-        .arg("--sourcedir")
-        .arg(root.join("data"))
-        .arg("--target")
-        .arg(resources)
-        .arg(root.join("data/gmux.gresource.xml"))
-        .status()
-        .expect("glib-compile-resources is required to bundle the app's icons");
-    assert!(
-        status.success(),
-        "Could not compile the app's icon resources"
-    );
     let prefix = env::var_os("GHOSTTY_PREFIX")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(".deps/ghostty"));
@@ -129,6 +126,7 @@ fn main() {
         prefix.join("lib").display()
     );
     println!("cargo:rustc-link-lib=dylib=ghostty-vt");
+    println!("cargo::metadata=lib_dir={}", prefix.join("lib").display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/gmux");
     println!(
         "cargo:rustc-link-arg=-Wl,-rpath,{}",

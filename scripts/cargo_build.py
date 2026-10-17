@@ -31,7 +31,8 @@ def compiler_artifacts(output, *, profile="debug"):
     return artifacts
 
 
-def build_artifacts(profile="debug", *, target=None, examples=False, timeout=None, log_path=None):
+def build_artifacts(profile="debug", *, target=None, examples=False, headless=False,
+                    timeout=None, log_path=None):
     command = ["cargo", "build", "--locked", "--bins", "--message-format=json-render-diagnostics"]
     if examples:
         command.append("--examples")
@@ -39,16 +40,27 @@ def build_artifacts(profile="debug", *, target=None, examples=False, timeout=Non
         command.append("--release")
     if target:
         command.extend(["--target", target])
-    print("Running " + " ".join(command), file=sys.stderr, flush=True)
-    if log_path is None:
-        result = subprocess.run(command, cwd=ROOT, check=True, timeout=timeout,
-                                text=True, stdout=subprocess.PIPE)
-        output = result.stdout
-    else:
+    # Build the daemon independently in both installation modes. GTK enables
+    # additional features on shared dependencies; building it alongside the
+    # daemon would otherwise produce a different daemon artifact.
+    selections = [["-p", "gmux-core", "-p", "gmux"]]
+    if not headless:
+        selections.append(["-p", "gmux-gtk"])
+    output = ""
+    if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        # Keep partial output for diagnostics when Cargo fails or times out.
-        with log_path.open("w") as log:
-            subprocess.run(command, cwd=ROOT, check=True, timeout=timeout, stdout=log)
+    for index, selection in enumerate(selections):
+        invocation = command + selection
+        print("Running " + " ".join(invocation), file=sys.stderr, flush=True)
+        if log_path is None:
+            result = subprocess.run(invocation, cwd=ROOT, check=True, timeout=timeout,
+                                    text=True, stdout=subprocess.PIPE)
+            output += result.stdout
+        else:
+            # Keep partial output for diagnostics when Cargo fails or times out.
+            with log_path.open("a" if index else "w") as log:
+                subprocess.run(invocation, cwd=ROOT, check=True, timeout=timeout, stdout=log)
+    if log_path is not None:
         output = log_path.read_text()
     return compiler_artifacts(output, profile=profile)
 
@@ -56,12 +68,13 @@ def build_artifacts(profile="debug", *, target=None, examples=False, timeout=Non
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true")
+    parser.add_argument("--headless", action="store_true", help="Build the daemon and CLI without GTK")
     parser.add_argument("--target", help="Build for an explicit Cargo target")
     parser.add_argument("binaries", nargs="+", help="Binary names, in output order")
     args = parser.parse_args()
     profile = "release" if args.release else "debug"
     try:
-        artifacts = build_artifacts(profile, target=args.target)
+        artifacts = build_artifacts(profile, target=args.target, headless=args.headless)
     except subprocess.CalledProcessError as error:
         raise SystemExit(error.returncode) from None
     keys = [f"{profile}/bin/{name}" for name in args.binaries]

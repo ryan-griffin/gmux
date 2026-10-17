@@ -13,7 +13,7 @@ def stop_daemon(path, timeout=8):
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(6)
             connection.connect(str(path))
-            connection.sendall(b'{"method":"quit"}\n')
+            connection.sendall(b'{"method":"stop"}\n')
             result = json.loads(connection.makefile("rb").readline())
             assert "error" not in result, result
     except (OSError, ValueError):

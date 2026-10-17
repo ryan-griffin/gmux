@@ -12,10 +12,29 @@ import time
 from daemon_test_support import stop_daemon
 
 
-def rpc(socket_path, method, /, *, timeout=6, check=True, **params):
+def rpc(socket_path, method, /, *, timeout=21, check=True, client=True, env=None, **params):
+    if client and env is not None and method in {"connection-list", "connection-add", "connection-edit", "connection-remove", "_connection-call"}:
+        from cargo_test_support import cargo_binary
+        result = subprocess.run([str(cargo_binary("gmux")), "rpc", json.dumps(dict(method=method, **params))],
+                                env=env, capture_output=True, text=True, timeout=timeout)
+        reply = json.loads(result.stdout) if result.returncode == 0 else {"error": result.stderr.strip().removeprefix("Error: ")}
+        if check:
+            assert "error" not in reply, reply
+        return reply
+    client_methods = {"new", "split", "close", "close-tab", "rename", "reset-name", "list", "read", "send",
+        "workspace-add", "workspace-edit", "workspace-remove", "move", "focus", "filter", "windows", "new-window",
+        "detach", "renderer-info", "search-tabs", "screenshot", "resize", "action", "_state", "_command",
+        "_desktop-save", "_desktop-tab"}
+    ui = Path(str(socket_path) + ".ui")
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(timeout)
-        connection.connect(str(socket_path))
+        if client and method in client_methods:
+            try:
+                connection.connect(str(ui))
+            except (FileNotFoundError, ConnectionRefusedError):
+                connection.connect(str(socket_path))
+        else:
+            connection.connect(str(socket_path))
         connection.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())
         result = json.loads(connection.makefile("rb").readline())
     if check:
@@ -46,6 +65,18 @@ def assert_stays(predicate, duration, *, message):
         if time.monotonic() >= deadline:
             return
         time.sleep(0.025)
+
+
+def create_tab_when_connected(socket_path, **params):
+    """Wait for client setup, which finishes after its daemon-side attachment."""
+    def create():
+        result = rpc(socket_path, "new", check=False, **params)
+        if "error" in result:
+            assert "disconnected or connecting" in result["error"], result
+            return None
+        return result
+
+    return wait_for(create, exceptions=(), message="The client did not finish connecting")
 
 
 def descendants(element):
@@ -156,6 +187,8 @@ class DelayedViewport:
         self.proxy_path = str(proxy_path)
         self.delay = 0
         self.closed = threading.Event()
+        self.forwarding = threading.Event()
+        self.forwarding.set()
         self.sockets = []
         self.threads = []
 
@@ -171,6 +204,8 @@ class DelayedViewport:
         def relay(source, destination, delayed=False):
             try:
                 while data := source.recv(65536):
+                    if delayed:
+                        self.forwarding.wait()
                     if self.closed.wait(self.delay if delayed else 0):
                         return
                     destination.sendall(data)
@@ -195,9 +230,16 @@ class DelayedViewport:
         worker.start()
         return self
 
+    def pause(self):
+        self.forwarding.clear()
+
+    def resume(self):
+        self.forwarding.set()
+
     def __exit__(self, *_):
         import socket
         self.closed.set()
+        self.forwarding.set()
         for connection in self.sockets:
             try:
                 connection.shutdown(socket.SHUT_RDWR)
@@ -214,7 +256,8 @@ class AppFixture:
         self.path = Path(self.directory.name)
         self.config = self.path / "config/gmux"
         self.config.mkdir(parents=True)
-        self.settings_path = self.config / "settings.json"
+        self.settings_path = self.config / "clients/gtk/settings.json"
+        self.settings_path.parent.mkdir(parents=True)
         self.set_settings(settings or {})
         shell = self.path / "shell"
         shell.write_text(shell_script or "#!/bin/sh\nexport PS1=''\nstty -echo\nexec /bin/bash --noprofile --norc -i\n")
@@ -226,7 +269,7 @@ class AppFixture:
         self.processes = []
 
     def set_settings(self, settings):
-        self.settings_path.write_text(json.dumps(settings))
+        self.settings_path.write_text(json.dumps({"local_daemon_enabled": True, **settings}))
 
     def start(self, binary, *args, **kwargs):
         process = subprocess.Popen([str(binary), *map(str, args)], env=self.env, **kwargs)
@@ -235,10 +278,12 @@ class AppFixture:
 
     def start_app(self, binary, *args, **kwargs):
         process = self.start(binary, *args, **kwargs)
-        wait_for(lambda: process.poll() is not None or self.rpc("daemon-info")["attached"],
+        wait_for(lambda: process.poll() is not None or self.rpc("status")["local_clients"],
                  message="Application did not attach to its daemon")
         assert process.poll() is None, "Application exited before attaching to its daemon"
         wait_for(lambda: self.rpc("renderer-info")["gtk"], message="Application did not construct its window")
+        if "--directory" in args:
+            wait_for(lambda: self.rpc("list")["tabs"], message="Application did not open its initial directory")
         return process
 
     def stop(self):
@@ -249,7 +294,7 @@ class AppFixture:
                 stop_process(process)
 
     def rpc(self, method, **params):
-        return rpc(self.env["GMUX_SOCKET"], method, **params)
+        return rpc(self.env["GMUX_SOCKET"], method, env=self.env, **params)
 
     def __enter__(self):
         return self

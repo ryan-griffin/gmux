@@ -1,30 +1,46 @@
 //! Ordered disk writes outside the daemon's PTY owner thread.
-use crate::{
+use crate::scrollback::Checkpoint;
+use gmux_client::{
     ipc,
-    model::{Session, WorkspaceCatalog},
-    scrollback::Checkpoint,
+    model::{DaemonId, ExecutionState},
     storage,
 };
 use std::{
     cell::Cell,
     collections::VecDeque,
+    path::Path,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::JoinHandle,
 };
 
+pub(crate) fn daemon_id() -> anyhow::Result<DaemonId> {
+    storage::with_state_lock("daemon-id.json", identity_at)
+}
+fn identity_at(path: &Path) -> anyhow::Result<DaemonId> {
+    let saved: Option<DaemonId> = storage::load_at(path)?;
+    if let Some(id) = saved {
+        return Ok(id);
+    }
+    anyhow::ensure!(
+        !path.exists(),
+        "Invalid daemon identity in {}",
+        path.display()
+    );
+    let id = DaemonId::generate()?;
+    storage::save_locked_at(path, &Some(id))?;
+    Ok(id)
+}
 pub(crate) enum Save {
-    Session(Session),
+    Execution(ExecutionState),
     Checkpoint(Checkpoint),
     Prune,
-    Catalog(WorkspaceCatalog),
 }
 impl Save {
     fn write(self) -> anyhow::Result<()> {
         match self {
-            Self::Session(value) => crate::scrollback::save_session(&value),
+            Self::Execution(value) => crate::scrollback::save_execution(&value),
             Self::Checkpoint(value) => value.write(),
             Self::Prune => crate::scrollback::prune_committed(),
-            Self::Catalog(value) => storage::save("workspaces.json", &value),
         }
     }
 }
@@ -89,6 +105,7 @@ impl Worker {
         if automatic
             && let Some(last) = jobs.queue.back_mut()
             && last.automatic
+            && std::mem::discriminant(&last.save) == std::mem::discriminant(&save)
         {
             last.save = save;
             return Ok(last.id);
@@ -131,25 +148,59 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn daemon_identity_is_durable_and_concurrent_initialization_keeps_one_id() {
+        let directory = std::env::temp_dir().join(format!(
+            "gmux-identity-{}-{}",
+            std::process::id(),
+            DaemonId::generate().unwrap()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("daemon-id.json");
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = &path;
+                    scope.spawn(move || storage::with_lock_at(path, || identity_at(path)).unwrap())
+                })
+                .collect();
+            let ids: Vec<_> = writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .collect();
+            assert!(ids.iter().all(|id| *id == ids[0]));
+            assert_eq!(identity_at(&path).unwrap(), ids[0]);
+        });
+        for invalid in ["null", "\"bad-id\"", "{broken"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(storage::with_lock_at(&path, || identity_at(&path)).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn slow_saves_leave_the_caller_free_and_coalesce_only_automatic_snapshots() {
         let (started, began) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let (seen, writes) = mpsc::channel();
         let mut worker = Worker::with_save(ipc::Wake::new().unwrap(), move |save| {
-            let Save::Session(session) = save else {
-                panic!("Expected a session")
-            };
-            if session.width == 1 {
-                started.send(()).unwrap();
-                gate.recv_timeout(Duration::from_secs(3)).unwrap();
+            match save {
+                Save::Execution(value) => {
+                    if value.last_id == 1 {
+                        started.send(()).unwrap();
+                        gate.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    seen.send(value.last_id).unwrap();
+                }
+                Save::Prune => seen.send(6).unwrap(),
+                _ => panic!("Expected execution"),
             }
-            seen.send(session.width).unwrap();
             Ok(())
         });
-        let session = |width| {
-            Save::Session(Session {
-                width,
-                ..Session::default()
+        let session = |last_id| {
+            Save::Execution(ExecutionState {
+                last_id,
+                ..Default::default()
             })
         };
         worker.submit(session(1), false).unwrap();
@@ -158,9 +209,14 @@ mod tests {
         worker.submit(session(3), true).unwrap();
         worker.submit(session(4), false).unwrap();
         worker.submit(session(5), true).unwrap();
+        worker.submit(Save::Prune, true).unwrap();
+        worker.submit(session(7), true).unwrap();
         release.send(()).unwrap();
         worker.finish();
-        assert_eq!(writes.try_iter().collect::<Vec<_>>(), vec![1, 3, 4, 5]);
-        assert_eq!(worker.results().count(), 4);
+        assert_eq!(
+            writes.try_iter().collect::<Vec<_>>(),
+            vec![1, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(worker.results().count(), 6);
     }
 }

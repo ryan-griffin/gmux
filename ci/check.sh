@@ -27,9 +27,23 @@ print(f"Ghostty {pins['REVISION']}; Zig {pins['ZIG_VERSION']}")
 PY
 ./scripts/bootstrap-ghostty.sh
 sha256sum .deps/ghostty.tar.gz
-python3 scripts/check.py
+python3 scripts/check.py --headless
+python3 - <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+sys.path.insert(0, "scripts")
+from cargo_build import compiler_artifacts
+artifacts = compiler_artifacts(Path("artifacts/cargo-build-headless.jsonl").read_text())
+daemon = Path(artifacts["debug/bin/gmux"])
+Path("artifacts/daemon-headless.sha256").write_text(hashlib.sha256(daemon.read_bytes()).hexdigest())
+PY
+# The headless pass already exercised this same daemon. Check the full workspace
+# and its GTK linkage without repeating those smoke suites.
+python3 scripts/check.py --skip-smoke
 python3 - <<'PY'
 from pathlib import Path
+import hashlib
 import json
 import os
 import subprocess
@@ -38,15 +52,19 @@ sys.path.insert(0, "scripts")
 from cargo_build import compiler_artifacts
 from cargo_test_support import ARTIFACT_ENV, cargo_binary
 os.environ[ARTIFACT_ENV] = json.dumps(compiler_artifacts(Path("artifacts/cargo-build.jsonl").read_text()))
-for name in ("gmux", "gmux-daemon"):
+for name in ("gmux-gtk", "gmux"):
     binary = cargo_binary(name)
     print(f"Built binary: {binary}", flush=True)
     linkage = subprocess.check_output(["ldd", str(binary)], text=True)
     print(linkage)
     ghostty = [line for line in linkage.splitlines() if "libghostty-vt.so" in line]
     # Terminal parsing lives in the daemon; the frontend may not link Ghostty.
-    if name == "gmux-daemon":
+    if name == "gmux":
         assert len(ghostty) == 1, "The daemon must link the bootstrapped Ghostty library"
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == Path("artifacts/daemon-headless.sha256").read_text(), \
+            "Headless and desktop builds must ship the same daemon artifact"
+    else:
+        assert not ghostty, "GTK must run without the native execution library"
     for library in ghostty:
         assert str(Path(".deps/ghostty/lib").resolve()) + "/" in library, library
 PY

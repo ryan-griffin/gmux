@@ -1,8 +1,10 @@
-/* Keep Adwaita's colors and controls for the tab rows and terminal canvas. */
-.list-row-content { padding: 10px 6px; }
+/* Pad the three-line tab contents while retaining Adwaita's colors and controls. */
+.navigation-sidebar > row.tab-row { padding: 8px 12px; }
 .tab-unread { background: var(--accent-bg-color); border-radius: 50%; }
 .tab-content { padding: 6px; }
-/* Give the empty-state split button pill proportions, retaining Adwaita's states. */
+/* Adwaita dims disabled menu labels; custom row icons need the same filter. */
+.connection-menu-icon:disabled { filter: opacity(var(--disabled-opacity)); }
+/* The empty-state action intentionally uses a pill-shaped split button. */
 splitbutton.empty-tab-button { border-radius: 9999px; }
 splitbutton.empty-tab-button > button {
   padding: 10px 32px;
