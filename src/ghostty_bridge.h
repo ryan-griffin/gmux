@@ -40,6 +40,11 @@ GmuxView *gmux_engine_view_new(GmuxEngine *engine);
 void gmux_engine_view_free(GmuxView *view);
 void gmux_engine_view_enter(GmuxEngine *engine, GmuxView *view);
 void gmux_engine_view_leave(GmuxEngine *engine, GmuxView *view);
+void gmux_engine_view_theme(GmuxView *view, const uint8_t *background,
+    const uint8_t *foreground, const uint8_t *cursor, const uint8_t *palette, bool dark);
+int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
+// The size owner supplies defaults for shared program queries and resets.
+int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
 // Called synchronously; true accepts all borrowed bytes, false aborts formatting.

@@ -5,7 +5,7 @@ output in the daemon; fonts and render nodes stay in each frontend.
 
 ## Implementation
 
-`src/renderer.rs` retains row nodes and shapes text through Pango. Compatible
+`crates/gtk/src/renderer.rs` retains row nodes and shapes text through Pango. Compatible
 glyphs share text nodes across font fallback changes when their ink does not
 overlap. Cell graphics flush pending text batches to preserve paint order.
 Backgrounds precede text; decorations and cursors use cell geometry.

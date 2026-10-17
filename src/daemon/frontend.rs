@@ -1,6 +1,6 @@
 //! Frontend socket buffering, terminal input, and viewport updates.
 use super::*;
-use crate::transport::{PasteOptions, StreamCommand, StreamRequest};
+use gmux_client::transport::{PasteOptions, StreamCommand, StreamRequest};
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
 const READ_CHUNK: usize = 16 * 1024;
@@ -21,12 +21,16 @@ pub(super) struct Frontend {
     pub(super) output: Vec<u8>,
     pub(super) offset: usize,
     pub(super) attached: bool,
+    pub(super) remote: bool,
     pub(super) visible: HashSet<u64>,
+    pub(super) git_panes: HashSet<u64>,
+    pub(super) git_sent: HashMap<u64, transport::GitMetadata>,
+    git_revision: Option<u64>,
     pub(super) screens: HashMap<u64, SentScreen>,
     pub(super) metadata: HashMap<u64, Metadata>,
     pub(super) scroll_serials: HashMap<u64, u64>,
     pub(super) sent_scroll_serials: HashMap<u64, u64>,
-    pub(super) find: HashMap<u64, crate::search::FindState>,
+    pub(super) find: HashMap<u64, gmux_client::search::FindState>,
     pub(super) selections: HashMap<u64, Option<(u64, u64)>>,
     pub(super) discarding: bool,
     pub(super) paste: Option<Paste>,
@@ -54,7 +58,11 @@ impl Frontend {
             output: Vec::new(),
             offset: 0,
             attached: false,
+            remote: false,
             visible: HashSet::new(),
+            git_panes: HashSet::new(),
+            git_sent: HashMap::new(),
+            git_revision: None,
             screens: HashMap::new(),
             metadata: HashMap::new(),
             scroll_serials: HashMap::new(),
@@ -175,10 +183,10 @@ impl Frontend {
     }
 }
 
-fn requested_size<'a>(
+fn size_owner<'a>(
     pane: u64,
     frontends: impl Iterator<Item = (u64, &'a Frontend)>,
-) -> Option<TerminalSize> {
+) -> Option<&'a Frontend> {
     frontends
         .filter(|(_, frontend)| {
             frontend.attached
@@ -187,7 +195,14 @@ fn requested_size<'a>(
         })
         // Without a focused subscriber, keep a stable owner to avoid contention.
         .min_by_key(|(id, frontend)| (!frontend.focused, *id))
-        .map(|(_, frontend)| frontend.sizes[&pane])
+        .map(|(_, frontend)| frontend)
+}
+#[cfg(test)]
+fn requested_size<'a>(
+    pane: u64,
+    frontends: impl Iterator<Item = (u64, &'a Frontend)>,
+) -> Option<TerminalSize> {
+    size_owner(pane, frontends).map(|frontend| frontend.sizes[&pane])
 }
 
 impl Daemon {
@@ -200,7 +215,7 @@ impl Daemon {
 
     fn resize_session(&mut self, pane: u64, current: Option<(u64, &Frontend)>) {
         // Input processing temporarily removes its frontend from the map.
-        let Some((cols, rows, cw, ch, width, height)) = requested_size(
+        let Some(owner) = size_owner(
             pane,
             self.frontends
                 .iter()
@@ -212,6 +227,13 @@ impl Daemon {
         let Some(session) = self.sessions.get_mut(&pane) else {
             return;
         };
+        if let Some(view) = owner.views.get(&pane)
+            && let Err(error) = session.use_view_appearance(view)
+        {
+            self.errors.insert(pane, error.to_string());
+            self.changed.insert(pane);
+        }
+        let (cols, rows, cw, ch, width, height) = owner.sizes[&pane];
         match session.resize(cols, rows, cw, ch, width, height) {
             Ok(true) => {
                 self.changed.insert(pane);
@@ -229,6 +251,7 @@ impl Daemon {
         self.frontends
             .retain(|_, frontend| frontend.flush().is_ok());
         if self.frontends.len() != before {
+            self.git_dirty = true;
             self.resize_sessions(None);
         }
     }
@@ -241,12 +264,19 @@ impl Daemon {
     ) -> anyhow::Result<()> {
         let StreamRequest { pane, command } = request;
         match command {
-            StreamCommand::Attach { version } => {
+            StreamCommand::Attach {
+                version,
+                daemon,
+                remote,
+            } => {
+                anyhow::ensure!(!frontend.attached, "Frontend already attached");
                 anyhow::ensure!(
                     version == transport::VERSION,
                     "Incompatible frontend protocol"
                 );
+                anyhow::ensure!(daemon == self.id, "Frontend attached to a different daemon");
                 frontend.attached = true;
+                frontend.remote = remote;
                 return Ok(());
             }
             StreamCommand::Invalid { message, .. } => {
@@ -279,7 +309,22 @@ impl Daemon {
             self.resize_sessions(Some((frontend_id, frontend)));
             return Ok(());
         }
-        let id = match self.resolve_pane(pane) {
+        if let StreamCommand::GitSubscribe { mut panes } = command {
+            panes.retain(|id| self.sessions.contains_key(id));
+            frontend.git_sent.retain(|id, _| panes.contains(id));
+            frontend.git_panes = panes;
+            frontend.git_revision = None;
+            self.git_dirty = true;
+            return Ok(());
+        }
+        let target = if frontend.remote && pane.is_none() {
+            Err(anyhow::anyhow!(
+                "Remote pane commands require an explicit pane"
+            ))
+        } else {
+            self.resolve_pane(pane)
+        };
+        let id = match target {
             Ok(id) => id,
             Err(error) => {
                 frontend.paste = None;
@@ -296,7 +341,7 @@ impl Daemon {
         } = command
         {
             anyhow::ensure!(
-                crate::viewport::valid(cols.into(), rows.into()),
+                gmux_client::viewport::valid(cols.into(), rows.into()),
                 "Invalid terminal size"
             );
             frontend
@@ -384,6 +429,10 @@ impl Daemon {
             entry.insert(session.new_view()?);
         }
         let view = frontend.views.get_mut(&id).unwrap();
+        let appearance_changed = matches!(
+            command,
+            StreamCommand::Theme { .. } | StreamCommand::Style { .. }
+        );
         match command {
             StreamCommand::Input { bytes } => session.send(&bytes)?,
             StreamCommand::Paste { text, options } => {
@@ -429,12 +478,10 @@ impl Daemon {
                 }
             }
             StreamCommand::Theme { theme } => {
-                session.set_theme(&theme)?;
-                self.changed.insert(id);
+                view.set_theme(&theme);
             }
             StreamCommand::Style { style } => {
-                session.set_cursor_style(style)?;
-                self.changed.insert(id);
+                view.set_cursor_style(style)?;
             }
             command => session.with_view(view, |engine| -> anyhow::Result<()> {
                 // Search navigation uses this client's current viewport metadata.
@@ -462,6 +509,9 @@ impl Daemon {
             })?,
         }
         frontend.changed.insert(id);
+        if appearance_changed {
+            self.resize_session(id, Some((frontend_id, frontend)));
+        }
         Ok(())
     }
     pub(super) fn updates_pending(&self) -> bool {
@@ -472,6 +522,9 @@ impl Daemon {
                     || !self.errors.is_empty()
                     || !frontend.changed.is_empty()
                     || frontend.state_revision != Some(self.revision)
+                    || (!frontend.git_panes.is_empty()
+                        && frontend.git_revision
+                            != self.git.as_ref().map(crate::branch::Service::revision))
                     || frontend
                         .views
                         .values()
@@ -482,10 +535,9 @@ impl Daemon {
         let before = self.frontends.len();
         let mut ids: Vec<_> = self.frontends.keys().copied().collect();
         ids.sort_by_key(|id| (!self.frontends[id].focused, *id));
-        // Every window receives the same revision. Read the catalog, capture
-        // metadata, and serialize it once for this broadcast.
+        // Every client receives the same execution revision. Serialize each transport snapshot once per broadcast.
         let mut state = None;
-        // Deliver each alert once, preferring a focused GUI. All clients receive unread state.
+        // Deliver each alert once, preferring a focused client. All clients receive unread state.
         let mut notifications = std::mem::take(&mut self.notifications);
         for id in ids {
             let mut frontend = self.frontends.remove(&id).unwrap();
@@ -516,6 +568,7 @@ impl Daemon {
         self.changed.clear();
         self.errors.clear();
         if self.frontends.len() != before {
+            self.git_dirty = true;
             // Keep handoff changes pending even if survivors were already sent a frame.
             self.resize_sessions(None);
         }
@@ -524,14 +577,15 @@ impl Daemon {
         let mut bytes = Vec::new();
         Packet {
             header: Header {
-                state: Some(self.shared_state()?),
+                git: None,
+                state: Some(self.execution_state()),
                 meta: Metadata {
                     id: 0,
                     directory: PathBuf::new(),
                     title: String::new(),
                     size: (80, 24),
                     exited: false,
-                    unread: 0,
+                    unread_sequence: 0,
                     busy: false,
                     modes: [false; 2],
                 },
@@ -555,6 +609,27 @@ impl Daemon {
         metadata_due: bool,
         notifications: &mut HashMap<u64, NotificationQueue>,
     ) -> anyhow::Result<()> {
+        if let Some(git) = &self.git
+            && frontend.git_revision != Some(git.revision())
+        {
+            let updates: Vec<_> = frontend
+                .git_panes
+                .iter()
+                .filter_map(|&pane| git.metadata(pane))
+                .filter(|meta| frontend.git_sent.get(&meta.id) != Some(meta))
+                .collect();
+            for meta in updates {
+                frontend.git_sent.insert(meta.id, meta.clone());
+                frontend.queue(Packet {
+                    header: Header {
+                        git: Some(meta),
+                        ..Header::default()
+                    },
+                    cells: Vec::new(),
+                })?;
+            }
+            frontend.git_revision = Some(git.revision());
+        }
         for (&id, session) in &mut self.sessions {
             let notify: Vec<_> = notifications
                 .remove(&id)
@@ -644,7 +719,7 @@ impl Daemon {
                     Ok((frame, engine.find_state(), engine.selection()))
                 })?
             } else {
-                (None, crate::search::FindState::default(), None)
+                (None, gmux_client::search::FindState::default(), None)
             };
             let find_changed = frontend.find.get(&id) != Some(&find);
             let selection_changed = frontend.selections.get(&id) != Some(&selection);
@@ -668,6 +743,7 @@ impl Daemon {
             if let Some(text) = copy.take() {
                 frontend.queue(Packet {
                     header: Header {
+                        git: None,
                         state: None,
                         meta: meta.clone(),
                         frame: None,
@@ -684,6 +760,7 @@ impl Daemon {
             }
             frontend.queue(Packet {
                 header: Header {
+                    git: None,
                     state: None,
                     meta,
                     frame,
@@ -836,7 +913,7 @@ mod tests {
                 .write_all(&vec![b' '; MAX_INPUT_PER_TURN + 1])
                 .unwrap();
             writer
-                .write_all(b"{\"method\":\"attach\",\"version\":7}\n")
+                .write_all(b"{\"method\":\"attach\",\"version\":9,\"daemon\":\"00000000000000000000000000000001\"}\n")
                 .unwrap();
             writer
         });
@@ -856,7 +933,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(matches!(
             requests[0].command,
-            StreamCommand::Attach { version: 7 }
+            StreamCommand::Attach { version: 9, .. }
         ));
         assert!(frontend.input.is_empty());
     }
@@ -883,14 +960,14 @@ mod tests {
     fn fragmented_utf8_and_paste_commands_survive_request_and_byte_limits() {
         let (mut frontend, mut writer) = connection();
         writer.write_all(&[b'\n'; MAX_REQUESTS_PER_TURN]).unwrap();
-        writer.write_all(b"{\"method\":\"attach\",\"version\":7}\n{\"method\":\"paste-begin\",\"size\":6}\n{\"method\":\"paste-data\",\"text\":\"").unwrap();
+        writer.write_all(b"{\"method\":\"attach\",\"version\":9,\"daemon\":\"00000000000000000000000000000001\"}\n{\"method\":\"paste-begin\",\"size\":6}\n{\"method\":\"paste-data\",\"text\":\"").unwrap();
         writer.write_all(&[0xc3]).unwrap();
         assert_eq!(frontend.requests().unwrap().len(), MAX_REQUESTS_PER_TURN);
         let batch = frontend.requests().unwrap();
         assert_eq!(batch.len(), 2);
         assert!(matches!(
             batch[0].command,
-            StreamCommand::Attach { version: 7 }
+            StreamCommand::Attach { version: 9, .. }
         ));
         assert!(matches!(
             batch[1].command,
@@ -916,7 +993,7 @@ mod tests {
                 .write_all(&vec![b'x'; MAX_COMMAND + MAX_INPUT_PER_TURN * 2])
                 .unwrap();
             writer
-                .write_all(b"\n{\"method\":\"attach\",\"version\":7}\n")
+                .write_all(b"\n{\"method\":\"attach\",\"version\":9,\"daemon\":\"00000000000000000000000000000001\"}\n")
                 .unwrap();
             writer
         });
@@ -938,7 +1015,7 @@ mod tests {
         );
         assert!(matches!(
             received[1].command,
-            StreamCommand::Attach { version: 7 }
+            StreamCommand::Attach { version: 9, .. }
         ));
         assert!(!frontend.discarding);
         assert!(frontend.input.is_empty());
