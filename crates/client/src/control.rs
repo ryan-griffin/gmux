@@ -58,7 +58,7 @@ pub enum ExecutionRequest {
     },
 }
 impl ExecutionRequest {
-    pub fn mutates_state(&self) -> bool {
+    pub fn changes_layout(&self) -> bool {
         matches!(
             self,
             Self::New { .. }
@@ -68,20 +68,6 @@ impl ExecutionRequest {
                 | Self::Rename { .. }
                 | Self::ResetName { .. }
         )
-    }
-    pub fn command(self) -> Result<Command, Self> {
-        Ok(match self {
-            Self::New { directory, name } => Command::New { directory, name },
-            Self::Split { pane, down } => Command::Split {
-                pane: Some(pane),
-                down,
-            },
-            Self::Close { pane } => Command::Close { pane: Some(pane) },
-            Self::CloseTab { tab } => Command::CloseTab { tab },
-            Self::Rename { tab, name } => Command::Rename { tab, name },
-            Self::ResetName { tab } => Command::ResetName { tab },
-            request => return Err(request),
-        })
     }
 }
 
@@ -163,54 +149,89 @@ pub enum Request {
     Public(PublicRequest),
 }
 impl Request {
-    /// Convert local control conveniences to execution commands. The boolean
-    /// selects the public command result rather than a full execution snapshot.
-    pub(crate) fn execution(self) -> anyhow::Result<(ExecutionRequest, bool)> {
-        let pane = |pane: Option<u64>| {
-            pane.ok_or_else(|| {
-                anyhow::anyhow!("Remote pane requests require an explicit pane field")
-            })
-        };
-        let command = |command: Command| -> anyhow::Result<ExecutionRequest> {
+    /// Normalize control requests, resolving and validating pane targets through
+    /// the destination's policy. The boolean selects a public command result
+    /// rather than a full execution snapshot.
+    pub fn into_execution(
+        self,
+        mut resolve_pane: impl FnMut(Option<u64>) -> anyhow::Result<u64>,
+    ) -> anyhow::Result<(ExecutionRequest, bool)> {
+        let mut command = |command: Command| -> anyhow::Result<ExecutionRequest> {
             Ok(match command {
                 Command::New { directory, name } => ExecutionRequest::New { directory, name },
                 Command::Split { pane: id, down } => ExecutionRequest::Split {
-                    pane: pane(id)?,
+                    pane: resolve_pane(id)?,
                     down,
                 },
-                Command::Close { pane: id } => ExecutionRequest::Close { pane: pane(id)? },
+                Command::Close { pane: id } => ExecutionRequest::Close {
+                    pane: resolve_pane(id)?,
+                },
                 Command::CloseTab { tab } => ExecutionRequest::CloseTab { tab },
                 Command::Rename { tab, name } => ExecutionRequest::Rename { tab, name },
                 Command::ResetName { tab } => ExecutionRequest::ResetName { tab },
             })
         };
         Ok(match self {
-            Self::Execution(request) => (request, false),
             Self::Layout(value) => (command(value)?, true),
             Self::Internal(InternalRequest::Command { command: value }) => (command(value)?, false),
-            Self::Internal(InternalRequest::Execution { request }) => (request, false),
+            Self::Execution(mut request)
+            | Self::Internal(InternalRequest::Execution { mut request }) => {
+                if let ExecutionRequest::New {
+                    directory: Some(directory),
+                    ..
+                } = &request
+                {
+                    anyhow::ensure!(
+                        crate::model::is_machine_directory(directory),
+                        "Remote directories must be absolute paths or start with ~/ on the remote machine"
+                    );
+                }
+                match &mut request {
+                    ExecutionRequest::Split { pane: id, .. }
+                    | ExecutionRequest::Close { pane: id }
+                    | ExecutionRequest::Read { pane: id }
+                    | ExecutionRequest::Send { pane: id, .. }
+                    | ExecutionRequest::Notify { pane: id, .. }
+                    | ExecutionRequest::Metadata { pane: id }
+                    | ExecutionRequest::Copy { pane: id } => *id = resolve_pane(Some(*id))?,
+                    _ => (),
+                }
+                (request, false)
+            }
             Self::Internal(InternalRequest::State) => (ExecutionRequest::State, false),
             Self::Internal(InternalRequest::Busy { panes }) => {
                 (ExecutionRequest::Busy { panes }, false)
             }
-            Self::Internal(InternalRequest::Metadata { pane: id }) => {
-                (ExecutionRequest::Metadata { pane: pane(id)? }, false)
-            }
-            Self::Internal(InternalRequest::Copy { pane: id }) => {
-                (ExecutionRequest::Copy { pane: pane(id)? }, false)
-            }
-            Self::Internal(InternalRequest::Read { pane: id }) => {
-                (ExecutionRequest::Read { pane: pane(id)? }, false)
-            }
+            Self::Internal(InternalRequest::Metadata { pane: id }) => (
+                ExecutionRequest::Metadata {
+                    pane: resolve_pane(id)?,
+                },
+                false,
+            ),
+            Self::Internal(InternalRequest::Copy { pane: id }) => (
+                ExecutionRequest::Copy {
+                    pane: resolve_pane(id)?,
+                },
+                false,
+            ),
+            Self::Internal(InternalRequest::Read { pane: id }) => (
+                ExecutionRequest::Read {
+                    pane: resolve_pane(id)?,
+                },
+                false,
+            ),
             Self::Internal(InternalRequest::Hello) => {
                 anyhow::bail!("Hello is part of connection setup")
             }
             Self::Public(PublicRequest::Status) => (ExecutionRequest::Status, false),
             Self::Public(PublicRequest::Stop) => (ExecutionRequest::Stop, false),
             Self::Public(PublicRequest::List) => (ExecutionRequest::List, false),
-            Self::Public(PublicRequest::Read { pane: id }) => {
-                (ExecutionRequest::Read { pane: pane(id)? }, false)
-            }
+            Self::Public(PublicRequest::Read { pane: id }) => (
+                ExecutionRequest::Read {
+                    pane: resolve_pane(id)?,
+                },
+                false,
+            ),
             Self::Public(PublicRequest::Send {
                 pane: id,
                 text,
@@ -218,7 +239,7 @@ impl Request {
                 enter,
             }) => (
                 ExecutionRequest::Send {
-                    pane: pane(id)?,
+                    pane: resolve_pane(id)?,
                     text,
                     paste,
                     enter,
@@ -227,7 +248,7 @@ impl Request {
             ),
             Self::Public(PublicRequest::Notify { pane: id, message }) => (
                 ExecutionRequest::Notify {
-                    pane: pane(id)?,
+                    pane: resolve_pane(id)?,
                     message,
                 },
                 false,
@@ -250,11 +271,11 @@ impl Request {
     }
     pub fn mutates_state(&self) -> bool {
         match self {
-            Self::Execution(request) => request.mutates_state(),
+            Self::Execution(request) => request.changes_layout(),
             Self::Internal(InternalRequest::Execution {
                 request: ExecutionRequest::Stop,
             }) => true,
-            Self::Internal(InternalRequest::Execution { request }) => request.mutates_state(),
+            Self::Internal(InternalRequest::Execution { request }) => request.changes_layout(),
             Self::Layout(_)
             | Self::Internal(InternalRequest::Command { .. })
             | Self::Public(PublicRequest::Stop) => true,
@@ -327,6 +348,45 @@ impl Command {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalization_resolves_local_targets_and_requires_remote_targets() {
+        for body in [
+            json!({"method":"split"}),
+            json!({"method":"_command","command":{"method":"split"}}),
+            json!({"method":"read"}),
+            json!({"method":"_read"}),
+            json!({"method":"_execution","request":{"method":"read","pane":7}}),
+        ] {
+            let (request, _) = Request::decode(body.clone())
+                .unwrap()
+                .into_execution(|pane| Ok(pane.unwrap_or(7)))
+                .unwrap();
+            assert!(matches!(
+                request,
+                ExecutionRequest::Split { pane: 7, .. } | ExecutionRequest::Read { pane: 7 }
+            ));
+            let remote = Request::decode(body.clone())
+                .unwrap()
+                .into_execution(|pane| {
+                    pane.ok_or_else(|| anyhow::anyhow!("Explicit pane required"))
+                });
+            assert_eq!(remote.is_ok(), body["method"] == "_execution");
+        }
+        for method in ["new", "_command", "_execution"] {
+            let command = json!({"method":"new","directory":"relative"});
+            let body = match method {
+                "new" => command,
+                "_command" => json!({"method":method,"command":command}),
+                _ => json!({"method":method,"request":command}),
+            };
+            let normalized = Request::decode(body)
+                .unwrap()
+                .into_execution(|_| unreachable!());
+            assert_eq!(normalized.is_ok(), method != "_execution");
+        }
+    }
+
     #[test]
     fn daemon_requests_reject_client_organization_and_presentation() {
         for body in [

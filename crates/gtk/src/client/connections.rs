@@ -3,8 +3,8 @@ use super::{
     Snapshot, Store, Subscription,
     control::{BackendReply, Command, CommandOutput, CommandReply, CommandResult, InternalRequest},
     model::{
-        DaemonId, DesktopState, DesktopTab, Layout, Machine, MachineKind, PaneRef, Session, TabRef,
-        TabState,
+        DaemonId, DesktopState, DesktopTab, ExecutionState, Layout, Machine, MachineKind, PaneRef,
+        Session, TabRef, TabState,
     },
 };
 use gmux_client::{
@@ -25,9 +25,8 @@ struct Origin {
     machine: Machine,
     home_directory: Option<PathBuf>,
     link: Connection,
-    state: Session,
+    execution: ExecutionState,
     revision: u64,
-    last_id: u64,
 }
 impl Origin {
     fn new(machine: Machine, wake: ipc::Wake) -> Self {
@@ -40,9 +39,8 @@ impl Origin {
             machine,
             home_directory: None,
             link,
-            state: Session::default(),
+            execution: ExecutionState::default(),
             revision: 0,
-            last_id: 0,
         }
     }
 }
@@ -493,11 +491,7 @@ impl Connections {
             origin.machine.machine_kind = reply.machine_kind;
             origin.home_directory = Some(reply.home_directory);
             origin.revision = reply.revision;
-            origin.last_id = reply.execution.last_id;
-            origin.state = self
-                .organization
-                .desktop
-                .execution_session(daemon, reply.execution);
+            origin.execution = reply.execution;
         }
         match &mut result.output {
             CommandOutput::New { tab, pane, .. } => {
@@ -521,19 +515,12 @@ impl Connections {
         let handles = &mut self.handles;
         let mut execution_count = 0;
         for (&daemon, origin) in &self.origins {
-            for tab in &origin.state.tabs {
-                let mut tab = tab.clone();
+            for tab in &origin.execution.tabs {
                 let reference = TabRef { daemon, id: tab.id };
-                if let Some(index) = desktop_indices.get(&reference) {
-                    let saved = &self.desktop.tabs[*index];
-                    tab.workspace = saved.workspace;
-                    tab.layout.update_ratios(&saved.layout);
-                    if tab.layout.contains(saved.active.id) {
-                        tab.active = saved.active.id;
-                    }
-                } else if Some(daemon) != self.local {
-                    tab.workspace = None;
-                }
+                let saved = desktop_indices
+                    .get(&reference)
+                    .map(|&index| &self.desktop.tabs[index]);
+                let mut tab = TabState::from_execution(daemon, tab, saved);
                 tab.id = handles.get(daemon, tab.id);
                 tab.active = handles.get(daemon, tab.active);
                 execution_count += 1;
@@ -700,7 +687,7 @@ impl Connections {
         }
         let mut live = HashSet::new();
         for (&daemon, origin) in &self.origins {
-            for tab in &origin.state.tabs {
+            for tab in &origin.execution.tabs {
                 live.insert((daemon, tab.id));
                 live.extend(tab.layout.ids().into_iter().map(|id| (daemon, id)));
             }
@@ -801,7 +788,7 @@ impl Connections {
             };
             let name = origin.machine.name.clone();
             let panes: Vec<_> = origin
-                .state
+                .execution
                 .tabs
                 .iter()
                 .flat_map(|tab| tab.layout.ids())
@@ -827,10 +814,12 @@ impl Connections {
                     // Organization can arrive before execution. Only an ID already
                     // allocated in a snapshot can be confirmed closed by its absence.
                     origin.link.manager().is_none()
-                        || t.reference.id > origin.last_id
+                        || t.reference.id > origin.execution.last_id
                         || live_tabs
                             .entry(t.reference.daemon)
-                            .or_insert_with(|| origin.state.tabs.iter().map(|tab| tab.id).collect())
+                            .or_insert_with(|| {
+                                origin.execution.tabs.iter().map(|tab| tab.id).collect()
+                            })
                             .contains(&t.reference.id)
                 })
         });

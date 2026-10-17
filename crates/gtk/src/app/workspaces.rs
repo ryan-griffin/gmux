@@ -620,13 +620,12 @@ impl Ui {
         let initial_focus = name.downgrade();
         let default_button = save.downgrade();
         let weak = Rc::downgrade(self);
-        let close = dialog.downgrade();
-        let view = view.downgrade();
+        let editor = management::EditorRequest::new(&dialog, &view, &save, &error);
         let fields: Vec<_> = fields
             .into_iter()
             .map(|(machine, path, _)| (machine, path))
             .collect();
-        save.connect_clicked(move |button| {
+        save.connect_clicked(move |_| {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
@@ -665,37 +664,9 @@ impl Ui {
                     tab,
                 }
             };
-            let Some(dialog) = close.upgrade() else {
-                return;
-            };
-            dialog.set_can_close(false);
-            if let Some(view) = view.upgrade() {
-                view.set_sensitive(false);
-            }
-            let view = view.clone();
-            let error = error.clone();
-            let close = close.clone();
-            let button = button.clone();
-            button.set_sensitive(false);
-            ui.command(command, move |_, result| {
-                button.set_sensitive(true);
-                if let Some(dialog) = close.upgrade() {
-                    dialog.set_can_close(true);
-                }
-                if let Some(view) = view.upgrade() {
-                    view.set_sensitive(true);
-                }
-                match result {
-                    Ok(_) => {
-                        if let Some(dialog) = close.upgrade() {
-                            dialog.close();
-                        }
-                    }
-                    Err(message) => {
-                        show_error(&error, message);
-                    }
-                }
-            });
+            editor.begin(None);
+            let editor = editor.clone();
+            ui.command(command, move |_, result| editor.finish(result.map(|_| ())));
         });
         dialog.present(Some(&self.window));
         if let Some(button) = default_button.upgrade() {

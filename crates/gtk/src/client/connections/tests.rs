@@ -274,7 +274,7 @@ fn stream_loss_updates_local_and_remote_status_without_discarding_cached_executi
                     f.hub.connection_status(daemon),
                     ConnectionStatus::Disconnected { error: Some(_) }
                 ));
-                assert_eq!(f.hub.origins[&daemon].state.tabs.len(), 1);
+                assert_eq!(f.hub.origins[&daemon].execution.tabs.len(), 1);
                 if host != 0 {
                     let pane = f.hub.lookup(daemon, 2).unwrap();
                     assert!(updates[&pane].error.is_some());
@@ -599,6 +599,87 @@ fn closed_results_remain_translatable_and_handle_storage_is_bounded_under_churn(
 }
 
 #[test]
+fn organization_changes_reproject_cached_execution_without_changing_its_topology() {
+    let mut f = Fixture::new(2);
+    for host in 0..2 {
+        f.hub.project_execution(f.execution(host, 1, 1)).unwrap();
+    }
+    let daemon = f.ids[1];
+    let reply = f.hub.snapshot();
+    let mut desktop = f.hub.desktop(&reply.session);
+    let saved = desktop
+        .tabs
+        .iter_mut()
+        .find(|t| t.reference.daemon == daemon)
+        .unwrap();
+    saved.name = "Updated presentation".into();
+    saved.active.id = 3;
+    let Layout::Split { ratio, .. } = &mut saved.layout else {
+        panic!("Expected split")
+    };
+    *ratio = 0.8;
+    f.hub
+        .store
+        .save_desktop(desktop, f.hub.desktop_revision())
+        .unwrap();
+    let view = f.hub.snapshot();
+    let tab = view
+        .session
+        .tabs
+        .iter()
+        .find(|t| t.daemon == daemon)
+        .unwrap();
+    assert_eq!(tab.name, "Updated presentation");
+    assert!(matches!(tab.layout, Layout::Split { ratio: 0.8, .. }));
+    assert_eq!(f.hub.pane_ref(tab.active).id, 3);
+    assert_eq!(f.hub.origins[&daemon].revision, 1);
+
+    let mut desktop = f.hub.store.snapshot().0.desktop.clone();
+    let saved = desktop
+        .tabs
+        .iter_mut()
+        .find(|t| t.reference.daemon == daemon)
+        .unwrap();
+    saved.layout = Layout::Pane(99);
+    saved.active.id = 99;
+    f.hub
+        .store
+        .save_desktop(desktop, f.hub.desktop_revision())
+        .unwrap();
+    let view = f.hub.snapshot();
+    let tab = view
+        .session
+        .tabs
+        .iter()
+        .find(|t| t.daemon == daemon)
+        .unwrap();
+    assert_eq!(
+        tab.layout
+            .ids()
+            .into_iter()
+            .map(|id| f.hub.pane_ref(id).id)
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert!(matches!(tab.layout, Layout::Split { ratio: 0.5, .. }));
+    assert_eq!(f.hub.pane_ref(tab.active).id, 2);
+
+    let mut named = f.execution(1, 1, 2);
+    named.execution.tabs[0].custom_name = true;
+    named.execution.tabs[0].name = "Shared name".into();
+    let view = f.hub.project_execution(named).unwrap();
+    assert_eq!(
+        view.session
+            .tabs
+            .iter()
+            .find(|t| t.daemon == daemon)
+            .unwrap()
+            .name,
+        "Shared name"
+    );
+}
+
+#[test]
 fn execution_projection_uses_current_organization_without_reusing_ids_across_hosts() {
     let mut f = Fixture::new(2);
     let CommandOutput::Workspace { workspace } = f
@@ -872,7 +953,7 @@ fn creation_times_merge_remote_imports_and_external_tabs_without_saved_order_ove
         .store
         .save_desktop(desktop, f.hub.desktop_revision())
         .unwrap();
-    f.hub.origins.get_mut(&f.ids[1]).unwrap().state = Session::default();
+    f.hub.origins.get_mut(&f.ids[1]).unwrap().execution = Default::default();
     let mut remote = f.execution(1, 3, 3);
     remote.execution = reconnect;
     let reply = f.hub.project_execution(remote).unwrap();
@@ -926,7 +1007,7 @@ fn snapshot_bursts_advance_the_view_once_and_removed_connections_cannot_reappear
             .all(|tab| f.hub.tab_ref(tab.id).daemon != f.ids[2])
     );
     assert_eq!(f.hub.origins[&f.ids[1]].revision, 2);
-    assert_eq!(f.hub.origins[&f.ids[1]].state.tabs.len(), 2);
+    assert_eq!(f.hub.origins[&f.ids[1]].execution.tabs.len(), 2);
     f.hub.prune_handles([]);
     assert_eq!(f.hub.lookup(f.ids[2], 1), None);
     let before = f.hub.revision;

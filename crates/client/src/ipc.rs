@@ -178,7 +178,11 @@ impl Endpoint {
                         "machine_kind":client.machine_kind,"quitting":false}),
                     );
                 }
-                let (request, output_only) = request.execution()?;
+                let (request, output_only) = request.into_execution(|pane| {
+                    pane.ok_or_else(|| {
+                        anyhow::anyhow!("Remote pane requests require an explicit pane field")
+                    })
+                })?;
                 let reply = self.execute(&request, cancellation)?;
                 if output_only {
                     return Ok(serde_json::to_value(

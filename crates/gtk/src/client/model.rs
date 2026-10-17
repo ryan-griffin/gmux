@@ -5,8 +5,8 @@ use std::{
 };
 
 pub use gmux_client::model::{
-    CursorStyle, DaemonId, ExecutionState, Machine, MachineKind, PaneRef, PaneTree, TabRef,
-    directory_name, display_path, expand_home, home, is_machine_directory,
+    CursorStyle, DaemonId, ExecutionState, ExecutionTab, Machine, MachineKind, PaneRef, PaneTree,
+    TabRef, directory_name, display_path, expand_home, home, is_machine_directory,
 };
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Layout {
@@ -19,6 +19,12 @@ pub enum Layout {
     },
 }
 impl Layout {
+    fn first_pane(&self) -> u64 {
+        match self {
+            Self::Pane(id) => *id,
+            Self::Split { first, .. } => first.first_pane(),
+        }
+    }
     pub fn contains(&self, target: u64) -> bool {
         match self {
             Self::Pane(id) => *id == target,
@@ -290,179 +296,35 @@ pub struct DesktopState {
     pub height: i32,
     pub maximized: bool,
 }
-impl DesktopState {
-    /// Desktop entries cannot create execution or change its topology.
-    pub fn execution_session(&self, daemon: DaemonId, execution: ExecutionState) -> Session {
-        let presentation: HashMap<_, _> = self
-            .tabs
-            .iter()
-            .filter(|tab| tab.reference.daemon == daemon)
-            .map(|tab| (tab.reference.id, tab))
-            .collect();
-        let mut tabs: Vec<_> = execution
-            .tabs
-            .into_iter()
-            .map(|tab| {
-                let mut layout = Layout::from(&tab.layout);
-                let saved = presentation.get(&tab.id).copied();
-                if let Some(saved) = saved {
-                    layout.update_ratios(&saved.layout);
-                }
-                let active = saved
-                    .filter(|saved| {
-                        saved.active.daemon == daemon && layout.contains(saved.active.id)
-                    })
-                    .map(|saved| saved.active.id)
-                    .unwrap_or_else(|| layout.ids()[0]);
-                TabState {
-                    daemon,
-                    id: tab.id,
-                    created_at: tab.created_at,
-                    name: if tab.custom_name {
-                        tab.name
-                    } else {
-                        saved.map(|saved| saved.name.clone()).unwrap_or(tab.name)
-                    },
-                    custom_name: tab.custom_name,
-                    workspace: saved.and_then(|saved| saved.workspace),
-                    layout,
-                    directories: tab.directories,
-                    active,
-                }
-            })
-            .collect();
-        tabs.sort_unstable_by_key(|tab| {
-            (std::cmp::Reverse(tab.created_at), std::cmp::Reverse(tab.id))
-        });
-        Session {
-            tabs,
-            filter: self.filter,
-            active: self
-                .active
-                .filter(|tab| tab.daemon == daemon)
-                .map(|tab| tab.id)
-                .unwrap_or(0),
-            width: self.width,
-            height: self.height,
-            maximized: self.maximized,
+impl TabState {
+    /// Saved presentation can decorate execution, but cannot create panes or change topology.
+    pub fn from_execution(
+        daemon: DaemonId,
+        tab: &ExecutionTab,
+        saved: Option<&DesktopTab>,
+    ) -> Self {
+        let mut layout = Layout::from(&tab.layout);
+        if let Some(saved) = saved {
+            layout.update_ratios(&saved.layout);
         }
-    }
-}
-
-#[cfg(test)]
-mod desktop_tests {
-    use super::*;
-
-    fn desktop(daemon: DaemonId, workspace: u64) -> DesktopState {
-        DesktopState {
-            tabs: vec![DesktopTab {
-                reference: TabRef { daemon, id: 1 },
-                workspace: Some(workspace),
-                layout: Layout::Split {
-                    vertical: false,
-                    first: Box::new(Layout::Pane(2)),
-                    second: Box::new(Layout::Pane(3)),
-                    ratio: 0.7,
-                },
-                active: PaneRef { daemon, id: 3 },
-                name: "Project".into(),
-            }],
-            active: Some(TabRef { daemon, id: 1 }),
-            width: 1200,
-            height: 800,
-            ..DesktopState::default()
+        let active = saved
+            .filter(|saved| saved.active.daemon == daemon && layout.contains(saved.active.id))
+            .map_or_else(|| layout.first_pane(), |saved| saved.active.id);
+        Self {
+            daemon,
+            id: tab.id,
+            created_at: tab.created_at,
+            name: if tab.custom_name {
+                tab.name.clone()
+            } else {
+                saved.map_or_else(|| tab.name.clone(), |saved| saved.name.clone())
+            },
+            custom_name: tab.custom_name,
+            workspace: saved.and_then(|saved| saved.workspace),
+            layout,
+            directories: tab.directories.clone(),
+            active,
         }
-    }
-
-    fn execution(last_id: u64) -> ExecutionState {
-        ExecutionState {
-            last_id,
-            scrollback: HashMap::new(),
-            tabs: vec![gmux_client::model::ExecutionTab {
-                id: 1,
-                created_at: 1,
-                name: "Project".into(),
-                custom_name: false,
-                layout: PaneTree::Split {
-                    vertical: false,
-                    first: Box::new(PaneTree::Pane(2)),
-                    second: Box::new(PaneTree::Pane(3)),
-                },
-                directories: HashMap::from([(2, PathBuf::from("/tmp"))]),
-            }],
-        }
-    }
-    #[test]
-    fn desktops_organize_the_same_execution_independently_and_cannot_create_panes() {
-        let daemon = DaemonId::generate().unwrap();
-        let execution = execution(90);
-        let json = serde_json::to_value(&execution).unwrap();
-        assert!(json.get("width").is_none());
-        assert!(json["tabs"][0].get("workspace").is_none());
-        assert!(json["tabs"][0].get("active").is_none());
-        assert!(json["tabs"][0]["layout"]["Split"].get("ratio").is_none());
-        let first = desktop(daemon, 10);
-        let mut second = desktop(daemon, 20);
-        let a = first.execution_session(daemon, execution.clone());
-        let b = second.execution_session(daemon, execution.clone());
-        assert_eq!(a.tabs[0].workspace, Some(10));
-        assert_eq!(b.tabs[0].workspace, Some(20));
-        assert_eq!(a.tabs[0].layout, first.tabs[0].layout);
-        second.tabs[0].layout = Layout::Pane(99);
-        second.tabs[0].active.id = 99;
-        let stale = second.execution_session(daemon, execution);
-        assert_eq!(stale.tabs[0].layout.ids(), [2, 3]);
-        assert_eq!(stale.tabs[0].active, 2);
-        assert!(
-            first
-                .execution_session(daemon, ExecutionState::default())
-                .tabs
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn creation_order_overrides_saved_positions_and_id_order() {
-        let daemon = DaemonId::generate().unwrap();
-        let mut execution = execution(5);
-        execution.tabs[0].created_at = 200;
-        let mut older = execution.tabs[0].clone();
-        older.id = 4;
-        older.created_at = 100;
-        older.layout = PaneTree::Pane(5);
-        older.directories.clear();
-        execution.tabs.insert(0, older);
-        let mut desktop = desktop(daemon, 10);
-        desktop.tabs[0].reference.id = 4;
-        desktop.tabs[0].layout = Layout::Pane(5);
-        desktop.tabs[0].active.id = 5;
-        let projected = desktop.execution_session(daemon, execution);
-        assert_eq!(
-            projected.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
-            [1, 4]
-        );
-        assert_eq!(projected.tabs[1].workspace, Some(10));
-    }
-
-    #[test]
-    fn equal_ids_on_different_daemons_keep_separate_membership_and_presentation() {
-        let a = DaemonId::generate().unwrap();
-        let b = DaemonId::generate().unwrap();
-        let mut state = desktop(a, 10);
-        state.tabs.extend(desktop(b, 20).tabs);
-        let execution = execution(3);
-        assert_eq!(
-            state.execution_session(a, execution.clone()).tabs[0].workspace,
-            Some(10)
-        );
-        assert_eq!(
-            state.execution_session(b, execution.clone()).tabs[0].workspace,
-            Some(20)
-        );
-        state.tabs[0].active.daemon = b;
-        let projected = state.execution_session(a, execution);
-        assert_eq!(projected.tabs[0].daemon, a);
-        assert_eq!(projected.tabs[0].active, 2);
     }
 }
 

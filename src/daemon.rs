@@ -5,7 +5,7 @@ use crate::{
 };
 use gmux_client::{
     Cell, Frame,
-    control::{Command, CommandOutput, CommandResult},
+    control::{CommandOutput, CommandResult},
     ipc,
     model::{self, CursorStyle, DaemonId, ExecutionState, ExecutionTab, PaneRef, PaneTree, TabRef},
     storage,

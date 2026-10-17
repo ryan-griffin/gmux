@@ -63,6 +63,74 @@ impl EditorDialog {
     }
 }
 
+/// Share request feedback without keeping a closed editor or its widgets alive.
+#[derive(Clone)]
+pub(super) struct EditorRequest {
+    dialog: glib::WeakRef<adw::Dialog>,
+    view: glib::WeakRef<adw::ToolbarView>,
+    submit: glib::WeakRef<gtk::Button>,
+    error: glib::WeakRef<gtk::Label>,
+    label: glib::GString,
+}
+impl EditorRequest {
+    pub fn new(
+        dialog: &adw::Dialog,
+        view: &adw::ToolbarView,
+        submit: &gtk::Button,
+        error: &gtk::Label,
+    ) -> Self {
+        Self {
+            dialog: dialog.downgrade(),
+            view: view.downgrade(),
+            submit: submit.downgrade(),
+            error: error.downgrade(),
+            label: submit.label().unwrap_or_default(),
+        }
+    }
+    pub fn begin(&self, label: Option<&str>) {
+        if let Some(error) = self.error.upgrade() {
+            error.set_visible(false);
+        }
+        if let Some(dialog) = self.dialog.upgrade() {
+            dialog.set_can_close(false);
+        }
+        if let Some(view) = self.view.upgrade() {
+            view.set_sensitive(false);
+        }
+        if let Some(submit) = self.submit.upgrade()
+            && let Some(label) = label
+        {
+            submit.set_label(label);
+        }
+    }
+    pub fn restore(&self) {
+        if let Some(dialog) = self.dialog.upgrade() {
+            dialog.set_can_close(true);
+        }
+        if let Some(view) = self.view.upgrade() {
+            view.set_sensitive(true);
+        }
+        if let Some(submit) = self.submit.upgrade() {
+            submit.set_label(&self.label);
+        }
+    }
+    pub fn finish(&self, result: anyhow::Result<()>) {
+        self.restore();
+        match result {
+            Ok(()) => {
+                if let Some(dialog) = self.dialog.upgrade() {
+                    dialog.close();
+                }
+            }
+            Err(message) => {
+                if let Some(error) = self.error.upgrade() {
+                    show_error(&error, message);
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn editor_header(dialog: &adw::Dialog, label: &str) -> (adw::HeaderBar, gtk::Button) {
     let header = adw::HeaderBar::builder()
         .show_start_title_buttons(false)

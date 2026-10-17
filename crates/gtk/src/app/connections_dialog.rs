@@ -38,6 +38,22 @@ struct RemoteRow {
     reconnect: gtk::Button,
 }
 
+struct ConnectionFields {
+    name: glib::WeakRef<adw::EntryRow>,
+    address: glib::WeakRef<adw::EntryRow>,
+    authentication: glib::WeakRef<adw::ComboRow>,
+    token: glib::WeakRef<adw::EntryRow>,
+    submit: glib::WeakRef<gtk::Button>,
+    error: glib::WeakRef<gtk::Label>,
+}
+struct LocalConnectionFields {
+    connection: ConnectionFields,
+    enabled: glib::WeakRef<adw::SwitchRow>,
+    credentials: glib::WeakRef<adw::PreferencesGroup>,
+    reset: glib::WeakRef<gtk::Button>,
+    execution: glib::WeakRef<adw::SwitchRow>,
+}
+
 fn display_address(address: &str) -> &str {
     match address.rsplit_once(':') {
         Some((host, port))
@@ -441,25 +457,25 @@ impl Ui {
         view.set_content(Some(&page));
         dialog.set_child(Some(&view));
         // Weak widget references keep form signal handlers from retaining the dialog.
-        let fields = (
-            name.downgrade(),
-            address.downgrade(),
-            authentication.downgrade(),
-            token.downgrade(),
-            submit.downgrade(),
-        );
-        let validation_error = error.downgrade();
+        let fields = ConnectionFields {
+            name: name.downgrade(),
+            address: address.downgrade(),
+            authentication: authentication.downgrade(),
+            token: token.downgrade(),
+            submit: submit.downgrade(),
+            error: error.downgrade(),
+        };
         let original = remote.clone();
         let validate = Rc::new(move || {
-            if let Some(error) = validation_error.upgrade() {
+            if let Some(error) = fields.error.upgrade() {
                 error.set_visible(false);
             }
             if let (Some(name), Some(address), Some(auth), Some(token), Some(submit)) = (
-                fields.0.upgrade(),
-                fields.1.upgrade(),
-                fields.2.upgrade(),
-                fields.3.upgrade(),
-                fields.4.upgrade(),
+                fields.name.upgrade(),
+                fields.address.upgrade(),
+                fields.authentication.upgrade(),
+                fields.token.upgrade(),
+                fields.submit.upgrade(),
             ) {
                 let name = name.text();
                 let address = address.text();
@@ -486,14 +502,9 @@ impl Ui {
         let initial_focus = name.downgrade();
         let default_button = submit.downgrade();
         let weak = Rc::downgrade(self);
-        let close = dialog.downgrade();
-        let view = view.downgrade();
-        submit.connect_clicked(move |button| {
-            let (Some(ui), Some(dialog), Some(view)) =
-                (weak.upgrade(), close.upgrade(), view.upgrade())
-            else {
-                return;
-            };
+        let editor = management::EditorRequest::new(&dialog, &view, &submit, &error);
+        submit.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else { return };
             let authentication =
                 match authentication_value(authentication.selected(), &token.text()) {
                     Ok(value) => value,
@@ -502,18 +513,11 @@ impl Ui {
                         return;
                     }
                 };
-            error.set_visible(false);
-            view.set_sensitive(false);
-            dialog.set_can_close(false);
-            button.set_label(if editing {
+            editor.begin(Some(if editing {
                 "Saving…"
             } else {
                 "Connecting…"
-            });
-            let button = button.downgrade();
-            let error = error.downgrade();
-            let close = dialog.downgrade();
-            let view = view.downgrade();
+            }));
             let mut request = json!({"method":"connection-add", "name":name.text().trim(),
                 "address":address.text().trim(), "authentication":authentication});
             if let Some(remote) = &remote {
@@ -523,31 +527,13 @@ impl Ui {
             } else if name.text().trim().is_empty() {
                 request["name"] = Value::Null;
             }
+            let editor = editor.clone();
             ui.request(request, move |ui, result| {
-                if let Some(dialog) = close.upgrade() {
-                    dialog.set_can_close(true);
-                }
-                if let Some(view) = view.upgrade() {
-                    view.set_sensitive(true);
-                }
-                if let Some(button) = button.upgrade() {
-                    button.set_label(label);
-                }
-                match result {
-                    Ok(value) => {
-                        if let Ok(daemon) = serde_json::from_value(value["daemon"].clone()) {
-                            ui.sessions.borrow_mut().connect(daemon);
-                        }
-                        if let Some(dialog) = close.upgrade() {
-                            dialog.close();
-                        }
+                editor.finish(result.map(|value| {
+                    if let Ok(daemon) = serde_json::from_value(value["daemon"].clone()) {
+                        ui.sessions.borrow_mut().connect(daemon);
                     }
-                    Err(message) => {
-                        if let Some(error) = error.upgrade() {
-                            show_error(&error, message);
-                        }
-                    }
-                }
+                }));
             });
         });
         dialog.present(Some(&self.window));
@@ -630,23 +616,25 @@ impl Ui {
             authentication_fields(self, &remote_access.authentication);
         page.add(&credentials);
         let original_address = remote_access.listen_address;
-        let fields = (
-            enabled.downgrade(),
-            address.downgrade(),
-            credentials.downgrade(),
-            authentication.downgrade(),
-            token.downgrade(),
-            save.downgrade(),
-            error.downgrade(),
-            name.downgrade(),
-            reset.downgrade(),
-        );
+        let fields = LocalConnectionFields {
+            connection: ConnectionFields {
+                name: name.downgrade(),
+                address: address.downgrade(),
+                authentication: authentication.downgrade(),
+                token: token.downgrade(),
+                submit: save.downgrade(),
+                error: error.downgrade(),
+            },
+            enabled: enabled.downgrade(),
+            credentials: credentials.downgrade(),
+            reset: reset.downgrade(),
+            execution: local_connection.downgrade(),
+        };
         let hostname = hostname.to_owned();
         let default_name = hostname.clone();
         let original_name = current.to_owned();
         let original_remote_access = remote_access.clone();
         let original_execution = self.settings.borrow().local_daemon_enabled;
-        let execution = local_connection.downgrade();
         let validate = Rc::new(move || {
             if let (
                 Some(enabled),
@@ -659,15 +647,15 @@ impl Ui {
                 Some(reset),
                 Some(execution),
             ) = (
-                fields.0.upgrade(),
-                fields.1.upgrade(),
-                fields.2.upgrade(),
-                fields.3.upgrade(),
-                fields.4.upgrade(),
-                fields.5.upgrade(),
-                fields.7.upgrade(),
-                fields.8.upgrade(),
-                execution.upgrade(),
+                fields.enabled.upgrade(),
+                fields.connection.address.upgrade(),
+                fields.credentials.upgrade(),
+                fields.connection.authentication.upgrade(),
+                fields.connection.token.upgrade(),
+                fields.connection.submit.upgrade(),
+                fields.connection.name.upgrade(),
+                fields.reset.upgrade(),
+                fields.execution.upgrade(),
             ) {
                 let name = name.text();
                 reset.set_sensitive(name.trim() != default_name);
@@ -693,7 +681,7 @@ impl Ui {
                                 && (auth.selected() == 0 || !token.trim().is_empty()))),
                 );
             }
-            if let Some(error) = fields.6.upgrade() {
+            if let Some(error) = fields.connection.error.upgrade() {
                 error.set_visible(false);
             }
         });
@@ -716,60 +704,19 @@ impl Ui {
         let initial_focus = name.downgrade();
         let default_button = save.downgrade();
         let weak = Rc::downgrade(self);
-        let close = dialog.downgrade();
-        let view = view.downgrade();
-        save.connect_clicked(move |button| {
-            let (Some(ui), Some(dialog), Some(view)) =
-                (weak.upgrade(), close.upgrade(), view.upgrade())
-            else {
-                return;
+        let editor = management::EditorRequest::new(&dialog, &view, &save, &error);
+        save.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else { return };
+            let authentication = match authentication_value(authentication.selected(), &token.text()) {
+                Ok(value) => value,
+                Err(message) => { show_error(&error, message); return; }
             };
-            let authentication =
-                match authentication_value(authentication.selected(), &token.text()) {
-                    Ok(value) => value,
-                    Err(message) => {
-                        show_error(&error, message);
-                        return;
-                    }
-                };
-            error.set_visible(false);
-            view.set_sensitive(false);
-            dialog.set_can_close(false);
-            button.set_label("Saving…");
+            editor.begin(Some("Saving…"));
             let value = name.text();
             let value = (value.trim() != hostname).then(|| value.trim().to_owned());
-            let close = dialog.downgrade();
-            let view = view.downgrade();
-            let button = button.downgrade();
-            let error = error.downgrade();
-            let restore = Rc::new(move || {
-                if let Some(dialog) = close.upgrade() {
-                    dialog.set_can_close(true);
-                }
-                if let Some(view) = view.upgrade() {
-                    view.set_sensitive(true);
-                }
-                if let Some(button) = button.upgrade() {
-                    button.set_label("Save");
-                }
-            });
-            let abort = restore.clone();
-            let close = dialog.downgrade();
-            let finish = move |_: &Rc<Ui>, result: anyhow::Result<()>| {
-                restore();
-                match result {
-                    Ok(()) => {
-                        if let Some(dialog) = close.upgrade() {
-                            dialog.close();
-                        }
-                    }
-                    Err(message) => {
-                        if let Some(error) = error.upgrade() {
-                            show_error(&error, message);
-                        }
-                    }
-                }
-            };
+            let abort = editor.clone();
+            let editor = editor.clone();
+            let finish = move |_: &Rc<Ui>, result| editor.finish(result);
             let remote_access = gmux_client::network::RemoteAccess {
                 enabled: enabled.is_active(),
                 listen_address: network::parse_listen_address(address.text().trim()).unwrap_or(original_address),
@@ -808,7 +755,7 @@ impl Ui {
                             apply(&ui);
                         }
                     } else {
-                        abort();
+                        abort.restore();
                     }
                 });
                 confirm.present(Some(&ui.window));

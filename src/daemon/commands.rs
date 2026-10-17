@@ -1,6 +1,6 @@
 //! Layout commands and their ordered persistence.
 use super::*;
-use gmux_client::control::{InternalRequest, PublicRequest, Request};
+use gmux_client::control::{ExecutionRequest, InternalRequest, Request};
 
 pub(super) struct ControlRequest {
     pub(super) body: Request,
@@ -23,8 +23,7 @@ impl ControlRequest {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplyKind {
     Direct,
-    Command,
-    Execution,
+    Snapshot,
 }
 struct ControlReply {
     kind: ReplyKind,
@@ -48,21 +47,26 @@ impl PendingControl {
                 .try_send(json!({"error":"Daemon is shutting down"}));
             return None;
         }
-        let kind = match &request.body {
-            Request::Internal(InternalRequest::Execution { request })
-                if request.mutates_state() =>
-            {
-                ReplyKind::Execution
+        let mut kind = ReplyKind::Direct;
+        let mut broadcast = false;
+        let result: anyhow::Result<Value> = (|| {
+            if matches!(request.body, Request::Internal(InternalRequest::Hello)) {
+                return Ok(daemon.hello());
             }
-            Request::Internal(InternalRequest::Command { .. }) => ReplyKind::Command,
-            _ => ReplyKind::Direct,
-        };
-        let broadcast = matches!(kind, ReplyKind::Execution | ReplyKind::Command)
-            || matches!(
-                &request.body,
-                Request::Layout(_) | Request::Internal(InternalRequest::Command { .. })
-            );
-        let result = daemon.control(request.body);
+            let (request, output_only) = request
+                .body
+                .into_execution(|pane| daemon.resolve_pane(pane))?;
+            broadcast = request.changes_layout();
+            if broadcast && !output_only {
+                kind = ReplyKind::Snapshot;
+            }
+            let mut value = daemon.control(request)?;
+            Ok(if output_only {
+                value["result"].take()
+            } else {
+                value
+            })
+        })();
         let failed = result.is_err();
         let reply = ControlReply {
             kind,
@@ -92,7 +96,7 @@ impl PendingControl {
 }
 impl ControlReply {
     fn save_failed(mut self, error: String) -> Self {
-        let result = if matches!(self.kind, ReplyKind::Command | ReplyKind::Execution) {
+        let result = if self.kind == ReplyKind::Snapshot {
             &mut self.value["result"]
         } else {
             &mut self.value
@@ -105,9 +109,7 @@ impl ControlReply {
             daemon.revision += 1;
             self.value["daemon"] = json!(daemon.id);
         }
-        if matches!(self.kind, ReplyKind::Command | ReplyKind::Execution)
-            && self.value.get("error").is_none()
-        {
+        if self.kind == ReplyKind::Snapshot && self.value.get("error").is_none() {
             self.value = (|| -> anyhow::Result<Value> {
                 let result = serde_json::from_value(self.value["result"].take())?;
                 let mut reply = daemon.execution_state();
@@ -158,13 +160,13 @@ impl Daemon {
             "tabs": tabs,
         }))
     }
-    pub(super) fn result_with_state_save(&mut self, output: CommandOutput) -> CommandResult {
+    fn result_with_state_save(&mut self, output: CommandOutput) -> Value {
         self.prepare_state_save();
-        output.into()
+        json!({"result":CommandResult::from(output)})
     }
-    pub(super) fn execute(&mut self, command: Command) -> anyhow::Result<CommandResult> {
-        match command {
-            Command::New { directory, name } => {
+    fn control(&mut self, request: ExecutionRequest) -> anyhow::Result<Value> {
+        match request {
+            ExecutionRequest::New { directory, name } => {
                 let directory = directory.unwrap_or_else(model::home);
                 let directory = model::expand_home(&directory);
                 anyhow::ensure!(
@@ -208,8 +210,7 @@ impl Daemon {
                 );
                 Ok(self.result_with_state_save(CommandOutput::New { tab, pane }))
             }
-            Command::Split { pane, down } => {
-                let target = self.resolve_pane(pane)?;
+            ExecutionRequest::Split { pane: target, down } => {
                 let tab = self
                     .state
                     .tabs
@@ -238,12 +239,11 @@ impl Daemon {
                 tab.directories.insert(pane, directory);
                 Ok(self.result_with_state_save(CommandOutput::Split { pane }))
             }
-            Command::Close { pane } => {
-                let pane = self.resolve_pane(pane)?;
+            ExecutionRequest::Close { pane } => {
                 self.close(pane);
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
-            Command::CloseTab { tab } => {
+            ExecutionRequest::CloseTab { tab } => {
                 let panes = self
                     .state
                     .tabs
@@ -257,7 +257,7 @@ impl Daemon {
                 }
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
-            Command::Rename { tab, name } => {
+            ExecutionRequest::Rename { tab, name } => {
                 let name = name.trim();
                 anyhow::ensure!(!name.is_empty(), "Enter a tab name");
                 let tab = self
@@ -270,7 +270,7 @@ impl Daemon {
                 tab.custom_name = true;
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
-            Command::ResetName { tab } => {
+            ExecutionRequest::ResetName { tab } => {
                 let tab = self
                     .state
                     .tabs
@@ -286,19 +286,7 @@ impl Daemon {
                 tab.custom_name = false;
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
-        }
-    }
-    pub(super) fn control(&mut self, request: Request) -> anyhow::Result<Value> {
-        match request {
-            Request::Execution(request) => self.execute_remote(request),
-            Request::Internal(InternalRequest::Execution { request }) => {
-                self.execute_remote(request)
-            }
-            Request::Layout(command) => Ok(serde_json::to_value(self.execute(command)?)?),
-            Request::Internal(InternalRequest::Hello) => Ok(
-                json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_client::model::MachineKind::local(),"hostname":model::hostname(),"home_directory":model::home(),"quitting":self.quitting}),
-            ),
-            Request::Public(PublicRequest::Status) => Ok(json!({
+            ExecutionRequest::Status => Ok(json!({
                 "version": transport::VERSION,
                 "daemon": self.id,
                 "hostname": model::hostname(),
@@ -315,30 +303,24 @@ impl Daemon {
                 "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),
                 "git": self.git.as_ref().map_or_else(crate::branch::Stats::default, crate::branch::Service::stats),
             })),
-            Request::Internal(InternalRequest::Busy { panes: ids }) => {
+            ExecutionRequest::Busy { panes: ids } => {
                 let busy = ids
                     .into_iter()
                     .any(|id| self.sessions.get(&id).is_some_and(TerminalSession::busy));
                 Ok(json!({"busy":busy}))
             }
-            Request::Internal(InternalRequest::Command { command }) => {
-                let result = self.execute(command)?;
-                Ok(json!({"result":result}))
-            }
-            Request::Internal(InternalRequest::State) => {
+            ExecutionRequest::State => {
                 self.refresh_state();
                 Ok(serde_json::to_value(self.execution_state())?)
             }
-            Request::Internal(InternalRequest::Metadata { pane }) => {
-                let id = self.resolve_pane(pane)?;
+            ExecutionRequest::Metadata { pane: id } => {
                 let session = self.sessions.get_mut(&id).unwrap();
                 session.refresh_directory();
                 Ok(
                     json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))}),
                 )
             }
-            Request::Internal(InternalRequest::Copy { pane }) => {
-                let id = self.resolve_pane(pane)?;
+            ExecutionRequest::Copy { pane: id } => {
                 let frontend = self
                     .frontends
                     .iter()
@@ -362,12 +344,10 @@ impl Daemon {
                 };
                 Ok(json!({"text":text}))
             }
-            Request::Internal(InternalRequest::Read { pane })
-            | Request::Public(PublicRequest::Read { pane }) => {
-                let id = self.resolve_pane(pane)?;
+            ExecutionRequest::Read { pane: id } => {
                 Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
             }
-            Request::Public(PublicRequest::Stop) => {
+            ExecutionRequest::Stop => {
                 let checkpoint = self.prepare_checkpoint();
                 let warning = match checkpoint {
                     Ok(checkpoint) => {
@@ -383,14 +363,13 @@ impl Daemon {
                 self.quitting = true;
                 Ok(json!({"ok":true,"warning":warning}))
             }
-            Request::Public(PublicRequest::List) => self.list(),
-            Request::Public(PublicRequest::Send {
-                pane,
+            ExecutionRequest::List => self.list(),
+            ExecutionRequest::Send {
+                pane: id,
                 text,
                 paste,
                 enter,
-            }) => {
-                let id = self.resolve_pane(pane)?;
+            } => {
                 let session = self.sessions.get_mut(&id).unwrap();
                 if paste {
                     session.send_text(&text, enter)?;
@@ -399,79 +378,13 @@ impl Daemon {
                 }
                 Ok(json!({"ok":true}))
             }
-            Request::Public(PublicRequest::Notify { pane, message }) => {
-                let id = self.resolve_pane(pane)?;
+            ExecutionRequest::Notify { pane: id, message } => {
                 self.queue_notifications(id, [message]);
                 Ok(json!({"ok":true}))
             }
         }
     }
-    fn execute_remote(
-        &mut self,
-        request: gmux_client::control::ExecutionRequest,
-    ) -> anyhow::Result<Value> {
-        use gmux_client::control::ExecutionRequest;
-        let request = match request.command() {
-            Ok(command) => {
-                if let Command::New {
-                    directory: Some(directory),
-                    ..
-                } = &command
-                {
-                    anyhow::ensure!(
-                        model::is_machine_directory(directory),
-                        "Remote directories must be absolute paths or start with ~/ on the remote machine"
-                    );
-                }
-                let result = self.execute(command)?;
-                return Ok(json!({"result":result}));
-            }
-            Err(request) => request,
-        };
-        match request {
-            ExecutionRequest::List => self.list(),
-            ExecutionRequest::Status => self.control(Request::Public(PublicRequest::Status)),
-            ExecutionRequest::Stop => self.control(Request::Public(PublicRequest::Stop)),
-            ExecutionRequest::State => {
-                self.refresh_state();
-                Ok(serde_json::to_value(self.execution_state())?)
-            }
-            ExecutionRequest::Read { pane } => {
-                self.control(Request::Internal(InternalRequest::Read {
-                    pane: Some(pane),
-                }))
-            }
-            ExecutionRequest::Send {
-                pane,
-                text,
-                paste,
-                enter,
-            } => self.control(Request::Public(PublicRequest::Send {
-                pane: Some(pane),
-                text,
-                paste,
-                enter,
-            })),
-            ExecutionRequest::Notify { pane, message } => {
-                self.control(Request::Public(PublicRequest::Notify {
-                    pane: Some(pane),
-                    message,
-                }))
-            }
-            ExecutionRequest::Busy { panes } => {
-                self.control(Request::Internal(InternalRequest::Busy { panes }))
-            }
-            ExecutionRequest::Metadata { pane } => {
-                self.control(Request::Internal(InternalRequest::Metadata {
-                    pane: Some(pane),
-                }))
-            }
-            ExecutionRequest::Copy { pane } => {
-                self.control(Request::Internal(InternalRequest::Copy {
-                    pane: Some(pane),
-                }))
-            }
-            _ => unreachable!("Execution commands were handled above"),
-        }
+    fn hello(&self) -> Value {
+        json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_client::model::MachineKind::local(),"hostname":model::hostname(),"home_directory":model::home(),"quitting":self.quitting})
     }
 }
