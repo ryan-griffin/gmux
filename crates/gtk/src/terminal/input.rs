@@ -431,10 +431,10 @@ impl Terminal {
                     let (ox, oy) = t.drag_origin.get();
                     t.drag_position.set(Some((ox + x, oy + y)));
                     t.update_drag_selection();
-                    // Flush the final endpoint before Copy or other input can
-                    // follow release, even if the next frame has not started.
-                    t.send_drag_selection();
                 }
+                // Flush pending bounds before Copy can follow release, including
+                // a stationary word/line selection refreshed by terminal output.
+                t.send_drag_selection();
                 t.stop_selection_drag();
             }
         });

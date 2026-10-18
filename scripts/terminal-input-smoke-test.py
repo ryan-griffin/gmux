@@ -224,6 +224,16 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 11])
             resume_selection([0, 11])
             copied("one café_界é")
+
+            # Output can change word bounds without moving the held pointer.
+            repeat_click(10, 0, 2, hold=True)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 11])
+            rpc("send", pane=pane, text="printf '\\033[Hone alphabetlong two'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one alphabetlong two"))
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 15])
+            native.button(False)
+            copied("alphabetlong")
+
             wrapped_line = "wrapped_" + "x" * cols
             rpc("send", pane=pane, text=f"printf '\\033[3J\\033[2J\\033[H{wrapped_line}\\n  line two\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("wrapped_"))

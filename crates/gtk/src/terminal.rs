@@ -55,6 +55,13 @@ impl SearchHighlights {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DragSelectionRequest {
+    endpoint: (u16, u32),
+    text_revision: u64,
+    grid: (u16, u16),
+}
+
 pub struct Terminal {
     pub id: u64,
     pub root: gtk::Box,
@@ -74,7 +81,7 @@ pub struct Terminal {
     selection_preview: RefCell<gmux_client::selection::Preview>,
     drag_origin: ValueCell<(f64, f64)>,
     drag_position: ValueCell<Option<(f64, f64)>>,
-    drag_endpoint: ValueCell<Option<(u16, u32)>>,
+    drag_request: ValueCell<Option<DragSelectionRequest>>,
     drag_selection_tick: RefCell<Option<gtk::TickCallbackId>>,
     drag_scroll_timer: RefCell<Option<glib::SourceId>>,
     drag_kinetic_scrolling: ValueCell<Option<bool>>,
@@ -234,7 +241,7 @@ impl Terminal {
             selection_preview: RefCell::new(gmux_client::selection::Preview::default()),
             drag_origin: ValueCell::new((0.0, 0.0)),
             drag_position: ValueCell::new(None),
-            drag_endpoint: ValueCell::new(None),
+            drag_request: ValueCell::new(None),
             drag_selection_tick: RefCell::new(None),
             drag_scroll_timer: RefCell::new(None),
             drag_kinetic_scrolling: ValueCell::new(None),
@@ -322,9 +329,20 @@ impl Terminal {
             return;
         };
         let session = self.session.borrow();
-        let cols = session.snapshot().frame.cols.max(1) as usize;
+        let screen = session.snapshot();
+        let cols = screen.frame.cols.max(1) as usize;
         let endpoint = ((end % cols) as u16, (end / cols) as u32);
-        if self.drag_endpoint.get() == Some(endpoint) {
+        let request = DragSelectionRequest {
+            endpoint,
+            // Cell selection keeps fixed bounds when only the text changes.
+            text_revision: if self.selection_mode.get() == SelectionMode::Cell {
+                0
+            } else {
+                screen.text_revision
+            },
+            grid: (screen.frame.cols, screen.frame.rows),
+        };
+        if self.drag_request.get() == Some(request) {
             return;
         }
         if let Err(error) = session.select(
@@ -335,7 +353,7 @@ impl Terminal {
             self.show_status(&error.to_string());
             return;
         }
-        self.drag_endpoint.set(Some(endpoint));
+        self.drag_request.set(Some(request));
     }
     fn sync_accessible_selection(&self) {
         let session = self.session.borrow();
@@ -399,7 +417,7 @@ impl Terminal {
     }
     fn stop_selection_drag(&self) {
         self.drag_position.set(None);
-        self.drag_endpoint.set(None);
+        self.drag_request.set(None);
         self.selection_anchor.set(None);
         if let Some(tick) = self.drag_selection_tick.borrow_mut().take() {
             tick.remove();
@@ -640,6 +658,7 @@ impl Terminal {
         })
     }
     pub fn copy(&self) -> bool {
+        self.send_drag_selection();
         // Paint can invalidate the displayed range before a resize reply arrives.
         // The daemon validates its tracked selection in command order.
         if let Err(error) = self.session.borrow().copy() {
