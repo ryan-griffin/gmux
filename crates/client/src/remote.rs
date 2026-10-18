@@ -1213,17 +1213,8 @@ mod tests {
         sender
             .send(Ok(Packet {
                 header: Header {
-                    git: None,
-                    state: None,
                     meta,
-                    frame: None,
-                    scroll_serial: 0,
-                    rows: vec![],
                     notifications: vec!["ready".into()],
-                    error: None,
-                    find: None,
-                    selection: None,
-                    copy: None,
                     ..Header::default()
                 },
                 cells: vec![],
@@ -1248,7 +1239,6 @@ mod tests {
         let (mut manager, sender, session) = manager();
         let packet = |daemon| Packet {
             header: Header {
-                git: None,
                 state: Some(crate::control::CommandReply {
                     home_directory: "/home/test".into(),
                     machine_kind: crate::model::MachineKind::Unknown,
@@ -1260,14 +1250,6 @@ mod tests {
                     metadata: vec![],
                 }),
                 meta: session.borrow().meta.clone(),
-                frame: None,
-                scroll_serial: 0,
-                rows: vec![],
-                notifications: vec![],
-                error: None,
-                find: None,
-                selection: None,
-                copy: None,
                 ..Header::default()
             },
             cells: vec![],
@@ -1300,17 +1282,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        git: None,
-                        state: None,
                         meta,
-                        frame: None,
-                        scroll_serial: 0,
-                        rows: vec![],
-                        notifications: vec![],
-                        error: None,
-                        find: None,
-                        selection: None,
-                        copy: None,
                         ..Header::default()
                     },
                     cells: vec![],
@@ -1341,17 +1313,8 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        git: None,
-                        state: None,
                         meta,
-                        frame: None,
-                        scroll_serial: 0,
-                        rows: vec![],
                         notifications: notifications.into_iter().map(str::to_owned).collect(),
-                        error: None,
-                        find: None,
-                        selection: None,
-                        copy: None,
                         ..Header::default()
                     },
                     cells: vec![],
@@ -1381,17 +1344,9 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        git: None,
-                        state: None,
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
-                        scroll_serial: 0,
                         rows: vec![row],
-                        notifications: vec![],
-                        error: None,
-                        find: None,
-                        selection: None,
-                        copy: None,
                         ..Header::default()
                     },
                     cells: vec![cell; 2],
@@ -1424,17 +1379,10 @@ mod tests {
         sender
             .send(Ok(Packet {
                 header: Header {
-                    git: None,
-                    state: None,
                     meta: session.borrow().meta.clone(),
                     frame: Some(frame),
-                    scroll_serial: 0,
                     rows,
-                    notifications: vec![],
-                    error: None,
-                    find: None,
                     selection,
-                    copy: None,
                     ..Header::default()
                 },
                 cells,
@@ -1600,17 +1548,9 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        git: None,
-                        state: None,
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
                         scroll_serial: serial,
-                        rows: vec![],
-                        notifications: vec![],
-                        error: None,
-                        find: None,
-                        selection: None,
-                        copy: None,
                         ..Header::default()
                     },
                     cells: vec![],
@@ -1665,17 +1605,7 @@ mod tests {
             sender
                 .send(Ok(Packet {
                     header: Header {
-                        git: None,
-                        state: None,
                         meta,
-                        frame: None,
-                        scroll_serial: 0,
-                        rows: vec![],
-                        notifications: vec![],
-                        error: None,
-                        find: None,
-                        selection: None,
-                        copy: None,
                         ..Header::default()
                     },
                     cells: vec![],

@@ -14,6 +14,10 @@ pub(super) struct SentScreen {
     pub(super) cells: Vec<Cell>,
     pub(super) row_flags: Vec<u8>,
 }
+pub(super) struct SentSelection {
+    range: Option<(u64, u64)>,
+    serial: u64,
+}
 pub(super) struct Frontend {
     pub(super) socket: UnixStream,
     pub(super) input: Vec<u8>,
@@ -32,9 +36,8 @@ pub(super) struct Frontend {
     pub(super) scroll_serials: HashMap<u64, u64>,
     pub(super) sent_scroll_serials: HashMap<u64, u64>,
     pub(super) find: HashMap<u64, gmux_client::search::FindState>,
-    pub(super) selections: HashMap<u64, Option<(u64, u64)>>,
+    pub(super) selections: HashMap<u64, SentSelection>,
     pub(super) selection_serials: HashMap<u64, u64>,
-    pub(super) sent_selection_serials: HashMap<u64, u64>,
     pub(super) discarding: bool,
     pub(super) paste: Option<Paste>,
     pub(super) views: HashMap<u64, crate::engine::EngineView>,
@@ -73,7 +76,6 @@ impl Frontend {
             find: HashMap::new(),
             selections: HashMap::new(),
             selection_serials: HashMap::new(),
-            sent_selection_serials: HashMap::new(),
             discarding: false,
             paste: None,
             views: HashMap::new(),
@@ -603,7 +605,6 @@ impl Daemon {
         let mut bytes = Vec::new();
         Packet {
             header: Header {
-                git: None,
                 state: Some(self.execution_state()),
                 meta: Metadata {
                     id: 0,
@@ -615,14 +616,6 @@ impl Daemon {
                     busy: false,
                     modes: [false; 2],
                 },
-                frame: None,
-                scroll_serial: 0,
-                rows: Vec::new(),
-                notifications: Vec::new(),
-                error: None,
-                find: None,
-                selection: None,
-                copy: None,
                 ..Header::default()
             },
             cells: Vec::new(),
@@ -769,10 +762,10 @@ impl Daemon {
                 (None, gmux_client::search::FindState::default(), None, None)
             };
             let find_changed = frontend.find.get(&id) != Some(&find);
-            let selection_changed = frontend.selections.get(&id) != Some(&selection);
             let selection_serial = frontend.selection_serials.get(&id).copied().unwrap_or(0);
-            let selection_ack_changed =
-                frontend.sent_selection_serials.get(&id) != Some(&selection_serial);
+            let previous = frontend.selections.get(&id);
+            let selection_changed = previous.is_none_or(|sent| sent.range != selection);
+            let selection_ack_changed = previous.is_none_or(|sent| sent.serial != selection_serial);
             if frame.is_none()
                 && !find_changed
                 && !selection_changed
@@ -785,8 +778,13 @@ impl Daemon {
                 continue;
             }
             frontend.find.insert(id, find.clone());
-            frontend.selections.insert(id, selection);
-            frontend.sent_selection_serials.insert(id, selection_serial);
+            frontend.selections.insert(
+                id,
+                SentSelection {
+                    range: selection,
+                    serial: selection_serial,
+                },
+            );
             frontend.metadata.insert(id, meta.clone());
             frontend
                 .sent_scroll_serials
