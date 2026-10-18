@@ -321,7 +321,6 @@ impl Daemon {
             frontend.find.remove(&id);
             frontend.selections.remove(&id);
             frontend.selection_serials.remove(&id);
-            frontend.sent_selection_serials.remove(&id);
         }
         self.state.tabs.retain_mut(|tab| {
             if !tab.layout.contains(id) {
@@ -471,8 +470,6 @@ mod tests {
         queue.push("\x01".repeat(MAX_NOTIFICATION_BYTES));
         let packet = Packet {
             header: Header {
-                git: None,
-                state: None,
                 meta: Metadata {
                     id: 1,
                     directory: PathBuf::from("/tmp"),
@@ -483,7 +480,6 @@ mod tests {
                     busy: false,
                     modes: [false; 2],
                 },
-                scroll_serial: 0,
                 frame: Some(Frame {
                     cols: 512,
                     rows: 256,
@@ -491,7 +487,6 @@ mod tests {
                 }),
                 rows: (0..256).collect(),
                 notifications: queue.messages.into_iter().collect(),
-                error: None,
                 find: Some(gmux_client::search::FindState {
                     current: 1,
                     total: gmux_client::viewport::MAX_CELLS,
@@ -500,8 +495,6 @@ mod tests {
                         .map(|i| (i, i + 1, 1))
                         .collect(),
                 }),
-                selection: None,
-                copy: None,
                 ..Header::default()
             },
             cells: vec![Cell::default(); gmux_client::viewport::MAX_CELLS],
@@ -550,8 +543,6 @@ mod tests {
             cell.text[0] = text;
             Packet {
                 header: Header {
-                    git: None,
-                    state: None,
                     meta: Metadata {
                         id: 1,
                         directory: PathBuf::from("/tmp"),
@@ -562,18 +553,12 @@ mod tests {
                         busy: false,
                         modes: [false; 2],
                     },
-                    scroll_serial: 0,
                     frame: Some(Frame {
                         cols: 80,
                         rows: 24,
                         ..Frame::default()
                     }),
                     rows: (0..24).collect(),
-                    notifications: Vec::new(),
-                    error: None,
-                    find: None,
-                    selection: None,
-                    copy: None,
                     ..Header::default()
                 },
                 cells: vec![cell; 80 * 24],

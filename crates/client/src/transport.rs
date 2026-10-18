@@ -202,8 +202,6 @@ mod tests {
         cell.flags = 65;
         Packet {
             header: Header {
-                git: None,
-                state: None,
                 meta: Metadata {
                     id: 1,
                     directory: PathBuf::from("/tmp"),
@@ -228,10 +226,6 @@ mod tests {
                 rows: vec![1],
                 row_flags: vec![1],
                 notifications: vec!["alert".into()],
-                error: None,
-                find: None,
-                selection: None,
-                copy: None,
                 ..Header::default()
             },
             cells: vec![cell, Cell::default()],
