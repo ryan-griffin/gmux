@@ -33,7 +33,7 @@ def handshake(address, **params):
     connection = socket.create_connection(("127.0.0.1", int(address.rsplit(":", 1)[1])), 6)
     connection.settimeout(6)
     reader = connection.makefile("rb")
-    connection.sendall((json.dumps(dict(version=21, channel="control", **params)) + "\n").encode())
+    connection.sendall((json.dumps(dict(version=22, channel="control", **params)) + "\n").encode())
     return connection, reader, json.loads(reader.readline())
 
 

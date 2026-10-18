@@ -110,8 +110,13 @@ pub enum StreamCommand {
         end: (u16, u32),
         #[serde(default)]
         mode: SelectionMode,
+        #[serde(default)]
+        serial: u64,
     },
-    ClearSelection,
+    ClearSelection {
+        #[serde(default)]
+        serial: u64,
+    },
     ClearScreen,
     Input {
         bytes: Vec<u8>,

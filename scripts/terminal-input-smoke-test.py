@@ -176,7 +176,7 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             assert (selected.start_offset, selected.end_offset) == (0, cols), (selected.start_offset, selected.end_offset, cols)
             assert "\n" not in Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset)
 
-            # Real clicks cover GTK recognition, grouped dragging, and Copy ordering.
+            # No daemon reply is available while recognizing and reversing a drag.
             rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[Hone café_界é two\\n  line two\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one café_界é two"))
             ch = rpc("renderer-info", pane=pane)["viewport"]["cell_height"]
@@ -201,20 +201,40 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
                 wait_for(lambda: native.clipboard_text() == expected,
                          message=f"Selection must copy {expected!r}")
 
-            repeat_click(10, 0, 2)
+            def resume_selection(expected):
+                native.button(False)
+                proxy.delay = .035
+                proxy.resume()
+                deadline = time.monotonic() + .3
+                while time.monotonic() < deadline:
+                    assert rpc("renderer-info", pane=pane)["viewport"]["selection"] == expected, "A stale selection reply replaced the current highlight"
+                    time.sleep(.005)
+                proxy.delay = 0
+
+            proxy.pause()
+            repeat_click(10, 0, 2, hold=True)
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 11],
                      message="Double-click must select the complete word")
-            copied("café_界é")
             selected = wait_for(lambda: Atspi.Text.get_selection(text_iface, 0)
                                 if Atspi.Text.get_n_selections(text_iface) else None)
             assert Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset) == "café_界é"
+            move_cell(14, 0)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 15])
+            move_cell(1, 0)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 11])
+            resume_selection([0, 11])
+            copied("one café_界é")
+            wrapped_line = "wrapped_" + "x" * cols
+            rpc("send", pane=pane, text=f"printf '\\033[3J\\033[2J\\033[H{wrapped_line}\\n  line two\\n'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("wrapped_"))
+            proxy.pause()
             repeat_click(5, 1, 3, hold=True)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [cols, 2 * cols - 1],
-                     message="Triple-click must select the complete line")
-            move_cell(3, 0)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 2 * cols - 1])
-            native.button(False)
-            copied("one café_界é two\n  line two")
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 2 * cols - 1],
+                     message="Triple-click must select the complete wrapped line")
+            move_cell(3, 2)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 3 * cols - 1])
+            resume_selection([0, 3 * cols - 1])
+            copied(wrapped_line + "\n  line two")
             repeat_click(5, 1, 1)
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
 

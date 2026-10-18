@@ -39,9 +39,9 @@ impl Default for Cell {
     }
 }
 impl Cell {
-    /// Compare stored glyphs and wide-cell continuation, ignoring rendition.
+    /// Compare stored glyphs and wide-cell layout, ignoring rendition.
     pub fn text_eq(&self, other: &Self) -> bool {
-        self.text == other.text && (self.flags ^ other.flags) & 64 == 0
+        self.text == other.text && (self.flags ^ other.flags) & (64 | 128) == 0
     }
     pub fn text(&self) -> &str {
         let end = self.text.iter().position(|&x| x == 0).unwrap_or(64);

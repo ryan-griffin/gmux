@@ -420,6 +420,10 @@ impl SessionManager {
             pending_scroll: ValueCell::new(None),
             find: crate::search::FindState::default(),
             selection: None,
+            selection_serial: ValueCell::new(0),
+            selection_acknowledged: 0,
+            selection_origin: None,
+            row_flags: vec![0; 24],
         }));
         self.sessions.insert(id, handle.clone());
         Ok(handle)
@@ -481,21 +485,33 @@ impl SessionManager {
                             update.changed |= session.find != find;
                             session.find = find;
                         }
-                        update.changed |= session.selection != packet.header.selection;
-                        session.selection = packet.header.selection;
+                        // Preserve the local prediction until the daemon has
+                        // processed the latest selection command, including clears.
+                        if packet.header.selection_serial >= session.selection_serial.get() {
+                            update.changed |= session.selection != packet.header.selection
+                                || session.selection_acknowledged != packet.header.selection_serial;
+                            session.selection = packet.header.selection;
+                            session.selection_origin = packet.header.selection_origin;
+                            session.selection_acknowledged = packet.header.selection_serial;
+                        }
                         if let Some(frame) = packet.header.frame {
                             let mut text_changed = (frame.cols, frame.rows)
                                 != (session.frame.cols, session.frame.rows);
                             session
                                 .cells
                                 .resize(frame.cols as usize * frame.rows as usize, Cell::default());
+                            session.row_flags.resize(frame.rows as usize, 0);
                             let cols = frame.cols as usize;
                             for (index, row) in packet.header.rows.iter().enumerate() {
+                                let flags =
+                                    packet.header.row_flags.get(index).copied().unwrap_or(0);
+                                text_changed |= session.row_flags[*row as usize] != flags;
+                                session.row_flags[*row as usize] = flags;
                                 let previous = &mut session.cells
                                     [*row as usize * cols..(*row as usize + 1) * cols];
                                 let next = &packet.cells[index * cols..(index + 1) * cols];
-                                // Accessibility only uses glyph bytes and the
-                                // wide-cell continuation flag, not rendition.
+                                // Text consumers use glyph bytes and wide-cell
+                                // layout, not rendition.
                                 text_changed = text_changed
                                     || previous.iter().zip(next).any(|(a, b)| !a.text_eq(b));
                                 previous.copy_from_slice(next);
@@ -576,6 +592,10 @@ pub struct RemoteSession {
     pending_scroll: ValueCell<Option<u64>>,
     find: crate::search::FindState,
     selection: Option<(u64, u64)>,
+    selection_serial: ValueCell<u64>,
+    selection_acknowledged: u64,
+    selection_origin: Option<u64>,
+    row_flags: Vec<u8>,
 }
 impl RemoteSession {
     pub fn branch(&self) -> &str {
@@ -700,13 +720,32 @@ impl RemoteSession {
         end: (u16, u32),
         mode: crate::transport::SelectionMode,
     ) -> anyhow::Result<()> {
-        self.command(StreamCommand::Select { start, end, mode })
+        let serial = self.selection_serial.get() + 1;
+        self.command(StreamCommand::Select {
+            start,
+            end,
+            mode,
+            serial,
+        })?;
+        self.selection_serial.set(serial);
+        Ok(())
     }
     pub fn copy(&self) -> anyhow::Result<()> {
         self.command(StreamCommand::Copy)
     }
     pub fn clear_selection(&self) -> anyhow::Result<()> {
-        self.command(StreamCommand::ClearSelection)
+        let serial = self.selection_serial.get() + 1;
+        self.command(StreamCommand::ClearSelection { serial })?;
+        self.selection_serial.set(serial);
+        Ok(())
+    }
+    pub fn selection_pending(&self) -> bool {
+        self.selection_acknowledged < self.selection_serial.get()
+    }
+    pub fn selection_origin(&self) -> Option<u64> {
+        (!self.selection_pending())
+            .then_some(self.selection_origin)
+            .flatten()
     }
     pub fn clear_screen(&self) -> anyhow::Result<()> {
         self.command(StreamCommand::ClearScreen)
@@ -768,6 +807,7 @@ impl RemoteSession {
         ScreenSnapshot {
             frame: self.frame,
             cells: &self.cells,
+            row_flags: &self.row_flags,
             revision: self.revision,
             text_revision: self.text_revision,
         }
@@ -948,6 +988,10 @@ mod tests {
             pending_scroll: ValueCell::new(None),
             find: crate::search::FindState::default(),
             selection: None,
+            selection_serial: ValueCell::new(0),
+            selection_acknowledged: 0,
+            selection_origin: None,
+            row_flags: vec![0; 2],
         }));
         (
             SessionManager {
@@ -1180,6 +1224,7 @@ mod tests {
                     find: None,
                     selection: None,
                     copy: None,
+                    ..Header::default()
                 },
                 cells: vec![],
             }))
@@ -1223,6 +1268,7 @@ mod tests {
                 find: None,
                 selection: None,
                 copy: None,
+                ..Header::default()
             },
             cells: vec![],
         };
@@ -1265,6 +1311,7 @@ mod tests {
                         find: None,
                         selection: None,
                         copy: None,
+                        ..Header::default()
                     },
                     cells: vec![],
                 }))
@@ -1305,6 +1352,7 @@ mod tests {
                         find: None,
                         selection: None,
                         copy: None,
+                        ..Header::default()
                     },
                     cells: vec![],
                 }))
@@ -1344,6 +1392,7 @@ mod tests {
                         find: None,
                         selection: None,
                         copy: None,
+                        ..Header::default()
                     },
                     cells: vec![cell; 2],
                 }))
@@ -1386,6 +1435,7 @@ mod tests {
                     find: None,
                     selection,
                     copy: None,
+                    ..Header::default()
                 },
                 cells,
             }))
@@ -1440,6 +1490,53 @@ mod tests {
         send_frame(&sender, &session, frame, vec![1], row, None);
         assert!(manager.poll()[&1].changed);
         assert_eq!(session.borrow().snapshot().text_revision, 3);
+    }
+
+    #[test]
+    fn selection_replies_wait_for_the_latest_range_or_clear() {
+        use crate::transport::SelectionMode;
+        let (mut manager, sender, session) = manager();
+        let (commands, _outgoing) = mpsc::sync_channel(16);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        session.borrow_mut().connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        let send = |serial, selection| {
+            sender
+                .send(Ok(transport::Packet {
+                    header: Header {
+                        meta: session.borrow().meta.clone(),
+                        selection,
+                        selection_serial: serial,
+                        ..Header::default()
+                    },
+                    cells: Vec::new(),
+                }))
+                .unwrap();
+        };
+        session
+            .borrow()
+            .select((0, 0), (1, 0), SelectionMode::Word)
+            .unwrap();
+        send(0, Some((2, 3)));
+        manager.poll();
+        assert!(session.borrow().selection_pending());
+        assert_eq!(session.borrow().selection(), None);
+        send(1, Some((0, 1)));
+        assert!(manager.poll()[&1].changed);
+        assert!(!session.borrow().selection_pending());
+        assert_eq!(session.borrow().selection(), Some((0, 1)));
+        session.borrow().clear_selection().unwrap();
+        send(1, Some((2, 3)));
+        manager.poll();
+        assert!(session.borrow().selection_pending());
+        assert_eq!(session.borrow().selection(), Some((0, 1)));
+        send(2, None);
+        assert!(manager.poll()[&1].changed);
+        assert!(!session.borrow().selection_pending());
+        assert_eq!(session.borrow().selection(), None);
     }
 
     #[test]
@@ -1514,6 +1611,7 @@ mod tests {
                         find: None,
                         selection: None,
                         copy: None,
+                        ..Header::default()
                     },
                     cells: vec![],
                 }))
@@ -1578,6 +1676,7 @@ mod tests {
                         find: None,
                         selection: None,
                         copy: None,
+                        ..Header::default()
                     },
                     cells: vec![],
                 }))

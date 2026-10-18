@@ -3,8 +3,10 @@ use crate::{Cell, Frame};
 pub struct ScreenSnapshot<'a> {
     pub frame: Frame,
     pub cells: &'a [Cell],
+    /// Bit zero marks a soft wrap to the next row.
+    pub row_flags: &'a [u8],
     pub revision: u64,
-    /// Changes when text or wide-cell layout may differ.
+    /// Changes when text, wide-cell layout, or soft wraps may differ.
     pub text_revision: u64,
 }
 

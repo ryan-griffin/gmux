@@ -28,7 +28,7 @@ class Client:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(6)
         self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
-        self.send("attach", version=21, daemon=fixture.rpc("_hello")["daemon"])
+        self.send("attach", version=22, daemon=fixture.rpc("_hello")["daemon"])
 
     def send(self, method, **params):
         self.socket.sendall(wire(method, pane=self.pane, **params))
@@ -279,7 +279,7 @@ with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture() 
         with socket.socket(socket.AF_UNIX) as delayed:
             delayed.settimeout(3)
             delayed.connect(fixture.env["GMUX_SOCKET"] + ".stream")
-            delayed.sendall(wire("focused", active=False) * 128 + wire("attach", version=21, daemon=fixture.rpc("_hello")["daemon"]))
+            delayed.sendall(wire("focused", active=False) * 128 + wire("attach", version=22, daemon=fixture.rpc("_hello")["daemon"]))
             wait_for(lambda: fixture.rpc("status")["local_clients"] == 1)
             # State output proves Attach ran even when it was left in a read buffer.
             assert delayed.recv(4), "Buffered Attach did not run"
