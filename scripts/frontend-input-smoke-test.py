@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shlex
 import socket
+import statistics
 import struct
 import subprocess
 import threading
@@ -104,6 +105,124 @@ parser.add_argument("--report", type=Path)
 args = parser.parse_args()
 binary = args.binary or cargo_binary("gmux")
 results = []
+
+with scenario("empty and metadata-only updates leave the viewport deadline available"), AppFixture(
+        prefix="gmux-frame-deadline-") as fixture:
+    worker = fixture.path / "probe.py"
+    worker.write_text('''
+import os, time, tty
+tty.setraw(0)
+os.write(1, b"\\x1b[?1049h\\x1b[?25l\\x1b[HREADY")
+response = metadata = 0
+while True:
+    key = os.read(0, 1)
+    if not key:
+        break
+    if key == b"m":
+        metadata += 1
+        os.write(1, f"\\x1b]2;metadata-{metadata}\\x07".encode())
+    elif key == b"b":
+        for index in range(160):
+            os.write(1, f"\\x1b[HSTREAM{index:04d}".encode())
+            time.sleep(.001)
+        os.write(1, b"\\x1b[HSTREAM_DONE\\x1b]2;stream-done\\x07")
+    elif key == b"u":
+        for index in range(160):
+            os.write(1, b"\\x1b[HUNCHANGED")
+            time.sleep(.001)
+        os.write(1, b"\\x1b]2;unchanged-done\\x07")
+    elif key == b"h":
+        os.write(1, b"\\x1b[?1049l\\x1b[2J\\x1b[H" + b"history\\r\\n" * 2048
+                 + b"\\x1b]2;history-ready\\x07")
+    else:
+        response += 1
+        os.write(1, f"\\x1b[HPROBE{response:06d}".encode())
+''')
+    (fixture.path / "shell").write_text(f"#!/bin/sh\nexec python3 {shlex.quote(str(worker))}\n")
+    daemon = fixture.start(binary, "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for(lambda: fixture.rpc("status"))
+    pane = fixture.rpc("new")["pane"]
+    hidden = fixture.rpc("split", pane=pane)["pane"]
+    for target in (pane, hidden):
+        wait_for(lambda: "READY" in fixture.rpc("read", pane=target)["text"])
+    client = Client(fixture, pane)
+    try:
+        client.send("subscribe", panes=[pane])
+        client.until(lambda h, text: h["meta"]["id"] == pane and "READY" in text)
+        response = 0
+        metadata = {pane: 0, hidden: 0}
+        latencies = {}
+        for workload, target in (("idle", None), ("visible-metadata", pane), ("hidden-metadata", hidden)):
+            samples = []
+            for index in range(23):
+                # Finish the preceding real viewport's coalescing interval.
+                time.sleep(.025)
+                if target is not None:
+                    metadata[target] += 1
+                    client.socket.sendall(wire("input", pane=target, bytes=[ord("m")]))
+                    header = client.until(lambda h, text: h["meta"]["id"] == target
+                        and h["meta"]["title"] == f"metadata-{metadata[target]}")
+                    assert header["frame"] is None and not header["rows"], header
+                response += 1
+                start = time.perf_counter_ns()
+                # Exercise both raw socket input and the GTK client's key path.
+                if index % 2:
+                    client.send("input", bytes=[ord("q")])
+                else:
+                    client.send("key", name="q", cp=ord("q"), text="q")
+                client.until(lambda h, text: h["meta"]["id"] == pane and f"PROBE{response:06d}" in text)
+                if index >= 3:
+                    samples.append((time.perf_counter_ns() - start) / 1e6)
+            latencies[workload] = dict(median_ms=statistics.median(samples), samples_ms=samples)
+        result = dict(workload="viewport-deadline", latency=latencies,
+                      binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                      latency_method="Unix stream key/input send to its matching terminal cell packet; excludes GTK and presentation.")
+        results.append(result)
+        print(json.dumps(result), flush=True)
+        if not args.measure:
+            # Medians tolerate isolated scheduling stalls while catching a full
+            # 16 ms interval consumed by an empty or metadata-only update.
+            assert all(values["median_ms"] < 8 for values in latencies.values()), result
+
+        with scenario("visible streaming output still coalesces viewport packets"):
+            time.sleep(.025)
+            frames = []
+            def streamed(header, text):
+                if header["meta"]["id"] == pane and header["frame"]:
+                    frames.append(time.perf_counter_ns())
+                return header["meta"]["id"] == pane and "STREAM_DONE" in text
+            start = time.monotonic()
+            client.send("input", bytes=[ord("b")])
+            client.until(streamed)
+            limit = int((time.monotonic() - start) / .016) + 3
+            assert 2 <= len(frames) <= limit, f"Streaming output produced {len(frames)} viewport packets"
+        with scenario("repeated identical output still coalesces viewport extraction"):
+            time.sleep(.025)
+            before = fixture.rpc("status")["snapshots"]
+            start = time.monotonic()
+            client.send("input", bytes=[ord("u")])
+            client.until(lambda h, text: h["meta"]["id"] == pane
+                         and h["meta"]["title"] == "unchanged-done")
+            snapshots = fixture.rpc("status")["snapshots"] - before
+            limit = int((time.monotonic() - start) / .016) + 4
+            assert snapshots <= limit, f"Identical output extracted {snapshots} viewports"
+        with scenario("search batches stay paced when no matches change the visible state"):
+            client.send("input", bytes=[ord("h")])
+            header = client.until(lambda h, text: h["meta"]["id"] == pane
+                                  and h["meta"]["title"] == "history-ready")
+            history_rows = header["frame"]["scrollback"]["total"]
+            assert history_rows > 512, header
+            start = time.monotonic()
+            client.send("find", query="absent-needle")
+            completed = client.until(lambda h, text: h["meta"]["id"] == pane and h["find"]
+                                     and not h["find"]["pending"])
+            elapsed = time.monotonic() - start
+            # Each turn scans at most 64 rows. Allow an immediate first batch
+            # and an extra metadata pass, but require pacing for the rest.
+            minimum = ((history_rows + 63) // 64 - 2) * .016
+            assert elapsed >= minimum, dict(elapsed=elapsed, rows=history_rows, completed=completed)
+    finally:
+        client.close()
 
 for kind in ("valid-input-scroll", "empty-lines-input"):
     with scenario(kind), AppFixture(prefix="gmux-frontend-input-") as fixture:
@@ -217,4 +336,4 @@ with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture() 
 if args.report:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(results, indent=2) + "\n")
-print("PASS: bounded floods, control and independent pane responsiveness, buffered Attach, and ordered UTF-8 paste")
+print("PASS: viewport scheduling, bounded floods, control and independent pane responsiveness, buffered Attach, and ordered UTF-8 paste")

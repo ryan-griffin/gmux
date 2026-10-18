@@ -26,6 +26,20 @@ and excludes physical display scanout.
 Use `--renderer gl` or `--renderer cairo` to change the default Vulkan backend.
 `--seconds` and `--samples` control sample sizes. Reports include binary hashes.
 
+## Daemon input
+
+```sh
+python3 scripts/frontend-input-smoke-test.py --binary target/release/gmux \
+  --measure --report artifacts/frontend-input.json
+```
+
+The headless probe measures socket input to the corresponding changed-cell
+packet, including the child's PTY response. It compares idle input with input
+immediately after visible or hidden pane metadata changes. It excludes GTK,
+compositing, and display latency. The suite also checks viewport coalescing,
+search pacing, request fairness, and large pastes. `--measure` reports timings
+without applying input-latency thresholds.
+
 ## Rendering
 
 `crates/gtk/examples/renderer-benchmark.rs` measures scene preparation, completed rendering,

@@ -345,8 +345,11 @@ pub fn run() -> anyhow::Result<()> {
             || metadata_due
             || !exited.is_empty()
         {
-            daemon.updates(metadata_due);
-            next_frame = Instant::now() + Duration::from_millis(16);
+            // Only viewport and search work consume the interval. Metadata
+            // packets alone must not postpone the next visible response.
+            if daemon.updates(metadata_due) {
+                next_frame = Instant::now() + Duration::from_millis(16);
+            }
         } else {
             daemon.flush_frontends();
         }
