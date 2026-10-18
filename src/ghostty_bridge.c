@@ -12,6 +12,13 @@ typedef struct {
     bool dark;
 } Appearance;
 
+typedef struct { uint64_t start, end; } SelectionBounds;
+typedef struct {
+    SelectionBounds anchor, current;
+    uint64_t generation;
+    uint8_t mode, valid;
+} SelectionCache;
+
 struct GmuxEngine {
     GhosttyTerminal terminal;
     GhosttyRenderState render;
@@ -27,6 +34,8 @@ struct GmuxEngine {
     bool dark;
     bool held;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
+    SelectionCache selection_cache;
+    uint64_t text_generation;
     uint64_t hold_started_ms;
     GmuxView *views;
     bool view_held;
@@ -41,6 +50,7 @@ struct GmuxView {
     GhosttyRenderState render;
     GhosttyTerminalScrollbar scrollbar;
     GhosttyTrackedGridRef viewport, selection_start, selection_end, selection_anchor;
+    SelectionCache selection_cache;
     bool held_used;
     bool captured;
     bool active;
@@ -83,6 +93,7 @@ static void swap_view(GmuxEngine *e, GmuxView *v) {
     SWAP(selection_start, GhosttyTrackedGridRef);
     SWAP(selection_end, GhosttyTrackedGridRef);
     SWAP(selection_anchor, GhosttyTrackedGridRef);
+    SWAP(selection_cache, SelectionCache);
 #undef SWAP
 }
 
@@ -254,6 +265,7 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     if (!e) return NULL;
     e->userdata = ud;
     e->callback = cb;
+    e->text_generation = 1;
     e->applied.cursor_style = UINT8_MAX;
     if (ghostty_terminal_new(NULL, &e->terminal, 80, 24) ||
         ghostty_render_state_new(NULL, &e->render) ||
@@ -470,6 +482,7 @@ int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
     return gmux_engine_cursor_style(e, v->appearance.cursor_style);
 }
 void gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
+    e->text_generation++;
     if (e->clear_pending) {
         size_t consumed = 0;
         if (ghostty_terminal_vt_write_until_ground(e->terminal, data, len, &consumed)) return;
@@ -496,6 +509,7 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
     e->held = false;
     // ED2 can move prompt rows into history, so erase history afterwards.
     const char clear[] = "\x1b[2J\x1b[3J\x1b[H";
+    e->text_generation++;
     ghostty_terminal_vt_write(e->terminal, (const uint8_t *)clear, sizeof(clear) - 1);
     gmux_engine_clear_selection(e);
     for (GmuxView *v = e->views; v; v = v->next) {
@@ -503,6 +517,7 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
         ghostty_tracked_grid_ref_free(v->selection_start); v->selection_start = NULL;
         ghostty_tracked_grid_ref_free(v->selection_end); v->selection_end = NULL;
         ghostty_tracked_grid_ref_free(v->selection_anchor); v->selection_anchor = NULL;
+        v->selection_cache.valid = 0;
     }
     gmux_engine_scroll(e, 0, true);
     return 0;
@@ -516,6 +531,10 @@ int gmux_engine_cursor_style(GmuxEngine *e, uint8_t style) {
     return result;
 }
 int gmux_engine_resize(GmuxEngine *e, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch) {
+    uint16_t previous_cols = 0, previous_rows = 0;
+    ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &previous_cols);
+    ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ROWS, &previous_rows);
+    if (cols != previous_cols || rows != previous_rows) e->text_generation++;
     return ghostty_terminal_resize(e->terminal, cols, rows, cw, ch);
 }
 void gmux_engine_scroll(GmuxEngine *e, intptr_t delta, bool bottom) {
@@ -568,7 +587,7 @@ int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len, bool clipb
     paste.allow_unsafe = true;
     return ghostty_terminal_paste(e->terminal, &paste, NULL);
 }
-int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap) {
+int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap, uint8_t *row_flags) {
     if (e->appearance_error) return -1;
     if (!e->view_held) gmux_engine_expire_render_hold(e);
     if (e->held) {
@@ -599,6 +618,11 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
     // Rust keeps the cell buffer between snapshots. Only changed rows need
     // extraction; resize, scrolling and palette changes invalidate the full grid.
     while (ghostty_render_state_row_iterator_next_dirty(e->iterator, &y)) {
+        GhosttyRow row;
+        bool wrapped = false;
+        if (ghostty_render_state_row_get(e->iterator, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &row) ||
+            ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, &wrapped)) return -1;
+        row_flags[y] = wrapped;
         ghostty_render_state_row_get(e->iterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &e->cells);
         size_t x = 0;
         while (ghostty_render_state_row_cells_next(e->cells)) {
@@ -619,6 +643,7 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
             if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) cell->flags |= 64;
+            if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) cell->flags |= 128;
             GhosttyBuffer buffer = {.ptr = (uint8_t *)cell->text, .cap = sizeof(cell->text) - 1};
             // A cluster too large for this cell is shown as a replacement character.
             if (ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buffer))
@@ -757,6 +782,50 @@ static int track_selection_point(GmuxEngine *e, GhosttyTrackedGridRef *ref, Ghos
         ghostty_terminal_grid_ref_track(e->terminal, point, ref);
 }
 
+static GhosttyPoint selection_point(uint64_t index, uint16_t cols) {
+    return (GhosttyPoint){.tag=GHOSTTY_POINT_TAG_SCREEN,
+        .value.coordinate={(uint16_t)(index % cols), (uint32_t)(index / cols)}};
+}
+static int selection_unit(GmuxEngine *e, uint64_t from, uint64_t toward, uint16_t cols,
+    uint8_t mode, SelectionBounds *out) {
+    SelectionCache *cache = &e->selection_cache;
+    if ((cache->valid & 1) && from >= cache->anchor.start && from <= cache->anchor.end) {
+        *out = cache->anchor; return GHOSTTY_SUCCESS;
+    }
+    if ((cache->valid & 2) && from >= cache->current.start && from <= cache->current.end) {
+        *out = cache->current; return GHOSTTY_SUCCESS;
+    }
+    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    if (ghostty_terminal_grid_ref(e->terminal, selection_point(from, cols), &ref)) return GHOSTTY_INVALID_VALUE;
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    GhosttyResult result;
+    if (mode == 1) {
+        GhosttyTerminalSelectWordBetweenOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
+        options.start = ref;
+        options.end.size = sizeof(GhosttyGridRef);
+        if (ghostty_terminal_grid_ref(e->terminal, selection_point(toward, cols), &options.end)) return GHOSTTY_INVALID_VALUE;
+        result = ghostty_terminal_select_word_between(e->terminal, &options, &selection);
+    } else {
+        GhosttyTerminalSelectLineOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+        // An explicit empty trim set preserves wrapped lines of written spaces.
+        const uint32_t no_trim = 0;
+        options.whitespace = &no_trim;
+        options.ref = ref;
+        result = ghostty_terminal_select_line(e->terminal, &options, &selection);
+        if (result == GHOSTTY_NO_VALUE) {
+            selection.start = selection.end = ref;
+            result = GHOSTTY_SUCCESS;
+        }
+    }
+    if (result) return result;
+    GhosttyPointCoordinate start, end;
+    if (ghostty_terminal_point_from_grid_ref(e->terminal, &selection.start, GHOSTTY_POINT_TAG_SCREEN, &start) ||
+        ghostty_terminal_point_from_grid_ref(e->terminal, &selection.end, GHOSTTY_POINT_TAG_SCREEN, &end))
+        return GHOSTTY_INVALID_VALUE;
+    if (mode == 2) { start.x = 0; end.x = cols - 1; }
+    *out = (SelectionBounds){(uint64_t)start.y * cols + start.x, (uint64_t)end.y * cols + end.x};
+    return GHOSTTY_SUCCESS;
+}
 int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey, uint8_t mode) {
     GhosttyPoint start = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={sx,sy}};
     GhosttyPoint end = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={ex,ey}};
@@ -765,54 +834,36 @@ int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uin
         return track_selection_point(e, &e->selection_end, end);
     }
     if (mode > 2) return -1;
-    // Keep the original click separate from the expanded bounds so reversing a
-    // word/line drag retains the whole starting unit, even after reflow.
+    // Track the click separately so reversal and reflow retain its complete unit.
     if (!e->selection_anchor && track_selection_point(e, &e->selection_anchor, start)) return -1;
-    GhosttyGridRef anchor = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-    GhosttyGridRef current = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-    if (ghostty_tracked_grid_ref_snapshot(e->selection_anchor, &anchor) ||
-        ghostty_tracked_grid_ref_point(e->selection_anchor, GHOSTTY_POINT_TAG_SCREEN, &start.value.coordinate) ||
-        ghostty_terminal_grid_ref(e->terminal, end, &current)) return -1;
-    bool reverse = start.value.coordinate.y > ey || (start.value.coordinate.y == ey && start.value.coordinate.x > ex);
-    GhosttySelection a = GHOSTTY_INIT_SIZED(GhosttySelection);
-    GhosttySelection b = GHOSTTY_INIT_SIZED(GhosttySelection);
-    GhosttyResult ra, rb;
-    if (mode == 1) {
-        GhosttyTerminalSelectWordBetweenOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
-        options.start = anchor; options.end = current;
-        ra = ghostty_terminal_select_word_between(e->terminal, &options, &a);
-        options.start = current; options.end = anchor;
-        rb = ghostty_terminal_select_word_between(e->terminal, &options, &b);
-    } else {
-        GhosttyTerminalSelectLineOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
-        // A non-null, empty trim set keeps lines containing only written spaces.
-        const uint32_t no_trim = 0;
-        options.whitespace = &no_trim;
-        options.ref = anchor;
-        ra = ghostty_terminal_select_line(e->terminal, &options, &a);
-        options.ref = current;
-        rb = ghostty_terminal_select_line(e->terminal, &options, &b);
-        // Blank lines have no text bounds, but are still selectable rows.
-        if (ra == GHOSTTY_NO_VALUE) { a.start = a.end = anchor; ra = GHOSTTY_SUCCESS; }
-        if (rb == GHOSTTY_NO_VALUE) { b.start = b.end = current; rb = GHOSTTY_SUCCESS; }
+    GhosttyPointCoordinate anchor;
+    uint16_t cols = 0;
+    if (ghostty_tracked_grid_ref_point(e->selection_anchor, GHOSTTY_POINT_TAG_SCREEN, &anchor) ||
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols) || !cols || ex >= cols) return -1;
+    SelectionCache *cache = &e->selection_cache;
+    if (cache->generation != e->text_generation || cache->mode != mode) {
+        cache->generation = e->text_generation;
+        cache->mode = mode;
+        cache->valid = 0;
     }
-    if (ra == GHOSTTY_NO_VALUE || rb == GHOSTTY_NO_VALUE) return 0;
-    if (ra || rb) return -1;
-    if (ghostty_terminal_point_from_grid_ref(e->terminal, reverse ? &a.end : &a.start,
-            GHOSTTY_POINT_TAG_SCREEN, &start.value.coordinate) ||
-        ghostty_terminal_point_from_grid_ref(e->terminal, reverse ? &b.start : &b.end,
-            GHOSTTY_POINT_TAG_SCREEN, &end.value.coordinate)) return -1;
-    if (mode == 2) {
-        uint16_t cols = 0;
-        if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols) || !cols) return -1;
-        // Include indentation and the unused cells through the right margin.
-        start.value.coordinate.x = reverse ? cols - 1 : 0;
-        end.value.coordinate.x = reverse ? 0 : cols - 1;
-    }
+    uint64_t origin = (uint64_t)anchor.y * cols + anchor.x;
+    uint64_t endpoint = (uint64_t)ey * cols + ex;
+    SelectionBounds a, b;
+    int result = selection_unit(e, origin, endpoint, cols, mode, &a);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    if (result) return -1;
+    cache->anchor = a; cache->valid |= 1;
+    result = selection_unit(e, endpoint, origin, cols, mode, &b);
+    if (result == GHOSTTY_NO_VALUE) return 0;
+    if (result) return -1;
+    cache->current = b; cache->valid |= 2;
+    start = selection_point(a.start < b.start ? a.start : b.start, cols);
+    end = selection_point(a.end > b.end ? a.end : b.end, cols);
     if (track_selection_point(e, &e->selection_start, start)) return -1;
     return track_selection_point(e, &e->selection_end, end);
 }
 void gmux_engine_clear_selection(GmuxEngine *e) {
+    e->selection_cache.valid = 0;
     ghostty_tracked_grid_ref_free(e->selection_start); e->selection_start=NULL;
     ghostty_tracked_grid_ref_free(e->selection_end); e->selection_end=NULL;
     ghostty_tracked_grid_ref_free(e->selection_anchor); e->selection_anchor=NULL;
@@ -825,6 +876,15 @@ int gmux_engine_selection(GmuxEngine *e, uint64_t *start, uint64_t *end) {
         ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols)) return -1;
     *start = (uint64_t)a.y*cols+a.x; *end=(uint64_t)b.y*cols+b.x;
     if (*start > *end) { uint64_t swap=*start; *start=*end; *end=swap; }
+    return 0;
+}
+int gmux_engine_selection_origin(GmuxEngine *e, uint64_t *origin) {
+    GhosttyTrackedGridRef ref = e->selection_anchor ? e->selection_anchor : e->selection_start;
+    GhosttyPointCoordinate point;
+    uint16_t cols = 0;
+    if (!ref || ghostty_tracked_grid_ref_point(ref, GHOSTTY_POINT_TAG_SCREEN, &point) ||
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols)) return -1;
+    *origin = (uint64_t)point.y * cols + point.x;
     return 0;
 }
 int gmux_engine_copy(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {

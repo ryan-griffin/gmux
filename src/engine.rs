@@ -86,7 +86,9 @@ pub struct Engine {
     events: Box<Events>,
     pub frame: Frame,
     pub cells: Vec<Cell>,
+    pub row_flags: Vec<u8>,
     held_cells: Vec<Cell>,
+    held_row_flags: Vec<u8>,
     size: (u16, u16),
     find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
@@ -170,12 +172,15 @@ impl Engine {
             // Every held snapshot extracts all rows, so one scratch buffer
             // serves every view while preserving the normal incremental cells.
             self.held_cells.resize(self.cells.len(), Cell::default());
+            self.held_row_flags.resize(self.row_flags.len(), 0);
             std::mem::swap(&mut self.cells, &mut self.held_cells);
+            std::mem::swap(&mut self.row_flags, &mut self.held_row_flags);
             std::mem::swap(&mut self.frame, &mut view.held_frame);
         }
         let result = f(self);
         if held {
             std::mem::swap(&mut self.cells, &mut self.held_cells);
+            std::mem::swap(&mut self.row_flags, &mut self.held_row_flags);
             std::mem::swap(&mut self.frame, &mut view.held_frame);
         }
         self.swap_view(view);
@@ -277,10 +282,12 @@ impl Engine {
             events,
             frame: Frame::default(),
             cells: vec![Cell::default(); 80 * 24],
+            row_flags: vec![0; 24],
             size: (80, 24),
             find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
             held_cells: Vec::new(),
+            held_row_flags: Vec::new(),
         };
         engine.set_theme(&Theme::adwaita(true))?;
         engine.set_cursor_style(CursorStyle::default())?;
@@ -313,6 +320,7 @@ impl Engine {
         let result = unsafe { gmux_engine_resize(self.raw.as_ptr(), cols, rows, cw, ch) };
         anyhow::ensure!(result == 0, "Ghostty resize failed ({result})");
         if self.size != (cols, rows) {
+            self.row_flags.resize(rows as usize, 0);
             self.find.invalidate();
             self.find.pending = false;
             self.cells
@@ -329,6 +337,7 @@ impl Engine {
                 &mut self.frame,
                 self.cells.as_mut_ptr(),
                 self.cells.len(),
+                self.row_flags.as_mut_ptr(),
             )
         };
         anyhow::ensure!(result >= 0, "Ghostty render-state update failed");
@@ -413,6 +422,11 @@ impl Engine {
     }
     pub fn clear_selection(&mut self) {
         unsafe { gmux_engine_clear_selection(self.raw.as_ptr()) }
+    }
+    pub fn selection_origin(&self) -> Option<u64> {
+        let mut origin = 0;
+        (unsafe { gmux_engine_selection_origin(self.raw.as_ptr(), &mut origin) } == 0)
+            .then_some(origin)
     }
     pub fn clear_screen(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -804,7 +818,7 @@ mod tests {
         view.set_theme(&light);
         engine.with_view(&mut view, |engine| {
             engine.scroll_to(0);
-            engine.select((0, 0), (2, 0)).unwrap();
+            engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
             engine.find("one");
         });
         engine.write(b"\x1b[?2026h");
@@ -1191,6 +1205,82 @@ mod tests {
             assert_eq!(fresh.text().unwrap(), "fresh");
         }
     }
+    #[test]
+    fn viewport_selection_matches_engine_bounds_across_wraps_wide_cells_and_empty_cells() {
+        use gmux_client::{selection::Preview, session::ScreenSnapshot};
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 6, 8, 16).unwrap();
+        let mut preview = Preview::default();
+        for (revision, text) in [
+            "12345678901界 café\u{301} /tmp/a.rs\r\n     \r\nlast_line",
+            "\x1b[2J\x1b[Hone two\r\nnext",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.write(text.as_bytes());
+            for rows in [6, 3] {
+                engine.resize(12, rows, 8, 16).unwrap();
+                for offset in [0, 2] {
+                    engine.scroll_to(offset);
+                    engine.snapshot().unwrap();
+                    let base = engine.frame.scrollback.offset as usize * 12;
+                    let limit = base + engine.cells.len() - 1;
+                    let clip = |range: Option<(u64, u64)>| {
+                        range.and_then(|(a, b)| {
+                            let start = a.max(base as u64);
+                            let end = b.min(limit as u64);
+                            (start <= end).then_some((start, end))
+                        })
+                    };
+                    for mode in [SelectionMode::Word, SelectionMode::Line] {
+                        for origin in [0, 11, 13, 17, 36, 47] {
+                            for endpoint in base..base + engine.cells.len() {
+                                let predicted = preview.range(
+                                    &ScreenSnapshot {
+                                        frame: engine.frame,
+                                        cells: &engine.cells,
+                                        row_flags: &engine.row_flags,
+                                        revision: revision as u64,
+                                        text_revision: revision as u64,
+                                    },
+                                    origin,
+                                    endpoint,
+                                    mode,
+                                );
+                                engine.clear_selection();
+                                engine
+                                    .select(
+                                        ((origin % 12) as u16, (origin / 12) as u32),
+                                        ((endpoint % 12) as u16, (endpoint / 12) as u32),
+                                        mode,
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    clip(predicted.map(|(a, b)| (a as u64, b as u64))),
+                                    clip(engine.selection()),
+                                    "mode {}, origin {origin}, endpoint {endpoint}, revision {revision}",
+                                    mode as u8
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_bounds_cache_is_invalidated_by_terminal_output() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"longword tail");
+        engine.select((1, 0), (4, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "longword");
+        engine.write(b"\r\x1b[2Kone two");
+        engine.select((1, 0), (1, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "one");
+    }
+
     #[test]
     fn word_drag_reversal_keeps_the_starting_word_and_skips_unwritten_cells() {
         let mut engine = Engine::new().unwrap();

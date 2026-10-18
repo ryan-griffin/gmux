@@ -29,20 +29,20 @@ class Client:
             self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(6)
         if address:
-            self.socket.sendall((json.dumps(dict(version=21, channel="stream", token=token)) + "\n").encode())
+            self.socket.sendall((json.dumps(dict(version=22, channel="stream", token=token)) + "\n").encode())
             line = bytearray()
             while not line.endswith(b"\n"):
                 line.extend(self.exact(1))
             hello = json.loads(line)
             assert "error" not in hello, hello
-            assert hello["version"] == 21, hello
+            assert hello["version"] == 22, hello
         else:
             self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
             hello = fixture.rpc("_hello")
         self.cells = {}
         self.git = {}
         self.frame = None
-        self.send("attach", version=21, daemon=hello["daemon"])
+        self.send("attach", version=22, daemon=hello["daemon"])
         self.send("subscribe", panes=[pane])
 
     def send(self, method, **params):

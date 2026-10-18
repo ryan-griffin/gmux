@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 21;
+pub const VERSION: u32 = 22;
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 16 * 1024 * 1024;
@@ -47,10 +47,17 @@ pub struct Header {
     pub frame: Option<Frame>,
     pub scroll_serial: u64,
     pub rows: Vec<u16>,
+    /// Flags corresponding to `rows`; empty means every changed row is unwrapped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_flags: Vec<u8>,
     pub notifications: Vec<String>,
     pub error: Option<String>,
     pub find: Option<crate::search::FindState>,
     pub selection: Option<(u64, u64)>,
+    #[serde(default)]
+    pub selection_serial: u64,
+    #[serde(default)]
+    pub selection_origin: Option<u64>,
     pub copy: Option<String>,
 }
 
@@ -105,6 +112,12 @@ impl Packet {
             reader.read_exact(&mut bytes)?;
             serde_json::from_slice::<Header>(&bytes)?
         };
+        anyhow::ensure!(
+            header.row_flags.is_empty()
+                || (header.row_flags.len() == header.rows.len()
+                    && header.row_flags.iter().all(|flags| flags & !1 == 0)),
+            "Invalid viewport row flags"
+        );
         let expected = if let Some(frame) = header.frame {
             let cols = frame.cols as usize;
             let rows = frame.rows as usize;
@@ -213,11 +226,13 @@ mod tests {
                     ..Frame::default()
                 }),
                 rows: vec![1],
+                row_flags: vec![1],
                 notifications: vec!["alert".into()],
                 error: None,
                 find: None,
                 selection: None,
                 copy: None,
+                ..Header::default()
             },
             cells: vec![cell, Cell::default()],
         }
@@ -230,6 +245,7 @@ mod tests {
         let decoded = Packet::read(&mut &encoded[..]).unwrap();
         assert_eq!(decoded.header.meta, packet.header.meta);
         assert_eq!(decoded.header.rows, vec![1]);
+        assert_eq!(decoded.header.row_flags, vec![1]);
         assert_eq!(decoded.header.scroll_serial, 42);
         assert_eq!(
             decoded.header.frame.unwrap().scrollback,
@@ -270,6 +286,13 @@ mod tests {
     #[test]
     fn malformed_headers_and_payload_lengths_are_rejected() {
         let mut packet = packet();
+        for flags in [vec![0, 1], vec![2]] {
+            packet.header.row_flags = flags;
+            let mut encoded = Vec::new();
+            packet.encode_into(&mut encoded).unwrap();
+            assert!(Packet::read(&mut &encoded[..]).is_err());
+        }
+        packet.header.row_flags.clear();
         let mut encoded = Vec::new();
         for rows in [vec![3], vec![1, 1], vec![2, 1], vec![0, 1, 2, 3]] {
             packet.cells.resize(rows.len() * 2, Cell::default());
@@ -344,6 +367,7 @@ mod tests {
         let mut packet = packet();
         packet.header.frame.as_mut().unwrap().cols = 73;
         packet.header.rows = vec![0, 2];
+        packet.header.row_flags = vec![1, 0];
         packet.cells = (0..146)
             .map(|i| {
                 let mut cell = Cell::default();
@@ -380,6 +404,7 @@ mod tests {
                 } else {
                     assert!(decoded.cells == packet.cells);
                     assert_eq!(decoded.header.rows, packet.header.rows);
+                    assert_eq!(decoded.header.row_flags, packet.header.row_flags);
                     assert_eq!(decoded.header.meta, packet.header.meta);
                 }
             }

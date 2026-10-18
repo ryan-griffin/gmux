@@ -12,6 +12,7 @@ const MAX_COMMAND: usize = 1_048_577;
 pub(super) struct SentScreen {
     pub(super) frame: Frame,
     pub(super) cells: Vec<Cell>,
+    pub(super) row_flags: Vec<u8>,
 }
 pub(super) struct Frontend {
     pub(super) socket: UnixStream,
@@ -32,6 +33,8 @@ pub(super) struct Frontend {
     pub(super) sent_scroll_serials: HashMap<u64, u64>,
     pub(super) find: HashMap<u64, gmux_client::search::FindState>,
     pub(super) selections: HashMap<u64, Option<(u64, u64)>>,
+    pub(super) selection_serials: HashMap<u64, u64>,
+    pub(super) sent_selection_serials: HashMap<u64, u64>,
     pub(super) discarding: bool,
     pub(super) paste: Option<Paste>,
     pub(super) views: HashMap<u64, crate::engine::EngineView>,
@@ -69,6 +72,8 @@ impl Frontend {
             sent_scroll_serials: HashMap::new(),
             find: HashMap::new(),
             selections: HashMap::new(),
+            selection_serials: HashMap::new(),
+            sent_selection_serials: HashMap::new(),
             discarding: false,
             paste: None,
             views: HashMap::new(),
@@ -501,10 +506,19 @@ impl Daemon {
                     }
                     StreamCommand::Find { query } => engine.find(&query),
                     StreamCommand::FindAdvance { previous } => engine.find_advance(previous),
-                    StreamCommand::Select { start, end, mode } => {
+                    StreamCommand::Select {
+                        start,
+                        end,
+                        mode,
+                        serial,
+                    } => {
+                        frontend.selection_serials.insert(id, serial);
                         engine.select(start, end, mode)?
                     }
-                    StreamCommand::ClearSelection => engine.clear_selection(),
+                    StreamCommand::ClearSelection { serial } => {
+                        frontend.selection_serials.insert(id, serial);
+                        engine.clear_selection();
+                    }
                     StreamCommand::Scroll { delta, bottom } => engine.scroll(delta, bottom),
                     StreamCommand::ScrollTo { row, serial } => {
                         engine.scroll_to(row);
@@ -609,6 +623,7 @@ impl Daemon {
                 find: None,
                 selection: None,
                 copy: None,
+                ..Header::default()
             },
             cells: Vec::new(),
         }
@@ -686,7 +701,10 @@ impl Daemon {
             }
             let mut rows = Vec::new();
             let mut cells = Vec::new();
-            let (frame, find, selection) = if screen || frontend.views.contains_key(&id) {
+            let mut row_flags = Vec::new();
+            let (frame, find, selection, selection_origin) = if screen
+                || frontend.views.contains_key(&id)
+            {
                 if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
                     let mut view = session.new_view()?;
                     view.set_active(frontend.visible.contains(&id));
@@ -715,11 +733,15 @@ impl Daemon {
                         let full = old.frame.cols != frame.cols || old.frame.rows != frame.rows;
                         if full {
                             old.cells.resize(cells_snapshot.len(), Cell::default());
+                            old.row_flags.resize(frame.rows as usize, 0);
                         }
                         for (row, data) in cells_snapshot.chunks_exact(cols).enumerate() {
                             let previous = &mut old.cells[row * cols..(row + 1) * cols];
-                            if full || *previous != *data {
+                            let flags = engine.row_flags[row];
+                            if full || *previous != *data || old.row_flags[row] != flags {
                                 rows.push(row as u16);
+                                row_flags.push(flags);
+                                old.row_flags[row] = flags;
                                 cells.extend_from_slice(data);
                                 previous.copy_from_slice(data);
                             }
@@ -736,16 +758,25 @@ impl Daemon {
                     } else {
                         None
                     };
-                    Ok((frame, engine.find_state(), engine.selection()))
+                    Ok((
+                        frame,
+                        engine.find_state(),
+                        engine.selection(),
+                        engine.selection_origin(),
+                    ))
                 })?
             } else {
-                (None, gmux_client::search::FindState::default(), None)
+                (None, gmux_client::search::FindState::default(), None, None)
             };
             let find_changed = frontend.find.get(&id) != Some(&find);
             let selection_changed = frontend.selections.get(&id) != Some(&selection);
+            let selection_serial = frontend.selection_serials.get(&id).copied().unwrap_or(0);
+            let selection_ack_changed =
+                frontend.sent_selection_serials.get(&id) != Some(&selection_serial);
             if frame.is_none()
                 && !find_changed
                 && !selection_changed
+                && !selection_ack_changed
                 && notify.is_empty()
                 && error.is_none()
                 && copy.is_none()
@@ -755,6 +786,7 @@ impl Daemon {
             }
             frontend.find.insert(id, find.clone());
             frontend.selections.insert(id, selection);
+            frontend.sent_selection_serials.insert(id, selection_serial);
             frontend.metadata.insert(id, meta.clone());
             frontend
                 .sent_scroll_serials
@@ -774,6 +806,9 @@ impl Daemon {
                         error: None,
                         find: None,
                         selection,
+                        selection_serial,
+                        selection_origin,
+                        row_flags: Vec::new(),
                         copy: Some(text),
                     },
                     cells: Vec::new(),
@@ -787,10 +822,17 @@ impl Daemon {
                     frame,
                     scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
                     rows,
+                    row_flags: if row_flags.iter().any(|flags| *flags != 0) {
+                        row_flags
+                    } else {
+                        Vec::new()
+                    },
                     notifications: notify,
                     error,
                     find: find_changed.then_some(find),
                     selection,
+                    selection_serial,
+                    selection_origin,
                     copy,
                 },
                 cells,

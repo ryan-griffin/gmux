@@ -11,6 +11,7 @@ pub mod model;
 pub mod network;
 pub mod remote;
 pub mod search;
+pub mod selection;
 pub mod session;
 pub mod storage;
 pub mod theme;

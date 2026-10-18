@@ -394,6 +394,7 @@ impl Terminal {
                 t.selection.borrow_mut().take();
                 let _ = t.session.borrow().clear_selection();
                 if t.selection_mode.get() != SelectionMode::Cell {
+                    t.update_drag_selection();
                     t.send_drag_selection();
                 }
                 t.area.queue_draw();

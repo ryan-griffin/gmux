@@ -35,7 +35,7 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         with socket.socket(socket.AF_UNIX) as wrong:
             wrong.settimeout(3)
             wrong.connect(a.env["GMUX_SOCKET"] + ".stream")
-            wrong.sendall((json.dumps(dict(method="attach", version=21, daemon=other)) + "\n").encode())
+            wrong.sendall((json.dumps(dict(method="attach", version=22, daemon=other)) + "\n").encode())
             assert wrong.recv(4) == b"", "An attach for another daemon must disconnect"
 
     with scenario("daemon rejects organization and presentation without touching execution"):

@@ -77,7 +77,8 @@ int gmux_engine_theme(GmuxEngine *engine, const uint8_t *background,
 void gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
 int gmux_engine_cursor_style(GmuxEngine *engine, uint8_t style);
 int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch);
-int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCell *cells, size_t cap);
+int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCell *cells, size_t cap, uint8_t *row_flags);
+int gmux_engine_selection_origin(GmuxEngine *engine, uint64_t *origin);
 void gmux_engine_scroll(GmuxEngine *engine, intptr_t delta, bool bottom);
 void gmux_engine_scroll_to(GmuxEngine *engine, uint64_t row);
 bool gmux_engine_expire_render_hold(GmuxEngine *engine);

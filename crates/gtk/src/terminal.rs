@@ -71,6 +71,7 @@ pub struct Terminal {
     session: SessionHandle,
     selection: RefCell<Option<(usize, usize)>>,
     selection_mode: ValueCell<SelectionMode>,
+    selection_preview: RefCell<gmux_client::selection::Preview>,
     drag_origin: ValueCell<(f64, f64)>,
     drag_position: ValueCell<Option<(f64, f64)>>,
     drag_endpoint: ValueCell<Option<(u16, u32)>>,
@@ -230,6 +231,7 @@ impl Terminal {
             session,
             selection: RefCell::new(None),
             selection_mode: ValueCell::new(SelectionMode::Cell),
+            selection_preview: RefCell::new(gmux_client::selection::Preview::default()),
             drag_origin: ValueCell::new((0.0, 0.0)),
             drag_position: ValueCell::new(None),
             drag_endpoint: ValueCell::new(None),
@@ -288,15 +290,18 @@ impl Terminal {
         let Some(end) = self.drag_selection_end() else {
             return;
         };
-        if self.selection_mode.get() == SelectionMode::Cell {
-            let next = Some((start.min(end), start.max(end)));
-            if self.selection.replace(next) != next {
-                self.area.queue_draw();
-            }
+        let next = self.selection_preview.borrow_mut().range(
+            &self.session.borrow().snapshot(),
+            start,
+            end,
+            self.selection_mode.get(),
+        );
+        if self.selection.replace(next) != next {
+            self.area.queue_draw();
+            self.sync_accessible_selection();
         }
-        // Multiple pointer events between frames share one daemon command. The
-        // cell range follows the pointer immediately. Word and line bounds come
-        // from the engine, which also knows about soft wraps outside the viewport.
+        // The highlight follows the pointer immediately. Coalesce daemon commands
+        // to one per frame; the engine resolves any bounds outside the viewport.
         if self.drag_selection_tick.borrow().is_none() {
             let weak = Rc::downgrade(self);
             *self.drag_selection_tick.borrow_mut() =
@@ -331,6 +336,17 @@ impl Terminal {
             return;
         }
         self.drag_endpoint.set(Some(endpoint));
+    }
+    fn sync_accessible_selection(&self) {
+        let session = self.session.borrow();
+        let screen = session.snapshot();
+        let base = screen.frame.scrollback.offset as usize * screen.frame.cols as usize;
+        let selection = self.selection.borrow().and_then(|(a, b)| {
+            let start = a.max(base);
+            let end = b.min(base + screen.cells.len().saturating_sub(1));
+            (start <= end).then_some((start.saturating_sub(base), end.saturating_sub(base)))
+        });
+        self.area.update_text(&screen, selection);
     }
     fn selection_scroll_delta(&self) -> f64 {
         let Some((_, y)) = self.drag_position.get() else {
@@ -453,33 +469,25 @@ impl Terminal {
             self.area.clipboard().set_text(text);
         }
         if update.changed {
-            if self.selection_anchor.get().is_some()
-                && self.selection_mode.get() == SelectionMode::Cell
-            {
+            if self.selection_anchor.get().is_some() {
+                if let Some(origin) = self.session.borrow().selection_origin() {
+                    self.selection_anchor.set(Some(origin as usize));
+                }
                 // The drag owns the displayed selection. Replies may describe
                 // a previous pointer position, including the preceding clear.
                 self.update_drag_selection();
-            } else {
+            } else if !self.session.borrow().selection_pending() {
                 *self.selection.borrow_mut() = self
                     .session
                     .borrow()
                     .selection()
                     .map(|(a, b)| (a as usize, b as usize));
-                if self.selection_anchor.get().is_some() && self.drag_position.get().is_some() {
-                    self.update_drag_selection();
-                }
             }
             self.area.queue_draw();
+            self.sync_accessible_selection();
             let frame = {
                 let session = self.session.borrow();
                 let screen = session.snapshot();
-                let base = screen.frame.scrollback.offset as usize * screen.frame.cols as usize;
-                let selection = self.selection.borrow().and_then(|(a, b)| {
-                    let start = a.max(base);
-                    let end = b.min(base + screen.cells.len().saturating_sub(1));
-                    (start <= end).then_some((start.saturating_sub(base), end.saturating_sub(base)))
-                });
-                self.area.update_text(&screen, selection);
                 self.area
                     .set_scrollback(screen.frame.scrollback, session.scroll_pending());
                 screen.frame

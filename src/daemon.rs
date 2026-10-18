@@ -320,6 +320,8 @@ impl Daemon {
             frontend.sent_scroll_serials.remove(&id);
             frontend.find.remove(&id);
             frontend.selections.remove(&id);
+            frontend.selection_serials.remove(&id);
+            frontend.sent_selection_serials.remove(&id);
         }
         self.state.tabs.retain_mut(|tab| {
             if !tab.layout.contains(id) {
@@ -500,6 +502,7 @@ mod tests {
                 }),
                 selection: None,
                 copy: None,
+                ..Header::default()
             },
             cells: vec![Cell::default(); gmux_client::viewport::MAX_CELLS],
         };
@@ -571,6 +574,7 @@ mod tests {
                     find: None,
                     selection: None,
                     copy: None,
+                    ..Header::default()
                 },
                 cells: vec![cell; 80 * 24],
             }
