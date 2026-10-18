@@ -32,29 +32,106 @@ impl Layout {
         }
     }
     pub fn update_ratios(&mut self, saved: &Self) {
-        if let (
-            Self::Split {
-                vertical,
-                first,
-                second,
-                ratio,
-            },
-            Self::Split {
-                vertical: saved_vertical,
-                first: saved_first,
-                second: saved_second,
-                ratio: saved_ratio,
-            },
-        ) = (self, saved)
-            && vertical == saved_vertical
-            && first.ids() == saved_first.ids()
-            && second.ids() == saved_second.ids()
-        {
+        // For unchanged topology, verify pane identity and grouping once, then
+        // copy ratios without repeatedly collecting every subtree's panes.
+        fn same_panes(layout: &Layout, saved: &Layout) -> bool {
+            match (layout, saved) {
+                (Layout::Pane(id), Layout::Pane(saved_id)) => id == saved_id,
+                (
+                    Layout::Split { first, second, .. },
+                    Layout::Split {
+                        first: saved_first,
+                        second: saved_second,
+                        ..
+                    },
+                ) => same_panes(first, saved_first) && same_panes(second, saved_second),
+                _ => false,
+            }
+        }
+
+        // Record each split's first-branch leaf count in preorder. A branch with
+        // n leaves occupies n - 1 entries, so copying can skip mismatched branches.
+        fn index(layout: &Layout, splits: &mut Vec<usize>) -> usize {
+            match layout {
+                Layout::Pane(_) => 1,
+                Layout::Split { first, second, .. } => {
+                    let split = splits.len();
+                    splits.push(0);
+                    let first_len = index(first, splits);
+                    splits[split] = first_len;
+                    first_len + index(second, splits)
+                }
+            }
+        }
+
+        fn copy(layout: &mut Layout, saved: &Layout, spans: Option<(&[usize], &[usize])>) {
+            let (
+                Layout::Split {
+                    vertical,
+                    first,
+                    second,
+                    ratio,
+                },
+                Layout::Split {
+                    vertical: saved_vertical,
+                    first: saved_first,
+                    second: saved_second,
+                    ratio: saved_ratio,
+                },
+            ) = (layout, saved)
+            else {
+                return;
+            };
+            if vertical != saved_vertical {
+                return;
+            }
+            let (first_spans, second_spans) = if let Some((splits, saved_splits)) = spans {
+                if splits[0] != saved_splits[0] {
+                    return;
+                }
+                let (first, second) = splits[1..].split_at(splits[0] - 1);
+                let (saved_first, saved_second) = saved_splits[1..].split_at(saved_splits[0] - 1);
+                (Some((first, saved_first)), Some((second, saved_second)))
+            } else {
+                (None, None)
+            };
             if saved_ratio.is_finite() {
                 *ratio = saved_ratio.clamp(0.05, 0.95);
             }
-            first.update_ratios(saved_first);
-            second.update_ratios(saved_second);
+            copy(first, saved_first, first_spans);
+            copy(second, saved_second, second_spans);
+        }
+
+        let (
+            Self::Split { vertical, .. },
+            Self::Split {
+                vertical: saved_vertical,
+                ..
+            },
+        ) = (&*self, saved)
+        else {
+            return;
+        };
+        if vertical != saved_vertical {
+            return;
+        }
+        if same_panes(self, saved) {
+            copy(self, saved, None);
+        } else {
+            // Different grouping can still have matching ancestors. Compare the
+            // full leaf order once, then use branch boundaries to check each split.
+            let split_count = {
+                let ids = self.ids();
+                if ids != saved.ids() {
+                    return;
+                }
+                ids.len() - 1
+            };
+            let mut splits = Vec::with_capacity(split_count);
+            let mut saved_splits = Vec::with_capacity(split_count);
+            index(self, &mut splits);
+            index(saved, &mut saved_splits);
+            copy(self, saved, Some((&splits, &saved_splits)));
         }
     }
     pub fn ids(&self) -> Vec<u64> {
@@ -208,6 +285,123 @@ impl WorkspaceCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split(first: Layout, second: Layout, vertical: bool, ratio: f64) -> Layout {
+        Layout::Split {
+            first: Box::new(first),
+            second: Box::new(second),
+            vertical,
+            ratio,
+        }
+    }
+
+    #[test]
+    fn ratio_updates_require_exact_pane_identity_order_and_branch_boundaries() {
+        use Layout::Pane;
+        let current = split(split(Pane(1), Pane(2), true, 0.4), Pane(3), false, 0.3);
+        for saved in [
+            split(split(Pane(1), Pane(9), true, 0.8), Pane(3), false, 0.7),
+            split(split(Pane(2), Pane(1), true, 0.8), Pane(3), false, 0.7),
+            split(Pane(1), split(Pane(2), Pane(3), true, 0.8), false, 0.7),
+            split(split(Pane(1), Pane(2), true, 0.8), Pane(3), true, 0.7),
+            split(split(Pane(1), Pane(2), true, 0.8), Pane(4), false, 0.7),
+        ] {
+            let mut updated = current.clone();
+            updated.update_ratios(&saved);
+            assert_eq!(updated, current, "saved: {saved:?}");
+        }
+    }
+
+    #[test]
+    fn regrouped_children_keep_matching_ancestor_and_sibling_ratios() {
+        use Layout::Pane;
+        let changed = split(
+            split(split(Pane(1), Pane(2), false, 0.5), Pane(3), false, 0.5),
+            Pane(4),
+            false,
+            0.5,
+        );
+        let mut current = split(
+            changed.clone(),
+            split(Pane(5), split(Pane(6), Pane(7), true, 0.5), false, 0.5),
+            true,
+            0.5,
+        );
+        let saved = split(
+            split(
+                Pane(1),
+                split(Pane(2), split(Pane(3), Pane(4), false, 0.8), false, 0.8),
+                false,
+                0.8,
+            ),
+            split(Pane(5), split(Pane(6), Pane(7), true, 0.6), false, 0.7),
+            true,
+            0.9,
+        );
+        current.update_ratios(&saved);
+        assert_eq!(
+            current,
+            split(
+                changed,
+                split(Pane(5), split(Pane(6), Pane(7), true, 0.6), false, 0.7),
+                true,
+                0.9,
+            )
+        );
+    }
+
+    #[test]
+    fn differing_orientation_blocks_descendants_but_not_siblings() {
+        use Layout::Pane;
+        let blocked = split(split(Pane(1), Pane(2), false, 0.4), Pane(3), true, 0.3);
+        let mut current = split(
+            blocked.clone(),
+            split(Pane(4), Pane(5), true, 0.5),
+            false,
+            0.5,
+        );
+        let saved = split(
+            split(split(Pane(1), Pane(2), false, 0.8), Pane(3), false, 0.7),
+            split(Pane(4), Pane(5), true, 0.6),
+            false,
+            0.9,
+        );
+        current.update_ratios(&saved);
+        assert_eq!(
+            current,
+            split(blocked, split(Pane(4), Pane(5), true, 0.6), false, 0.9)
+        );
+    }
+
+    #[test]
+    fn saved_ratios_clamp_finite_values_and_ignore_nonfinite_values() {
+        use Layout::Pane;
+        for (saved_ratio, expected) in [
+            (f64::NAN, 0.3),
+            (f64::INFINITY, 0.3),
+            (f64::NEG_INFINITY, 0.3),
+            (-1.0, 0.05),
+            (0.05, 0.05),
+            (0.4, 0.4),
+            (0.95, 0.95),
+            (2.0, 0.95),
+        ] {
+            let mut current = split(split(Pane(1), Pane(2), true, 0.5), Pane(3), false, 0.3);
+            let saved = split(
+                split(Pane(1), Pane(2), true, 0.8),
+                Pane(3),
+                false,
+                saved_ratio,
+            );
+            current.update_ratios(&saved);
+            assert_eq!(
+                current,
+                split(split(Pane(1), Pane(2), true, 0.8), Pane(3), false, expected),
+                "saved ratio: {saved_ratio}"
+            );
+        }
+    }
+
     #[test]
     fn catalog_validation_keeps_first_valid_ids_and_preserves_definition_order() {
         let definition = |id, name: &str| WorkspaceDefinition {
