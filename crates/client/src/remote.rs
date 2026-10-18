@@ -232,17 +232,22 @@ impl SessionManager {
             let mut reader = BufReader::new(reader);
             loop {
                 let packet = Packet::read(&mut reader)
-                    .and_then(|packet| {
-                        anyhow::ensure!(
-                            incoming::packet_size(&packet) <= incoming::MAX_BYTES,
-                            "Viewport packet exceeds the frontend memory budget"
-                        );
-                        Ok(packet)
-                    })
                     .map_err(|e| format!("Lost connection to the terminal daemon: {e}"));
                 let failed = packet.is_err();
-                if sender.send(packet).is_err() {
-                    break;
+                match sender.send(packet) {
+                    Ok(()) => (),
+                    Err(incoming::SendError::TooLarge) => {
+                        // Admission accounts retained storage once. Keep its
+                        // rejection ordered after packets already in the queue.
+                        if sender
+                            .send(Err("Lost connection to the terminal daemon: Viewport packet exceeds the frontend memory budget".into()))
+                            .is_ok()
+                        {
+                            reader_wake.notify();
+                        }
+                        break;
+                    }
+                    Err(incoming::SendError::Closed) => break,
                 }
                 reader_wake.notify();
                 if failed {
@@ -962,6 +967,74 @@ mod tests {
             sender,
             session,
         )
+    }
+
+    #[test]
+    fn streamed_oversized_packet_disconnects_after_applying_earlier_packets() {
+        use std::{
+            io::Write,
+            time::{Duration, Instant},
+        };
+        let (socket, mut daemon_socket) = UnixStream::pair().unwrap();
+        daemon_socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut manager = SessionManager::from_attached_stream(
+            ipc::Endpoint::local(),
+            ipc::Wake::new().unwrap(),
+            crate::model::DaemonId::generate().unwrap(),
+            socket.into(),
+        )
+        .unwrap();
+        let meta = Metadata {
+            id: 1,
+            title: "original".into(),
+            ..Metadata::default()
+        };
+        manager.install_metadata(std::slice::from_ref(&meta), 1);
+        let session = manager.attach(1, &Theme::adwaita(true)).unwrap();
+        let mut packet = Packet {
+            header: Header {
+                meta,
+                notifications: vec!["earlier notification".into()],
+                ..Header::default()
+            },
+            cells: vec![],
+        };
+        packet.header.meta.title = "before oversized packet".into();
+        let mut bytes = Vec::new();
+        packet.encode_into(&mut bytes).unwrap();
+        // Many empty strings fit on the wire, but their retained vector alone
+        // exceeds the frontend budget after deserialization.
+        packet.header.notifications =
+            vec![String::new(); incoming::MAX_BYTES / std::mem::size_of::<String>() + 1];
+        packet.header.meta.title = "oversized packet".into();
+        packet.encode_into(&mut bytes).unwrap();
+        packet.header.notifications.clear();
+        packet.header.meta.title = "after oversized packet".into();
+        packet.encode_into(&mut bytes).unwrap();
+        drop(packet);
+        daemon_socket.write_all(&bytes).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut notifications = Vec::new();
+        while !manager.disconnected() {
+            for update in manager.poll().into_values() {
+                notifications.extend(update.notifications);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reader did not report oversized packet"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            manager
+                .disconnect_reason()
+                .unwrap()
+                .contains("memory budget")
+        );
+        assert_eq!(session.borrow().meta.title, "before oversized packet");
+        assert_eq!(notifications, ["earlier notification"]);
     }
 
     #[test]
