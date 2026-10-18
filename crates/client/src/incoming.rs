@@ -28,7 +28,7 @@ struct Message {
     item: Result<Packet, String>,
     _permit: Permit,
 }
-pub fn packet_size(packet: &Packet) -> usize {
+fn packet_size(packet: &Packet) -> usize {
     packet.memory_size() + std::mem::size_of::<Message>() - std::mem::size_of::<Packet>()
 }
 #[derive(Clone)]
@@ -40,6 +40,21 @@ pub struct Receiver {
     receiver: mpsc::Receiver<Message>,
     budget: Arc<Budget>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendError {
+    TooLarge,
+    Closed,
+}
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TooLarge => "Incoming packet exceeds memory budget",
+            Self::Closed => "Incoming stream is closed",
+        })
+    }
+}
+impl std::error::Error for SendError {}
 
 pub fn channel(bytes: usize, packets: usize) -> (Sender, Receiver) {
     let (sender, receiver) = mpsc::sync_channel(packets);
@@ -57,20 +72,21 @@ pub fn channel(bytes: usize, packets: usize) -> (Sender, Receiver) {
     )
 }
 impl Sender {
-    pub fn send(&self, item: Result<Packet, String>) -> anyhow::Result<()> {
+    pub fn send(&self, item: Result<Packet, String>) -> Result<(), SendError> {
         let bytes = match &item {
             Ok(packet) => packet_size(packet),
             Err(error) => std::mem::size_of::<Message>() + error.capacity(),
         };
-        anyhow::ensure!(
-            bytes <= self.budget.limit,
-            "Incoming packet exceeds memory budget"
-        );
+        if bytes > self.budget.limit {
+            return Err(SendError::TooLarge);
+        }
         let mut state = self.budget.state.lock().unwrap();
         while !state.closed && state.bytes + bytes > self.budget.limit {
             state = self.budget.ready.wait(state).unwrap();
         }
-        anyhow::ensure!(!state.closed, "Incoming stream is closed");
+        if state.closed {
+            return Err(SendError::Closed);
+        }
         state.bytes += bytes;
         drop(state);
         self.sender
@@ -81,7 +97,7 @@ impl Sender {
                     bytes,
                 },
             })
-            .map_err(|_| anyhow::anyhow!("Incoming stream is closed"))
+            .map_err(|_| SendError::Closed)
     }
 }
 impl Receiver {

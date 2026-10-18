@@ -2,10 +2,11 @@
 use crate::{Cell, Frame};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Read, Write},
+    io::{BufRead, ErrorKind, Write},
     path::PathBuf,
 };
 
+mod memory;
 mod requests;
 pub use requests::{PasteOptions, StreamCommand, StreamRequest};
 
@@ -59,33 +60,6 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn memory_size(&self) -> usize {
-        let header = &self.header;
-        std::mem::size_of::<Self>()
-            + header.state.as_ref().map_or(0, |state| {
-                serde_json::to_vec(state).map_or(MAX_PACKET, |bytes| bytes.len())
-            })
-            + self.cells.capacity() * std::mem::size_of::<Cell>()
-            + header.meta.directory.capacity()
-            + header.meta.title.capacity()
-            + header
-                .git
-                .as_ref()
-                .map_or(0, |git| git.directory.capacity() + git.branch.capacity())
-            + header.rows.capacity() * std::mem::size_of::<u16>()
-            + header.notifications.capacity() * std::mem::size_of::<String>()
-            + header
-                .notifications
-                .iter()
-                .map(String::capacity)
-                .sum::<usize>()
-            + header.error.as_ref().map_or(0, String::capacity)
-            + header.copy.as_ref().map_or(0, String::capacity)
-            + header.find.as_ref().map_or(0, |find| {
-                find.highlights.capacity() * std::mem::size_of::<(usize, usize, u8)>()
-            })
-    }
-
     pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
         let start = bytes.len();
         // Serialize into the reusable output buffer, then fill the lengths.
@@ -113,7 +87,8 @@ impl Packet {
         result
     }
 
-    pub fn read(reader: &mut impl Read) -> anyhow::Result<Self> {
+    /// Decode one packet, leaving any following packet in the reader's buffer.
+    pub fn read(reader: &mut impl BufRead) -> anyhow::Result<Self> {
         let mut size = [0; 4];
         reader.read_exact(&mut size)?;
         let size = u32::from_le_bytes(size) as usize;
@@ -121,12 +96,15 @@ impl Packet {
             (4..=MAX_PACKET).contains(&size),
             "Invalid viewport packet size"
         );
-        let mut bytes = vec![0; size];
-        reader.read_exact(&mut bytes)?;
-        let header_size = u32::from_le_bytes(bytes[..4].try_into()?) as usize;
+        let mut header_size = [0; 4];
+        reader.read_exact(&mut header_size)?;
+        let header_size = u32::from_le_bytes(header_size) as usize;
         anyhow::ensure!(header_size <= size - 4, "Invalid viewport header size");
-        let header: Header = serde_json::from_slice(&bytes[4..4 + header_size])?;
-        let data = &bytes[4 + header_size..];
+        let header = {
+            let mut bytes = vec![0; header_size];
+            reader.read_exact(&mut bytes)?;
+            serde_json::from_slice::<Header>(&bytes)?
+        };
         let expected = if let Some(frame) = header.frame {
             let cols = frame.cols as usize;
             let rows = frame.rows as usize;
@@ -146,21 +124,45 @@ impl Packet {
             0
         };
         anyhow::ensure!(
-            data.len() == expected * CELL_BYTES,
+            size - 4 - header_size == expected * CELL_BYTES,
             "Invalid viewport cell data"
         );
-        let cells = data
-            .as_chunks::<CELL_BYTES>()
-            .0
-            .iter()
-            .map(|bytes| Cell {
-                text: bytes[..64].try_into().unwrap(),
-                fg: bytes[64..67].try_into().unwrap(),
-                bg: bytes[67..70].try_into().unwrap(),
-                flags: bytes[70],
-            })
-            .collect();
+        let mut cells = Vec::with_capacity(expected);
+        while cells.len() < expected {
+            let bytes = match reader.fill_buf() {
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            let count = (bytes.len() / CELL_BYTES).min(expected - cells.len());
+            if count == 0 {
+                // A cell can straddle buffered reads. read_exact also handles
+                // short reads, interrupted reads, and EOF within this cell.
+                let mut bytes = [0; CELL_BYTES];
+                reader.read_exact(&mut bytes)?;
+                cells.push(decode_cell(&bytes));
+            } else {
+                // Decode from the caller's buffer without copying the payload
+                // into another allocation or consuming the following packet.
+                cells.extend(
+                    bytes[..count * CELL_BYTES]
+                        .as_chunks::<CELL_BYTES>()
+                        .0
+                        .iter()
+                        .map(decode_cell),
+                );
+                reader.consume(count * CELL_BYTES);
+            }
+        }
         Ok(Self { header, cells })
+    }
+}
+
+fn decode_cell(bytes: &[u8; CELL_BYTES]) -> Cell {
+    Cell {
+        text: bytes[..64].try_into().unwrap(),
+        fg: bytes[64..67].try_into().unwrap(),
+        bg: bytes[67..70].try_into().unwrap(),
+        flags: bytes[70],
     }
 }
 
@@ -179,6 +181,7 @@ pub fn command(writer: &mut impl Write, request: &impl Serialize) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, BufReader, Read};
     fn packet() -> Packet {
         let mut cell = Cell::default();
         cell.text[..5].copy_from_slice("界é".as_bytes());
@@ -247,7 +250,7 @@ mod tests {
         oversized.cells.reserve_exact(4096);
         let mut encoded = Vec::new();
         oversized.encode_into(&mut encoded).unwrap();
-        let size = crate::incoming::packet_size(&oversized);
+        let size = oversized.memory_size();
         assert!(size > encoded.len());
         let (sender, receiver) = crate::incoming::channel(size - 1, 8);
         assert!(
@@ -265,17 +268,135 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(Ok(packet)) if packet.header.scroll_serial == 42));
     }
     #[test]
-    fn malformed_packets_are_rejected_before_applying_rows() {
+    fn malformed_headers_and_payload_lengths_are_rejected() {
         let mut packet = packet();
-        packet.header.rows = vec![3];
         let mut encoded = Vec::new();
-        packet.encode_into(&mut encoded).unwrap();
-        assert!(Packet::read(&mut &encoded[..]).is_err());
-        packet.header.rows = vec![1, 1];
+        for rows in [vec![3], vec![1, 1], vec![2, 1], vec![0, 1, 2, 3]] {
+            packet.cells.resize(rows.len() * 2, Cell::default());
+            packet.header.rows = rows;
+            encoded.clear();
+            packet.encode_into(&mut encoded).unwrap();
+            assert!(Packet::read(&mut encoded.as_slice()).is_err());
+        }
+        // Keep the payload valid so only the grid limits can reject these frames.
+        packet.header.rows.clear();
+        packet.cells.clear();
+        for (cols, rows) in [(0, 3), (2, 0), (1001, 3), (2, 1001), (512, 257)] {
+            let frame = packet.header.frame.as_mut().unwrap();
+            frame.cols = cols;
+            frame.rows = rows;
+            encoded.clear();
+            packet.encode_into(&mut encoded).unwrap();
+            assert!(Packet::read(&mut encoded.as_slice()).is_err());
+        }
+        packet = self::packet();
+        packet.header.frame = None;
+        packet.cells.clear();
         encoded.clear();
         packet.encode_into(&mut encoded).unwrap();
-        assert!(Packet::read(&mut &encoded[..]).is_err());
-        assert!(Packet::read(&mut &u32::MAX.to_le_bytes()[..]).is_err());
+        assert!(Packet::read(&mut encoded.as_slice()).is_err());
+
+        for size in [0, 3, MAX_PACKET as u32 + 1, u32::MAX] {
+            let mut bytes = size.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&encoded);
+            let mut reader = io::Cursor::new(bytes);
+            assert!(Packet::read(&mut reader).is_err());
+            assert_eq!(reader.position(), 4, "read beyond an invalid packet size");
+        }
+        // A claimed header that exceeds the packet must fail before reading it.
+        let mut bytes = vec![4, 0, 0, 0, 1, 0, 0, 0];
+        bytes.extend_from_slice(&encoded);
+        let mut reader = io::Cursor::new(bytes);
+        assert!(Packet::read(&mut reader).is_err());
+        assert_eq!(reader.position(), 8, "read beyond an invalid header size");
+
+        packet = self::packet();
+        encoded.clear();
+        packet.encode_into(&mut encoded).unwrap();
+        let size = u32::from_le_bytes(encoded[..4].try_into().unwrap());
+        for claimed_size in [size - 1, size + 1, size - CELL_BYTES as u32] {
+            encoded[..4].copy_from_slice(&claimed_size.to_le_bytes());
+            assert!(Packet::read(&mut encoded.as_slice()).is_err());
+        }
+        encoded[..4].copy_from_slice(&size.to_le_bytes());
+        encoded[8] = b'!';
+        assert!(Packet::read(&mut encoded.as_slice()).is_err());
+    }
+
+    struct Fragmented<'a> {
+        bytes: &'a [u8],
+        chunk: usize,
+        reads: usize,
+    }
+    impl Read for Fragmented<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads.is_multiple_of(5) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let len = out.len().min(self.chunk);
+            self.bytes.read(&mut out[..len])
+        }
+    }
+
+    #[test]
+    fn fragmented_and_interrupted_reads_preserve_cells_and_following_packets() {
+        let mut packet = packet();
+        packet.header.frame.as_mut().unwrap().cols = 73;
+        packet.header.rows = vec![0, 2];
+        packet.cells = (0..146)
+            .map(|i| {
+                let mut cell = Cell::default();
+                cell.text[..8].copy_from_slice("界ée\u{301}".as_bytes());
+                cell.fg = [i, 2, 3];
+                cell.bg = [4, i, 6];
+                cell.flags = i;
+                cell
+            })
+            .collect();
+        let mut encoded = Vec::new();
+        packet.encode_into(&mut encoded).unwrap();
+        // Put an empty delta between two payloads to catch packet overconsumption.
+        let unchanged = Packet {
+            header: Header::default(),
+            cells: vec![],
+        };
+        unchanged.encode_into(&mut encoded).unwrap();
+        packet.encode_into(&mut encoded).unwrap();
+        for (capacity, chunk) in [(1, 1), (70, 13), (71, 71), (72, 137), (8192, 8192)] {
+            let mut reader = BufReader::with_capacity(
+                capacity,
+                Fragmented {
+                    bytes: &encoded,
+                    chunk,
+                    reads: 0,
+                },
+            );
+            for index in 0..3 {
+                let decoded = Packet::read(&mut reader).unwrap();
+                if index == 1 {
+                    assert!(decoded.cells.is_empty());
+                    assert!(decoded.header.frame.is_none());
+                } else {
+                    assert!(decoded.cells == packet.cells);
+                    assert_eq!(decoded.header.rows, packet.header.rows);
+                    assert_eq!(decoded.header.meta, packet.header.meta);
+                }
+            }
+            let mut trailing = Vec::new();
+            reader.read_to_end(&mut trailing).unwrap();
+            assert!(trailing.is_empty());
+        }
+    }
+
+    #[test]
+    fn truncated_packets_fail_at_every_header_and_cell_boundary() {
+        let mut encoded = Vec::new();
+        packet().encode_into(&mut encoded).unwrap();
+        for len in 0..encoded.len() {
+            let mut reader = BufReader::with_capacity(71, &encoded[..len]);
+            assert!(Packet::read(&mut reader).is_err(), "accepted {len} bytes");
+        }
     }
     #[test]
     fn failed_encoding_preserves_previously_queued_packets() {
