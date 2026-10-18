@@ -782,6 +782,11 @@ static int track_selection_point(GmuxEngine *e, GhosttyTrackedGridRef *ref, Ghos
         ghostty_terminal_grid_ref_track(e->terminal, point, ref);
 }
 
+static void clear_selection_bounds(GmuxEngine *e) {
+    ghostty_tracked_grid_ref_free(e->selection_start); e->selection_start=NULL;
+    ghostty_tracked_grid_ref_free(e->selection_end); e->selection_end=NULL;
+}
+
 static GhosttyPoint selection_point(uint64_t index, uint16_t cols) {
     return (GhosttyPoint){.tag=GHOSTTY_POINT_TAG_SCREEN,
         .value.coordinate={(uint16_t)(index % cols), (uint32_t)(index / cols)}};
@@ -850,11 +855,16 @@ int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uin
     uint64_t endpoint = (uint64_t)ey * cols + ex;
     SelectionBounds a, b;
     int result = selection_unit(e, origin, endpoint, cols, mode, &a);
-    if (result == GHOSTTY_NO_VALUE) return 0;
-    if (result) return -1;
-    cache->anchor = a; cache->valid |= 1;
-    result = selection_unit(e, endpoint, origin, cols, mode, &b);
-    if (result == GHOSTTY_NO_VALUE) return 0;
+    if (!result) {
+        cache->anchor = a; cache->valid |= 1;
+        result = selection_unit(e, endpoint, origin, cols, mode, &b);
+    }
+    if (result == GHOSTTY_NO_VALUE) {
+        // No word remains between the pointer and the tracked click. Clear the
+        // visible range while retaining the click for the next drag movement.
+        clear_selection_bounds(e);
+        return 0;
+    }
     if (result) return -1;
     cache->current = b; cache->valid |= 2;
     start = selection_point(a.start < b.start ? a.start : b.start, cols);
@@ -864,8 +874,7 @@ int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uin
 }
 void gmux_engine_clear_selection(GmuxEngine *e) {
     e->selection_cache.valid = 0;
-    ghostty_tracked_grid_ref_free(e->selection_start); e->selection_start=NULL;
-    ghostty_tracked_grid_ref_free(e->selection_end); e->selection_end=NULL;
+    clear_selection_bounds(e);
     ghostty_tracked_grid_ref_free(e->selection_anchor); e->selection_anchor=NULL;
 }
 int gmux_engine_selection(GmuxEngine *e, uint64_t *start, uint64_t *end) {

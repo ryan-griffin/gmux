@@ -1294,6 +1294,18 @@ mod tests {
         assert_eq!(engine.copy().unwrap(), "middle");
         engine.select((6, 0), (15, 1), SelectionMode::Word).unwrap();
         assert_eq!(engine.copy().unwrap(), "middle two\nnext");
+        engine.clear_selection();
+        engine.select((15, 0), (1, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "one middle two");
+        engine
+            .select((15, 0), (15, 0), SelectionMode::Word)
+            .unwrap();
+        assert_eq!(engine.selection(), None);
+        assert_eq!(engine.copy().unwrap(), "");
+        // An empty range must retain the tracked click for the next movement.
+        assert_eq!(engine.selection_origin(), Some(15));
+        engine.select((15, 0), (1, 1), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "next");
     }
 
     #[test]
