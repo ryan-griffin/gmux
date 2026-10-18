@@ -8,9 +8,9 @@ use std::{
 
 mod memory;
 mod requests;
-pub use requests::{PasteOptions, StreamCommand, StreamRequest};
+pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 20;
+pub const VERSION: u32 = 21;
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 16 * 1024 * 1024;

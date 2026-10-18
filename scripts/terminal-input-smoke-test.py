@@ -175,6 +175,84 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             selected = wait_for(full_row_selection)
             assert (selected.start_offset, selected.end_offset) == (0, cols), (selected.start_offset, selected.end_offset, cols)
             assert "\n" not in Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset)
+
+            # Real clicks cover GTK recognition, grouped dragging, and Copy ordering.
+            rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[Hone café_界é two\\n  line two\\n'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one café_界é two"))
+            ch = rpc("renderer-info", pane=pane)["viewport"]["cell_height"]
+
+            def move_cell(col, row):
+                native.move(left + cw * (col + .5), top + ch * (row + .5))
+
+            def repeat_click(col, row, count, hold=False):
+                # End the preceding GTK click sequence before starting another.
+                time.sleep(.5)
+                move_cell(col, row)
+                for index in range(count):
+                    native.button(True)
+                    time.sleep(.025)
+                    if hold and index == count - 1:
+                        return
+                    native.button(False)
+                    time.sleep(.025)
+
+            def copied(expected):
+                rpc("action", name="copy")
+                wait_for(lambda: native.clipboard_text() == expected,
+                         message=f"Selection must copy {expected!r}")
+
+            repeat_click(10, 0, 2)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 11],
+                     message="Double-click must select the complete word")
+            copied("café_界é")
+            selected = wait_for(lambda: Atspi.Text.get_selection(text_iface, 0)
+                                if Atspi.Text.get_n_selections(text_iface) else None)
+            assert Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset) == "café_界é"
+            repeat_click(5, 1, 3, hold=True)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [cols, 2 * cols - 1],
+                     message="Triple-click must select the complete line")
+            move_cell(3, 0)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 2 * cols - 1])
+            native.button(False)
+            copied("one café_界é two\n  line two")
+            repeat_click(5, 1, 1)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
+
+            # Mouse-reporting applications keep repeat clicks unless Shift is held.
+            mouse_probe = temp / "mouse.py"
+            mouse_result = temp / "mouse-events"
+            mouse_probe.write_text("""import os, sys, termios, tty
+old = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, b'\\x1b[3J\\x1b[2J\\x1b[Hone two\\r\\n\\x1b[?1000h\\x1b[?1006h\\x1b]2;SELECTION_MOUSE_READY\\x07')
+    with open(sys.argv[1], 'wb', buffering=0) as events:
+        while True:
+            data = os.read(0, 128)
+            if b'q' in data:
+                break
+            events.write(data)
+finally:
+    os.write(1, b'\\x1b[?1000l\\x1b[?1006l')
+    termios.tcsetattr(0, termios.TCSANOW, old)
+""")
+            rpc("send", pane=pane,
+                text=f"python3 {shlex.quote(str(mouse_probe))} {shlex.quote(str(mouse_result))}",
+                paste=True, enter=True)
+            wait_for(lambda: any(p["id"] == pane and p["title"] == "SELECTION_MOUSE_READY"
+                                 for t in rpc("list")["tabs"] for p in t["panes"]))
+            repeat_click(1, 0, 3)
+            wait_for(lambda: mouse_result.read_bytes().count(b"\x1b[<0;") == 6)
+            assert rpc("renderer-info", pane=pane)["viewport"]["selection"] is None
+            reported = mouse_result.read_bytes()
+            native.key(Gdk.KEY_Shift_L, True)
+            repeat_click(1, 0, 2)
+            copied("one")
+            native.key(Gdk.KEY_Shift_L, False)
+            assert mouse_result.read_bytes() == reported
+            rpc("send", pane=pane, text="q")
+            wait_for(lambda: "GMUX_INPUT>" in Atspi.Text.get_text(text_iface, 0, -1))
+
             rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[H界éX\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("界éX"))
             for offset in (1, 2, 1):
@@ -448,7 +526,8 @@ finally:
             print("PASS: native Wayland keyboard input, Kitty modifier presses/releases with both sides and Caps Lock, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
-                  "wide-glyph geometry, stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
+                  "wide-glyph geometry, double/triple-click selection, line dragging, and Shift selection in mouse-reporting applications, "
+                  "stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
                   "fast edge drags during overscroll without viewport bouncing, "
                   "edge and release cancellation, "
                   "selection across scrollback, Ctrl+Shift+C, and large Unicode clipboard paste with XWayland disabled")

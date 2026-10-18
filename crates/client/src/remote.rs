@@ -694,8 +694,13 @@ impl RemoteSession {
     pub fn find_state(&self) -> &crate::search::FindState {
         &self.find
     }
-    pub fn select(&self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
-        self.command(StreamCommand::Select { start, end })
+    pub fn select(
+        &self,
+        start: (u16, u32),
+        end: (u16, u32),
+        mode: crate::transport::SelectionMode,
+    ) -> anyhow::Result<()> {
+        self.command(StreamCommand::Select { start, end, mode })
     }
     pub fn copy(&self) -> anyhow::Result<()> {
         self.command(StreamCommand::Copy)

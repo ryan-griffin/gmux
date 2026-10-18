@@ -64,7 +64,8 @@ int gmux_checkpoint_history(const uint8_t *data, size_t len, GmuxWriterFn write,
 int gmux_engine_history_size(GmuxEngine *engine, uint16_t *cols, size_t *rows);
 int gmux_engine_history_row(GmuxEngine *engine, uint32_t row, GmuxCell *cells,
     size_t cols, bool *wrapped);
-int gmux_engine_select(GmuxEngine *engine, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey);
+// mode: 0 = cells, 1 = words, 2 = logical lines. Clear to begin a new gesture.
+int gmux_engine_select(GmuxEngine *engine, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey, uint8_t mode);
 void gmux_engine_clear_selection(GmuxEngine *engine);
 // Clear primary screen/history at the next VT ground boundary. Reject alternate
 // screens so full-screen applications retain their cursor and display state.
