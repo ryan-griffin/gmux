@@ -135,6 +135,58 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
 
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
+with AppFixture(prefix="gmux-sync-views-") as fixture:
+    fixture.start(cargo_binary("gmux"), "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for(lambda: fixture.rpc("status"))
+    pane = fixture.rpc("_command", command=dict(method="new", directory=str(root)))["result"]["pane"]
+    first, second = Client(fixture, pane), Client(fixture, pane)
+    control = fixture.path / "sync-control"
+    worker = fixture.path / "sync-worker.py"
+    control.write_text("wait")
+    worker.write_text(r'''
+import os, pathlib, sys, time
+control = pathlib.Path(sys.argv[1])
+os.write(1, b"\x1b[2J\x1b[3J\x1b[Hone\r\ntwo\r\nthree\r\nfour\r\nfive")
+while control.read_text() != "hold": time.sleep(0.005)
+os.write(1, b"\x1b[?2026h\r\x1b[2Kpartial\x1b]2;SYNC_HELD\x07")
+while control.read_text() != "release": time.sleep(0.005)
+os.write(1, b"\r\x1b[2Kcomplete\x1b[?2026l")
+while control.read_text() != "quit": time.sleep(0.005)
+''')
+    try:
+        with scenario("tab switches preserve view state and resubscribe safely during synchronized output"):
+            for client in (first, second):
+                client.send("resize", cols=20, rows=3)
+            wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [20, 3])
+            command = "python3 " + shlex.quote(str(worker)) + " " + shlex.quote(str(control)) + "\n"
+            second.send("input", bytes=list(command.encode()))
+            first.output("five")
+            second.output("five")
+            first.send("scroll-to", row=0, serial=100)
+            first.until(lambda h: h["meta"]["id"] == pane and h["scroll_serial"] == 100)
+            first.send("select", start=[0, 0], end=[2, 0])
+            first.send("find", query="one")
+            first.until(lambda h: h["find"] and h["find"]["total"] == 1 and not h["find"]["pending"])
+            first.send("subscribe", panes=[])
+            first.barrier(101)
+            control.write_text("hold")
+            wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["title"] == "SYNC_HELD")
+            first.send("subscribe", panes=[pane])
+            held = first.until(lambda h: h["meta"]["id"] == pane and h["frame"])
+            assert "partial" not in first.text() and "five" in first.text(), first.text()
+            assert held["selection"] is not None
+            control.write_text("release")
+            second.output("complete")
+            first.until(lambda h: h["meta"]["id"] == pane and h["frame"]
+                        and h["frame"]["scrollback"]["offset"] == 0 and "one" in first.text())
+            first.send("copy")
+            copied = first.until(lambda h: h["copy"] is not None)
+            assert copied["copy"] == "one", copied
+    finally:
+        control.write_text("quit")
+        first.close()
+        second.close()
+
 with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-client-ownership.log").open("w") as log:
     fixture.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
     wait_for(lambda: fixture.rpc("status"))

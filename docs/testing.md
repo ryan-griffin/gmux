@@ -72,3 +72,28 @@ Logs, screenshots, and renderer reports go under the Git-ignored `artifacts/`
 directory. The runner stops at the first failure. Its default deadlines are
 1200 seconds per Cargo command and 300 seconds per smoke suite; change them with
 `--build-timeout` and `--smoke-timeout`.
+
+## Synchronized-output cache benchmark
+
+The native benchmark replays a 160 × 48 colored Unicode terminal with visible
+and previously visited hidden views. It checks complete frames during holds and
+updated frames after release. Build both revisions with the same compiler flags
+and Ghostty library:
+
+```sh
+ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
+mkdir -p artifacts
+cc -O2 -std=c11 -I"$ghostty_prefix/include" \
+  scripts/sync-output-benchmark.c src/ghostty_bridge.c \
+  -L"$ghostty_prefix/lib" -Wl,-rpath,"$ghostty_prefix/lib" \
+  -Wl,--wrap=ghostty_render_state_new -lghostty-vt -o artifacts/sync-output-benchmark
+artifacts/sync-output-benchmark 2 24 2000 0
+artifacts/sync-output-benchmark 2 24 2000 1
+```
+
+Arguments select visible views, hidden views, iterations, and allocation counting.
+Use counting off for process CPU measurements with the production allocator.
+Counting on substitutes a render-state allocator and reports allocation calls,
+requested bytes, and live bytes after warmup. These counts exclude terminal,
+Rust, transport, and GTK allocations. This benchmark measures the native engine;
+it does not measure complete daemon or desktop frame latency.
