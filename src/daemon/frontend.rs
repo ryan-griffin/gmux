@@ -536,8 +536,10 @@ impl Daemon {
                         .any(crate::engine::EngineView::find_pending))
         })
     }
-    pub(super) fn updates(&mut self, metadata_due: bool) {
+    /// Return whether viewport or search work used the frame interval.
+    pub(super) fn updates(&mut self, metadata_due: bool) -> bool {
         let before = self.frontends.len();
+        let mut frame_activity = false;
         let mut ids: Vec<_> = self.frontends.keys().copied().collect();
         ids.sort_by_key(|id| (!self.frontends[id].focused, *id));
         // Every client receives the same execution revision. Serialize each transport snapshot once per broadcast.
@@ -561,10 +563,12 @@ impl Daemon {
                 }
                 self.update_frontend(&mut frontend, metadata_due, &mut notifications)
             })();
-            if let Err(error) = result {
-                eprintln!("Detaching frontend: {error}");
-            } else {
-                self.frontends.insert(id, frontend);
+            match result {
+                Ok(active) => {
+                    frame_activity |= active;
+                    self.frontends.insert(id, frontend);
+                }
+                Err(error) => eprintln!("Detaching frontend: {error}"),
             }
         }
         if !self.frontends.values().any(|f| f.attached) {
@@ -577,6 +581,7 @@ impl Daemon {
             // Keep handoff changes pending even if survivors were already sent a frame.
             self.resize_sessions(None);
         }
+        frame_activity
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -613,7 +618,8 @@ impl Daemon {
         frontend: &mut Frontend,
         metadata_due: bool,
         notifications: &mut HashMap<u64, NotificationQueue>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        let mut frame_activity = false;
         if let Some(git) = &self.git
             && frontend.git_revision != Some(git.revision())
         {
@@ -689,9 +695,14 @@ impl Daemon {
                     view.invalidate();
                 }
                 session.with_view(view, |engine| -> anyhow::Result<_> {
+                    // Search scans bounded batches even when its visible state
+                    // is unchanged. Keep those batches paced instead of spinning.
+                    frame_activity |= engine.find_pending();
                     engine.poll_find();
                     if screen {
-                        engine.snapshot()?;
+                        // Repeated output can dirty and extract rows without
+                        // changing their final cells. Coalesce that work too.
+                        frame_activity |= engine.snapshot()?;
                     }
                     let frame = if screen {
                         let frame = engine.frame;
@@ -746,6 +757,7 @@ impl Daemon {
             frontend
                 .sent_scroll_serials
                 .insert(id, frontend.scroll_serials.get(&id).copied().unwrap_or(0));
+            let viewport_changed = screen && (frame.is_some() || find_changed || selection_changed);
             // Large selections should not share the size limit of a full viewport.
             if let Some(text) = copy.take() {
                 frontend.queue(Packet {
@@ -781,10 +793,11 @@ impl Daemon {
                 },
                 cells,
             })?;
+            frame_activity |= viewport_changed;
         }
         frontend.changed.clear();
         frontend.flush()?;
-        Ok(())
+        Ok(frame_activity)
     }
 }
 

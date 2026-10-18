@@ -42,7 +42,10 @@ The daemon reads nonblocking PTYs in one `poll` loop, with a 512 KiB read budget
 per ready pane and an 8 MiB pending-input limit per pane. An idle detached daemon
 blocks in `poll`. Signals, sockets, and disk-worker completions wake it.
 Attached views receive viewport batches at most every 16 ms and process metadata
-once a second. Hidden panes keep parsing output without extracting viewports.
+once a second. Dirty viewport extraction, visible presentation changes, and
+incremental history-search batches restart the frame interval. Metadata packets
+and passes without that work do not postpone the next visible response. Hidden
+panes keep parsing output without extracting viewports.
 
 GTK owns rendering, fonts, the clipboard, and accessible text. An `eventfd` wakes
 the frontend when packets or requests arrive. Both sides process bounded batches
