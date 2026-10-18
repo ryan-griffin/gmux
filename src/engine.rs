@@ -86,6 +86,7 @@ pub struct Engine {
     events: Box<Events>,
     pub frame: Frame,
     pub cells: Vec<Cell>,
+    held_cells: Vec<Cell>,
     size: (u16, u16),
     find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
@@ -95,11 +96,13 @@ pub struct Engine {
 pub(crate) struct EngineView {
     raw: NonNull<GmuxView>,
     held_frame: Frame,
-    held_cells: Vec<Cell>,
     find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
 }
 impl EngineView {
+    pub(crate) fn set_active(&mut self, active: bool) {
+        unsafe { gmux_engine_view_set_active(self.raw.as_ptr(), active) }
+    }
     pub(crate) fn set_theme(&mut self, theme: &Theme) {
         unsafe {
             gmux_engine_view_theme(
@@ -153,7 +156,6 @@ impl Engine {
             find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
             held_frame: Frame::default(),
-            held_cells: Vec::new(),
         })
     }
     pub(crate) fn with_view<T>(
@@ -165,13 +167,15 @@ impl Engine {
         self.swap_view(view);
         let held = self.mode(2026);
         if held {
-            view.held_cells.resize(self.cells.len(), Cell::default());
-            std::mem::swap(&mut self.cells, &mut view.held_cells);
+            // Every held snapshot extracts all rows, so one scratch buffer
+            // serves every view while preserving the normal incremental cells.
+            self.held_cells.resize(self.cells.len(), Cell::default());
+            std::mem::swap(&mut self.cells, &mut self.held_cells);
             std::mem::swap(&mut self.frame, &mut view.held_frame);
         }
         let result = f(self);
         if held {
-            std::mem::swap(&mut self.cells, &mut view.held_cells);
+            std::mem::swap(&mut self.cells, &mut self.held_cells);
             std::mem::swap(&mut self.frame, &mut view.held_frame);
         }
         self.swap_view(view);
@@ -276,6 +280,7 @@ impl Engine {
             size: (80, 24),
             find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
+            held_cells: Vec::new(),
         };
         engine.set_theme(&Theme::adwaita(true))?;
         engine.set_cursor_style(CursorStyle::default())?;
@@ -717,6 +722,99 @@ mod tests {
         });
         engine.with_view(&mut first, |engine| {
             assert_eq!(engine.text().unwrap(), earlier)
+        });
+        // An empty hold fills the shared scratch buffer with a scrolled view.
+        // The normal incremental buffer must retain its own unchanged rows.
+        let complete = engine.text().unwrap();
+        engine.write(b"\x1b[?2026h");
+        engine.with_view(&mut first, |engine| {
+            assert_eq!(engine.text().unwrap(), earlier)
+        });
+        engine.write(b"\x1b[?2026l");
+        assert_eq!(engine.text().unwrap(), complete);
+    }
+
+    #[test]
+    fn reused_hold_caches_refresh_rows_consumed_by_other_views() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(30, 3, 0, 0).unwrap();
+        let mut first = engine.new_view().unwrap();
+        let mut second = engine.new_view().unwrap();
+        for frame in 0..4 {
+            let complete = format!("complete {frame}");
+            // The shared cache consumes the changed row before both held
+            // caches. All views have the same appearance and viewport.
+            engine.write(format!("\r\x1b[2K{complete}").as_bytes());
+            assert_eq!(engine.text().unwrap(), complete);
+            engine.write(b"\x1b[?2026h\r\x1b[2Kpartial");
+            for index in 0..4 {
+                let view = if index % 2 == 0 {
+                    &mut first
+                } else {
+                    &mut second
+                };
+                engine.with_view(view, |engine| assert_eq!(engine.text().unwrap(), complete));
+            }
+            engine.write(b" frame\x1b[?2026l");
+            engine.with_view(&mut second, |engine| {
+                assert_eq!(engine.text().unwrap(), "partial frame")
+            });
+        }
+        // Reuse also follows a changed grid size after resize ends a hold.
+        engine.write(b"\x1b[?2026h\r\x1b[2Kresized");
+        engine.resize(40, 4, 0, 0).unwrap();
+        engine.write(b"\x1b[?2026h\r\x1b[2Kunfinished");
+        for view in [&mut first, &mut second] {
+            engine.with_view(view, |engine| {
+                assert_eq!(engine.text().unwrap(), "resized");
+                assert_eq!((engine.frame.cols, engine.frame.rows), (40, 4));
+            });
+        }
+    }
+
+    #[test]
+    fn inactive_views_keep_scroll_selection_search_and_theme_when_reactivated_during_a_hold() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(20, 3, 0, 0).unwrap();
+        engine.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut view = engine.new_view().unwrap();
+        let light = Theme::adwaita(false);
+        view.set_theme(&light);
+        engine.with_view(&mut view, |engine| {
+            engine.scroll_to(0);
+            engine.select((0, 0), (2, 0)).unwrap();
+            engine.find("one");
+        });
+        engine.write(b"\x1b[?2026h");
+        engine.with_view(&mut view, |engine| {
+            assert_eq!(engine.text().unwrap(), "one\ntwo\nthree")
+        });
+        view.set_active(false);
+        engine.write(b"\x1b[?2026l");
+        for _ in 0..3 {
+            engine.write(b"\x1b[?2026h\r\x1b[2Kcomplete\x1b[?2026l");
+        }
+        engine.write(b"\x1b[?2026h\r\x1b[2Kpartial");
+        view.set_active(true);
+        let mut new_view = engine.new_view().unwrap();
+        let complete = engine.with_view(&mut new_view, |engine| engine.text().unwrap());
+        engine.with_view(&mut view, |engine| {
+            // As for a new subscription, use the complete base frozen frame
+            // until release; never read the already modified live terminal.
+            assert_eq!(engine.text().unwrap(), complete);
+            assert!(!complete.contains("partial"));
+            assert_eq!(engine.copy().unwrap(), "one");
+        });
+        engine.write(b"\x1b[?2026l");
+        engine.with_view(&mut view, |engine| {
+            assert_eq!(engine.text().unwrap(), "one\ntwo\nthree");
+            assert_eq!(engine.frame.scrollback.offset, 0);
+            assert_eq!(engine.frame.background, light.background);
+            assert_eq!(engine.copy().unwrap(), "one");
+            while engine.find_pending() {
+                engine.poll_find();
+            }
+            assert_eq!(engine.find_state().total, 1);
         });
     }
 
@@ -1373,13 +1471,20 @@ mod tests {
     #[test]
     fn abandoned_synchronized_output_expires_without_more_pty_output() {
         let mut engine = Engine::new().unwrap();
+        let mut first = engine.new_view().unwrap();
+        let mut second = engine.new_view().unwrap();
         engine.write(b"before\x1b[?2026h\r\x1b[2Kafter");
-        assert_eq!(engine.text().unwrap(), "before");
+        for view in [&mut first, &mut second] {
+            engine.with_view(view, |engine| assert_eq!(engine.text().unwrap(), "before"));
+        }
         assert!(!engine.expire_render_hold());
         std::thread::sleep(std::time::Duration::from_millis(1050));
         assert!(engine.expire_render_hold());
         assert!(!engine.mode(2026));
         assert_eq!(engine.text().unwrap(), "after");
+        for view in [&mut first, &mut second] {
+            engine.with_view(view, |engine| assert_eq!(engine.text().unwrap(), "after"));
+        }
     }
 
     #[test]
@@ -1615,24 +1720,32 @@ mod tests {
         let dark = Theme::adwaita(true);
         let light = Theme::adwaita(false);
         second.set_theme(&light);
-        e.write(b"OLD");
-        e.write(b"\x1b[?2026h\rNEW");
-        for (view, theme) in [(&mut first, dark), (&mut second, light)] {
-            e.with_view(view, |e| {
-                e.snapshot().unwrap();
-                assert_eq!(e.frame.background, theme.background);
-                assert_eq!(e.cells[0].fg, theme.foreground);
-                assert_eq!(e.cells[0].text(), "O");
-            });
-        }
-        e.write(b"\x1b[?2026l");
-        for (view, theme) in [(&mut first, dark), (&mut second, light)] {
-            e.with_view(view, |e| {
-                e.snapshot().unwrap();
-                assert_eq!(e.frame.background, theme.background);
-                assert_eq!(e.cells[0].fg, theme.foreground);
-                assert_eq!(e.cells[0].text(), "N");
-            });
+        for (sequence, foreground) in [
+            (b"".as_slice(), None),
+            (b"\x1b]10;#abcdef\x07".as_slice(), Some([0xab, 0xcd, 0xef])),
+            (b"\x1b]110\x07".as_slice(), None),
+        ] {
+            e.write(sequence);
+            for _ in 0..2 {
+                e.write(b"\rOLD\x1b[?2026h\rNEW");
+                for (view, theme) in [(&mut first, &dark), (&mut second, &light)] {
+                    e.with_view(view, |e| {
+                        e.snapshot().unwrap();
+                        assert_eq!(e.frame.background, theme.background);
+                        assert_eq!(e.cells[0].fg, foreground.unwrap_or(theme.foreground));
+                        assert_eq!(e.cells[0].text(), "O");
+                    });
+                }
+                e.write(b"\x1b[?2026l");
+                for (view, theme) in [(&mut first, &dark), (&mut second, &light)] {
+                    e.with_view(view, |e| {
+                        e.snapshot().unwrap();
+                        assert_eq!(e.frame.background, theme.background);
+                        assert_eq!(e.cells[0].fg, foreground.unwrap_or(theme.foreground));
+                        assert_eq!(e.cells[0].text(), "N");
+                    });
+                }
+            }
         }
     }
 

@@ -305,6 +305,9 @@ impl Daemon {
                 }
             }
             frontend.screens.retain(|id, _| panes.contains(id));
+            for (id, view) in &mut frontend.views {
+                view.set_active(panes.contains(id));
+            }
             frontend.visible = panes;
             self.resize_sessions(Some((frontend_id, frontend)));
             return Ok(());
@@ -426,7 +429,9 @@ impl Daemon {
         }
         let session = self.sessions.get_mut(&id).unwrap();
         if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
-            entry.insert(session.new_view()?);
+            let mut view = session.new_view()?;
+            view.set_active(frontend.visible.contains(&id));
+            entry.insert(view);
         }
         let view = frontend.views.get_mut(&id).unwrap();
         let appearance_changed = matches!(
@@ -675,7 +680,9 @@ impl Daemon {
             let mut cells = Vec::new();
             let (frame, find, selection) = if screen || frontend.views.contains_key(&id) {
                 if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
-                    entry.insert(session.new_view()?);
+                    let mut view = session.new_view()?;
+                    view.set_active(frontend.visible.contains(&id));
+                    entry.insert(view);
                 }
                 let view = frontend.views.get_mut(&id).unwrap();
                 if terminal_changed {

@@ -43,6 +43,7 @@ struct GmuxView {
     GhosttyTrackedGridRef viewport, selection_start, selection_end;
     bool held_used;
     bool captured;
+    bool active;
     Appearance appearance;
 };
 
@@ -89,7 +90,15 @@ GmuxView *gmux_engine_view_new(GmuxEngine *e) {
     if (!v) return NULL;
     v->owner=e; v->next=e->views; e->views=v;
     v->appearance=e->appearance;
+    v->active=true;
     return v;
+}
+void gmux_engine_view_set_active(GmuxView *v, bool active) {
+    v->active=active;
+    if (!active) {
+        ghostty_render_state_free(v->render); v->render=NULL;
+        v->captured=false;
+    }
 }
 void gmux_engine_view_free(GmuxView *v) {
     if (!v) return;
@@ -155,18 +164,24 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         if (ghostty_render_state_update(e->render, terminal)) return;
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
         for (GmuxView *v=e->views; v; v=v->next) {
+            if (!v->active) continue;
             gmux_engine_view_enter(e, v);
-            // A fresh held cache must read all rows, independently of the
-            // dirty flags already consumed by the normal render state.
-            GhosttyRenderState frozen=NULL;
             v->captured=false;
-            if (!ghostty_render_state_new(NULL, &frozen)) {
-                if (!ghostty_render_state_update(frozen, terminal)) {
-                    ghostty_render_state_free(v->render); v->render=frozen;
-                    v->captured=true;
-                } else ghostty_render_state_free(frozen);
+            if (!v->render) ghostty_render_state_new(NULL, &v->render);
+            // Reapplying the current default dirties Ghostty's terminal
+            // palette without changing OSC overrides. DIRTY_FULL on a render
+            // cache only controls extraction; other caches consumed the rows.
+            GhosttyColorRgb foreground;
+            memcpy(&foreground, e->applied.foreground, 3);
+            if (!e->appearance_error && v->render &&
+                !ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground) &&
+                !ghostty_render_state_update(v->render, terminal) &&
+                !ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &v->scrollbar)) {
+                v->captured=true;
+            } else {
+                // An unsuccessful update may leave an incomplete cache.
+                ghostty_render_state_free(v->render); v->render=NULL;
             }
-            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &v->scrollbar);
             gmux_engine_view_leave(e, v);
         }
         e->hold_started_ms = now_ms();

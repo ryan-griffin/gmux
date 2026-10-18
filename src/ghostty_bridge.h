@@ -38,6 +38,9 @@ typedef struct GmuxView GmuxView;
 // Per-frontend rendering, scroll anchors, and selections over one terminal.
 GmuxView *gmux_engine_view_new(GmuxEngine *engine);
 void gmux_engine_view_free(GmuxView *view);
+// Inactive subscribers retain presentation state without a frozen render cache.
+// Call outside view_enter/view_leave, while the view owns its render cache.
+void gmux_engine_view_set_active(GmuxView *view, bool active);
 void gmux_engine_view_enter(GmuxEngine *engine, GmuxView *view);
 void gmux_engine_view_leave(GmuxEngine *engine, GmuxView *view);
 void gmux_engine_view_theme(GmuxView *view, const uint8_t *background,
