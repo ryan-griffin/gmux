@@ -65,6 +65,16 @@ pub struct PasteOptions {
     pub bottom: bool,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum SelectionMode {
+    #[default]
+    Cell,
+    Word,
+    Line,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum StreamCommand {
@@ -98,6 +108,8 @@ pub enum StreamCommand {
     Select {
         start: (u16, u32),
         end: (u16, u32),
+        #[serde(default)]
+        mode: SelectionMode,
     },
     ClearSelection,
     ClearScreen,

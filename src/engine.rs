@@ -1,4 +1,4 @@
-use gmux_client::{model::CursorStyle, theme::Theme};
+use gmux_client::{model::CursorStyle, theme::Theme, transport::SelectionMode};
 use std::{
     ffi::{CString, c_void},
     ptr::NonNull,
@@ -392,9 +392,22 @@ impl Engine {
             }
         }
     }
-    pub fn select(&mut self, start: (u16, u32), end: (u16, u32)) -> anyhow::Result<()> {
-        let result =
-            unsafe { gmux_engine_select(self.raw.as_ptr(), start.0, start.1, end.0, end.1) };
+    pub fn select(
+        &mut self,
+        start: (u16, u32),
+        end: (u16, u32),
+        mode: SelectionMode,
+    ) -> anyhow::Result<()> {
+        let result = unsafe {
+            gmux_engine_select(
+                self.raw.as_ptr(),
+                start.0,
+                start.1,
+                end.0,
+                end.1,
+                mode as u8,
+            )
+        };
         anyhow::ensure!(result == 0, "Selection is outside terminal history");
         Ok(())
     }
@@ -551,7 +564,7 @@ mod tests {
         engine.scroll_to(0);
         engine.snapshot().unwrap();
         assert!(engine.frame.scrollback.total > 3);
-        engine.select((0, 0), (2, 0)).unwrap();
+        engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
         engine.find("old");
         while engine.find_pending() {
             engine.poll_find();
@@ -616,7 +629,7 @@ mod tests {
         for view in [&mut first, &mut second] {
             engine.with_view(view, |engine| {
                 engine.scroll_to(0);
-                engine.select((0, 0), (2, 0)).unwrap();
+                engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
                 engine.snapshot().unwrap();
             });
         }
@@ -652,7 +665,7 @@ mod tests {
         let mut second = engine.new_view().unwrap();
         engine.with_view(&mut first, |engine| {
             engine.scroll_to(0);
-            engine.select((0, 0), (2, 0)).unwrap();
+            engine.select((1, 0), (1, 0), SelectionMode::Word).unwrap();
             engine.find("one");
             while engine.find_pending() {
                 engine.poll_find();
@@ -664,6 +677,8 @@ mod tests {
             assert!(engine.text().unwrap().contains("five"));
             assert!(engine.selection().is_none());
             assert_eq!(engine.find_state().total, 0);
+            engine.select((1, 1), (1, 1), SelectionMode::Line).unwrap();
+            assert_eq!(engine.copy().unwrap(), "two");
         });
         engine.write(b"\r\nsix");
         first.invalidate();
@@ -683,7 +698,14 @@ mod tests {
         });
         engine.resize(20, 4, 8, 16).unwrap();
         engine.with_view(&mut first, |engine| {
-            assert_eq!(engine.copy().unwrap(), "one")
+            assert_eq!(engine.copy().unwrap(), "one");
+            engine.select((1, 0), (2, 2), SelectionMode::Word).unwrap();
+            assert_eq!(engine.copy().unwrap(), "one\ntwo\nthree");
+        });
+        engine.with_view(&mut second, |engine| {
+            assert_eq!(engine.copy().unwrap(), "two");
+            engine.select((1, 1), (1, 0), SelectionMode::Line).unwrap();
+            assert_eq!(engine.copy().unwrap(), "one\ntwo");
         });
         // Tracked view references can be freed after their terminal disappears.
         drop(engine);
@@ -870,7 +892,11 @@ mod tests {
             fresh.resize(cols, 3, 0, 0).unwrap();
             assert_eq!(rendered_history(&mut fresh), expected, "{cols} columns");
             fresh
-                .select((0, 0), (cols - 1, fresh.frame.scrollback.total as u32 - 1))
+                .select(
+                    (0, 0),
+                    (cols - 1, fresh.frame.scrollback.total as u32 - 1),
+                    SelectionMode::Cell,
+                )
                 .unwrap();
             assert!(
                 fresh
@@ -942,7 +968,11 @@ mod tests {
             fresh.resize(cols, 3, 0, 0).unwrap();
             fresh.snapshot().unwrap();
             fresh
-                .select((0, 0), (cols - 1, fresh.frame.scrollback.total as u32 - 1))
+                .select(
+                    (0, 0),
+                    (cols - 1, fresh.frame.scrollback.total as u32 - 1),
+                    SelectionMode::Cell,
+                )
                 .unwrap();
             assert_eq!(
                 fresh.copy().unwrap(),
@@ -1082,7 +1112,9 @@ mod tests {
             assert_eq!(fresh.find_state().total, 1);
             fresh.snapshot().unwrap();
             let total = fresh.frame.scrollback.total;
-            fresh.select((0, 0), (cols - 1, total as u32 - 1)).unwrap();
+            fresh
+                .select((0, 0), (cols - 1, total as u32 - 1), SelectionMode::Cell)
+                .unwrap();
             let text = fresh.copy().unwrap();
             assert!(text.contains(line), "{text:?}");
             assert!(text.contains("second hard line\nthird\nfourth"), "{text:?}");
@@ -1160,6 +1192,55 @@ mod tests {
         }
     }
     #[test]
+    fn word_drag_reversal_keeps_the_starting_word_and_skips_unwritten_cells() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(16, 4, 8, 16).unwrap();
+        engine.write(b"one middle two\r\nnext\r\n");
+        engine.select((6, 0), (12, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "middle two");
+        engine.select((6, 0), (1, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "one middle");
+        engine.select((6, 0), (6, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "middle");
+        engine.select((6, 0), (15, 1), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "middle two\nnext");
+    }
+
+    #[test]
+    fn line_selection_includes_blank_rows_and_margins() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(16, 4, 8, 16).unwrap();
+        engine.write(b"one\r\n  next  \r\n\r\n");
+        engine.select((5, 1), (3, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((16, 47)));
+        engine.clear_selection();
+        engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((32, 47)));
+    }
+
+    #[test]
+    fn unit_selection_crosses_wraps_and_keeps_the_click_anchor_through_reflow() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(8, 5, 8, 16).unwrap();
+        engine.write(b"  wrapped_word end\r\nlast");
+        engine.select((0, 1), (0, 1), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "wrapped_word");
+        // The old click coordinates now point to "last" on a different line.
+        engine.resize(20, 5, 8, 16).unwrap();
+        engine.select((0, 1), (16, 0), SelectionMode::Word).unwrap();
+        assert_eq!(engine.copy().unwrap(), "wrapped_word end");
+        engine.clear_selection();
+        engine.resize(8, 5, 8, 16).unwrap();
+        engine.select((2, 1), (2, 1), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((0, 23)));
+        assert_eq!(engine.copy().unwrap(), "  wrapped_word end");
+        engine.clear_screen().unwrap();
+        engine.write(b"                      ");
+        engine.select((2, 1), (2, 1), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((0, 23)));
+    }
+
+    #[test]
     fn history_find_preserves_unicode_matching_and_selection_across_scrolling() {
         let mut engine = Engine::new().unwrap();
         engine.resize(30, 3, 8, 16).unwrap();
@@ -1191,7 +1272,7 @@ mod tests {
         assert!(engine.frame.scrollback.offset > 0);
         engine.find_advance(false);
         assert!(engine.text().unwrap().starts_with("needle"));
-        engine.select((0, 0), (7, 1)).unwrap();
+        engine.select((0, 0), (7, 1), SelectionMode::Cell).unwrap();
         let copied = engine.copy().unwrap();
         assert!(copied.starts_with("needle É"));
         assert!(copied.contains("line-000"));
@@ -1200,7 +1281,9 @@ mod tests {
         assert_eq!(engine.copy().unwrap(), copied);
         engine.clear_selection();
         assert_eq!(engine.copy().unwrap(), "");
-        engine.select((11, 201), (0, 0)).unwrap();
+        engine
+            .select((11, 201), (0, 0), SelectionMode::Cell)
+            .unwrap();
         let copied = engine.copy().unwrap();
         assert!(copied.starts_with("needle É"));
         assert!(copied.ends_with("another line"));

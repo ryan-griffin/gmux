@@ -5,7 +5,7 @@ use crate::{
     terminal_canvas::TerminalCanvas,
     theme::Theme,
 };
-use gmux_client::Frame;
+use gmux_client::{Frame, transport::SelectionMode};
 use gmux_client::{remote::SessionHandle, session::SessionUpdate};
 use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
 use std::{
@@ -70,6 +70,7 @@ pub struct Terminal {
     paste_action: gio::SimpleAction,
     session: SessionHandle,
     selection: RefCell<Option<(usize, usize)>>,
+    selection_mode: ValueCell<SelectionMode>,
     drag_origin: ValueCell<(f64, f64)>,
     drag_position: ValueCell<Option<(f64, f64)>>,
     drag_endpoint: ValueCell<Option<(u16, u32)>>,
@@ -228,6 +229,7 @@ impl Terminal {
             paste_action,
             session,
             selection: RefCell::new(None),
+            selection_mode: ValueCell::new(SelectionMode::Cell),
             drag_origin: ValueCell::new((0.0, 0.0)),
             drag_position: ValueCell::new(None),
             drag_endpoint: ValueCell::new(None),
@@ -273,7 +275,9 @@ impl Terminal {
         terminal
     }
     fn drag_selection_end(&self) -> Option<usize> {
-        let (x, y) = self.drag_position.get()?;
+        let (x, y) = self.drag_position.get().or_else(|| {
+            (self.selection_mode.get() != SelectionMode::Cell).then(|| self.drag_origin.get())
+        })?;
         let frame = self.session.borrow().snapshot().frame;
         Some(frame.scrollback.offset as usize * frame.cols as usize + self.cell_at(x, y))
     }
@@ -284,13 +288,15 @@ impl Terminal {
         let Some(end) = self.drag_selection_end() else {
             return;
         };
-        let next = Some((start.min(end), start.max(end)));
-        if self.selection.replace(next) != next {
-            self.area.queue_draw();
+        if self.selection_mode.get() == SelectionMode::Cell {
+            let next = Some((start.min(end), start.max(end)));
+            if self.selection.replace(next) != next {
+                self.area.queue_draw();
+            }
         }
         // Multiple pointer events between frames share one daemon command. The
-        // visible range follows the current pointer immediately, without waiting
-        // for older daemon selection replies to arrive.
+        // cell range follows the pointer immediately. Word and line bounds come
+        // from the engine, which also knows about soft wraps outside the viewport.
         if self.drag_selection_tick.borrow().is_none() {
             let weak = Rc::downgrade(self);
             *self.drag_selection_tick.borrow_mut() =
@@ -316,8 +322,11 @@ impl Terminal {
         if self.drag_endpoint.get() == Some(endpoint) {
             return;
         }
-        if let Err(error) = session.select(((start % cols) as u16, (start / cols) as u32), endpoint)
-        {
+        if let Err(error) = session.select(
+            ((start % cols) as u16, (start / cols) as u32),
+            endpoint,
+            self.selection_mode.get(),
+        ) {
             self.show_status(&error.to_string());
             return;
         }
@@ -444,7 +453,9 @@ impl Terminal {
             self.area.clipboard().set_text(text);
         }
         if update.changed {
-            if self.selection_anchor.get().is_some() {
+            if self.selection_anchor.get().is_some()
+                && self.selection_mode.get() == SelectionMode::Cell
+            {
                 // The drag owns the displayed selection. Replies may describe
                 // a previous pointer position, including the preceding clear.
                 self.update_drag_selection();
@@ -454,6 +465,9 @@ impl Terminal {
                     .borrow()
                     .selection()
                     .map(|(a, b)| (a as usize, b as usize));
+                if self.selection_anchor.get().is_some() && self.drag_position.get().is_some() {
+                    self.update_drag_selection();
+                }
             }
             self.area.queue_draw();
             let frame = {
@@ -606,6 +620,7 @@ impl Terminal {
             "selection": *self.selection.borrow(),
             "selection_drag": self.drag_position.get().map(|position| serde_json::json!({
                 "anchor": self.selection_anchor.get(), "position": position,
+                "mode": self.selection_mode.get(),
             })),
             "scrollbar": {
                 "visible": scrollbar.is_mapped(),

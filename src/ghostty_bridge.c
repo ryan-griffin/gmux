@@ -26,7 +26,7 @@ struct GmuxEngine {
     void *userdata;
     bool dark;
     bool held;
-    GhosttyTrackedGridRef selection_start, selection_end;
+    GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
     uint64_t hold_started_ms;
     GmuxView *views;
     bool view_held;
@@ -40,7 +40,7 @@ struct GmuxView {
     GmuxView *next;
     GhosttyRenderState render;
     GhosttyTerminalScrollbar scrollbar;
-    GhosttyTrackedGridRef viewport, selection_start, selection_end;
+    GhosttyTrackedGridRef viewport, selection_start, selection_end, selection_anchor;
     bool held_used;
     bool captured;
     bool active;
@@ -82,6 +82,7 @@ static void swap_view(GmuxEngine *e, GmuxView *v) {
 #define SWAP(field, type) do { type tmp=e->field; e->field=v->field; v->field=tmp; } while (0)
     SWAP(selection_start, GhosttyTrackedGridRef);
     SWAP(selection_end, GhosttyTrackedGridRef);
+    SWAP(selection_anchor, GhosttyTrackedGridRef);
 #undef SWAP
 }
 
@@ -110,6 +111,7 @@ void gmux_engine_view_free(GmuxView *v) {
     ghostty_tracked_grid_ref_free(v->viewport);
     ghostty_tracked_grid_ref_free(v->selection_start);
     ghostty_tracked_grid_ref_free(v->selection_end);
+    ghostty_tracked_grid_ref_free(v->selection_anchor);
     ghostty_render_state_free(v->render);
     free(v);
 }
@@ -236,6 +238,7 @@ void gmux_engine_free(GmuxEngine *e) {
     for (GmuxView *v=e->views; v; v=v->next) v->owner=NULL;
     ghostty_tracked_grid_ref_free(e->selection_start);
     ghostty_tracked_grid_ref_free(e->selection_end);
+    ghostty_tracked_grid_ref_free(e->selection_anchor);
     ghostty_key_event_free(e->key);
     ghostty_mouse_event_free(e->mouse);
     ghostty_mouse_encoder_free(e->mouse_encoder);
@@ -499,6 +502,7 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
         ghostty_tracked_grid_ref_free(v->viewport); v->viewport = NULL;
         ghostty_tracked_grid_ref_free(v->selection_start); v->selection_start = NULL;
         ghostty_tracked_grid_ref_free(v->selection_end); v->selection_end = NULL;
+        ghostty_tracked_grid_ref_free(v->selection_anchor); v->selection_anchor = NULL;
     }
     gmux_engine_scroll(e, 0, true);
     return 0;
@@ -748,16 +752,70 @@ int gmux_engine_history_row(GmuxEngine *e, uint32_t y, GmuxCell *out, size_t col
     }
     return 0;
 }
-int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey) {
+static int track_selection_point(GmuxEngine *e, GhosttyTrackedGridRef *ref, GhosttyPoint point) {
+    return *ref ? ghostty_tracked_grid_ref_set(*ref, e->terminal, point) :
+        ghostty_terminal_grid_ref_track(e->terminal, point, ref);
+}
+
+int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey, uint8_t mode) {
     GhosttyPoint start = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={sx,sy}};
     GhosttyPoint end = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={ex,ey}};
-    if (!e->selection_start && ghostty_terminal_grid_ref_track(e->terminal, start, &e->selection_start)) return -1;
-    if (!e->selection_end && ghostty_terminal_grid_ref_track(e->terminal, end, &e->selection_end)) return -1;
-    return ghostty_tracked_grid_ref_set(e->selection_end, e->terminal, end);
+    if (mode == 0) {
+        if (!e->selection_start && track_selection_point(e, &e->selection_start, start)) return -1;
+        return track_selection_point(e, &e->selection_end, end);
+    }
+    if (mode > 2) return -1;
+    // Keep the original click separate from the expanded bounds so reversing a
+    // word/line drag retains the whole starting unit, even after reflow.
+    if (!e->selection_anchor && track_selection_point(e, &e->selection_anchor, start)) return -1;
+    GhosttyGridRef anchor = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef current = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    if (ghostty_tracked_grid_ref_snapshot(e->selection_anchor, &anchor) ||
+        ghostty_tracked_grid_ref_point(e->selection_anchor, GHOSTTY_POINT_TAG_SCREEN, &start.value.coordinate) ||
+        ghostty_terminal_grid_ref(e->terminal, end, &current)) return -1;
+    bool reverse = start.value.coordinate.y > ey || (start.value.coordinate.y == ey && start.value.coordinate.x > ex);
+    GhosttySelection a = GHOSTTY_INIT_SIZED(GhosttySelection);
+    GhosttySelection b = GHOSTTY_INIT_SIZED(GhosttySelection);
+    GhosttyResult ra, rb;
+    if (mode == 1) {
+        GhosttyTerminalSelectWordBetweenOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
+        options.start = anchor; options.end = current;
+        ra = ghostty_terminal_select_word_between(e->terminal, &options, &a);
+        options.start = current; options.end = anchor;
+        rb = ghostty_terminal_select_word_between(e->terminal, &options, &b);
+    } else {
+        GhosttyTerminalSelectLineOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+        // A non-null, empty trim set keeps lines containing only written spaces.
+        const uint32_t no_trim = 0;
+        options.whitespace = &no_trim;
+        options.ref = anchor;
+        ra = ghostty_terminal_select_line(e->terminal, &options, &a);
+        options.ref = current;
+        rb = ghostty_terminal_select_line(e->terminal, &options, &b);
+        // Blank lines have no text bounds, but are still selectable rows.
+        if (ra == GHOSTTY_NO_VALUE) { a.start = a.end = anchor; ra = GHOSTTY_SUCCESS; }
+        if (rb == GHOSTTY_NO_VALUE) { b.start = b.end = current; rb = GHOSTTY_SUCCESS; }
+    }
+    if (ra == GHOSTTY_NO_VALUE || rb == GHOSTTY_NO_VALUE) return 0;
+    if (ra || rb) return -1;
+    if (ghostty_terminal_point_from_grid_ref(e->terminal, reverse ? &a.end : &a.start,
+            GHOSTTY_POINT_TAG_SCREEN, &start.value.coordinate) ||
+        ghostty_terminal_point_from_grid_ref(e->terminal, reverse ? &b.start : &b.end,
+            GHOSTTY_POINT_TAG_SCREEN, &end.value.coordinate)) return -1;
+    if (mode == 2) {
+        uint16_t cols = 0;
+        if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols) || !cols) return -1;
+        // Include indentation and the unused cells through the right margin.
+        start.value.coordinate.x = reverse ? cols - 1 : 0;
+        end.value.coordinate.x = reverse ? 0 : cols - 1;
+    }
+    if (track_selection_point(e, &e->selection_start, start)) return -1;
+    return track_selection_point(e, &e->selection_end, end);
 }
 void gmux_engine_clear_selection(GmuxEngine *e) {
     ghostty_tracked_grid_ref_free(e->selection_start); e->selection_start=NULL;
     ghostty_tracked_grid_ref_free(e->selection_end); e->selection_end=NULL;
+    ghostty_tracked_grid_ref_free(e->selection_anchor); e->selection_anchor=NULL;
 }
 int gmux_engine_selection(GmuxEngine *e, uint64_t *start, uint64_t *end) {
     if (!e->selection_start || !e->selection_end) return -1;

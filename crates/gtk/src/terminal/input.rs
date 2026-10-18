@@ -357,10 +357,10 @@ impl Terminal {
         self.area.add_controller(motion);
     }
     pub(super) fn install_selection(self: &Rc<Self>) {
-        let drag = gtk::GestureDrag::new();
-        drag.set_button(1);
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
         let weak = Rc::downgrade(self);
-        drag.connect_drag_begin(move |gesture, x, y| {
+        click.connect_pressed(move |gesture, presses, x, y| {
             if let Some(t) = weak.upgrade() {
                 t.stop_selection_drag();
                 if t.context_menu.is_visible()
@@ -382,23 +382,32 @@ impl Terminal {
                 adjustment.emit_by_name::<()>("value-changed", &[]);
                 t.area.grab_focus();
                 t.drag_origin.set((x, y));
+                t.selection_mode.set(match (presses - 1) % 3 {
+                    1 => SelectionMode::Word,
+                    2 => SelectionMode::Line,
+                    _ => SelectionMode::Cell,
+                });
                 let offset = t.session.borrow().snapshot().frame.scrollback.offset as usize;
                 let cols = t.session.borrow().snapshot().frame.cols as usize;
                 t.selection_anchor
                     .set(Some(offset * cols + t.cell_at(x, y)));
                 t.selection.borrow_mut().take();
                 let _ = t.session.borrow().clear_selection();
+                if t.selection_mode.get() != SelectionMode::Cell {
+                    t.send_drag_selection();
+                }
                 t.area.queue_draw();
             }
         });
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(1);
         let weak = Rc::downgrade(self);
         drag.connect_drag_update(move |_, x, y| {
             if let Some(t) = weak.upgrade()
                 && t.selection_anchor.get().is_some()
             {
                 let (ox, oy) = t.drag_origin.get();
-                // GestureDrag begins on press. Wait for intentional movement,
-                // using GTK's configured threshold rather than selecting a click.
+                // Use GTK's configured threshold to wait for intentional movement.
                 if t.drag_position.get().is_none()
                     && !t.area.drag_check_threshold(
                         ox.round() as i32,
@@ -434,7 +443,9 @@ impl Terminal {
                 t.stop_selection_drag();
             }
         });
-        self.area.add_controller(drag);
+        self.area.add_controller(click.clone());
+        self.area.add_controller(drag.clone());
+        click.group_with(&drag);
         let weak = Rc::downgrade(self);
         self.area.connect_unmap(move |_| {
             if let Some(t) = weak.upgrade() {

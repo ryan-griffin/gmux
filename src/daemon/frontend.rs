@@ -501,7 +501,9 @@ impl Daemon {
                     }
                     StreamCommand::Find { query } => engine.find(&query),
                     StreamCommand::FindAdvance { previous } => engine.find_advance(previous),
-                    StreamCommand::Select { start, end } => engine.select(start, end)?,
+                    StreamCommand::Select { start, end, mode } => {
+                        engine.select(start, end, mode)?
+                    }
                     StreamCommand::ClearSelection => engine.clear_selection(),
                     StreamCommand::Scroll { delta, bottom } => engine.scroll(delta, bottom),
                     StreamCommand::ScrollTo { row, serial } => {
