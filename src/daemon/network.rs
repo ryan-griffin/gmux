@@ -38,15 +38,25 @@ pub struct Server {
     pub address: SocketAddr,
 }
 pub struct PreparedServer {
-    listener: TcpListener,
+    listener: Listener,
     stop: ipc::Wake,
     token: Option<String>,
     address: SocketAddr,
 }
+
+struct Listener(TcpListener);
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // Forked shell children can retain a close-on-exec descriptor until exec.
+        // Shut down the shared socket so replacement can bind immediately.
+        unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+}
+
 impl Server {
     pub fn prepare(address: SocketAddr, token: Option<String>) -> anyhow::Result<PreparedServer> {
         let listener = bind(address)?;
-        let address = listener.local_addr()?;
+        let address = listener.0.local_addr()?;
         let stop = ipc::Wake::new()?;
         Ok(PreparedServer {
             listener,
@@ -110,13 +120,13 @@ impl PreparedServer {
         }
     }
 }
-fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
-    let listener = TcpListener::bind(address)?;
-    listener.set_nonblocking(true)?;
+fn bind(address: SocketAddr) -> std::io::Result<Listener> {
+    let listener = Listener(TcpListener::bind(address)?);
+    listener.0.set_nonblocking(true)?;
     Ok(listener)
 }
 fn accept(
-    listener: TcpListener,
+    listener: Listener,
     stopping: ipc::Wake,
     clients: Arc<Clients>,
     control: PathBuf,
@@ -125,7 +135,7 @@ fn accept(
     std::thread::spawn(move || {
         let mut fds = [
             libc::pollfd {
-                fd: listener.as_raw_fd(),
+                fd: listener.0.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -146,7 +156,7 @@ fn accept(
                 }
                 break;
             }
-            let Ok((stream, _)) = listener.accept() else {
+            let Ok((stream, _)) = listener.0.accept() else {
                 continue;
             };
             let deadline = Instant::now() + TIMEOUT;
@@ -247,6 +257,7 @@ fn serve(
             }
         }
         Channel::Stream => {
+            gmux_client::network::configure_liveness(&stream)?;
             reader.get_mut().deadline = Some(Instant::now() + TIMEOUT);
             let value = read_json(&mut reader, MAX_REQUEST)?;
             let mut request: transport::StreamRequest = serde_json::from_value(value)?;
@@ -456,6 +467,27 @@ fn bridge_with_drain_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discarded_and_paused_listeners_release_addresses_with_inherited_descriptors() {
+        let daemon = DaemonId::generate().unwrap();
+        for running in [false, true] {
+            let prepared = Server::prepare("127.0.0.1:0".parse().unwrap(), None).unwrap();
+            let address = prepared.address;
+            // A duplicate keeps the same socket alive, as a child does after fork.
+            let inherited = prepared.listener.0.try_clone().unwrap();
+            if running {
+                let mut server = prepared.start(PathBuf::from("unused-control.sock"), daemon);
+                server.pause();
+            } else {
+                drop(prepared);
+            }
+            let replacement =
+                TcpListener::bind(address).expect("Inherited listener retained the port");
+            drop(inherited);
+            drop(replacement);
+        }
+    }
 
     #[test]
     fn trickling_unauthenticated_handshakes_release_the_connection_at_the_deadline() {

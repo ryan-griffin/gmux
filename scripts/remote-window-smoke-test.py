@@ -152,6 +152,47 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
     wait_for(lambda: any(t["connection"] == "renamed" and t["workspace"] == workspace for t in receiver.rpc("list")["tabs"]))
     command(receiver, "send", "printf '%s%s\\n' REMOTE_ONLY_ INPUT", "--pane", original["pane"], "--enter", "--connection", "renamed")
     wait_for(lambda: "REMOTE_ONLY_INPUT" in server.rpc("read", pane=original["pane"])["text"].splitlines())
+    with scenario("heartbeats detect a stopped daemon while its host keeps acknowledging TCP"):
+        def resources(pid):
+            fields = Path(f"/proc/{pid}/stat").read_text().split()
+            return dict(cpu_ticks=sum(map(int, fields[13:15])), rss_pages=int(fields[23]),
+                        threads=len(list(Path(f"/proc/{pid}/task").iterdir())))
+
+        time.sleep(.5)
+        snapshots = server.rpc("status")["snapshots"]
+        before_idle = dict(client=resources(app.pid), daemon=resources(server_process.pid))
+        time.sleep(11)
+        after_idle = dict(client=resources(app.pid), daemon=resources(server_process.pid))
+        assert server.rpc("status")["snapshots"] == snapshots, "Heartbeats extracted terminal viewports"
+        (artifacts / "heartbeat-idle.json").write_text(json.dumps(dict(
+            seconds=11, clock_ticks_per_second=os.sysconf("SC_CLK_TCK"),
+            before=before_idle, after=after_idle,
+            cpu_ticks={name: after_idle[name]["cpu_ticks"] - before_idle[name]["cpu_ticks"] for name in before_idle},
+        ), indent=2) + "\n")
+        marker = server.path / "heartbeat-job-pid"
+        command(receiver, "send", "sleep 120 & echo $! > " + shlex.quote(str(marker)),
+                "--pane", original["pane"], "--enter", "--connection", "renamed")
+        wait_for(lambda: marker.is_file())
+        job = int(marker.read_text())
+        started = time.monotonic()
+        os.kill(server_process.pid, signal.SIGSTOP)
+        try:
+            wait_for(lambda: any(t["connection"] == "renamed" and not t["connected"]
+                                 for t in receiver.rpc("list")["tabs"]), timeout=40,
+                     message="A daemon stopped on a responsive host remained connected")
+            elapsed = time.monotonic() - started
+            # The timeout starts at the last reply, up to one probe interval
+            # before SIGSTOP, rather than when the daemon was stopped.
+            assert 20 <= elapsed < 40, elapsed
+            assert any(t["connection"] == "other" and t["connected"] for t in receiver.rpc("list")["tabs"])
+            os.kill(job, 0)
+            (artifacts / "heartbeat-stall.json").write_text(json.dumps(dict(detection_seconds=elapsed), indent=2) + "\n")
+        finally:
+            os.kill(server_process.pid, signal.SIGCONT)
+        wait_for(lambda: any(t["connection"] == "renamed" and t["connected"]
+                             for t in receiver.rpc("list")["tabs"]), timeout=20)
+        os.kill(job, 0)
+        command(receiver, "send", f"kill {job}", "--pane", original["pane"], "--enter", "--connection", "renamed")
     os.kill(server_process.pid,signal.SIGSTOP)
     try:
         before=time.monotonic()
@@ -652,17 +693,18 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         remote_access["enabled"] = False
         b.rpc("connection-edit", connection="local", remote_access=remote_access)
         wait_for(lambda: not tab(identities[1], added["tab"])["connected"])
-        remote_access.update(enabled=True, listen_address=addresses[1])
-        b.rpc("connection-edit", connection="local", remote_access=remote_access)
-        # Control is reachable again, but this window still needs an explicit reconnect.
         for args in (("new",), ("split", "--pane", str(added["pane"]))):
             result = subprocess.run([str(cli), "--connection", "server", *args], env=a.env,
                                     text=True, capture_output=True, timeout=10)
-            assert result.returncode != 0 and "Reconnect in Manage Connections" in result.stderr, result
+            assert result.returncode != 0 and "Wait for reconnection" in result.stderr, result
         assert b.rpc("_state")["execution"] == before, "A rejected creation started a remote shell"
         assert not tab(identities[1], added["tab"])["connected"]
+        remote_access.update(enabled=True, listen_address=addresses[1])
+        b.rpc("connection-edit", connection="local", remote_access=remote_access)
+        wait_for(lambda: tab(identities[1], added["tab"])["connected"])
+        assert b.rpc("_state")["execution"] == before
 
-    with scenario("disconnection preserves organization and reopening reconnects the host"):
+    with scenario("offline startup automatically reconnects every window and preserves organization"):
         original_times = {t["id"]: t["created_at"] for t in b.rpc("list")["tabs"]}
         b.rpc("stop")
         assert pb.wait(timeout=10) == 0
@@ -681,13 +723,23 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         app = a.start_app(cli, stdout=log, stderr=log)
         assert time.monotonic() - before < 3, "Offline host delayed local startup"
         first = a.rpc("windows")["windows"][0]["id"]
-        # Let the failed attach finish, then retry the same pinned identity.
+        second_window = a.rpc("new-window")["window"]
+        time.sleep(3.5)
+        before_idle = Path(f"/proc/{app.pid}/stat").read_text().split()
+        idle_threads = len(list(Path(f"/proc/{app.pid}/task").iterdir()))
+        idle_fds = len(list(Path(f"/proc/{app.pid}/fd").iterdir()))
+        time.sleep(1)
+        after_idle = Path(f"/proc/{app.pid}/stat").read_text().split()
+        (artifacts / "remote-recovery-idle.json").write_text(json.dumps(dict(
+            windows=2, cpu_ticks=sum(map(int, after_idle[13:15])) - sum(map(int, before_idle[13:15])),
+            clock_ticks_per_second=os.sysconf("SC_CLK_TCK"),
+            threads=idle_threads, file_descriptors=idle_fds,
+            rss_pages=int(after_idle[23]),
+        ), indent=2) + "\n")
         pb = start(b, log, addresses[1])
-        a.rpc("detach")
-        assert app.wait(timeout=10) == 0
-        app = a.start_app(cli, stdout=log, stderr=log)
-        first = a.rpc("windows")["windows"][0]["id"]
         wait_for(lambda: any(t["reference"] == dict(daemon=identities[1], id=added["tab"]) and t["connected"] for t in view()["tabs"]))
+        wait_for(lambda: all(t["connected"] for t in a.rpc("list", window=second_window)["tabs"]))
+        a.rpc("detach", window=second_window)
         assert tab(identities[1], added["tab"])["workspace"] == workspace
         assert {t["id"]: t["created_at"] for t in b.rpc("list")["tabs"]} == original_times
         timestamps = [t["created_at"] for t in view()["tabs"]]

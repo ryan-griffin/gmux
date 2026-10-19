@@ -84,6 +84,7 @@ pub enum StreamCommand {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         remote: bool,
     },
+    Ping,
     Focused {
         active: bool,
     },

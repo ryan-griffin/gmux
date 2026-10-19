@@ -51,7 +51,10 @@ fn set_icon(image: &gtk::Image, name: &str, label: &str) {
 
 pub(super) fn update_tab(tab: &mut Tab, sessions: &connections::Connections) {
     let status = sessions.connection_status(sessions.tab_ref(tab.id).daemon);
-    let disconnected = matches!(status, ConnectionStatus::Disconnected { .. });
+    let disconnected = matches!(
+        status,
+        ConnectionStatus::Disconnected { .. } | ConnectionStatus::Reconnecting { .. }
+    );
     let icon_kind = if disconnected {
         None
     } else {
@@ -77,8 +80,11 @@ pub(super) fn update_tab(tab: &mut Tab, sessions: &connections::Connections) {
     if !caption.is_empty() && matches!(status, ConnectionStatus::Connecting) {
         caption.push_str(" · Connecting…");
     }
+    if !caption.is_empty() && matches!(status, ConnectionStatus::Reconnecting { .. }) {
+        caption.push_str(" · Reconnecting…");
+    }
     tab.machine_label.set_text(&caption);
-    if !caption.is_empty() && disconnected {
+    if !caption.is_empty() && matches!(status, ConnectionStatus::Disconnected { .. }) {
         caption.push_str(" · Disconnected");
     }
     tab.machine_box.set_tooltip_text(Some(&caption));

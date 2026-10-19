@@ -11,6 +11,7 @@ from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 from cargo_test_support import cargo_binary
+from stream_test_support import PROTOCOL_VERSION
 import select
 import shlex
 import socket
@@ -159,7 +160,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=22, daemon=rpc("_hello")["daemon"])
+        command("attach", version=PROTOCOL_VERSION, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header["frame"]["rows"])), header
@@ -301,7 +302,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(5)
         stream.connect(str(temp / "socket.stream"))
-        command("attach", version=22, daemon=rpc("_hello")["daemon"])
+        command("attach", version=PROTOCOL_VERSION, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[hidden])
         screen(hidden)
         command("scroll-to", pane=hidden, row=0, serial=99)

@@ -271,6 +271,7 @@ impl Ui {
             command_exits: RefCell::new(HashSet::new()),
             keyboard,
             update_source: RefCell::new(None),
+            reconnect_source: RefCell::new(None),
             theme_handler: RefCell::new(None),
         });
         let weak = Rc::downgrade(&ui);
@@ -508,7 +509,16 @@ impl Ui {
                         if !sessions.is_local(id)
                             && !sessions.connected(sessions.pane_ref(id).daemon)
                         {
-                            error.push_str(". Reconnect in Manage Connections");
+                            error.push_str(
+                                if matches!(
+                                    sessions.connection_status(sessions.pane_ref(id).daemon),
+                                    connections::ConnectionStatus::Reconnecting { .. }
+                                ) {
+                                    ". Reconnecting…"
+                                } else {
+                                    ". Check Manage Connections"
+                                },
+                            );
                         }
                     }
                     pane.tick(&update);
@@ -559,11 +569,37 @@ impl Ui {
                         .chain(ui.restore_selection.get().map(|(desired, _, _)| desired));
                     ui.sessions.borrow_mut().prune_handles(retained);
                 }
+                ui.schedule_reconnect(&wake);
                 glib::ControlFlow::Continue
             });
         *ui.update_source.borrow_mut() = Some(source);
         ui.sessions.borrow_mut().connect_remotes();
         Ok(ui)
+    }
+    fn schedule_reconnect(self: &Rc<Self>, wake: &ipc::Wake) {
+        let next = self.sessions.borrow().next_retry();
+        let mut pending = self.reconnect_source.borrow_mut();
+        if pending.as_ref().map(|(at, _)| *at) == next {
+            return;
+        }
+        if let Some((_, source)) = pending.take() {
+            source.remove();
+        }
+        if let Some(at) = next {
+            let weak = Rc::downgrade(self);
+            let wake = wake.clone();
+            let source = glib::timeout_add_local_once(
+                at.saturating_duration_since(std::time::Instant::now())
+                    .max(Duration::from_millis(1)),
+                move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.reconnect_source.borrow_mut().take();
+                        wake.notify();
+                    }
+                },
+            );
+            *pending = Some((at, source));
+        }
     }
     pub(super) fn open_initial_directory(self: &Rc<Self>) {
         let ready = {

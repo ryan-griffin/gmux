@@ -21,7 +21,49 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
+    time::{Duration, Instant},
 };
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const PING: &[u8] = b"{\"method\":\"ping\"}\n";
+
+struct Heartbeat {
+    interval: Duration,
+    next: Instant,
+}
+impl Heartbeat {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next: Instant::now() + interval,
+        }
+    }
+    fn remaining(&self) -> Duration {
+        self.next.saturating_duration_since(Instant::now())
+    }
+    fn check(&mut self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+        let now = Instant::now();
+        if now >= self.next {
+            writer.write_all(PING)?;
+            self.next = now + self.interval;
+        }
+        Ok(())
+    }
+}
+
+fn stream_error(error: anyhow::Error) -> String {
+    if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    }) {
+        "Terminal daemon is not responding".into()
+    } else {
+        format!("Lost connection to the terminal daemon: {error}")
+    }
+}
 
 pub type SessionHandle = Rc<RefCell<RemoteSession>>;
 
@@ -31,6 +73,7 @@ struct Connection {
     socket: ipc::Stream,
 }
 enum Outgoing {
+    Close,
     Command(Vec<u8>),
     Paste {
         pane: Option<u64>,
@@ -60,24 +103,36 @@ impl Outgoing {
 
     fn bytes(&self) -> usize {
         match self {
+            Self::Close => 0,
             Self::Command(bytes) => bytes.len(),
             Self::Paste { text, .. } => text.len(),
         }
     }
 
-    fn write(self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+    fn write(
+        self,
+        writer: &mut impl std::io::Write,
+        heartbeat: &mut Heartbeat,
+    ) -> anyhow::Result<()> {
         match self {
-            Self::Command(bytes) => Ok(writer.write_all(&bytes)?),
+            Self::Close => return Ok(()),
+            Self::Command(bytes) => writer.write_all(&bytes)?,
             Self::Paste {
                 pane,
                 text,
                 options,
-            } => write_paste(writer, pane, &text, options),
+            } => write_paste(writer, pane, &text, options, heartbeat)?,
         }
+        heartbeat.check(writer)
     }
 }
 
 impl Connection {
+    fn close(&self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        // Cached viewports may retain this sender after their manager is gone.
+        let _ = self.commands.try_send(Outgoing::Close);
+    }
     fn send(&self, request: StreamRequest) -> anyhow::Result<()> {
         let outgoing = Outgoing::prepare(request)?;
         let bytes = outgoing.bytes();
@@ -99,6 +154,7 @@ fn write_paste(
     pane: Option<u64>,
     text: &str,
     options: PasteOptions,
+    heartbeat: &mut Heartbeat,
 ) -> anyhow::Result<()> {
     transport::command(
         writer,
@@ -123,6 +179,7 @@ fn write_paste(
             },
         )?;
         start = end;
+        heartbeat.check(writer)?;
     }
     transport::command(
         writer,
@@ -134,7 +191,7 @@ fn write_paste(
 }
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        self.close();
     }
 }
 
@@ -154,7 +211,7 @@ pub struct SessionManager {
     pending_reads: HashMap<u64, u64>,
     wake: ipc::Wake,
     disconnected: bool,
-    disconnect_error: Option<String>,
+    disconnect_error: Option<anyhow::Error>,
     state: Option<crate::control::CommandReply>,
 }
 
@@ -204,6 +261,25 @@ impl SessionManager {
         daemon: crate::model::DaemonId,
         socket: ipc::Stream,
     ) -> anyhow::Result<Self> {
+        Self::with_heartbeat(
+            endpoint,
+            wake,
+            daemon,
+            socket,
+            HEARTBEAT_INTERVAL,
+            RESPONSE_TIMEOUT,
+        )
+    }
+    fn with_heartbeat(
+        endpoint: ipc::Endpoint,
+        wake: ipc::Wake,
+        daemon: crate::model::DaemonId,
+        socket: ipc::Stream,
+        interval: Duration,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
         let mut writer = socket.try_clone()?;
         let reader = socket.try_clone()?;
         let (commands, queue) = mpsc::sync_channel::<Outgoing>(128);
@@ -213,26 +289,40 @@ impl SessionManager {
         let errors = sender.clone();
         let writer_wake = wake.clone();
         std::thread::spawn(move || {
-            while let Ok(outgoing) = queue.recv() {
-                let bytes = outgoing.bytes();
-                let result = outgoing.write(&mut writer);
-                writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            let mut heartbeat = Heartbeat::new(interval);
+            loop {
+                let (result, commands_changed) = match queue.recv_timeout(heartbeat.remaining()) {
+                    Ok(Outgoing::Close) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(outgoing) => {
+                        let bytes = outgoing.bytes();
+                        let result = outgoing.write(&mut writer, &mut heartbeat);
+                        writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                        (result, true)
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => (heartbeat.check(&mut writer), false),
+                };
                 if let Err(error) = result {
-                    let _ = errors.send(Err(error.to_string()));
+                    let _ = errors.send(Err(stream_error(error)));
                     writer_wake.notify();
                     let _ = writer.shutdown(std::net::Shutdown::Both);
                     break;
                 }
                 // Retry state commands after queue backpressure without a timer.
-                writer_wake.notify();
+                if commands_changed {
+                    writer_wake.notify();
+                }
             }
         });
         let reader_wake = wake.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             loop {
-                let packet = Packet::read(&mut reader)
-                    .map_err(|e| format!("Lost connection to the terminal daemon: {e}"));
+                let packet = match Packet::read_message(&mut reader) {
+                    Ok(None) => continue,
+                    Ok(Some(packet)) => Ok(packet),
+                    Err(error) => Err(error),
+                }
+                .map_err(stream_error);
                 let failed = packet.is_err();
                 match sender.send(packet) {
                     Ok(()) => (),
@@ -243,11 +333,16 @@ impl SessionManager {
                             .send(Err("Lost connection to the terminal daemon: Viewport packet exceeds the frontend memory budget".into()))
                             .is_ok()
                         {
+                            let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
                             reader_wake.notify();
                         }
                         break;
                     }
                     Err(incoming::SendError::Closed) => break,
+                }
+                if failed {
+                    // Queue the cause before shutdown can make the writer fail too.
+                    let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
                 }
                 reader_wake.notify();
                 if failed {
@@ -292,7 +387,7 @@ impl SessionManager {
     pub fn validate_state(&self, reply: &crate::control::CommandReply) -> anyhow::Result<()> {
         anyhow::ensure!(
             reply.daemon == self.daemon,
-            "State belongs to a different daemon"
+            crate::network::ConnectionRejected("State belongs to a different daemon".into())
         );
         Ok(())
     }
@@ -456,10 +551,10 @@ impl SessionManager {
                     if let Some(state) = packet.header.state.take() {
                         if let Err(error) = self.validate_state(&state) {
                             self.disconnected = true;
-                            self.disconnect_error = Some(error.to_string());
                             for &id in self.sessions.keys() {
                                 updates.entry(id).or_default().error = Some(error.to_string());
                             }
+                            self.disconnect_error = Some(error);
                             let _ = self.connection.socket.shutdown(std::net::Shutdown::Both);
                             break;
                         }
@@ -535,7 +630,7 @@ impl SessionManager {
                     }
                 }
                 Ok(Err(error)) => {
-                    self.disconnect_error = Some(error);
+                    self.disconnect_error = Some(anyhow::Error::msg(error));
                     self.disconnected = true;
                     break;
                 }
@@ -552,8 +647,8 @@ impl SessionManager {
     pub fn disconnected(&self) -> bool {
         self.disconnected
     }
-    pub fn disconnect_reason(&self) -> Option<&str> {
-        self.disconnect_error.as_deref()
+    pub fn disconnect_error(&self) -> Option<&anyhow::Error> {
+        self.disconnect_error.as_ref()
     }
     pub fn close(&mut self, id: u64) {
         self.sessions.remove(&id);
@@ -569,7 +664,7 @@ impl SessionManager {
         self.git.clear();
         self.git_panes.clear();
         self.sessions.clear();
-        let _ = self.connection.socket.shutdown(std::net::Shutdown::Both);
+        self.connection.close();
     }
 }
 impl Drop for SessionManager {
@@ -818,19 +913,141 @@ impl RemoteSession {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn heartbeat_replies_keep_idle_streams_alive_without_waking_the_ui() {
+        use std::{
+            io::{BufRead, Write},
+            os::fd::AsRawFd,
+        };
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let wake = ipc::Wake::new().unwrap();
+        let mut manager = SessionManager::with_heartbeat(
+            ipc::Endpoint::local(),
+            wake.clone(),
+            crate::model::DaemonId::generate().unwrap(),
+            socket.into(),
+            Duration::from_millis(10),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let cached = manager.connection.clone();
+        let (ready, done) = mpsc::channel();
+        let (release, hold) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(peer.try_clone().unwrap());
+            for _ in 0..40 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.as_bytes(), PING);
+                peer.write_all(transport::HEARTBEAT_REPLY).unwrap();
+            }
+            ready.send(()).unwrap();
+            let _ = hold.recv();
+        });
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(manager.poll().is_empty());
+        assert!(!manager.disconnected());
+        let mut event = libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 0) }, 0);
+        drop(manager);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The old viewport can retain its connection without retaining a worker.
+        loop {
+            if matches!(
+                cached.commands.try_send(Outgoing::Close),
+                Err(mpsc::TrySendError::Disconnected(_))
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Closing the manager retained its heartbeat worker"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_open_socket_without_daemon_replies_times_out() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut manager = SessionManager::with_heartbeat(
+            ipc::Endpoint::local(),
+            ipc::Wake::new().unwrap(),
+            crate::model::DaemonId::generate().unwrap(),
+            socket.into(),
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !manager.disconnected() {
+            manager.poll();
+            assert!(
+                Instant::now() < deadline,
+                "An unresponsive daemon stayed connected"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            manager
+                .disconnect_error()
+                .unwrap()
+                .to_string()
+                .contains("not responding")
+        );
+    }
+
+    #[test]
+    fn heartbeat_probes_can_be_interleaved_with_paste_chunks() {
+        let text = "a界".repeat(transport::PASTE_CHUNK);
+        let mut bytes = Vec::new();
+        let mut heartbeat = Heartbeat::new(Duration::ZERO);
+        Outgoing::prepare(request(json!({"method":"paste","pane":7,"text":text})))
+            .unwrap()
+            .write(&mut bytes, &mut heartbeat)
+            .unwrap();
+        let commands: Vec<Value> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert!(commands.iter().any(|command| command["method"] == "ping"));
+        let paste: Vec<_> = commands
+            .iter()
+            .filter(|command| command["method"] != "ping")
+            .collect();
+        assert_eq!(paste.first().unwrap()["method"], "paste-begin");
+        assert_eq!(paste.last().unwrap()["method"], "paste-end");
+        let received: String = paste
+            .iter()
+            .filter_map(|command| command["text"].as_str())
+            .collect();
+        assert_eq!(received, text);
+    }
+
     fn request(value: Value) -> StreamRequest {
         serde_json::from_value(value).unwrap()
     }
     fn wire(outgoing: Outgoing) -> Value {
         let mut bytes = Vec::new();
-        outgoing.write(&mut bytes).unwrap();
+        outgoing
+            .write(&mut bytes, &mut Heartbeat::new(HEARTBEAT_INTERVAL))
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
     #[test]
     fn large_pastes_use_bounded_utf8_chunks_and_preserve_operation_options() {
         let text = "a界\n\0".repeat(transport::MAX_PASTE / 6);
         let mut bytes = Vec::new();
-        Outgoing::prepare(request(json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true}))).unwrap().write(&mut bytes).unwrap();
+        Outgoing::prepare(request(json!({"method":"paste", "pane":7, "text":text, "clipboard":true, "enter":true, "bottom":true}))).unwrap().write(&mut bytes, &mut Heartbeat::new(HEARTBEAT_INTERVAL)).unwrap();
         let commands: Vec<Value> = bytes
             .split(|b| *b == b'\n')
             .filter(|line| !line.is_empty())
@@ -1078,8 +1295,9 @@ mod tests {
         }
         assert!(
             manager
-                .disconnect_reason()
+                .disconnect_error()
                 .unwrap()
+                .to_string()
                 .contains("memory budget")
         );
         assert_eq!(session.borrow().meta.title, "before oversized packet");
@@ -1196,7 +1414,11 @@ mod tests {
         manager.poll();
         assert!(!manager.git_subscription_pending);
         let mut bytes = Vec::new();
-        receiver.try_recv().unwrap().write(&mut bytes).unwrap();
+        receiver
+            .try_recv()
+            .unwrap()
+            .write(&mut bytes, &mut Heartbeat::new(HEARTBEAT_INTERVAL))
+            .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&bytes).unwrap(),
             json!({"method":"git-subscribe","panes":[1]})
@@ -1235,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn state_from_another_daemon_disconnects_without_replacing_the_local_view() {
+    fn state_from_another_daemon_stops_recovery_without_replacing_the_local_view() {
         let (mut manager, sender, session) = manager();
         let packet = |daemon| Packet {
             header: Header {
@@ -1260,11 +1482,18 @@ mod tests {
         sender
             .send(Ok(packet(crate::model::DaemonId::generate().unwrap())))
             .unwrap();
-        let updates = manager.poll();
-        assert!(manager.disconnected);
-        assert!(manager.take_state().is_none());
+        let mut connection =
+            crate::connection::Connection::from_session(manager, ipc::Wake::new().unwrap());
+        connection.set_auto_reconnect(true);
+        let update = connection.poll();
+        assert!(matches!(
+            connection.status(),
+            crate::connection::Status::Disconnected { error: Some(_) }
+        ));
+        assert!(connection.next_retry().is_none());
+        assert!(update.state.is_none());
         assert!(
-            updates[&1]
+            update.panes[&1]
                 .error
                 .as_ref()
                 .unwrap()

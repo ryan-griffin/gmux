@@ -115,7 +115,25 @@ connection, resolving local relative paths from the calling shell and remote `~/
 paths on the destination. Local execution follows its separate saved preference.
 The GTK client can use remotes without the `gmux` executable installed.
 
-Open **Manage Connections…** to add or reconnect to remote daemons. To run
+Saved remotes connect when a window opens and retry automatically after failed
+connections or network loss. Retry delays grow from about one second to at most
+thirty seconds, with small random variations between clients. A connection must
+stay healthy for ten seconds before its retry delay resets. Manage Connections
+shows Reconnecting and lets you retry immediately while waiting. Authentication,
+version, identity, and invalid credential-file errors pause automatic retries;
+correct the settings or retry manually. Removing a connection or closing the
+window cancels its retries. Reconnection restores the current terminal state
+without replaying input or commands. Jobs continue if the remote daemon stayed
+running; a restarted daemon restores fresh shells.
+
+Local and remote terminal streams send a heartbeat every ten seconds. Thirty
+seconds without a reply or terminal output closes the stream and starts recovery,
+including when the host still accepts TCP data but its daemon has stopped
+responding. Remote streams also use TCP keepalive and a thirty-second timeout
+for unacknowledged data. CLI commands remain short-lived and do not retry
+execution requests automatically.
+
+Open **Manage Connections…** to add or check remote daemons. To run
 terminals locally, open **This Computer**, turn on **Local Daemon**, and Save.
 Use **Allow Remote Connections** to configure incoming access separately.
 See [connection dialogs](ui.md#dialogs-and-accessibility) for dialog behavior.

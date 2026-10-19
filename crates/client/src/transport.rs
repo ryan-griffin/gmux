@@ -10,7 +10,9 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 22;
+pub const VERSION: u32 = 23;
+/// A zero-length record acknowledges a connection heartbeat without a viewport.
+pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 16 * 1024 * 1024;
@@ -94,11 +96,23 @@ impl Packet {
         result
     }
 
-    /// Decode one packet, leaving any following packet in the reader's buffer.
+    /// Decode one packet, skipping heartbeat replies and leaving following data buffered.
     pub fn read(reader: &mut impl BufRead) -> anyhow::Result<Self> {
+        loop {
+            if let Some(packet) = Self::read_message(reader)? {
+                return Ok(packet);
+            }
+        }
+    }
+
+    /// Read a viewport packet or a heartbeat acknowledgement, represented by None.
+    pub fn read_message(reader: &mut impl BufRead) -> anyhow::Result<Option<Self>> {
         let mut size = [0; 4];
         reader.read_exact(&mut size)?;
         let size = u32::from_le_bytes(size) as usize;
+        if size == 0 {
+            return Ok(None);
+        }
         anyhow::ensure!(
             (4..=MAX_PACKET).contains(&size),
             "Invalid viewport packet size"
@@ -166,7 +180,7 @@ impl Packet {
                 reader.consume(count * CELL_BYTES);
             }
         }
-        Ok(Self { header, cells })
+        Ok(Some(Self { header, cells }))
     }
 }
 
@@ -278,6 +292,28 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(Ok(packet)) if packet.header.scroll_serial == 42));
     }
     #[test]
+    fn heartbeat_records_are_separate_from_viewports_and_do_not_consume_following_data() {
+        let mut bytes = HEARTBEAT_REPLY.to_vec();
+        packet().encode_into(&mut bytes).unwrap();
+        bytes.extend_from_slice(HEARTBEAT_REPLY);
+        let mut reader = &bytes[..];
+        assert!(Packet::read_message(&mut reader).unwrap().is_none());
+        assert_eq!(
+            Packet::read_message(&mut reader)
+                .unwrap()
+                .unwrap()
+                .header
+                .scroll_serial,
+            42
+        );
+        assert!(Packet::read_message(&mut reader).unwrap().is_none());
+        assert!(reader.is_empty());
+        let mut reader = &bytes[..];
+        assert_eq!(Packet::read(&mut reader).unwrap().header.scroll_serial, 42);
+        assert_eq!(reader, HEARTBEAT_REPLY);
+    }
+
+    #[test]
     fn malformed_headers_and_payload_lengths_are_rejected() {
         let mut packet = packet();
         for flags in [vec![0, 1], vec![2]] {
@@ -313,7 +349,7 @@ mod tests {
         packet.encode_into(&mut encoded).unwrap();
         assert!(Packet::read(&mut encoded.as_slice()).is_err());
 
-        for size in [0, 3, MAX_PACKET as u32 + 1, u32::MAX] {
+        for size in [3, MAX_PACKET as u32 + 1, u32::MAX] {
             let mut bytes = size.to_le_bytes().to_vec();
             bytes.extend_from_slice(&encoded);
             let mut reader = io::Cursor::new(bytes);

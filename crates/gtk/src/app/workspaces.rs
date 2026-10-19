@@ -146,7 +146,7 @@ impl Ui {
         self.mark_dirty();
     }
     pub(super) fn refresh_empty(&self) {
-        let (connected, connecting, configured) = {
+        let (connected, connecting, reconnecting, configured) = {
             let sessions = self.sessions.borrow();
             let connections = sessions.connections();
             (
@@ -159,13 +159,24 @@ impl Ui {
                         connections::ConnectionStatus::Connecting
                     )
                 }),
+                connections.iter().any(|connection| {
+                    matches!(
+                        sessions.connection_status(connection.daemon),
+                        connections::ConnectionStatus::Reconnecting { .. }
+                    )
+                }),
                 !connections.is_empty(),
             )
         };
         self.empty_actions
             .set_visible_child_name(if connected { "new" } else { "connections" });
         if !connected {
-            let (title, description) = if connecting {
+            let (title, description) = if reconnecting {
+                (
+                    "Reconnecting…",
+                    "Open Manage Connections to check connection status or retry now",
+                )
+            } else if connecting {
                 (
                     "Connecting…",
                     "Open Manage Connections to check connection status",
@@ -173,7 +184,7 @@ impl Ui {
             } else if configured {
                 (
                     "Not Connected",
-                    "Open Manage Connections to start the local daemon or reconnect to a remote daemon",
+                    "Open Manage Connections to start the local daemon or check a remote connection",
                 )
             } else {
                 (

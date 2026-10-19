@@ -10,6 +10,7 @@ from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 from cargo_test_support import cargo_binary
+from stream_test_support import PROTOCOL_VERSION
 import socket
 import struct
 import subprocess
@@ -68,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             stream = socket.socket(socket.AF_UNIX)
             stream.settimeout(6)
             stream.connect(env["GMUX_SOCKET"] + ".stream")
-            command("attach", version=22, daemon=rpc("_hello")["daemon"])
+            command("attach", version=PROTOCOL_VERSION, daemon=rpc("_hello")["daemon"])
 
         def command(method, **params):
             stream.sendall((json.dumps(dict(method=method, **params)) + "\n").encode())

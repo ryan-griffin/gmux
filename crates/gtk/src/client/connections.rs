@@ -19,6 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use gmux_client::connection::Connection;
@@ -33,11 +34,12 @@ struct Origin {
 }
 impl Origin {
     fn new(machine: Machine, wake: ipc::Wake) -> Self {
-        let link = Connection::new(
+        let mut link = Connection::new(
             machine.daemon,
             ipc::Endpoint::remote(machine.name.clone(), Some(machine.daemon)),
             wake,
         );
+        link.set_auto_reconnect(true);
         Self {
             machine,
             home_directory: None,
@@ -179,7 +181,9 @@ impl Connections {
         self.local = Some(daemon);
         self.origins
             .entry(daemon)
-            .or_insert_with(|| Origin::new(machine, self.wake.clone()));
+            .or_insert_with(|| Origin::new(machine, self.wake.clone()))
+            .link
+            .set_auto_reconnect(false);
         if self.preferred.as_deref().is_none_or(|name| name == "local") || self.primary.is_none() {
             self.primary = Some(daemon);
         }
@@ -362,6 +366,12 @@ impl Connections {
             self.connect(id);
         }
     }
+    pub fn next_retry(&self) -> Option<Instant> {
+        self.origins
+            .values()
+            .filter_map(|origin| origin.link.next_retry())
+            .min()
+    }
     pub fn connect(&mut self, id: DaemonId) {
         let Some(origin) = self.origins.get(&id) else {
             return;
@@ -443,7 +453,11 @@ impl Connections {
             origin.machine.name = remote.name.clone();
             origin.machine.machine_kind = remote.machine_kind;
             if connection_changed
-                || (renamed && origin.link.status() == ConnectionStatus::Connecting)
+                || (renamed
+                    && matches!(
+                        origin.link.status(),
+                        ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. }
+                    ))
             {
                 origin.link.cancel();
                 reconnect.push(remote.daemon);
@@ -754,9 +768,10 @@ impl Connections {
         let mut states = Vec::new();
         let mut updates = HashMap::new();
         let mut lost = Vec::new();
+        let now = Instant::now();
         for (&daemon, origin) in &mut self.origins {
             let was_connected = origin.link.status() == ConnectionStatus::Connected;
-            let update = origin.link.poll();
+            let update = origin.link.poll_at(now);
             if update.status_changed {
                 self.status_changed = true;
                 if let Some(manager) = origin.link.manager() {
@@ -803,7 +818,8 @@ impl Connections {
                 updates
                     .entry(handle)
                     .or_insert_with(SessionUpdate::default)
-                    .error = Some(format!("Connection to {name} lost"));
+                    .error
+                    .get_or_insert_with(|| format!("Connection to {name} lost"));
             }
         }
         updates
@@ -1098,7 +1114,7 @@ impl Connections {
         if creates_pane {
             anyhow::ensure!(
                 daemon.is_some_and(|id| self.connected(id)),
-                "Connection is disconnected or connecting. Reconnect in Manage Connections before creating a tab or pane"
+                "Connection is disconnected or connecting. Wait for reconnection or check Manage Connections before creating a tab or pane"
             );
         }
         Ok(Route {

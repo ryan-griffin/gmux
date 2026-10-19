@@ -5,6 +5,7 @@ import fcntl
 import json
 from pathlib import Path
 from cargo_test_support import cargo_binary
+from stream_test_support import PROTOCOL_VERSION
 import runpy
 import socket
 import struct
@@ -28,7 +29,7 @@ class History:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(8)
         self.socket.connect(str(fixture.path / "socket.stream"))
-        self.send("attach", version=22, daemon=fixture.rpc("_hello")["daemon"])
+        self.send("attach", version=PROTOCOL_VERSION, daemon=fixture.rpc("_hello")["daemon"])
         self.send("subscribe", panes=[pane])
 
     def send(self, method, **params):

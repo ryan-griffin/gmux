@@ -35,7 +35,11 @@ windows filtering it to All Tabs. Its tabs remain open without an assignment.
 Workspace membership belongs to the receiving desktop. It orders tabs newest first
 using creation times from their owning daemons, including existing tabs when adding
 a connection. Notifications and selection do not change the order. A disconnected
-tab keeps its last viewport; use Reconnect in Manage Connections to retry.
+tab keeps its last viewport. Remote connections retry automatically and show
+Reconnecting while recovering. Use Retry Now in Manage Connections to retry
+immediately while waiting. Authentication, version, and identity errors pause
+automatic recovery. Edit the connection or retry manually after correcting
+the problem.
 
 ## Menus and focus
 
@@ -73,15 +77,24 @@ confirmation when their affected panes have busy processes.
 
 Manage Connections uses the same dialog layout as Manage Workspaces, with an Add
 Connection row, the local connection labeled This Computer, then saved remote
-connections with status and reconnect controls. The local entry remains available
-when its daemon is stopped or local execution is disabled. The Local Connection
-dialog includes its name, a Local Daemon toggle with the subtitle Run terminals on this computer,
+connections. Local and remote rows show their connection status beside Retry Now.
+Connected uses the theme's success color, recovery after a failure uses warning,
+and disconnection with an error uses error. Connecting and Disabled stay neutral.
+The local row shows Disabled when local execution is off. Status remains readable
+as text in every theme. Retry stays visible but disabled
+while a connection is connected or connecting. The local button appears only
+when local execution is enabled and uses the shared local recovery flow to skip
+the retry delay. The local entry remains available when its daemon is stopped or
+local execution is disabled. The Local Connection dialog includes its name,
+a Local Daemon toggle with the subtitle Run terminals on this computer,
 and a separate Remote Access group. The toggle defaults to
 off and stays temporary until Save. Cancel discards the draft. The daemon state
 changes after the preference is saved to disk. If saving fails, the editor keeps
 the draft and displays the error. Saving it on starts or attaches to the daemon,
 remembers the choice for future launches, and restarts
-the daemon if it stops. Saving it off asks for confirmation, stops local
+the daemon if it stops. Failed recovery backs off from one second to thirty
+seconds. The delay resets after a connection stays healthy for ten seconds.
+Saving it off asks for confirmation, stops local
 terminals, and cancels recovery while keeping the app and remote connections open.
 Canceling the confirmation keeps the draft open and leaves the saved settings and
 daemon unchanged. Use Hostname restores the default name when saved. Allow Remote
@@ -92,8 +105,8 @@ persists the settings. Disabling remote access disconnects incoming clients and
 leaves terminals running. Remote access settings can be saved while the daemon
 is stopped. They do not enable local execution.
 
-The empty page distinguishes No Connections, Connecting, and Not Connected and
-offers Manage Connections when no daemon is connected. Workspace organization
+The empty page shows No Connections, Connecting, Reconnecting, or Not Connected.
+It offers Manage Connections when no daemon is connected. Workspace organization
 remains available without any daemon.
 
 Management rows open editors without navigation arrows; Add rows have a plus icon
