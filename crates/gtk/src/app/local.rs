@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct LocalDaemon {
     pending: Cell<bool>,
     retry: RefCell<Option<glib::SourceId>>,
-    delay: Cell<u64>,
+    backoff: RefCell<gmux_client::connection::Backoff>,
     error: RefCell<Option<String>>,
 }
 impl Default for LocalDaemon {
@@ -12,12 +12,21 @@ impl Default for LocalDaemon {
         Self {
             pending: Cell::new(false),
             retry: RefCell::new(None),
-            delay: Cell::new(1),
+            backoff: RefCell::new(gmux_client::connection::Backoff::default()),
             error: RefCell::new(None),
         }
     }
 }
 impl LocalDaemon {
+    pub(super) fn pending(&self) -> bool {
+        self.pending.get()
+    }
+    pub(super) fn recovering(&self) -> bool {
+        self.pending.get() || self.retry.borrow().is_some()
+    }
+    pub(super) fn error(&self) -> std::cell::Ref<'_, Option<String>> {
+        self.error.borrow()
+    }
     fn cancel_retry(&self) {
         if let Some(source) = self.retry.borrow_mut().take() {
             source.remove();
@@ -38,6 +47,7 @@ struct LocalOperation {
 impl LocalOperation {
     fn new(owner: &Rc<Windows>) -> Self {
         owner.local.pending.set(true);
+        owner.refresh_local_controls();
         Self {
             owner: Rc::downgrade(owner),
             complete: false,
@@ -47,6 +57,7 @@ impl LocalOperation {
         self.complete = true;
         let owner = self.owner.upgrade()?;
         owner.local.pending.set(false);
+        owner.refresh_local_controls();
         Some(owner)
     }
 }
@@ -59,6 +70,7 @@ impl Drop for LocalOperation {
             let weak = self.owner.clone();
             glib::idle_add_local_once(move || {
                 if let Some(owner) = weak.upgrade() {
+                    owner.refresh_local_controls();
                     owner.recover_local();
                 }
             });
@@ -67,6 +79,11 @@ impl Drop for LocalOperation {
 }
 
 impl Windows {
+    fn refresh_local_controls(&self) {
+        for ui in self.windows.borrow().iter() {
+            ui.refresh_connections_ui();
+        }
+    }
     fn local_enabled(&self) -> bool {
         self.preferences
             .borrow()
@@ -108,31 +125,49 @@ impl Windows {
             }
         });
     }
+    pub(super) fn retry_local(self: &Rc<Self>) {
+        if !self.local_enabled() || self.local.pending.get() || !self.local_disconnected() {
+            return;
+        }
+        self.local.cancel_retry();
+        self.ensure_local();
+    }
     pub(super) fn recover_local(self: &Rc<Self>) {
         if !self.local_enabled() || self.local.pending.get() {
             return;
         }
         if !self.local_disconnected() {
             self.local.cancel_retry();
-            self.local.delay.set(1);
-            self.local.error.borrow_mut().take();
+            if self.windows.borrow().iter().all(|ui| {
+                let sessions = ui.sessions.borrow();
+                sessions
+                    .local_daemon()
+                    .is_some_and(|id| sessions.connected(id))
+            }) {
+                self.local
+                    .backoff
+                    .borrow_mut()
+                    .connected(std::time::Instant::now());
+                self.local.error.borrow_mut().take();
+            }
             return;
         }
         if self.local.retry.borrow().is_some() || self.windows.borrow().is_empty() {
             return;
         }
-        let delay = self.local.delay.get();
-        self.local.delay.set((delay * 2).min(30));
+        let delay = self
+            .local
+            .backoff
+            .borrow_mut()
+            .next_delay(std::time::Instant::now());
         let weak = Rc::downgrade(self);
-        *self.local.retry.borrow_mut() = Some(glib::timeout_add_local_once(
-            Duration::from_secs(delay),
-            move || {
-                if let Some(owner) = weak.upgrade() {
-                    owner.local.retry.borrow_mut().take();
-                    owner.ensure_local();
-                }
-            },
-        ));
+        *self.local.retry.borrow_mut() = Some(glib::timeout_add_local_once(delay, move || {
+            if let Some(owner) = weak.upgrade() {
+                owner.local.retry.borrow_mut().take();
+                owner.ensure_local();
+            }
+        }));
+        self.refresh_local_controls();
     }
 }
 
@@ -171,17 +206,17 @@ impl Ui {
         }
         let operation = LocalOperation::new(&owner);
         owner.local.cancel_retry();
-        owner.local.delay.set(1);
+        *owner.local.backoff.borrow_mut() = gmux_client::connection::Backoff::default();
         owner.local.error.borrow_mut().take();
         let preferences = owner.preferences.borrow().as_ref().unwrap().clone();
         let finish = move |ui: &Rc<Ui>, result: anyhow::Result<()>| {
-            let Some(owner) = operation.finish() else {
-                return;
-            };
             if !enabled && result.is_err() && !ui.settings.borrow().local_daemon_enabled {
                 ui.settings.borrow_mut().local_daemon_enabled = true;
                 ui.persist_settings();
             }
+            let Some(owner) = operation.finish() else {
+                return;
+            };
             owner.recover_local();
             callback(ui, result);
         };
@@ -194,6 +229,9 @@ impl Ui {
             else {
                 return;
             };
+            if let Some(owner) = ui.owner.upgrade() {
+                owner.refresh_local_controls();
+            }
             if let Err(error) = result {
                 finish(&ui, Err(error));
             } else if enabled {

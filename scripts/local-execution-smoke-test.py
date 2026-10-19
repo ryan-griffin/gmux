@@ -125,6 +125,11 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
             memory=[line for line in status if line.startswith(("VmRSS:", "Threads:"))]), indent=2) + "\n")
 
     with scenario("local settings and remote access can be saved without starting execution"):
+        manager()
+        local_name = local.rpc("connection-list")["local"]["name"]
+        widget(local_name, "list item")
+        widget("Disabled", "label")
+        assert not find(f"Retry connection to {local_name} now", "button")
         editor()
         click("Allow Remote Connections", "switch")
         entry = widget("Listening Address", "text")
@@ -154,7 +159,8 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         assert not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
         click("Local Daemon", "switch")
         click("Local Daemon", "switch")
-        assert not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
+        wait_accessible(lambda: not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE),
+                        message="Reverting the local toggle did not disable Save")
         click("Cancel", "button")
         manager_page()
 
@@ -210,6 +216,9 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         manager_page()
         wait_for(lambda: local.rpc("status")["local_clients"])
         wait_for(saved_enabled)
+        retry_button = widget(f"Retry connection to {local_name} now", "button")
+        wait_accessible(lambda: not retry_button.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        widget("Connected", "label")
         wait_for(lambda: json.loads(local.settings_path.read_text())["show_sidebar"] != sidebar)
         local.rpc("detach", window=other_window)
         wait_for(lambda: len(local.rpc("windows")["windows"]) == 1)
@@ -297,6 +306,7 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         manager_page()
         wait_for(lambda: not Path(local.env["GMUX_SOCKET"]).exists())
         wait_for(lambda: not saved_enabled())
+        widget("Disabled", "label")
         for window in (first_window, second_window):
             wait_for(lambda: [tab["name"] for tab in local.rpc("list", window=window)["tabs"]] == ["Remote job"])
         assert_stays(lambda: not Path(local.env["GMUX_SOCKET"]).exists(), 2,
@@ -316,6 +326,39 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         close_manager()
         local.rpc("detach", window=second_window)
         wait_for(lambda: len(local.rpc("windows")["windows"]) == 1)
+
+    with scenario("a failed daemon stop restores the saved preference and local retry button"):
+        retry_name = f"Retry connection to {local.rpc('connection-list')['local']['name']} now"
+        pid = local.rpc("status")["pid"]
+        editor()
+        click("Local Daemon", "switch")
+        with settings_lock.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            click("Save", "button")
+            click("Stop Daemon", "button")
+            # Wait for the preference writer, after the connection settings commit.
+            wait_for(lambda: any(fd.readlink() == settings_lock
+                                 for fd in Path(f"/proc/{app.pid}/fd").iterdir()))
+            control = Path(local.env["GMUX_SOCKET"])
+            backup = control.with_name("saved-control")
+            control.rename(backup)
+            try:
+                # Fail control calls while the existing terminal stream stays alive.
+                control.symlink_to(control.name)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                wait_accessible(lambda: any(obj.get_role_name() == "label"
+                                and "Too many levels of symbolic links" in obj.get_name()
+                                for obj in objects()))
+                wait_for(saved_enabled)
+            finally:
+                control.unlink(missing_ok=True)
+                backup.rename(control)
+        click("Cancel", "button")
+        manager_page()
+        retry_button = widget(retry_name, "button")
+        assert not retry_button.get_state_set().contains(Atspi.StateType.SENSITIVE)
+        assert local.rpc("status")["pid"] == pid
+        close_manager()
 
     with scenario("the saved toggle restores the local connection on app launch"):
         assert local.rpc("_hello", client=False)["daemon"] == local_id
@@ -358,7 +401,7 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         assert close_remote.wait(timeout=8) == 0
         wait_for(lambda: local.rpc("list")["tabs"] == [])
         server.rpc("stop")
-        widget("Not Connected", "label")
+        widget("Reconnecting…", "label")
         widget("Manage Connections…", "button")
         quit_client = local.start(gtk, "quit", stdout=log, stderr=log)
         assert quit_client.wait(timeout=8) == 0
@@ -436,16 +479,19 @@ with scenario("closing the initiating window leaves recovery available to other 
         if Path(f"/proc/{pending_pid}").exists():
             os.kill(pending_pid, signal.SIGTERM)
 
-with scenario("failed startup backs off and recovers when the daemon becomes available"), \
-        (artifacts / "local-recovery-smoke.log").open("w") as log, AppFixture() as retry:
-    client = retry.path / "client/gmux-gtk"
+with scenario("local retry bypasses startup backoff and disables itself during recovery"), \
+        (artifacts / "local-recovery-smoke.log").open("w") as log, \
+        AppFixture(env={"GTK_A11Y": "atspi"}) as local, AccessibilityFixture(), WaylandInput() as native:
+    client = local.path / "client/gmux-gtk"
     client.parent.mkdir()
     shutil.copy2(gtk, client)
-    attempts = retry.path / "attempts"
+    attempts = local.path / "attempts"
+    hold = local.path / "hold-startup"
     executable = client.with_name("gmux")
-    executable.write_text("#!/bin/sh\necho attempt >> " + shlex.quote(str(attempts)) + "\nexit 1\n")
+    executable.write_text("#!/bin/sh\necho attempt >> " + shlex.quote(str(attempts)) +
+                          "\nwhile test -e " + shlex.quote(str(hold)) + "; do sleep .05; done\nexit 1\n")
     executable.chmod(0o700)
-    app = retry.start(client, stdout=log, stderr=log)
+    app = local.start(client, stdout=log, stderr=log)
     count = lambda: len(attempts.read_text().splitlines()) if attempts.exists() else 0
     wait_for(lambda: count() >= 3)
     assert count() == 3, "Failed startup retried without backoff"
@@ -454,10 +500,71 @@ with scenario("failed startup backs off and recovers when the daemon becomes ava
     after = Path(f"/proc/{app.pid}/stat").read_text().split()
     (artifacts / "local-recovery-idle.json").write_text(json.dumps(dict(
         attempts=count(), cpu_ticks=sum(map(int, after[13:15])) - sum(map(int, before[13:15]))), indent=2) + "\n")
-    executable.unlink()
-    executable.symlink_to(daemon)
-    wait_for(lambda: retry.rpc("status")["local_clients"])
+    manager()
+    retry_name = f"Retry connection to {local.rpc('connection-list')['local']['name']} now"
+    widget("Reconnecting…", "label")
+    widget(retry_name, "button")
+    # Grow the delay with a failed manual retry, without waiting for its timer.
+    previous = count()
+    click(retry_name, "button")
+    wait_for(lambda: count() > previous, timeout=1, message="Local retry did not bypass startup backoff")
+    wait_accessible(lambda: widget(retry_name, "button").get_state_set().contains(Atspi.StateType.SENSITIVE))
+    hold.touch()
+    try:
+        previous = count()
+        click(retry_name, "button")
+        wait_for(lambda: count() == previous + 1, timeout=1)
+        wait_accessible(lambda: not widget(retry_name, "button").get_state_set().contains(Atspi.StateType.SENSITIVE))
+        assert_stays(lambda: count() == previous + 1, .5, message="Pending local recovery started another daemon")
+        executable.unlink()
+        executable.symlink_to(daemon)
+    finally:
+        hold.unlink(missing_ok=True)
+    wait_accessible(lambda: widget(retry_name, "button").get_state_set().contains(Atspi.StateType.SENSITIVE))
+    click(retry_name, "button")
+    wait_for(lambda: local.rpc("status")["local_clients"])
+    wait_accessible(lambda: not widget(retry_name, "button").get_state_set().contains(Atspi.StateType.SENSITIVE))
+    widget("Connected", "label")
     assert app.poll() is None
+    assert saved_enabled()
+    close_manager()
+    local.rpc("detach")
+    assert app.wait(timeout=8) == 0
+
+with scenario("failed local attachments back off while the daemon remains running"), \
+        (artifacts / "local-attachment-recovery-smoke.log").open("w") as log, \
+        AppFixture(env={"GTK_A11Y": "none"}) as retry, socket.socket(socket.AF_UNIX) as unavailable:
+    retry.start(daemon, "serve", stdout=log, stderr=log)
+    wait_for(lambda: retry.rpc("status")["pid"])
+    stream_path = Path(retry.env["GMUX_SOCKET"] + ".stream")
+    saved_stream = stream_path.with_suffix(".saved-stream")
+    stream_path.rename(saved_stream)
+    attempts = 0
+
+    def count_attachments():
+        global attempts
+        while True:
+            try:
+                peer, _ = unavailable.accept()
+            except BlockingIOError:
+                return attempts
+            peer.close()
+            attempts += 1
+
+    try:
+        unavailable.bind(str(stream_path))
+        unavailable.listen()
+        unavailable.setblocking(False)
+        app = retry.start(gtk, stdout=log, stderr=log)
+        wait_for(lambda: count_attachments() >= 3)
+        assert_stays(lambda: count_attachments() == 3, 1.5,
+                     message="Connecting reset the local attachment backoff")
+    finally:
+        unavailable.close()
+        stream_path.unlink(missing_ok=True)
+        saved_stream.rename(stream_path)
+    wait_for(lambda: retry.rpc("status")["local_clients"])
+    create_tab_when_connected(retry.env["GMUX_SOCKET"], name="Recovered attachment")
     retry.rpc("detach")
     assert app.wait(timeout=8) == 0
 
@@ -480,6 +587,7 @@ with scenario("a failing local daemon can be disabled without starting another p
     click("Stop Daemon", "button")
     manager_page()
     assert not saved_enabled()
+    assert not find(f"Retry connection to {local.rpc('connection-list')['local']['name']} now", "button")
     stopped_attempts = count()
     assert_stays(lambda: count() == stopped_attempts, 3,
                  message="Disabling the local daemon did not cancel startup retries")

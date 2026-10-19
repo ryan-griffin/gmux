@@ -35,7 +35,12 @@ struct RemoteRow {
     icon: gtk::Image,
     machine_kind: Cell<model::MachineKind>,
     status: gtk::Label,
-    reconnect: gtk::Button,
+    retry: gtk::Button,
+}
+struct LocalRow {
+    row: adw::ActionRow,
+    status: gtk::Label,
+    retry: gtk::Button,
 }
 
 struct ConnectionFields {
@@ -71,11 +76,53 @@ pub(super) struct ConnectionControls {
     group: adw::PreferencesGroup,
     error: gtk::Label,
     rows: RefCell<Vec<RemoteRow>>,
-    local: RefCell<Option<adw::ActionRow>>,
+    local: RefCell<Option<LocalRow>>,
     definitions: RefCell<Option<ConnectionList>>,
     revision: Cell<u64>,
     loading: Cell<bool>,
     reload: Cell<bool>,
+}
+
+fn retry_button(name: &str) -> gtk::Button {
+    let label = format!("Retry connection to {name} now");
+    let button = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text(&label)
+        .valign(gtk::Align::Center)
+        .build();
+    button.add_css_class("flat");
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
+    button
+}
+
+fn can_retry(status: ConnectionStatus<'_>) -> bool {
+    matches!(
+        status,
+        ConnectionStatus::Disconnected { .. }
+            | ConnectionStatus::Reconnecting {
+                retry_at: Some(_),
+                ..
+            }
+    )
+}
+
+fn set_status(label: &gtk::Label, text: &str, style: &str, error: Option<&str>) {
+    label.set_text(text);
+    label.set_css_classes(&["caption", style]);
+    label.set_tooltip_text(error);
+}
+
+fn update_status(label: &gtk::Label, status: ConnectionStatus<'_>) {
+    let (text, style, error) = match status {
+        ConnectionStatus::Connected => ("Connected", "success", None),
+        ConnectionStatus::Connecting => ("Connecting…", "dimmed", None),
+        ConnectionStatus::Reconnecting { error, .. } => ("Reconnecting…", "warning", error),
+        ConnectionStatus::Disconnected { error: Some(error) } => {
+            ("Disconnected", "error", Some(error))
+        }
+        ConnectionStatus::Disconnected { error: None } => ("Disconnected", "dimmed", None),
+    };
+    set_status(label, text, style, error);
 }
 
 fn authentication_changed(initial: &Authentication, selected: u32, token: &str) -> bool {
@@ -184,8 +231,8 @@ impl ConnectionControls {
             return;
         }
         *self.definitions.borrow_mut() = Some(list.clone());
-        if let Some(row) = self.local.borrow_mut().take() {
-            self.group.remove(&row);
+        if let Some(local) = self.local.borrow_mut().take() {
+            self.group.remove(&local.row);
         }
         for remote in self.rows.borrow_mut().drain(..) {
             self.group.remove(&remote.row);
@@ -200,6 +247,18 @@ impl ConnectionControls {
                 .build();
             let icon = machine::icon(local.machine_kind);
             row.add_prefix(&icon);
+            let status = gtk::Label::new(None);
+            row.add_suffix(&status);
+            let retry = retry_button(&local.name);
+            let weak = Rc::downgrade(ui);
+            retry.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade()
+                    && let Some(owner) = ui.owner.upgrade()
+                {
+                    owner.retry_local();
+                }
+            });
+            row.add_suffix(&retry);
             let weak = Rc::downgrade(ui);
             row.connect_activated(move |_| {
                 if let Some(ui) = weak.upgrade() {
@@ -220,7 +279,7 @@ impl ConnectionControls {
                 }
             });
             self.group.add(&row);
-            *self.local.borrow_mut() = Some(row);
+            *self.local.borrow_mut() = Some(LocalRow { row, status, retry });
         }
         for remote in list.remotes {
             let row = adw::ActionRow::builder()
@@ -242,24 +301,13 @@ impl ConnectionControls {
             let icon = machine::icon(kind);
             row.add_prefix(&icon);
             let status = gtk::Label::new(None);
-            status.add_css_class("dimmed");
-            status.add_css_class("caption");
             row.add_suffix(&status);
-            let reconnect = gtk::Button::builder()
-                .icon_name("view-refresh-symbolic")
-                .tooltip_text(format!("Reconnect to {}", remote.name))
-                .valign(gtk::Align::Center)
-                .build();
-            reconnect.add_css_class("flat");
-            reconnect.update_property(&[gtk::accessible::Property::Label(&format!(
-                "Reconnect to {}",
-                remote.name
-            ))]);
-            row.add_suffix(&reconnect);
+            let retry = retry_button(&remote.name);
+            row.add_suffix(&retry);
             let weak = Rc::downgrade(ui);
             let controls = Rc::downgrade(self);
             let daemon = remote.daemon;
-            reconnect.connect_clicked(move |_| {
+            retry.connect_clicked(move |_| {
                 if let (Some(ui), Some(controls)) = (weak.upgrade(), controls.upgrade()) {
                     ui.sessions.borrow_mut().connect(daemon);
                     controls.status(&ui);
@@ -272,26 +320,54 @@ impl ConnectionControls {
                 icon,
                 machine_kind: Cell::new(kind),
                 status,
-                reconnect,
+                retry,
             });
         }
         self.status(ui);
     }
     fn status(&self, ui: &Ui) {
         let sessions = ui.sessions.borrow();
+        if let Some(local) = self.local.borrow().as_ref() {
+            let enabled = ui.settings.borrow().local_daemon_enabled;
+            let status = sessions
+                .local_daemon()
+                .map_or(ConnectionStatus::Disconnected { error: None }, |id| {
+                    sessions.connection_status(id)
+                });
+            let owner = ui.owner.upgrade();
+            let local_error = owner.as_ref().map(|owner| owner.local.error());
+            let error = local_error.as_ref().and_then(|error| error.as_deref());
+            match status {
+                _ if !enabled => set_status(&local.status, "Disabled", "dimmed", None),
+                ConnectionStatus::Connecting if error.is_some() => {
+                    set_status(&local.status, "Reconnecting…", "warning", error);
+                }
+                ConnectionStatus::Disconnected {
+                    error: connection_error,
+                } if owner.as_ref().is_some_and(|owner| owner.local.recovering()) => {
+                    if let Some(error) = connection_error.or(error) {
+                        set_status(&local.status, "Reconnecting…", "warning", Some(error));
+                    } else {
+                        set_status(&local.status, "Connecting…", "dimmed", None);
+                    }
+                }
+                _ => update_status(&local.status, status),
+            }
+            local.retry.set_visible(enabled);
+            local.retry.set_sensitive(
+                enabled
+                    && can_retry(status)
+                    && owner.as_ref().is_some_and(|owner| !owner.local.pending()),
+            );
+        }
         for remote in self.rows.borrow().iter() {
             let kind = sessions.kind(remote.daemon);
             if remote.machine_kind.replace(kind) != kind {
                 machine::update_icon(&remote.icon, kind);
             }
-            let (status, error, reconnect) = match sessions.connection_status(remote.daemon) {
-                ConnectionStatus::Connected => ("Connected", None, false),
-                ConnectionStatus::Connecting => ("Connecting…", None, false),
-                ConnectionStatus::Disconnected { error } => ("Disconnected", error, true),
-            };
-            remote.status.set_text(status);
-            remote.status.set_tooltip_text(error);
-            remote.reconnect.set_sensitive(reconnect);
+            let status = sessions.connection_status(remote.daemon);
+            update_status(&remote.status, status);
+            remote.retry.set_sensitive(can_retry(status));
         }
     }
 }

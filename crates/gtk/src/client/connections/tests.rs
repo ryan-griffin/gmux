@@ -292,6 +292,70 @@ fn stream_loss_updates_local_and_remote_status_without_discarding_cached_executi
 }
 
 #[test]
+fn rejected_stream_state_preserves_cached_views_and_the_disconnect_reason() {
+    use gmux_client::transport::{Header, Metadata, Packet};
+    use std::{
+        io::Write,
+        time::{Duration, Instant},
+    };
+    let mut f = Fixture::new(2);
+    let daemon = f.ids[1];
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let manager =
+        SessionManager::from_stream(ipc::Endpoint::local(), f.hub.wake.clone(), daemon, socket)
+            .unwrap();
+    let link = &mut f.hub.origins.get_mut(&daemon).unwrap().link;
+    *link = Connection::from_session(manager, f.hub.wake.clone());
+    link.set_auto_reconnect(true);
+    let mut snapshot = f.execution(1, 1, 1);
+    snapshot.metadata.push(Metadata {
+        id: 2,
+        title: "retained".into(),
+        size: (80, 24),
+        ..Default::default()
+    });
+    f.hub.project_execution(snapshot).unwrap();
+    let pane = f.hub.lookup(daemon, 2).unwrap();
+    let view = f.hub.attach(pane, &Theme::adwaita(true)).unwrap();
+    let packet = Packet {
+        header: Header {
+            state: Some(f.execution(0, 1, 2)),
+            ..Default::default()
+        },
+        cells: vec![],
+    };
+    let mut bytes = Vec::new();
+    packet.encode_into(&mut bytes).unwrap();
+    peer.write_all(&bytes).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let updates = f.hub.poll();
+        if !f.hub.connected(daemon) {
+            assert!(
+                updates[&pane]
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("different daemon")
+            );
+            assert!(matches!(
+                f.hub.connection_status(daemon),
+                ConnectionStatus::Disconnected { error: Some(_) }
+            ));
+            assert!(f.hub.next_retry().is_none());
+            assert!(!f.hub.has_handle(pane));
+            assert_eq!(view.borrow().title(), "retained");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Invalid stream state remained connected"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn abandoned_connection_setup_releases_sockets_in_both_phases_and_retries_cleanly() {
     use std::{
         io::{BufRead, BufReader, Read, Write},

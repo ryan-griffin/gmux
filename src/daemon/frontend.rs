@@ -293,6 +293,9 @@ impl Daemon {
             _ => {}
         }
         anyhow::ensure!(frontend.attached, "Frontend must attach first");
+        if let StreamCommand::Ping = command {
+            return frontend.queue_encoded(transport::HEARTBEAT_REPLY);
+        }
         if let StreamCommand::Focused { active } = command {
             // Keep the last focused client as size owner while another app has focus.
             if active {

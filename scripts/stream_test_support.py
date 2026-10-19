@@ -1,14 +1,22 @@
 """Stream clients for local and direct remote terminal checks."""
 import json
+from pathlib import Path
+import re
 import socket
 import struct
 import time
+
+# Keep raw fixture clients aligned with the Rust protocol definition.
+PROTOCOL_VERSION = int(re.search(
+    r"^pub const VERSION: u32 = (\d+);$",
+    (Path(__file__).resolve().parent.parent / "crates/client/src/transport.rs").read_text(),
+    re.MULTILINE,
+)[1])
 
 
 class Client:
     def __init__(self, fixture, pane, *, connection=None, address=None, token=None):
         if connection:
-            from pathlib import Path
             catalog = json.loads((fixture.config / "connections.json").read_text())
             remote = next(remote for remote in catalog["remotes"] if remote["name"] == connection)
             address = remote["address"]
@@ -29,20 +37,21 @@ class Client:
             self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(6)
         if address:
-            self.socket.sendall((json.dumps(dict(version=22, channel="stream", token=token)) + "\n").encode())
+            self.socket.sendall((json.dumps(dict(version=PROTOCOL_VERSION, channel="stream", token=token)) + "\n").encode())
             line = bytearray()
             while not line.endswith(b"\n"):
                 line.extend(self.exact(1))
             hello = json.loads(line)
             assert "error" not in hello, hello
-            assert hello["version"] == 22, hello
+            assert hello["version"] == PROTOCOL_VERSION, hello
         else:
             self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
             hello = fixture.rpc("_hello")
         self.cells = {}
         self.git = {}
         self.frame = None
-        self.send("attach", version=22, daemon=hello["daemon"])
+        self.heartbeats = 0
+        self.send("attach", version=PROTOCOL_VERSION, daemon=hello["daemon"])
         self.send("subscribe", panes=[pane])
 
     def send(self, method, **params):
@@ -60,6 +69,9 @@ class Client:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             size, = struct.unpack("<I", self.exact(4))
+            if size == 0:
+                self.heartbeats += 1
+                continue
             assert 4 <= size <= 16 * 1024 * 1024
             body = self.exact(size)
             header_size, = struct.unpack("<I", body[:4])

@@ -128,6 +128,7 @@ pub struct Ui {
     command_exits: RefCell<HashSet<u64>>,
     keyboard: Rc<RefCell<crate::terminal::KeyboardModifiers>>,
     update_source: RefCell<Option<glib::SourceId>>,
+    reconnect_source: RefCell<Option<(std::time::Instant, glib::SourceId)>>,
     theme_handler: RefCell<Option<glib::SignalHandlerId>>,
 }
 type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<BackendReply>)>;
@@ -135,6 +136,9 @@ type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<BackendReply>)>;
 impl Drop for Ui {
     fn drop(&mut self) {
         if let Some(source) = self.update_source.get_mut().take() {
+            source.remove();
+        }
+        if let Some((_, source)) = self.reconnect_source.get_mut().take() {
             source.remove();
         }
         if let Some(handler) = self.theme_handler.get_mut().take() {

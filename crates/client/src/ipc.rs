@@ -132,6 +132,9 @@ impl Endpoint {
         }
     }
     fn resolve(name: &str, daemon: Option<crate::model::DaemonId>) -> anyhow::Result<Self> {
+        Self::resolve_inner(name, daemon).map_err(crate::network::ConnectionRejected::from_error)
+    }
+    fn resolve_inner(name: &str, daemon: Option<crate::model::DaemonId>) -> anyhow::Result<Self> {
         let remote = crate::connections::Catalog::load()?
             .remote(name, daemon)?
             .clone();

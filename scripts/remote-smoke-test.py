@@ -10,7 +10,7 @@ import subprocess
 import time
 
 from cargo_test_support import cargo_binary
-from stream_test_support import Client
+from stream_test_support import Client, PROTOCOL_VERSION
 from test_support import AppFixture, scenario, wait_for, rpc
 
 binary = cargo_binary("gmux")
@@ -33,7 +33,7 @@ def handshake(address, **params):
     connection = socket.create_connection(("127.0.0.1", int(address.rsplit(":", 1)[1])), 6)
     connection.settimeout(6)
     reader = connection.makefile("rb")
-    connection.sendall((json.dumps(dict(version=22, channel="control", **params)) + "\n").encode())
+    connection.sendall((json.dumps(dict(version=PROTOCOL_VERSION, channel="control", **params)) + "\n").encode())
     return connection, reader, json.loads(reader.readline())
 
 
@@ -200,6 +200,14 @@ with (artifacts / "remote-smoke.log").open("w") as log, \
         # The independent protocol client uses the same daemon execution as the CLI.
         wait_for(lambda: "VIEWPORT_CLIENT_OK" in command(client, "--connection", "server", "read", "--pane", pane)["text"].splitlines())
         assert "MISSING_REMOTE_PANE" not in command(client, "--connection", "server", "read", "--pane", pane)["text"]
+        paste = "printf '%s%s\\n' HEARTBEAT_ PASTE_OK"
+        stream.send("paste-begin", size=len(paste), enter=True)
+        stream.send("paste-data", text=paste[:12])
+        stream.socket.sendall(b'{"method":"ping"}\n')
+        stream.send("paste-data", text=paste[12:])
+        stream.send("paste-end")
+        stream.output("HEARTBEAT_PASTE_OK")
+        assert stream.heartbeats == 1, "A connection heartbeat did not receive its own reply"
         stream.close()
         wait_for(lambda: server.rpc("status")["remote_clients"] == 0)
         no_local_daemon(client)

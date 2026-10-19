@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 20:
+handshake. The current protocol version is 23:
 
 ```json
-{"version":20,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":23,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -164,7 +164,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":20,"daemon":"returned-identity"}
+{"method":"attach","version":23,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -190,6 +190,13 @@ contains pane `meta`, an optional `frame`, changed `rows`, and optional executio
 `state`, Git metadata, notifications, search results, selection, copy text, or
 errors. A full viewport arrives on subscription; later packets contain changed
 rows. Metadata-only packets have no cell data.
+
+Send the connection command `{"method":"ping"}` to check that the daemon's
+event loop is responding. It replies with a zero-length record, four zero bytes,
+without changing pane state or an in-progress paste. The Rust session client sends
+a ping every ten seconds and closes streams that deliver no replies or output for
+thirty seconds. Heartbeat replies do not wake the UI. `Packet::read_message`
+returns None for these records; `Packet::read` skips them.
 
 Pane metadata uses `unread_sequence` for the newest unread alert's sequence
 number, or zero after acknowledgement. Send that sequence as `through` in

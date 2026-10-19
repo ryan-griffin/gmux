@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 
 from cargo_test_support import cargo_binary
+from stream_test_support import PROTOCOL_VERSION
 from test_support import AppFixture, scenario, wait_for
 
 binary = cargo_binary("gmux")
@@ -35,7 +36,7 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         with socket.socket(socket.AF_UNIX) as wrong:
             wrong.settimeout(3)
             wrong.connect(a.env["GMUX_SOCKET"] + ".stream")
-            wrong.sendall((json.dumps(dict(method="attach", version=22, daemon=other)) + "\n").encode())
+            wrong.sendall((json.dumps(dict(method="attach", version=PROTOCOL_VERSION, daemon=other)) + "\n").encode())
             assert wrong.recv(4) == b"", "An attach for another daemon must disconnect"
 
     with scenario("daemon rejects organization and presentation without touching execution"):

@@ -215,9 +215,11 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         widget("No Tabs", "label")
         open_manager()
         widget("This Computer", "label")
+        widget("Connected", "label")
         machines_size = dialog_size("Connections")
         assert not find(f"Remove {hostname}")
-        assert not find(f"Reconnect to {hostname}")
+        local_retry = widget(f"Retry connection to {hostname} now", "button")
+        assert not local_retry.get_state_set().contains(Atspi.StateType.SENSITIVE)
         click(hostname, "list item")
         widget("Local Connection", "dialog")
         assert dialog_size("Local Connection") == machines_size
@@ -935,18 +937,41 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         widget("server", "list item")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
 
-    with scenario("disconnection updates status and the reconnect button restores the same daemon"):
+    with scenario("disconnection shows automatic recovery and the retry button retries immediately"):
         stop_daemon(server.env["GMUX_SOCKET"])
         remote.wait(timeout=8)
-        reconnect = widget("Reconnect to server", "button")
-        wait_accessible(lambda: reconnect.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        retry = widget("Retry connection to server now", "button")
+        widget("Reconnecting…", "label")
+        wait_accessible(lambda: retry.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        screenshot("connections-reconnecting.png")
         server.rpc("connection-edit", connection="local", remote_access=dict(
             enabled=True, listen_address=address, authentication=dict(mode="none")))
         server.start(daemon, "serve", stdout=log, stderr=log)
         wait_for(lambda: server.rpc("status")["bound_address"] == address)
-        click("Reconnect to server", "button")
+        click("Retry connection to server now", "button")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
-        wait_accessible(lambda: not reconnect.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        wait_accessible(lambda: not retry.get_state_set().contains(Atspi.StateType.SENSITIVE))
+
+    with scenario("permanent credential failures show Disconnected and manual retry restores Connected"):
+        credentials = replacement_token.read_bytes()
+        try:
+            replacement_token.write_text("invalid")
+            # Changing authentication closes the existing stream and triggers recovery.
+            secured.rpc("connection-edit", connection="local", remote_access=dict(
+                enabled=True, listen_address=secure_address, authentication=dict(mode="none")))
+            widget("Disconnected", "label")
+            retry = widget("Retry connection to secured now", "button")
+            assert retry.get_state_set().contains(Atspi.StateType.SENSITIVE)
+            screenshot("connections-error.png")
+        finally:
+            replacement_token.write_bytes(credentials)
+            secured.rpc("connection-edit", connection="local", remote_access=dict(
+                enabled=True, listen_address=secure_address,
+                authentication=dict(mode="token", file=str(token))))
+        click("Retry connection to secured now", "button")
+        wait_accessible(lambda: not retry.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        wait_accessible(lambda: any(obj.get_role_name() == "label" and obj.get_name() == "Connected"
+                        for obj in descendants(widget("secured", "list item"))))
 
     with scenario("closing and reopening the manager releases dialog resources"):
         for name in ("server", "secured"):
@@ -1027,10 +1052,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         key(Gdk.KEY_Escape)
         server.start(daemon, "serve", stdout=log, stderr=log)
         wait_for(lambda: server.rpc("status")["bound_address"] == address)
-        open_manager()
-        click("Reconnect to server", "button")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
-        close_dialog("Connections")
         activate(empty_options)
         creation_menu(disconnected=("secured",))
         click(hostname, "menu item")

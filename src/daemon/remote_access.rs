@@ -305,13 +305,16 @@ mod tests {
                 })
                 .unwrap_err();
             assert_eq!(saved, !occupied, "Listener replacement failed: {error:#}");
-            assert!(if occupied {
-                error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
-            } else {
-                error.to_string().contains("disk write failed")
-            });
+            assert!(
+                if occupied {
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                } else {
+                    error.to_string().contains("disk write failed")
+                },
+                "occupied={occupied}: {error:#}"
+            );
             assert!(state.config == original);
             assert_eq!(state.status().bound_address, Some(address));
             assert!(state.error.is_none());

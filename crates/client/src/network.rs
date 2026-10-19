@@ -8,6 +8,7 @@ use std::{
     borrow::Cow,
     io::{BufRead, BufReader, Read, Write},
     net::{AddrParseError, Ipv6Addr, SocketAddr, TcpStream},
+    os::fd::AsRawFd,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -18,6 +19,47 @@ pub const CONTROL_TIMEOUT: Duration = TIMEOUT.saturating_add(TIMEOUT);
 pub const MAX_HANDSHAKE: usize = 4096;
 pub const MAX_REQUEST: usize = 1024 * 1024;
 pub const MAX_REPLY: usize = 16 * 1024 * 1024;
+
+/// Setup was rejected and needs a settings change or an explicit retry.
+#[derive(Debug)]
+pub(crate) struct ConnectionRejected(pub String);
+impl std::fmt::Display for ConnectionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for ConnectionRejected {}
+impl ConnectionRejected {
+    pub(crate) fn from_error(error: anyhow::Error) -> anyhow::Error {
+        Self(error.to_string()).into()
+    }
+}
+
+/// Detect broken paths even on idle terminal streams, without userspace timers.
+/// TCP_USER_TIMEOUT also bounds unacknowledged writes and zero-window stalls.
+pub fn configure_liveness(stream: &TcpStream) -> std::io::Result<()> {
+    for (level, option, value) in [
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1i32),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
+        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 30_000),
+    ] {
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                level,
+                option,
+                (&value as *const i32).cast(),
+                std::mem::size_of_val(&value) as _,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 /// Supply the default port without resolving hostnames on the caller's thread.
 pub fn with_default_port(address: &str) -> Cow<'_, str> {
@@ -220,6 +262,9 @@ fn connect_before(
     })?;
     let _active = cancellation.map(|c| c.register(&stream)).transpose()?;
     stream.set_nodelay(true)?;
+    if matches!(channel, Channel::Stream) {
+        configure_liveness(&stream)?;
+    }
     let mut stream = TimedStream {
         socket: stream,
         deadline: Some(deadline),
@@ -234,15 +279,16 @@ fn connect_before(
         },
     )?;
     let value = read_handshake(&mut stream)?;
-    check_error(&value)?;
-    let hello: ConnectionInfo = serde_json::from_value(value)?;
+    check_error(&value).map_err(ConnectionRejected::from_error)?;
+    let hello: ConnectionInfo =
+        serde_json::from_value(value).map_err(|error| ConnectionRejected(error.to_string()))?;
     anyhow::ensure!(
         hello.version == transport::VERSION,
-        "Gmux versions are incompatible"
+        ConnectionRejected("Gmux versions are incompatible".into())
     );
     anyhow::ensure!(
         expected.is_none_or(|id| hello.daemon == id),
-        "Remote connection identity changed"
+        ConnectionRejected("Remote connection identity changed".into())
     );
     Ok((stream.socket, hello))
 }
@@ -553,6 +599,82 @@ mod tests {
             .expect("Token loading waited for a FIFO writer")
             .unwrap_err();
         assert!(error.to_string().contains("regular file"));
+    }
+
+    #[test]
+    fn stream_setup_rejects_permanent_errors_and_configures_idle_liveness() {
+        let daemon = DaemonId::generate().unwrap();
+        for failure in [
+            Some("authentication"),
+            Some("version"),
+            Some("identity"),
+            None,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_json(
+                    &mut BufReader::new(stream.try_clone().unwrap()),
+                    MAX_HANDSHAKE,
+                )
+                .unwrap();
+                let mut reply = serde_json::to_value(ConnectionInfo {
+                    version: transport::VERSION,
+                    daemon,
+                    home_directory: "/tmp".into(),
+                    machine_kind: crate::model::MachineKind::Unknown,
+                    hostname: "server".into(),
+                })
+                .unwrap();
+                match failure {
+                    Some("authentication") => {
+                        reply = serde_json::json!({"error":"Authentication failed"})
+                    }
+                    Some("version") => reply["version"] = (transport::VERSION + 1).into(),
+                    Some("identity") => {
+                        reply["daemon"] =
+                            serde_json::to_value(DaemonId::generate().unwrap()).unwrap()
+                    }
+                    _ => (),
+                }
+                write_json(&mut stream, &reply).unwrap();
+            });
+            let result =
+                ipc::Endpoint::tcp(address, Credentials::default(), Some(daemon)).connect_stream();
+            if failure.is_some() {
+                assert!(result.err().unwrap().is::<ConnectionRejected>());
+            } else {
+                let ipc::Stream::Tcp(stream) = result.unwrap() else {
+                    panic!("Expected TCP stream")
+                };
+                assert!(stream.read_timeout().unwrap().is_none());
+                for (level, option, expected) in [
+                    (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1i32),
+                    (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15),
+                    (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5),
+                    (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
+                    (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 30_000),
+                ] {
+                    let mut actual = 0i32;
+                    let mut length = std::mem::size_of_val(&actual) as libc::socklen_t;
+                    assert_eq!(
+                        unsafe {
+                            libc::getsockopt(
+                                stream.as_raw_fd(),
+                                level,
+                                option,
+                                (&mut actual as *mut i32).cast(),
+                                &mut length,
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(actual, expected);
+                }
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]
