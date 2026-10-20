@@ -912,6 +912,7 @@ impl RemoteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cells::{decoration, underline};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -1634,7 +1635,8 @@ mod tests {
             cell.fg = [1, 2, 3];
             cell.bg = [4, 5, 6];
             cell.flags |= 63;
-            cell.decoration = 5 | 8 | 16;
+            cell.decoration =
+                underline::DASHED | decoration::OVERLINE | decoration::UNDERLINE_COLOR;
             cell.underline_color = [8, 9, 10];
         }
         send_frame(&sender, &session, frame, vec![0, 1], cells.clone(), None);

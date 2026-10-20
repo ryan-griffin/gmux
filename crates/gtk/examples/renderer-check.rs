@@ -1,6 +1,12 @@
 //! Check terminal rendering against GTK's independent Pango layout drawing.
-#[path = "../src/terminal/cursor.rs"]
-mod cursor;
+mod cursor {
+    include!("../src/terminal/cursor.rs");
+
+    // Native-only observation, without counters or extra state in the client.
+    pub(super) fn source_id(cursor: &Cursor) -> Option<u32> {
+        cursor.source.borrow().as_ref().map(glib::SourceId::as_raw)
+    }
+}
 #[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
@@ -9,7 +15,11 @@ mod render;
 mod renderer;
 
 use clap::{Parser, ValueEnum};
-use gmux_client::{Cell, Frame, theme::Theme};
+use gmux_client::{
+    Cell, Frame,
+    cells::{decoration, mouse_shape, underline},
+    theme::Theme,
+};
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
 use renderer::{Renderer, Scene};
 use serde_json::json;
@@ -48,8 +58,7 @@ fn cell(text: &str, theme: Theme, flags: u8) -> Cell {
     let mut cell = Cell {
         fg: theme.foreground,
         bg: theme.background,
-        flags: flags & !8,
-        decoration: u8::from(flags & 8 != 0),
+        flags,
         ..Cell::default()
     };
     cell.text[..text.len()].copy_from_slice(text.as_bytes());
@@ -95,7 +104,7 @@ fn fixture(theme: Theme) -> Vec<Cell> {
         "j",
     ];
     for y in 0..8 {
-        let flags = [0, 1, 2, 3, 4, 8, 16, 8 | 16][y];
+        let flags = [0, 1, 2, 3, 4, 0, 16, 16][y];
         let mut x = 0;
         while x < 40 {
             let cluster = clusters[(x + y) % clusters.len()];
@@ -105,6 +114,11 @@ fn fixture(theme: Theme) -> Vec<Cell> {
                 cells[y * 40 + x] = cell("", theme, flags | 64);
             }
             x += 1;
+        }
+    }
+    for y in [5, 7] {
+        for cell in &mut cells[y * 40..(y + 1) * 40] {
+            cell.decoration = underline::SINGLE;
         }
     }
     cells
@@ -176,8 +190,11 @@ fn reference(
             snapshot.append_layout(&layout, &color);
             snapshot.restore();
         }
-        for (flag, line_y) in [(8, ch - 2.0), (16, ch / 2.0)] {
-            if (flag == 8 && cell.decoration & 7 != 0) || (flag == 16 && cell.flags & 16 != 0) {
+        for (present, line_y) in [
+            (cell.underline() != underline::NONE, ch - 2.0),
+            (cell.flags & 16 != 0, ch / 2.0),
+        ] {
+            if present {
                 // Reference snapping is expressed in global device coordinates.
                 let left =
                     ((x + scene.origin.0) * scene.scale).round() / scene.scale - scene.origin.0;
@@ -668,13 +685,15 @@ fn validate_cursor_lifecycle(output: &Path) {
     settings.set_gtk_cursor_blink(true);
     settings.set_gtk_cursor_blink_time(200);
     settings.set_gtk_cursor_blink_timeout(10);
-    let cursor = cursor::Cursor::new(&area, |_| {});
+    let defaults = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = defaults.clone();
+    let cursor = cursor::Cursor::new(&area, move |blink| observed.borrow_mut().push(blink));
     let mut frame = Frame {
         cols: 80,
         rows: 24,
         cursor_visible: 1,
         cursor_blink: 1,
-        mouse_shape: 0,
+        mouse_shape: mouse_shape::DEFAULT,
         ..Frame::default()
     };
     cursor.update(frame, false);
@@ -705,6 +724,96 @@ fn validate_cursor_lifecycle(output: &Path) {
     // Text input must restart blinking even with identical terminal coordinates.
     cursor.restart();
     assert!(cursor.visible() && cursor.running());
+    // Activity close to an old deadline must keep the cursor visible for the
+    // complete new half-cycle, even when the old source wakes in between.
+    fn pump(duration: Duration) {
+        let end = Instant::now() + duration;
+        while Instant::now() < end {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    cursor.restart();
+    pump(Duration::from_millis(80));
+    assert!(cursor.visible());
+    let pending = cursor::source_id(&cursor);
+    let activity = Instant::now();
+    cursor.restart();
+    assert_eq!(cursor::source_id(&cursor), pending);
+    pump(Duration::from_millis(75));
+    assert!(
+        cursor.visible(),
+        "Old deadline hid the cursor after new activity"
+    );
+    wait(|| !cursor.visible());
+    assert!(
+        activity.elapsed() >= Duration::from_millis(100),
+        "Blink hid before the full new half-cycle"
+    );
+
+    // Key input and its echoed cursor update reuse the same pending source.
+    cursor.restart();
+    let pending = cursor::source_id(&cursor);
+    for index in 0..1000 {
+        cursor.restart();
+        frame.cursor_x = (index % 70) as u16;
+        cursor.update(frame, false);
+        assert_eq!(
+            cursor::source_id(&cursor),
+            pending,
+            "Input replaced a pending source"
+        );
+    }
+
+    // Timing changes take effect with a source pending, and never send daemon
+    // defaults while the effective enablement stays true.
+    settings.set_gtk_cursor_blink_time(800);
+    pump(Duration::from_millis(80));
+    let shortened = Instant::now();
+    settings.set_gtk_cursor_blink_time(200);
+    wait(|| !cursor.visible());
+    assert!(
+        shortened.elapsed() < Duration::from_millis(300),
+        "Shortened preference retained the old deadline"
+    );
+    settings.set_gtk_cursor_blink_time(800);
+    pump(Duration::from_millis(180));
+    assert!(
+        cursor.visible(),
+        "Lengthened preference retained an old deadline"
+    );
+    wait(|| !cursor.visible());
+    settings.set_gtk_cursor_blink_timeout(20);
+    settings.set_gtk_cursor_blink_timeout(10);
+    assert!(
+        defaults.borrow().is_empty(),
+        "Timing-only settings sent daemon defaults"
+    );
+    let timeout_spec = settings.find_property("gtk-cursor-blink-timeout").unwrap();
+    let minimum = timeout_spec
+        .downcast_ref::<glib::ParamSpecInt>()
+        .unwrap()
+        .minimum();
+    std::fs::write(
+        output.join("cursor-settings.json"),
+        json!({"timeout_minimum": minimum}).to_string(),
+    )
+    .unwrap();
+    if minimum <= 0 {
+        settings.set_gtk_cursor_blink_timeout(0);
+        assert!(!cursor.running());
+        assert_eq!(*defaults.borrow(), [false]);
+    }
+    settings.set_gtk_cursor_blink(false);
+    assert!(!cursor.running());
+    settings.set_gtk_cursor_blink_time(400);
+    assert_eq!(*defaults.borrow(), [false]);
+    settings.set_gtk_cursor_blink_timeout(10);
+    assert_eq!(*defaults.borrow(), [false]);
+    settings.set_gtk_cursor_blink(true);
+    assert_eq!(*defaults.borrow(), [false, true]);
+    settings.set_gtk_cursor_blink_time(200);
+
     frame.cursor_blink = 0;
     cursor.update(frame, false);
     assert!(cursor.visible() && !cursor.running());
@@ -746,8 +855,10 @@ fn validate_cursor_lifecycle(output: &Path) {
     assert!(!cursor.running() && cursor.visible());
     settings.set_gtk_cursor_blink(true);
     assert!(cursor.running());
+    assert_eq!(*defaults.borrow(), [false, true, false, true]);
 
     settings.set_gtk_cursor_blink_timeout(1);
+    assert_eq!(*defaults.borrow(), [false, true, false, true]);
     wait(|| !cursor.running());
     assert!(cursor.visible());
     cursor.restart();
@@ -799,15 +910,21 @@ fn validate_decoration_patterns(
         let texture = render(gpu, &node(&mut Renderer::new(), &s, font, context).0, &s);
         pixels(&texture)
     };
-    for style in [1, 2, 4, 5, 8] {
+    for style in [
+        underline::SINGLE,
+        underline::DOUBLE,
+        underline::DOTTED,
+        underline::DASHED,
+        decoration::OVERLINE,
+    ] {
         let data = check(&grid(style, 0));
         for y in 0..24 {
             for x in 0..60 {
                 let expected = match style {
-                    1 => y == 22,
-                    2 => y == 20 || y == 22,
-                    4 => y == 22 && x % 2 == 0,
-                    5 => y == 22 && x % 6 < 3,
+                    underline::SINGLE => y == 22,
+                    underline::DOUBLE => y == 20 || y == 22,
+                    underline::DOTTED => y == 22 && x % 2 == 0,
+                    underline::DASHED => y == 22 && x % 6 < 3,
                     _ => y == 0, // Overline is at the top, with no underline.
                 };
                 assert_eq!(
@@ -818,7 +935,7 @@ fn validate_decoration_patterns(
             }
         }
     }
-    let data = check(&grid(3, 0));
+    let data = check(&grid(underline::CURLY, 0));
     let mut extents = Vec::new();
     for x in 1..59 {
         let ink: Vec<_> = (0..24).filter(|&y| data[(y * 60 + x) * 4] > 20).collect();
@@ -835,10 +952,10 @@ fn validate_decoration_patterns(
     );
     assert!(extents.iter().any(|&(top, _)| top == 19));
     assert!(extents.iter().any(|&(_, bottom)| bottom == 23));
-    let faint = check(&grid(1 | 8, 4));
+    let faint = check(&grid(underline::SINGLE | decoration::OVERLINE, 4));
     assert!((127..=128).contains(&faint[22 * 60 * 4]));
     assert!((127..=128).contains(&faint[0]));
-    let invisible = check(&grid(3 | 8, 32));
+    let invisible = check(&grid(underline::CURLY | decoration::OVERLINE, 32));
     assert!(
         invisible
             .as_chunks::<4>()
@@ -846,6 +963,150 @@ fn validate_decoration_patterns(
             .iter()
             .all(|pixel| pixel[..3] == [0; 3])
     );
+}
+
+// Compare batched patterns with independent, individually snapped rectangles.
+// Blank cells isolate coverage, color, opacity, phase and clipped run edges.
+fn validate_batched_patterns(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+    output: &Path,
+) {
+    let theme = Theme::adwaita(true);
+    let mut cells = vec![cell("", theme, 0); 12 * 4];
+    for (index, cell) in cells.iter_mut().enumerate() {
+        let x = index % 12;
+        cell.decoration = if index / 12 % 2 == 0 {
+            underline::DOTTED
+        } else {
+            underline::DASHED
+        };
+        if (2..7).contains(&x) {
+            cell.decoration |= decoration::UNDERLINE_COLOR;
+            cell.underline_color = if x == 6 { [0; 3] } else { [240, 60, 180] };
+        }
+        if (4..10).contains(&x) {
+            cell.flags |= 4;
+        }
+        if x == 10 {
+            cell.flags |= 64;
+        }
+        if x == 11 {
+            cell.flags |= 32;
+        }
+    }
+    for (scale, origin) in [
+        (1.0, (0.25, 0.5)),
+        (1.25, (0.25, 0.5)),
+        (1.5, (0.2, 0.4)),
+        (2.0, (0.25, 0.5)),
+        (1.375, (0.2, 0.4)),
+        (1.3, (0.25, 0.5)), // Non-binary scale retains individual rectangles.
+        (1.0, (-0.5, 0.5)), // Rounding across zero cannot use a periodic tile.
+        (1.0, (0.599609375, 0.0)), // Saved glyph ink bounds require this translation when autosized.
+    ] {
+        let mut s = scene(&cells, theme);
+        s.frame.cols = 12;
+        s.frame.rows = 4;
+        s.metrics = (17.3, 21.3);
+        s.width = 208;
+        s.height = 86;
+        s.scale = scale;
+        s.origin = origin;
+        s.selection = Some((1, 19));
+        let expected = gtk::Snapshot::new();
+        expected.append_color(
+            &rgba(s.frame.background, 1.0),
+            &graphene::Rect::new(0.0, 0.0, 208.0, 86.0),
+        );
+        // Draw selection backgrounds independently of decoration color.
+        for y in 0..4 {
+            let row = gtk::Snapshot::new();
+            let row_y = y as f64 * s.metrics.1;
+            let snap_x = |x: f64| ((x + s.origin.0) * scale).round() / scale - s.origin.0;
+            let snap_y =
+                |y: f64| ((y + row_y + s.origin.1) * scale).round() / scale - row_y - s.origin.1;
+            for x in 0..12 {
+                let index = y * 12 + x;
+                let selected = (1..=19).contains(&index);
+                if selected {
+                    row.append_color(
+                        &rgba(theme.selection_background, 1.0),
+                        &graphene::Rect::new(
+                            snap_x(x as f64 * 17.3) as f32,
+                            snap_y(0.0) as f32,
+                            (snap_x((x + 1) as f64 * 17.3) - snap_x(x as f64 * 17.3)) as f32,
+                            (snap_y(21.3) - snap_y(0.0)) as f32,
+                        ),
+                    );
+                }
+            }
+            // Clip at appearance boundaries, not every cell edge. Splitting a
+            // single dot into adjacent rectangles adds an unrelated blend seam.
+            let mut runs: Vec<(usize, usize, [u8; 3], f32)> = Vec::new();
+            for x in 0..12 {
+                let index = y * 12 + x;
+                let cell = &cells[index];
+                if cell.flags & 32 != 0 {
+                    continue;
+                }
+                let color = if cell.has_underline_color() {
+                    cell.underline_color
+                } else if (1..=19).contains(&index) {
+                    theme.selection_foreground
+                } else {
+                    cell.fg
+                };
+                let alpha = if cell.flags & 4 != 0 { 0.5 } else { 1.0 };
+                if let Some((_, end, previous_color, previous_alpha)) = runs.last_mut()
+                    && *end == x
+                    && *previous_color == color
+                    && *previous_alpha == alpha
+                {
+                    *end += 1;
+                } else {
+                    runs.push((x, x + 1, color, alpha));
+                }
+            }
+            for (start, end, color, alpha) in runs {
+                let unit = if y % 2 == 0 { 1.0 } else { 3.0 };
+                let start = start as f64 * 17.3;
+                let end = end as f64 * 17.3;
+                let mut left = (start / (2.0 * unit)).floor() * 2.0 * unit;
+                while left < end {
+                    let a = left.max(start);
+                    let b = (left + unit).min(end);
+                    if b > a {
+                        row.append_color(
+                            &rgba(color, alpha),
+                            &graphene::Rect::new(
+                                snap_x(a) as f32,
+                                snap_y(19.3) as f32,
+                                (snap_x(b) - snap_x(a)) as f32,
+                                (snap_y(20.3) - snap_y(19.3)) as f32,
+                            ),
+                        );
+                    }
+                    left += 2.0 * unit;
+                }
+            }
+            expected.save();
+            expected.translate(&graphene::Point::new(0.0, row_y as f32));
+            expected.append_node(row.to_node().unwrap());
+            expected.restore();
+        }
+        let actual = node(&mut Renderer::new(), &s, font, context).0;
+        let expected = expected.to_node().unwrap();
+        assert_render_eq(
+            gpu,
+            &actual,
+            &expected,
+            &s,
+            output,
+            &format!("batched-patterns-{scale}"),
+        );
+    }
 }
 
 fn validate_decorations(gpu: &gsk::Renderer, context: &pango::Context, output: &Path) {
@@ -870,10 +1131,10 @@ fn validate_decorations(gpu: &gsk::Renderer, context: &pango::Context, output: &
         let s = configured(&glyphs, theme, scale);
         let plain = render(gpu, &node(&mut Renderer::new(), &s, &font, context).0, &s);
         let plain_pixels = pixels(&plain);
-        for style in 1..=5 {
+        for style in underline::STYLES {
             let mut decorated = glyphs.clone();
             for c in &mut decorated[..10] {
-                c.decoration = style | 16;
+                c.decoration = style | decoration::UNDERLINE_COLOR;
                 c.underline_color = [255, 0, 0];
             }
             let s = configured(&decorated, theme, scale);
@@ -1132,7 +1393,10 @@ fn validate_scroll_cache(
                     } else {
                         row
                     };
-                    cells[y * 40] = cell(&format!("{step}"), theme, 8 | 16);
+                    cells[y * 40] = Cell {
+                        decoration: underline::SINGLE,
+                        ..cell(&format!("{step}"), theme, 16)
+                    };
                     cells[y * 40].bg = [35 + step as u8, 45, 55];
                 }
                 let mut scene = scene(&cells, theme);
@@ -1258,10 +1522,16 @@ fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context
     // cells suppress text and decorations while retaining their background.
     let mut cells = cells.clone();
     for target in &mut cells[80..120] {
-        *target = cell(" ", theme, 8 | 16);
+        *target = Cell {
+            decoration: underline::SINGLE,
+            ..cell(" ", theme, 16)
+        };
     }
     cells[84].flags |= 64;
-    cells[85] = cell("H", theme, 32 | 8 | 16);
+    cells[85] = Cell {
+        decoration: underline::SINGLE,
+        ..cell("H", theme, 32 | 16)
+    };
     cells[86] = cell("界", theme, 0);
     cells[87] = cell("", theme, 64);
     scene.cells = &cells;
@@ -1414,6 +1684,8 @@ fn main() -> anyhow::Result<()> {
     validate_geometry(&gpu, &font, &context);
     validate_decorations(cache_gpu, &context, &options.output);
     validate_decoration_patterns(cache_gpu, &font, &context);
+    validate_batched_patterns(cache_gpu, &font, &context, &options.output);
+    validate_batched_patterns(&gpu, &font, &context, &options.output);
     std::fs::write(
         options.output.join("checks.json"),
         serde_json::to_string_pretty(&json!({
@@ -1422,7 +1694,7 @@ fn main() -> anyhow::Result<()> {
             "glyph_cases": cases,
             "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
                        "font and context changes", "fractional blocks", "selection and search",
-                       "distinct underline patterns and overline geometry", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
+                       "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
                        "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts"]
         }))?,
     )?;

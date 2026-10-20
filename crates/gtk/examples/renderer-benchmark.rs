@@ -9,7 +9,11 @@ mod render;
 mod renderer;
 
 use clap::Parser;
-use gmux_client::{Cell, Frame, theme::Theme};
+use gmux_client::{
+    Cell, Frame,
+    cells::{decoration, underline},
+    theme::Theme,
+};
 use gtk::{graphene, pango, prelude::*};
 use renderer::{Renderer, Scene};
 use serde_json::{Value, json};
@@ -38,8 +42,7 @@ fn cell(text: &str, fg: [u8; 3], bg: [u8; 3], flags: u8) -> Cell {
     let mut cell = Cell {
         fg,
         bg,
-        flags: flags & !8,
-        decoration: u8::from(flags & 8 != 0),
+        flags,
         ..Cell::default()
     };
     cell.text[..text.len()].copy_from_slice(text.as_bytes());
@@ -68,7 +71,7 @@ fn fixture(cols: u16, rows: u16, theme: Theme, mixed: bool) -> Vec<Cell> {
         let mut x = 0;
         while x < cols as usize {
             let fg = theme.palette[1 + (x / 20 + y / 4) % 7];
-            let flags = if mixed { [0, 1, 2, 4, 8, 16][y % 6] } else { 0 };
+            let flags = if mixed { [0, 1, 2, 4, 0, 16][y % 6] } else { 0 };
             if mixed && x % 18 < 2 && x + 1 < cols as usize {
                 let text = unicode[(x / 18 + y) % unicode.len()];
                 cells.push(cell(text, fg, theme.background, flags));
@@ -81,6 +84,13 @@ fn fixture(cols: u16, rows: u16, theme: Theme, mixed: bool) -> Vec<Cell> {
                 let text = (ascii[(x + y) % ascii.len()] as char).to_string();
                 cells.push(cell(&text, fg, theme.background, flags));
                 x += 1;
+            }
+        }
+    }
+    if mixed {
+        for (index, cell) in cells.iter_mut().enumerate() {
+            if (index / cols as usize) % 6 == 4 {
+                cell.decoration = underline::SINGLE;
             }
         }
     }
@@ -183,7 +193,9 @@ fn main() -> anyhow::Result<()> {
             }
             if fixture_name == "decorations" {
                 for (index, cell) in cells.iter_mut().enumerate() {
-                    cell.decoration = (1 + (index / options.cols as usize) % 5) as u8 | 8 | 16;
+                    cell.decoration = underline::STYLES[(index / options.cols as usize) % 5]
+                        | decoration::OVERLINE
+                        | decoration::UNDERLINE_COLOR;
                     cell.underline_color = theme.palette[1 + (index / options.cols as usize) % 7];
                 }
             }

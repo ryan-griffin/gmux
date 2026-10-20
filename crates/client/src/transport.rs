@@ -212,13 +212,14 @@ pub fn command(writer: &mut impl Write, request: &impl Serialize) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cells::{decoration, mouse_shape, underline};
     use std::io::{self, BufReader, Read};
     fn packet() -> Packet {
         let mut cell = Cell::default();
         cell.text[..5].copy_from_slice("界é".as_bytes());
         cell.fg = [1, 2, 3];
         cell.flags = 65;
-        cell.decoration = 3 | 8 | 16;
+        cell.decoration = underline::CURLY | decoration::OVERLINE | decoration::UNDERLINE_COLOR;
         cell.underline_color = [6, 7, 8];
         Packet {
             header: Header {
@@ -237,7 +238,7 @@ mod tests {
                     cols: 2,
                     rows: 3,
                     cursor_blink: 1,
-                    mouse_shape: 33,
+                    mouse_shape: mouse_shape::ZOOM_OUT,
                     scrollback: crate::Scrollback {
                         total: 500,
                         offset: 200,
@@ -404,6 +405,7 @@ mod tests {
     fn fragmented_and_interrupted_reads_preserve_cells_and_following_packets() {
         let mut packet = packet();
         packet.header.frame.as_mut().unwrap().cols = 73;
+        packet.header.frame.as_mut().unwrap().mouse_shape = u8::MAX;
         packet.header.rows = vec![0, 2];
         packet.header.row_flags = vec![1, 0];
         packet.cells = (0..146)
@@ -413,7 +415,7 @@ mod tests {
                 cell.fg = [i, 2, 3];
                 cell.bg = [4, i, 6];
                 cell.flags = i;
-                cell.decoration = (i % 6) | 8 | 16;
+                cell.decoration = i | decoration::OVERLINE | decoration::UNDERLINE_COLOR;
                 cell.underline_color = [i, 20, 30];
                 cell
             })
@@ -449,6 +451,7 @@ mod tests {
                     assert!(decoded.header.frame.is_none());
                 } else {
                     assert!(decoded.cells == packet.cells);
+                    assert!(decoded.header.frame == packet.header.frame);
                     assert_eq!(decoded.header.rows, packet.header.rows);
                     assert_eq!(decoded.header.row_flags, packet.header.row_flags);
                     assert_eq!(decoded.header.meta, packet.header.meta);

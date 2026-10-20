@@ -5,6 +5,52 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define GMUX_UNDERLINE_NONE 0
+#define GMUX_UNDERLINE_SINGLE 1
+#define GMUX_UNDERLINE_DOUBLE 2
+#define GMUX_UNDERLINE_CURLY 3
+#define GMUX_UNDERLINE_DOTTED 4
+#define GMUX_UNDERLINE_DASHED 5
+
+#define GMUX_MOUSE_SHAPE_DEFAULT 0
+#define GMUX_MOUSE_SHAPE_CONTEXT_MENU 1
+#define GMUX_MOUSE_SHAPE_HELP 2
+#define GMUX_MOUSE_SHAPE_POINTER 3
+#define GMUX_MOUSE_SHAPE_PROGRESS 4
+#define GMUX_MOUSE_SHAPE_WAIT 5
+#define GMUX_MOUSE_SHAPE_CELL 6
+#define GMUX_MOUSE_SHAPE_CROSSHAIR 7
+#define GMUX_MOUSE_SHAPE_TEXT 8
+#define GMUX_MOUSE_SHAPE_VERTICAL_TEXT 9
+#define GMUX_MOUSE_SHAPE_ALIAS 10
+#define GMUX_MOUSE_SHAPE_COPY 11
+#define GMUX_MOUSE_SHAPE_MOVE 12
+#define GMUX_MOUSE_SHAPE_NO_DROP 13
+#define GMUX_MOUSE_SHAPE_NOT_ALLOWED 14
+#define GMUX_MOUSE_SHAPE_GRAB 15
+#define GMUX_MOUSE_SHAPE_GRABBING 16
+#define GMUX_MOUSE_SHAPE_ALL_SCROLL 17
+#define GMUX_MOUSE_SHAPE_COL_RESIZE 18
+#define GMUX_MOUSE_SHAPE_ROW_RESIZE 19
+#define GMUX_MOUSE_SHAPE_N_RESIZE 20
+#define GMUX_MOUSE_SHAPE_E_RESIZE 21
+#define GMUX_MOUSE_SHAPE_S_RESIZE 22
+#define GMUX_MOUSE_SHAPE_W_RESIZE 23
+#define GMUX_MOUSE_SHAPE_NE_RESIZE 24
+#define GMUX_MOUSE_SHAPE_NW_RESIZE 25
+#define GMUX_MOUSE_SHAPE_SE_RESIZE 26
+#define GMUX_MOUSE_SHAPE_SW_RESIZE 27
+#define GMUX_MOUSE_SHAPE_EW_RESIZE 28
+#define GMUX_MOUSE_SHAPE_NS_RESIZE 29
+#define GMUX_MOUSE_SHAPE_NESW_RESIZE 30
+#define GMUX_MOUSE_SHAPE_NWSE_RESIZE 31
+#define GMUX_MOUSE_SHAPE_ZOOM_IN 32
+#define GMUX_MOUSE_SHAPE_ZOOM_OUT 33
+
+#define GMUX_DECORATION_UNDERLINE_MASK 7
+#define GMUX_DECORATION_OVERLINE 8
+#define GMUX_DECORATION_UNDERLINE_COLOR 16
+
 // Source of truth for the Gmux C/Rust ABI. Keep upstream Ghostty types in the
 // implementation; build.rs generates Rust declarations and layout checks here.
 typedef struct {
@@ -30,7 +76,7 @@ typedef struct {
     uint8_t cursor_visible;
     uint8_t cursor_style;
     uint8_t cursor_blink;
-    uint8_t mouse_shape; // W3C shapes from the pinned GhosttyMouseShape enum
+    uint8_t mouse_shape; // GMUX_MOUSE_SHAPE_* protocol codes
     uint8_t background[3];
     uint8_t foreground[3];
     uint8_t cursor[3];

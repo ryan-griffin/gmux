@@ -5,6 +5,58 @@
 #include <string.h>
 #include <time.h>
 
+// Explicit conversion keeps wire values independent of upstream enum ordering.
+static uint8_t mouse_shape_code(GhosttyMouseShape shape) {
+    switch (shape) {
+        case GHOSTTY_MOUSE_SHAPE_DEFAULT: return GMUX_MOUSE_SHAPE_DEFAULT;
+        case GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU: return GMUX_MOUSE_SHAPE_CONTEXT_MENU;
+        case GHOSTTY_MOUSE_SHAPE_HELP: return GMUX_MOUSE_SHAPE_HELP;
+        case GHOSTTY_MOUSE_SHAPE_POINTER: return GMUX_MOUSE_SHAPE_POINTER;
+        case GHOSTTY_MOUSE_SHAPE_PROGRESS: return GMUX_MOUSE_SHAPE_PROGRESS;
+        case GHOSTTY_MOUSE_SHAPE_WAIT: return GMUX_MOUSE_SHAPE_WAIT;
+        case GHOSTTY_MOUSE_SHAPE_CELL: return GMUX_MOUSE_SHAPE_CELL;
+        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR: return GMUX_MOUSE_SHAPE_CROSSHAIR;
+        case GHOSTTY_MOUSE_SHAPE_TEXT: return GMUX_MOUSE_SHAPE_TEXT;
+        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT: return GMUX_MOUSE_SHAPE_VERTICAL_TEXT;
+        case GHOSTTY_MOUSE_SHAPE_ALIAS: return GMUX_MOUSE_SHAPE_ALIAS;
+        case GHOSTTY_MOUSE_SHAPE_COPY: return GMUX_MOUSE_SHAPE_COPY;
+        case GHOSTTY_MOUSE_SHAPE_MOVE: return GMUX_MOUSE_SHAPE_MOVE;
+        case GHOSTTY_MOUSE_SHAPE_NO_DROP: return GMUX_MOUSE_SHAPE_NO_DROP;
+        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED: return GMUX_MOUSE_SHAPE_NOT_ALLOWED;
+        case GHOSTTY_MOUSE_SHAPE_GRAB: return GMUX_MOUSE_SHAPE_GRAB;
+        case GHOSTTY_MOUSE_SHAPE_GRABBING: return GMUX_MOUSE_SHAPE_GRABBING;
+        case GHOSTTY_MOUSE_SHAPE_ALL_SCROLL: return GMUX_MOUSE_SHAPE_ALL_SCROLL;
+        case GHOSTTY_MOUSE_SHAPE_COL_RESIZE: return GMUX_MOUSE_SHAPE_COL_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_ROW_RESIZE: return GMUX_MOUSE_SHAPE_ROW_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_N_RESIZE: return GMUX_MOUSE_SHAPE_N_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_E_RESIZE: return GMUX_MOUSE_SHAPE_E_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_S_RESIZE: return GMUX_MOUSE_SHAPE_S_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_W_RESIZE: return GMUX_MOUSE_SHAPE_W_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_NE_RESIZE: return GMUX_MOUSE_SHAPE_NE_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_NW_RESIZE: return GMUX_MOUSE_SHAPE_NW_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_SE_RESIZE: return GMUX_MOUSE_SHAPE_SE_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_SW_RESIZE: return GMUX_MOUSE_SHAPE_SW_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_EW_RESIZE: return GMUX_MOUSE_SHAPE_EW_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_NS_RESIZE: return GMUX_MOUSE_SHAPE_NS_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_NESW_RESIZE: return GMUX_MOUSE_SHAPE_NESW_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE: return GMUX_MOUSE_SHAPE_NWSE_RESIZE;
+        case GHOSTTY_MOUSE_SHAPE_ZOOM_IN: return GMUX_MOUSE_SHAPE_ZOOM_IN;
+        case GHOSTTY_MOUSE_SHAPE_ZOOM_OUT: return GMUX_MOUSE_SHAPE_ZOOM_OUT;
+        default: return GMUX_MOUSE_SHAPE_TEXT;
+    }
+}
+static uint8_t underline_code(GhosttySgrUnderline style) {
+    switch (style) {
+        case GHOSTTY_SGR_UNDERLINE_NONE: return GMUX_UNDERLINE_NONE;
+        case GHOSTTY_SGR_UNDERLINE_SINGLE: return GMUX_UNDERLINE_SINGLE;
+        case GHOSTTY_SGR_UNDERLINE_DOUBLE: return GMUX_UNDERLINE_DOUBLE;
+        case GHOSTTY_SGR_UNDERLINE_CURLY: return GMUX_UNDERLINE_CURLY;
+        case GHOSTTY_SGR_UNDERLINE_DOTTED: return GMUX_UNDERLINE_DOTTED;
+        case GHOSTTY_SGR_UNDERLINE_DASHED: return GMUX_UNDERLINE_DASHED;
+        default: return GMUX_UNDERLINE_NONE;
+    }
+}
+
 // Keep the moving libghostty ABI on this side of the Rust boundary.
 typedef struct {
     uint8_t background[3], foreground[3], cursor[3], ansi[16][3];
@@ -633,7 +685,7 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
     // Pointer requests affect the OS cursor immediately, independently of a
     // synchronized-output hold on cells and render-cursor state.
     ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE, &shape);
-    frame->mouse_shape = (uint8_t)shape;
+    frame->mouse_shape = mouse_shape_code(shape);
     GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &e->iterator);
@@ -661,7 +713,8 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
             memcpy(cell->fg, &fg, 3); memcpy(cell->bg, &bg, 3);
             cell->flags = style.bold | (style.italic << 1) | (style.faint << 2) |
                 (style.strikethrough << 4) | (style.invisible << 5);
-            cell->decoration = style.underline | (style.overline << 3);
+            cell->decoration = underline_code(style.underline) |
+                (style.overline ? GMUX_DECORATION_OVERLINE : 0);
             const GhosttyColorRgb *underline = NULL;
             switch (style.underline_color.tag) {
                 case GHOSTTY_STYLE_COLOR_PALETTE:
@@ -671,7 +724,7 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
                 default: break;
             }
             if (underline) {
-                cell->decoration |= 16;
+                cell->decoration |= GMUX_DECORATION_UNDERLINE_COLOR;
                 memcpy(cell->underline_color, underline, 3);
             }
             GhosttyCell raw;

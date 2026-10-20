@@ -1,5 +1,9 @@
 use crate::render::{self, Rect};
-use gmux_client::{Cell, Frame, theme::Theme};
+use gmux_client::{
+    Cell, Frame,
+    cells::{decoration, underline},
+    theme::Theme,
+};
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
 use std::{
     collections::{HashMap, VecDeque},
@@ -394,12 +398,18 @@ impl Renderer {
                 let background = gtk::Snapshot::new();
                 // Adjacent backgrounds share a node, which keeps full-screen
                 // applications from creating one color node for every cell.
+                let mut decorations = 0;
+                let mut flags = 0;
                 let mut x = 0;
                 while x < cells.len() {
+                    decorations |= cells[x].decoration;
+                    flags |= cells[x].flags;
                     let colors = backgrounds(scene, base + x, &cells[x]);
                     let mut end = x + 1;
                     while end < cells.len() && backgrounds(scene, base + end, &cells[end]) == colors
                     {
+                        decorations |= cells[end].decoration;
+                        flags |= cells[end].flags;
                         end += 1;
                     }
                     for (rgb, alpha) in colors.into_iter().flatten() {
@@ -436,8 +446,26 @@ impl Renderer {
                 }
                 // Ghostty paints underlines and overlines below glyphs so
                 // contrasting colors cannot cover descenders or tall ink.
-                append_decorations(&background, scene, cells, base, y, 0);
-                append_decorations(&background, scene, cells, base, y, 2);
+                if decorations & decoration::UNDERLINE_MASK != 0 {
+                    append_decorations(
+                        &background,
+                        scene,
+                        cells,
+                        base,
+                        y,
+                        DecorationKind::Underline,
+                    );
+                }
+                if decorations & decoration::OVERLINE != 0 {
+                    append_decorations(
+                        &background,
+                        scene,
+                        cells,
+                        base,
+                        y,
+                        DecorationKind::Overline,
+                    );
+                }
                 row.background = background.to_node();
                 let row_snapshot = gtk::Snapshot::new();
                 let mut x = 0;
@@ -529,7 +557,16 @@ impl Renderer {
                 }
                 stats.text_nodes += batch.flush(&row_snapshot);
                 // Strikethrough stays above the glyphs, matching Ghostty.
-                append_decorations(&row_snapshot, scene, cells, base, y, 1);
+                if flags & 16 != 0 {
+                    append_decorations(
+                        &row_snapshot,
+                        scene,
+                        cells,
+                        base,
+                        y,
+                        DecorationKind::Strike,
+                    );
+                }
                 row.foreground = row_snapshot.to_node();
                 row.cells.clear();
                 row.cells.extend_from_slice(cells);
@@ -747,6 +784,15 @@ fn append_row_rect(
     alpha: f32,
     (x, y, w, h): Rect,
 ) {
+    append_rect(
+        snapshot,
+        rgb,
+        alpha,
+        snapped_row_rect(scene, row_y, (x, y, w, h)),
+    );
+}
+
+fn snapped_row_rect(scene: &Scene<'_>, row_y: f64, (x, y, w, h): Rect) -> Rect {
     let snap = |position: f64, origin: f64| {
         ((position + origin) * scene.scale).round() / scene.scale - origin
     };
@@ -754,35 +800,37 @@ fn append_row_rect(
     let right = snap(x + w, scene.origin.0);
     let top = snap(y, scene.origin.1 + row_y);
     let bottom = snap(y + h, scene.origin.1 + row_y);
-    append_rect(
-        snapshot,
-        rgb,
-        alpha,
-        (left, top, right - left, bottom - top),
-    );
+    (left, top, right - left, bottom - top)
 }
 
-// kind: underline, strikethrough, overline. Explicit underline colors remain
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecorationKind {
+    Underline,
+    Strike,
+    Overline,
+}
+
+// Explicit underline colors remain
 // independent of selection and cursor text colors, including black.
 fn decoration(
     scene: &Scene<'_>,
     index: usize,
     cell: &Cell,
-    kind: u8,
+    kind: DecorationKind,
 ) -> Option<(u8, [u8; 3], f32)> {
     if cell.flags & 32 != 0 {
         return None;
     }
     let style = match kind {
-        0 => cell.decoration & 7,
-        1 => u8::from(cell.flags & 16 != 0),
-        _ => u8::from(cell.decoration & 8 != 0),
+        DecorationKind::Underline => cell.underline(),
+        DecorationKind::Strike => u8::from(cell.flags & 16 != 0),
+        DecorationKind::Overline => u8::from(cell.overline()),
     };
-    if style == 0 {
+    if style == underline::NONE || style > underline::DASHED {
         return None;
     }
     let (mut rgb, alpha) = scene.foreground(index, cell);
-    if kind == 0 && cell.decoration & 16 != 0 {
+    if kind == DecorationKind::Underline && cell.has_underline_color() {
         rgb = cell.underline_color;
     }
     Some((style, rgb, alpha))
@@ -794,7 +842,7 @@ fn append_decoration(
     row: usize,
     start: usize,
     end: usize,
-    kind: u8,
+    kind: DecorationKind,
     (style, rgb, alpha): (u8, [u8; 3], f32),
 ) {
     let (cw, ch) = scene.metrics;
@@ -802,9 +850,9 @@ fn append_decoration(
     let x = start as f64 * cw;
     let width = (end - start) as f64 * cw;
     let line_y = match kind {
-        0 => ch - 2.0,
-        1 => ch / 2.0,
-        _ => 0.0,
+        DecorationKind::Underline => ch - 2.0,
+        DecorationKind::Strike => ch / 2.0,
+        DecorationKind::Overline => 0.0,
     };
     let line = |left, top, width, height| {
         append_row_rect(
@@ -816,12 +864,12 @@ fn append_decoration(
             (left, top, width, height),
         );
     };
-    if kind != 0 || style == 1 {
+    if kind != DecorationKind::Underline || style == underline::SINGLE {
         line(x, line_y, width, 1.0);
-    } else if style == 2 {
+    } else if style == underline::DOUBLE {
         line(x, ch - 4.0, width, 1.0);
         line(x, line_y, width, 1.0);
-    } else if style == 3 {
+    } else if style == underline::CURLY {
         // One smooth path per run. Clip at the run bounds so a color or
         // selection change cannot paint over the neighboring decoration.
         // Anchor the wave to columns so its phase survives run boundaries.
@@ -854,16 +902,53 @@ fn append_decoration(
         snapshot.pop();
     } else {
         // Device-aligned dots and dashes stay crisp at fractional pane origins.
-        let unit = if style == 4 { 1.0 } else { 3.0 };
+        let unit = if style == underline::DOTTED { 1.0 } else { 3.0 };
         let period = unit * 2.0;
-        let mut left = (x / period).floor() * period;
-        while left < x + width {
-            let begin = left.max(x);
-            let last = (left + unit).min(x + width);
-            if last > begin {
-                line(begin, line_y, last - begin, 1.0);
+        // Repetition must preserve the exact device-pixel rounding phase.
+        // Use a short binary scale period, rather than approximating arbitrary
+        // scales. Negative origins can cross round()'s asymmetric zero boundary.
+        let cycles = if alpha == 1.0 && scene.origin.0 >= 0.0 {
+            [1, 2, 4, 8, 16, 32]
+                .into_iter()
+                .find(|&n| (scene.scale * n as f64).fract() == 0.0)
+                .map(|n| (n / 2).max(1))
+        } else {
+            None
+        };
+        let tile_width = cycles.map(|n| n as f64 * period);
+        let repeat = tile_width.filter(|&tile| width > tile * 2.0);
+        if let Some(tile) = repeat {
+            let (left, top, width, height) =
+                snapped_row_rect(scene, row_y, (x, line_y, width, 1.0));
+            let (tile_x, tile_y, tile_w, tile_h) =
+                snapped_row_rect(scene, row_y, (0.0, line_y, tile, 1.0));
+            snapshot.push_repeat(
+                &graphene::Rect::new(left as f32, top as f32, width as f32, height as f32),
+                Some(&graphene::Rect::new(
+                    tile_x as f32,
+                    tile_y as f32,
+                    tile_w as f32,
+                    tile_h as f32,
+                )),
+            );
+            let mut left = 0.0;
+            while left < tile {
+                append_row_rect(snapshot, scene, row_y, rgb, 1.0, (left, line_y, unit, 1.0));
+                left += period;
             }
-            left += period;
+            snapshot.pop();
+        } else {
+            // Faint repeats would blend through an intermediate texture. Retain
+            // rectangles for identical opacity, and for short/non-periodic runs.
+            let mut left = (x / period).floor() * period;
+            while left < x + width {
+                let begin = left.max(x);
+                let last = (left + unit).min(x + width);
+                if last > begin {
+                    line(begin, line_y, last - begin, 1.0);
+                }
+                left += period;
+            }
         }
     }
 }
@@ -874,7 +959,7 @@ fn append_decorations(
     cells: &[Cell],
     base: usize,
     y: usize,
-    kind: u8,
+    kind: DecorationKind,
 ) {
     let mut start = 0;
     while start < cells.len() {

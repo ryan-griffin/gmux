@@ -44,6 +44,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         )
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
+        .allowlist_var("GMUX_(UNDERLINE|MOUSE_SHAPE|DECORATION)_.*")
         .allowlist_function("gmux_engine_.*")
         .allowlist_function("gmux_checkpoint_history")
         .use_core()
@@ -70,6 +71,25 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         let end = start + declarations[start..].find("\n}").unwrap() + 2;
         let attributes = declarations[..start].rfind("#[repr(C)]").unwrap();
         declarations.replace_range(attributes..end, "");
+    }
+    // Check every named protocol code against the toolkit-free client values.
+    // The C implementation maps pinned Ghostty enum names explicitly.
+    for (prefix, module) in [
+        ("GMUX_UNDERLINE_", "underline"),
+        ("GMUX_MOUSE_SHAPE_", "mouse_shape"),
+        ("GMUX_DECORATION_", "decoration"),
+    ] {
+        let mut checked = 0;
+        for line in generated.lines() {
+            if let Some(rest) = line.strip_prefix(&format!("pub const {prefix}")) {
+                let (name, _) = rest.split_once(':').unwrap();
+                declarations.push_str(&format!(
+                    "const _: () = assert!({prefix}{name} == gmux_client::cells::{module}::{name} as u32);\n"
+                ));
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "Missing bridge constants for {module}");
     }
     std::fs::write(
         out_dir.join("ghostty_bridge.rs"),
