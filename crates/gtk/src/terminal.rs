@@ -714,7 +714,8 @@ impl Terminal {
         });
     }
     pub fn scroll(&self, delta: isize) {
-        self.session.borrow().scroll(delta, false);
+        let adjustment = self.scroller.vadjustment();
+        adjustment.set_value(adjustment.value() + delta as f64 * self.metrics.get().1);
     }
     pub fn search(&self, query: &str) {
         if *self.search_query.borrow() == query {
