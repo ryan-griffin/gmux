@@ -96,6 +96,7 @@ pub struct Terminal {
     zoom: ValueCell<f64>,
     settings: Rc<RefCell<Settings>>,
     renderer: RefCell<Renderer>,
+    cursor: Rc<cursor::Cursor>,
     render_font: RefCell<Option<(pango::FontDescription, pango::Context, u32)>>,
     im: gtk::IMMulticontext,
     mouse_position: ValueCell<(f64, f64)>,
@@ -104,6 +105,7 @@ pub struct Terminal {
     chrome_colors: ValueCell<Option<([u8; 3], [u8; 3])>>,
     chrome_css: gtk::CssProvider,
 }
+mod cursor;
 mod input;
 pub(crate) use input::KeyboardModifiers;
 use input::mods;
@@ -222,6 +224,16 @@ impl Terminal {
         content.append(&status);
         let im = gtk::IMMulticontext::new();
         im.set_client_widget(Some(&area));
+        let cursor_session = session.clone();
+        let cursor_settings = settings.clone();
+        let cursor = cursor::Cursor::new(&area, move |blink| {
+            if let Err(error) = cursor_session
+                .borrow()
+                .set_cursor_style(cursor_settings.borrow().cursor_style, blink)
+            {
+                eprintln!("{error}");
+            }
+        });
         let terminal = Rc::new(Self {
             id,
             root,
@@ -256,6 +268,7 @@ impl Terminal {
             settings,
             zoom: ValueCell::new(0.0),
             renderer: RefCell::new(Renderer::new()),
+            cursor,
             render_font: RefCell::new(None),
             im,
             mouse_position: ValueCell::new((0.0, 0.0)),
@@ -451,9 +464,13 @@ impl Terminal {
         self.session.borrow().send(bytes)
     }
     pub fn send_with_enter(&self, bytes: &[u8], enter: bool) -> anyhow::Result<()> {
+        self.cursor.restart();
         self.session.borrow().send_with_enter(bytes, enter)
     }
     fn key_input(&self, name: &str, cp: u32, mods: u16, release: bool, text: &str) {
+        if !release {
+            self.cursor.restart();
+        }
         if let Err(error) = self.session.borrow().key(name, cp, mods, release, text) {
             self.show_status(&error.to_string());
         }
@@ -474,6 +491,7 @@ impl Terminal {
         }
     }
     pub fn send_text(&self, text: &str, enter: bool) -> anyhow::Result<()> {
+        self.cursor.restart();
         self.session.borrow_mut().send_text(text, enter)
     }
     pub fn text(&self) -> String {
@@ -511,6 +529,7 @@ impl Terminal {
                 screen.frame
             };
             self.sync_chrome(frame);
+            self.cursor.update(frame, self.exited());
         }
         if update.directory_changed {
             self.title
@@ -563,11 +582,10 @@ impl Terminal {
         self.render_font.borrow_mut().take();
         self.title_bar
             .set_visible(self.settings.borrow().show_pane_titles);
-        if let Err(error) = self
-            .session
-            .borrow_mut()
-            .set_cursor_style(self.settings.borrow().cursor_style)
-        {
+        if let Err(error) = self.session.borrow_mut().set_cursor_style(
+            self.settings.borrow().cursor_style,
+            self.cursor.default_blink(),
+        ) {
             eprintln!("{error}");
         }
         self.area.queue_draw();
@@ -640,6 +658,9 @@ impl Terminal {
             "width": self.area.width(), "height": self.area.height(),
             "cols": cols, "rows": rows, "cell_width": cw, "cell_height": ch,
             "title_bar_visible": self.title_bar.is_visible(), "cursor_style": frame.cursor_style,
+            "cursor_blink": frame.cursor_blink, "cursor_blink_running": self.cursor.running(),
+            "cursor_phase_visible": self.cursor.visible(), "mouse_shape": frame.mouse_shape,
+            "pointer_name": self.area.cursor().and_then(|cursor| cursor.name()).map(|name| name.to_string()),
             "scale": scale, "origin": [origin.0, origin.1], "focused": self.area.has_focus(),
             "scrollback": session.snapshot().frame.scrollback,
             "scroll_pending": session.scroll_pending(),
@@ -684,6 +705,7 @@ impl Terminal {
                 t.stop_selection_drag();
                 t.selection.borrow_mut().take();
                 let _ = t.session.borrow().clear_selection();
+                t.cursor.restart();
                 if let Err(error) = t.session.borrow().paste(&text) {
                     t.show_status(&error.to_string());
                 }
@@ -812,7 +834,10 @@ impl Terminal {
         });
         let (scale, origin) = self.surface_position();
         let scene = Scene {
-            frame: e.frame,
+            frame: Frame {
+                cursor_visible: e.frame.cursor_visible * u8::from(self.cursor.visible()),
+                ..e.frame
+            },
             cells: e.cells,
             metrics: (cw, ch),
             scale,

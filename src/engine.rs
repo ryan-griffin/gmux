@@ -117,6 +117,14 @@ impl EngineView {
             )
         }
     }
+    pub(crate) fn set_cursor_blink(&mut self, blink: bool) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_view_cursor_blink(self.raw.as_ptr(), blink) };
+        anyhow::ensure!(
+            result == 0,
+            "Ghostty view cursor blink update failed ({result})"
+        );
+        Ok(())
+    }
     pub(crate) fn set_cursor_style(&mut self, style: CursorStyle) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_view_cursor_style(self.raw.as_ptr(), style as u8) };
         anyhow::ensure!(
@@ -291,7 +299,13 @@ impl Engine {
         };
         engine.set_theme(&Theme::adwaita(true))?;
         engine.set_cursor_style(CursorStyle::default())?;
+        engine.set_cursor_blink(true)?;
         Ok(engine)
+    }
+    pub fn set_cursor_blink(&mut self, blink: bool) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_cursor_blink(self.raw.as_ptr(), blink) };
+        anyhow::ensure!(result == 0, "Ghostty cursor blink update failed ({result})");
+        Ok(())
     }
     pub fn set_cursor_style(&mut self, style: CursorStyle) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_cursor_style(self.raw.as_ptr(), style as u8) };
@@ -854,7 +868,9 @@ mod tests {
         });
     }
 
-    fn rendered_history(engine: &mut Engine) -> Vec<(String, [u8; 3], [u8; 3], u8)> {
+    type HistoryRendition = (String, [u8; 3], [u8; 3], u8, u8, [u8; 3]);
+
+    fn rendered_history(engine: &mut Engine) -> Vec<HistoryRendition> {
         engine.snapshot().unwrap();
         let total = engine.frame.scrollback.total;
         let mut result = Vec::new();
@@ -873,7 +889,14 @@ mod tests {
                         cell.text()
                     };
                     if !text.is_empty() {
-                        result.push((text.to_owned(), cell.fg, cell.bg, cell.flags));
+                        result.push((
+                            text.to_owned(),
+                            cell.fg,
+                            cell.bg,
+                            cell.flags,
+                            cell.decoration,
+                            cell.underline_color,
+                        ));
                     }
                 }
             }
@@ -891,6 +914,7 @@ mod tests {
                 "\x1b[31;44mINDEX\x1b[38;5;201;48;5;22mEXTENDED\x1b[0m\r\n",
                 "\x1b[38;2;12;34;56;48;2;78;90;123;1;3;4;9m你好 e\u{301} 🦀 wrapped",
                 "\x1b[0m plain\r\n\r\n",
+                "\x1b[4:2;53;58;2;200;30;70mDOUBLE\x1b[4:3mCURLY\x1b[4:4mDOT\x1b[4:5mDASH\x1b[0m\r\n",
                 "\x1b[7;2;8mATTR\x1b[0m\r\n",
                 // No SGR reset before capture, with a background on the last row.
                 "\x1b[38;2;111;112;113;48;2;21;22;23mFINAL"
@@ -916,7 +940,7 @@ mod tests {
                 fresh
                     .copy()
                     .unwrap()
-                    .contains("你好 e\u{301} 🦀 wrapped plain\n\nATTR\nFINAL")
+                    .contains("你好 e\u{301} 🦀 wrapped plain\n\nDOUBLECURLYDOTDASH\nATTR\nFINAL")
             );
             fresh.find("你好 e\u{301} 🦀 wrapped");
             while fresh.find_pending() {
@@ -1932,6 +1956,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn decoration_styles_colors_resets_and_held_frames() {
+        let mut e = Engine::new().unwrap();
+        let dark = Theme::adwaita(true);
+        e.set_theme(&dark).unwrap();
+        e.write(
+            b"\x1b[4mA\x1b[4:2;58;5;4mB\x1b[4:3;58;2;1;2;3;53mC\x1b[4:4mD\x1b[4:5mE\x1b[24;55;59mF",
+        );
+        e.snapshot().unwrap();
+        assert_eq!(
+            e.cells[..6]
+                .iter()
+                .map(|c| c.decoration & 7)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 0]
+        );
+        assert_eq!(e.cells[0].decoration & 16, 0);
+        assert_eq!(e.cells[1].underline_color, dark.palette[4]);
+        assert_eq!(e.cells[2].decoration, 3 | 8 | 16);
+        assert_eq!(e.cells[2].underline_color, [1, 2, 3]);
+        assert_eq!(e.cells[5].decoration, 0);
+        e.write(b"\x1b]4;4;#123456\x07");
+        e.snapshot().unwrap();
+        assert_eq!(e.cells[1].underline_color, [0x12, 0x34, 0x56]);
+        e.write(b"\x1b]104;4\x07");
+        let light = Theme::adwaita(false);
+        e.set_theme(&light).unwrap();
+        e.snapshot().unwrap();
+        assert_eq!(e.cells[1].underline_color, light.palette[4]);
+        assert_eq!(e.cells[2].underline_color, [1, 2, 3]);
+        e.write(b"\r\x1b[?2026h\x1b[4:5;58;2;0;0;0mZ");
+        e.snapshot().unwrap();
+        assert_eq!(e.cells[0].text(), "A");
+        assert_eq!(e.cells[0].decoration, 1);
+        e.write(b"\x1b[?2026l");
+        e.snapshot().unwrap();
+        assert_eq!(e.cells[0].decoration, 5 | 16);
+        assert_eq!(e.cells[0].underline_color, [0; 3]);
+    }
+
+    #[test]
+    fn blink_modes_defaults_views_and_sync_output_preserve_effective_state() {
+        let mut e = Engine::new().unwrap();
+        let mut first = e.new_view().unwrap();
+        let mut second = e.new_view().unwrap();
+        first.set_cursor_blink(false).unwrap();
+        second.set_cursor_blink(true).unwrap();
+        for (sequence, expected) in [
+            ("", None),
+            ("\x1b[2 q", Some(0)),
+            ("\x1b[1 q", Some(1)),
+            ("\x1b[?12l", Some(0)),
+            ("\x1b[?12h", Some(1)),
+            ("\x1b[0 q", None),
+            ("\x1b[6 q\x1bc", None),
+        ] {
+            e.write(sequence.as_bytes());
+            for (view, default) in [(&mut first, 0), (&mut second, 1)] {
+                e.with_view(view, |e| {
+                    e.snapshot().unwrap();
+                    assert_eq!(
+                        e.frame.cursor_blink,
+                        expected.unwrap_or(default),
+                        "{sequence:?}"
+                    );
+                });
+            }
+        }
+        e.write(b"\x1b[1 q\x1b[?2026h\x1b[2 q");
+        e.snapshot().unwrap();
+        assert_eq!(e.frame.cursor_blink, 1);
+        e.write(b"\x1b[?2026l");
+        e.snapshot().unwrap();
+        assert_eq!(e.frame.cursor_blink, 0);
+    }
+
+    #[test]
+    fn mouse_shape_defaults_unknown_names_reset_and_sync_output() {
+        let mut e = Engine::new().unwrap();
+        for (sequence, shape) in [
+            ("", 8),
+            ("\x1b]22;pointer\x07", 3),
+            ("\x1b]22;unknown-name\x07", 3),
+            ("\x1b]22;default\x1b\\", 0),
+            ("\x1b]22;\x07", 8),
+            ("\x1b]22;zoom-in\x07", 32),
+            ("\x1b[?2026h\x1b]22;crosshair\x07", 7),
+            ("\x1b[?2026l", 7),
+        ] {
+            e.write(sequence.as_bytes());
+            e.snapshot().unwrap();
+            assert_eq!(e.frame.mouse_shape, shape, "{sequence:?}");
+        }
+        e.write(b"\rOLD\x1b[?2026h\rNEW\x1b]22;pointer\x07");
+        e.snapshot().unwrap();
+        assert_eq!(e.frame.mouse_shape, 3);
+        assert_eq!(e.cells[0].text(), "O");
+        e.write(b"\x1b[?2026l");
+        e.snapshot().unwrap();
+        assert_eq!(e.cells[0].text(), "N");
     }
 
     #[test]

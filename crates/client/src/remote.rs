@@ -873,8 +873,8 @@ impl RemoteSession {
     pub fn scroll_pending(&self) -> bool {
         self.scroll_acknowledged < self.scroll_serial.get()
     }
-    pub fn set_cursor_style(&self, style: CursorStyle) -> anyhow::Result<()> {
-        self.command(StreamCommand::Style { style })
+    pub fn set_cursor_style(&self, style: CursorStyle, blink: bool) -> anyhow::Result<()> {
+        self.command(StreamCommand::Style { style, blink })
     }
     pub fn set_theme(&self, theme: &Theme) -> anyhow::Result<()> {
         self.command(StreamCommand::Theme { theme: *theme })
@@ -1634,6 +1634,8 @@ mod tests {
             cell.fg = [1, 2, 3];
             cell.bg = [4, 5, 6];
             cell.flags |= 63;
+            cell.decoration = 5 | 8 | 16;
+            cell.underline_color = [8, 9, 10];
         }
         send_frame(&sender, &session, frame, vec![0, 1], cells.clone(), None);
         assert!(manager.poll()[&1].changed);

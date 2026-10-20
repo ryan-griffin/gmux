@@ -10,13 +10,13 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 23;
+pub const VERSION: u32 = 24;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 16 * 1024 * 1024;
-const CELL_BYTES: usize = 71;
+pub const CELL_BYTES: usize = 75;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
@@ -87,6 +87,8 @@ impl Packet {
                 bytes.extend_from_slice(&cell.fg);
                 bytes.extend_from_slice(&cell.bg);
                 bytes.push(cell.flags);
+                bytes.push(cell.decoration);
+                bytes.extend_from_slice(&cell.underline_color);
             }
             Ok(())
         })();
@@ -190,6 +192,8 @@ fn decode_cell(bytes: &[u8; CELL_BYTES]) -> Cell {
         fg: bytes[64..67].try_into().unwrap(),
         bg: bytes[67..70].try_into().unwrap(),
         flags: bytes[70],
+        decoration: bytes[71],
+        underline_color: bytes[72..75].try_into().unwrap(),
     }
 }
 
@@ -214,6 +218,8 @@ mod tests {
         cell.text[..5].copy_from_slice("界é".as_bytes());
         cell.fg = [1, 2, 3];
         cell.flags = 65;
+        cell.decoration = 3 | 8 | 16;
+        cell.underline_color = [6, 7, 8];
         Packet {
             header: Header {
                 meta: Metadata {
@@ -230,6 +236,8 @@ mod tests {
                 frame: Some(Frame {
                     cols: 2,
                     rows: 3,
+                    cursor_blink: 1,
+                    mouse_shape: 33,
                     scrollback: crate::Scrollback {
                         total: 500,
                         offset: 200,
@@ -405,6 +413,8 @@ mod tests {
                 cell.fg = [i, 2, 3];
                 cell.bg = [4, i, 6];
                 cell.flags = i;
+                cell.decoration = (i % 6) | 8 | 16;
+                cell.underline_color = [i, 20, 30];
                 cell
             })
             .collect();
@@ -417,7 +427,13 @@ mod tests {
         };
         unchanged.encode_into(&mut encoded).unwrap();
         packet.encode_into(&mut encoded).unwrap();
-        for (capacity, chunk) in [(1, 1), (70, 13), (71, 71), (72, 137), (8192, 8192)] {
+        for (capacity, chunk) in [
+            (1, 1),
+            (CELL_BYTES - 1, 13),
+            (CELL_BYTES, CELL_BYTES),
+            (CELL_BYTES + 1, 137),
+            (8192, 8192),
+        ] {
             let mut reader = BufReader::with_capacity(
                 capacity,
                 Fragmented {
@@ -449,7 +465,7 @@ mod tests {
         let mut encoded = Vec::new();
         packet().encode_into(&mut encoded).unwrap();
         for len in 0..encoded.len() {
-            let mut reader = BufReader::with_capacity(71, &encoded[..len]);
+            let mut reader = BufReader::with_capacity(CELL_BYTES, &encoded[..len]);
             assert!(Packet::read(&mut reader).is_err(), "accepted {len} bytes");
         }
     }

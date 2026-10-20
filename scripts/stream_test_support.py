@@ -86,7 +86,7 @@ class Client:
                 cells = body[4 + header_size:]
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):
-                        start = (index * frame["cols"] + col) * 71
+                        start = (index * frame["cols"] + col) * 75
                         self.cells[row, col] = cells[start:start + 64].split(b"\0", 1)[0].decode()
             if predicate(header):
                 return header

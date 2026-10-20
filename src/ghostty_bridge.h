@@ -11,7 +11,9 @@ typedef struct {
     uint8_t text[64];
     uint8_t fg[3];
     uint8_t bg[3];
-    uint8_t flags; // bold, italic, faint, underline, strike, invisible
+    uint8_t flags; // bold, italic, faint, reserved, strike, invisible, wide tail/head
+    uint8_t decoration; // underline style (bits 0-2), overline (3), underline color (4)
+    uint8_t underline_color[3];
 } GmuxCell;
 
 typedef struct {
@@ -27,6 +29,8 @@ typedef struct {
     uint16_t cursor_y;
     uint8_t cursor_visible;
     uint8_t cursor_style;
+    uint8_t cursor_blink;
+    uint8_t mouse_shape; // W3C shapes from the pinned GhosttyMouseShape enum
     uint8_t background[3];
     uint8_t foreground[3];
     uint8_t cursor[3];
@@ -45,6 +49,8 @@ void gmux_engine_view_enter(GmuxEngine *engine, GmuxView *view);
 void gmux_engine_view_leave(GmuxEngine *engine, GmuxView *view);
 void gmux_engine_view_theme(GmuxView *view, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *palette, bool dark);
+int gmux_engine_view_cursor_blink(GmuxView *view, bool blink);
+int gmux_engine_cursor_blink(GmuxEngine *engine, bool blink);
 int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
 // The size owner supplies defaults for shared program queries and resets.
 int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);

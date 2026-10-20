@@ -9,7 +9,7 @@
 typedef struct {
     uint8_t background[3], foreground[3], cursor[3], ansi[16][3];
     uint8_t cursor_style;
-    bool dark;
+    bool dark, cursor_blink;
 } Appearance;
 
 typedef struct { uint64_t start, end; } SelectionBounds;
@@ -82,6 +82,11 @@ static int apply_appearance(GmuxEngine *e, const Appearance *appearance) {
     if (e->applied.cursor_style != appearance->cursor_style) {
         GhosttyTerminalCursorStyle style = (GhosttyTerminalCursorStyle)appearance->cursor_style;
         GhosttyResult result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE, &style);
+        if (result) return result;
+    }
+    if (e->applied.cursor_blink != appearance->cursor_blink) {
+        GhosttyResult result = ghostty_terminal_set(e->terminal,
+            GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &appearance->cursor_blink);
         if (result) return result;
     }
     e->applied = *appearance;
@@ -470,6 +475,17 @@ void gmux_engine_view_theme(GmuxView *v, const uint8_t *background,
     memcpy(v->appearance.ansi, ansi, sizeof(v->appearance.ansi));
     v->appearance.dark=dark;
 }
+int gmux_engine_view_cursor_blink(GmuxView *v, bool blink) {
+    v->appearance.cursor_blink = blink;
+    return 0;
+}
+int gmux_engine_cursor_blink(GmuxEngine *e, bool blink) {
+    Appearance appearance = e->appearance;
+    appearance.cursor_blink = blink;
+    int result = apply_appearance(e, &appearance);
+    if (!result) e->appearance = appearance;
+    return result;
+}
 int gmux_engine_view_cursor_style(GmuxView *v, uint8_t style) {
     if (style > GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW) return GHOSTTY_INVALID_VALUE;
     v->appearance.cursor_style=style;
@@ -479,7 +495,8 @@ int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
     int result=gmux_engine_theme(e, v->appearance.background, v->appearance.foreground,
         v->appearance.cursor, (const uint8_t *)v->appearance.ansi, v->appearance.dark);
     if (result) return result;
-    return gmux_engine_cursor_style(e, v->appearance.cursor_style);
+    if ((result = gmux_engine_cursor_style(e, v->appearance.cursor_style))) return result;
+    return gmux_engine_cursor_blink(e, v->appearance.cursor_blink);
 }
 void gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
     e->text_generation++;
@@ -611,6 +628,12 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
     frame->cursor_y = cursor.viewport_y;
     frame->cursor_visible = cursor.visible && cursor.viewport_has_value;
     frame->cursor_style = cursor.visual_style;
+    frame->cursor_blink = cursor.blinking;
+    GhosttyMouseShape shape = GHOSTTY_MOUSE_SHAPE_TEXT;
+    // Pointer requests affect the OS cursor immediately, independently of a
+    // synchronized-output hold on cells and render-cursor state.
+    ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE, &shape);
+    frame->mouse_shape = (uint8_t)shape;
     GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &e->iterator);
@@ -637,7 +660,20 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
             if (style.inverse) { GhosttyColorRgb swap = fg; fg = bg; bg = swap; }
             memcpy(cell->fg, &fg, 3); memcpy(cell->bg, &bg, 3);
             cell->flags = style.bold | (style.italic << 1) | (style.faint << 2) |
-                ((style.underline != 0) << 3) | (style.strikethrough << 4) | (style.invisible << 5);
+                (style.strikethrough << 4) | (style.invisible << 5);
+            cell->decoration = style.underline | (style.overline << 3);
+            const GhosttyColorRgb *underline = NULL;
+            switch (style.underline_color.tag) {
+                case GHOSTTY_STYLE_COLOR_PALETTE:
+                    underline = &colors.palette[style.underline_color.value.palette]; break;
+                case GHOSTTY_STYLE_COLOR_RGB:
+                    underline = &style.underline_color.value.rgb; break;
+                default: break;
+            }
+            if (underline) {
+                cell->decoration |= 16;
+                memcpy(cell->underline_color, underline, 3);
+            }
             GhosttyCell raw;
             GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);

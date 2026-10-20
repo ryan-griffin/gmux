@@ -52,7 +52,7 @@ class Client:
             header = json.loads(body[4:4 + header_size])
             cells = body[4 + header_size:]
             text = b"".join(cells[i:i + 64].split(b"\0", 1)[0]
-                            for i in range(0, len(cells), 71)).decode()
+                            for i in range(0, len(cells), 75)).decode()
             if predicate(header, text):
                 return header
         raise AssertionError("Frontend did not receive the expected reply")

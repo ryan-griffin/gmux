@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         header = json.loads(body[4:4 + header_size])
         cells = body[4 + header_size:]
         if header["frame"]:
-            assert len(cells) == len(header["rows"]) * header["frame"]["cols"] * 71
+            assert len(cells) == len(header["rows"]) * header["frame"]["cols"] * 75
         else:
             assert not cells
         return header, cells
@@ -201,7 +201,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert len(header["rows"]) == header["frame"]["rows"], "New subscription must resync every row"
         command("scroll", pane=hidden, delta=-10000, bottom=False)
         header, cells = screen(hidden, lambda header, cells: len(header["rows"]) > 0)
-        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 71))
+        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 75))
         assert b"hidden 1" in text, "Daemon must retain scrollback while hidden"
         assert header["frame"]["scrollback"]["offset"] == 0
         assert header["frame"]["scrollback"]["total"] > header["frame"]["rows"]
@@ -307,7 +307,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         screen(hidden)
         command("scroll-to", pane=hidden, row=0, serial=99)
         header, cells = screen(hidden, lambda header, cells: header["scroll_serial"] == 99)
-        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 71))
+        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 75))
         assert b"hidden 1" in text, "Daemon restart must restore primary-screen history"
         command("scroll", pane=hidden, delta=0, bottom=True)
         screen(hidden, lambda header, cells: header["frame"]["scrollback"]["offset"] > 0)
