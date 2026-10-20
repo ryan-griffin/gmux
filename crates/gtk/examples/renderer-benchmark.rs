@@ -23,6 +23,8 @@ struct Options {
     cols: u16,
     #[arg(long, default_value_t = 40)]
     rows: u16,
+    #[arg(long, default_value = "Monospace 12")]
+    font: String,
     #[arg(long, default_value = "artifacts/renderer-benchmark")]
     output: PathBuf,
 }
@@ -101,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         .renderer()
         .ok_or_else(|| anyhow::anyhow!("Window has no renderer"))?;
     let context = window.pango_context();
-    let font = pango::FontDescription::from_string("Monospace 12");
+    let font = pango::FontDescription::from_string(&options.font);
     let measure = pango::Layout::new(&context);
     measure.set_font_description(Some(&font));
     measure.set_text("M");
@@ -120,10 +122,23 @@ fn main() -> anyhow::Result<()> {
         ..Frame::default()
     };
     let mut results = Vec::new();
-    for fixture_name in ["ascii", "mixed", "tui", "fallback"] {
+    for fixture_name in ["ascii", "mixed", "tui", "fallback", "ligatures", "unique"] {
         for workload in ["static", "single-row", "full-screen", "all-rows"] {
             let mut renderer = Renderer::new();
             let mut cells = fixture(options.cols, options.rows, theme, fixture_name != "ascii");
+            if fixture_name == "ligatures" {
+                let code = b"fn main() -> bool { a != b && c <= d || x === y; foo => bar; } ";
+                for (index, target) in cells.iter_mut().enumerate() {
+                    let x = index % options.cols as usize;
+                    let y = index / options.cols as usize;
+                    *target = cell(
+                        &(code[(x + y) % code.len()] as char).to_string(),
+                        theme.palette[1 + y % 7],
+                        theme.background,
+                        0,
+                    );
+                }
+            }
             if fixture_name == "fallback" {
                 for (index, cell) in cells.iter_mut().enumerate() {
                     let x = index % options.cols as usize;
@@ -157,7 +172,8 @@ fn main() -> anyhow::Result<()> {
             let mut total = Vec::new();
             let mut rebuilt_rows = 0;
             let mut new_text_nodes = 0;
-            let mut cached_glyphs = 0;
+            let mut cached_shapes = 0;
+            let mut cached_shape_bytes = 0;
             let mut pixels = vec![0; width as usize * height as usize * 4];
             for iteration in 0..options.frames + 5 {
                 if workload != "static" {
@@ -171,9 +187,13 @@ fn main() -> anyhow::Result<()> {
                     };
                     {
                         let index = y * options.cols as usize + options.cols as usize - 1;
+                        // Keep updates distinct when a scrolled row returns
+                        // after the alphabet's 26-character cycle.
+                        let mut fg = theme.foreground;
+                        fg[0] = fg[0].wrapping_add((iteration / 26) as u8);
                         cells[index] = cell(
                             &((b'a' + (iteration % 26) as u8) as char).to_string(),
-                            theme.foreground,
+                            fg,
                             theme.background,
                             0,
                         );
@@ -187,6 +207,24 @@ fn main() -> anyhow::Result<()> {
                                 theme.background,
                                 0,
                             );
+                        }
+                    }
+                    if fixture_name == "unique" {
+                        let rows = if workload == "all-rows" {
+                            0..options.rows as usize
+                        } else {
+                            y..y + 1
+                        };
+                        for y in rows {
+                            let word = format!("{:016x}", iteration * options.rows as usize + y);
+                            for (x, ch) in word.chars().enumerate() {
+                                cells[y * options.cols as usize + x] = cell(
+                                    &ch.to_string(),
+                                    theme.foreground,
+                                    theme.background,
+                                    (y % 4) as u8,
+                                );
+                            }
                         }
                     }
                 }
@@ -231,7 +269,8 @@ fn main() -> anyhow::Result<()> {
                     total.push(prepared + rendered);
                     rebuilt_rows += stats.rebuilt_rows;
                     new_text_nodes += stats.text_nodes;
-                    cached_glyphs = stats.cached_glyphs;
+                    cached_shapes = stats.cached_shapes;
+                    cached_shape_bytes = stats.cached_shape_bytes;
                 }
                 if iteration == options.frames + 4 {
                     let name = format!("{fixture_name}-{workload}-gsk");
@@ -241,7 +280,8 @@ fn main() -> anyhow::Result<()> {
             }
             let result = json!({"fixture": fixture_name, "workload": workload, "terminal_renderer": "gsk",
                     "prepare": summary(prepare), "render_and_download": summary(complete), "total": summary(total),
-                    "rebuilt_rows": rebuilt_rows, "new_text_nodes": new_text_nodes, "cached_glyphs": cached_glyphs});
+                    "rebuilt_rows": rebuilt_rows, "new_text_nodes": new_text_nodes,
+                    "cached_shapes": cached_shapes, "cached_shape_bytes": cached_shape_bytes});
             println!("{result}");
             results.push(result);
         }

@@ -11,7 +11,10 @@ use gmux_client::{Cell, Frame, theme::Theme};
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
 use renderer::{Renderer, Scene};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 #[derive(Parser)]
 struct Options {
@@ -111,7 +114,7 @@ fn rgba(rgb: [u8; 3], alpha: f32) -> gdk::RGBA {
 }
 
 // The reference deliberately does not extract, reposition, or batch glyphs.
-// GTK draws one complete Pango layout per terminal cluster.
+// GTK draws one complete Pango layout per supplied text span.
 fn reference(
     scene: &Scene<'_>,
     font: &pango::FontDescription,
@@ -122,6 +125,27 @@ fn reference(
         &rgba(scene.frame.background, 1.0),
         &graphene::Rect::new(0.0, 0.0, scene.width as f32, scene.height as f32),
     );
+    for (index, cell) in scene.cells.iter().enumerate() {
+        if cell.bg == scene.frame.background {
+            continue;
+        }
+        let (cw, ch) = scene.metrics;
+        let x = (index % scene.frame.cols as usize) as f64 * cw;
+        let y = (index / scene.frame.cols as usize) as f64 * ch;
+        let snap_x =
+            |x: f64| ((x + scene.origin.0) * scene.scale).round() / scene.scale - scene.origin.0;
+        let snap_y =
+            |y: f64| ((y + scene.origin.1) * scene.scale).round() / scene.scale - scene.origin.1;
+        snapshot.append_color(
+            &rgba(cell.bg, 1.0),
+            &graphene::Rect::new(
+                snap_x(x) as f32,
+                snap_y(y) as f32,
+                (snap_x(x + cw) - snap_x(x)) as f32,
+                (snap_y(y + ch) - snap_y(y)) as f32,
+            ),
+        );
+    }
     for (index, cell) in scene.cells.iter().enumerate() {
         if cell.flags & 32 != 0 {
             continue;
@@ -274,7 +298,7 @@ fn assert_render_eq(
             .unwrap();
     }
     panic!(
-        "{name}: retained/fresh mismatch on {}: nodes_equal={nodes_equal}, \
+        "{name}: pixel mismatch on {}: nodes_equal={nodes_equal}, \
         sizes={actual_size:?}/{expected_size:?}, {count} differing pixels, \
         bounds={bounds:?}, max channel delta={max_channel_delta}; see {}",
         gpu.type_().name(),
@@ -334,6 +358,226 @@ fn validate_overlapping_fallbacks(
         delta < 1.0,
         "Overlapping fallback glyphs changed paint order: {delta}"
     );
+}
+
+fn assert_ligature_layout(
+    gpu: &gsk::Renderer,
+    actual: &gsk::RenderNode,
+    expected: &gsk::RenderNode,
+    scene: &Scene<'_>,
+    spans: &[Range<usize>],
+    output: &Path,
+    name: &str,
+) {
+    let actual_texture = render(gpu, actual, scene);
+    let expected_texture = render(gpu, expected, scene);
+    let width = actual_texture.width() as usize;
+    let actual_pixels = pixels(&actual_texture);
+    let expected_pixels = pixels(&expected_texture);
+    for span in spans {
+        let col = span.start % scene.frame.cols as usize;
+        let row = span.start / scene.frame.cols as usize;
+        let left = (col as f64 * scene.metrics.0 * scene.scale).floor() as usize;
+        let right = (((col + span.len()) as f64 * scene.metrics.0 * scene.scale).ceil() as usize)
+            .min(width);
+        let top = (row as f64 * scene.metrics.1 * scene.scale).floor() as usize;
+        let bottom = (((row + 1) as f64 * scene.metrics.1 * scene.scale).ceil() as usize)
+            .min(actual_texture.height() as usize);
+        let mut delta = 0.0;
+        for y in top..bottom {
+            let range = (y * width + left) * 4..(y * width + right) * 4;
+            delta += actual_pixels[range.clone()]
+                .iter()
+                .zip(&expected_pixels[range])
+                .map(|(&a, &b)| a.abs_diff(b) as f64)
+                .sum::<f64>();
+        }
+        delta /= ((right - left) * (bottom - top) * 4) as f64;
+        // Check each operator, rather than diluting a missing glyph in the
+        // mostly empty viewport. GPU rasterization allows small edge differences.
+        if delta >= 1.0 {
+            actual_texture
+                .save_to_png(output.join(format!("{name}-actual.png")))
+                .unwrap();
+            expected_texture
+                .save_to_png(output.join(format!("{name}-expected.png")))
+                .unwrap();
+            panic!(
+                "{name}: layout mismatch on {} in {span:?}: mean channel delta {delta}; see {}",
+                gpu.type_().name(),
+                output.display()
+            );
+        }
+    }
+}
+
+fn validate_ligatures(
+    gpu: &gsk::Renderer,
+    cache_gpu: &gsk::Renderer,
+    context: &pango::Context,
+    output: &Path,
+) {
+    context
+        .font_map()
+        .unwrap()
+        .add_font_file(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fonts/GmuxLigatureTest.ttf"),
+        )
+        .unwrap();
+    let font = pango::FontDescription::from_string("Gmux Ligature Test 15px");
+    let measure = pango::Layout::new(context);
+    measure.set_font_description(Some(&font));
+    measure.set_text("M");
+    let (cw, ch) = measure.pixel_size();
+    let signature = |text: &str| {
+        measure.set_text(text);
+        let mut glyphs = Vec::new();
+        for run in measure.line_readonly(0).unwrap().runs() {
+            glyphs.extend(
+                run.glyph_string()
+                    .glyph_info()
+                    .iter()
+                    .map(|info| info.glyph()),
+            );
+        }
+        glyphs
+    };
+    assert_eq!(
+        signature("->").len(),
+        1,
+        "Fixture must form a two-cell ligature"
+    );
+    assert_eq!(
+        signature("ffi").len(),
+        1,
+        "Fixture must form a three-cell ligature"
+    );
+    assert_ne!(
+        signature("!="),
+        [signature("!"), signature("=")].concat(),
+        "Fixture must apply contextual substitutions"
+    );
+    let theme = Theme::adwaita(true);
+    for scale in [1.0, 1.5] {
+        let mut renderer = Renderer::new();
+        for case in [
+            "joined",
+            "foreground",
+            "background",
+            "bold",
+            "selection",
+            "search",
+            "cursor",
+            "restored",
+            "cell-width",
+        ] {
+            let mut cells = vec![cell(" ", theme, 0); 16 * 2];
+            for (index, ch) in "->X !=X ffiX".chars().enumerate() {
+                cells[index] = cell(&ch.to_string(), theme, 0);
+            }
+            // Shaping must stop at a row boundary even when the cells form an operator.
+            cells[15] = cell("-", theme, 0);
+            cells[16] = cell(">", theme, 0);
+            if case == "cell-width" {
+                // Complete layouts can draw merged ligatures at their natural width
+                // while placing the following glyphs on the wider terminal grid.
+                cells[4..7].fill(cell(" ", theme, 0));
+            }
+            let mut matches = vec![0; cells.len()];
+            if case == "search" {
+                matches[1] = 2;
+            }
+            match case {
+                "foreground" => cells[1].fg = theme.palette[1],
+                "background" => cells[1].bg = theme.palette[4],
+                "bold" => cells[1].flags = 1,
+                // Boundaries must split shaping even when the effective
+                // foreground matches the neighboring text.
+                "selection" => cells[1].fg = theme.selection_foreground,
+                "cursor" | "restored" => {
+                    cells[0].fg = theme.background;
+                    cells[1].fg = theme.background;
+                    cells[0].bg = theme.palette[4];
+                }
+                _ => {}
+            }
+            let mut scene = self::scene(&cells, theme);
+            scene.frame.cols = 16;
+            scene.frame.rows = 2;
+            scene.scale = scale;
+            scene.metrics = (cw as f64, (ch + 2) as f64);
+            if case == "cell-width" {
+                scene.metrics.0 += 1.0;
+            }
+            scene.width = (scene.metrics.0 * 16.0).ceil() as i32;
+            scene.height = (ch + 2) * 2;
+            scene.matches = &matches;
+            if case == "selection" {
+                scene.selection = Some((0, 0));
+            }
+            if case == "cursor" {
+                scene.frame.cursor_x = 1;
+                scene.frame.cursor_visible = 1;
+                scene.frame.cursor_style = 1;
+            }
+            let mut spans = vec![2..3, 4..6, 6..7, 8..11, 11..12, 15..16, 16..17];
+            if matches!(case, "joined" | "background" | "cell-width" | "restored") {
+                spans.insert(0, 0..2);
+            } else {
+                spans.splice(0..0, [0..1, 1..2]);
+            }
+            // Declare the expected text spans and colors explicitly. The reference
+            // draws these layouts without interpreting selection or cursor metadata.
+            let mut expected_cells = cells.clone();
+            match case {
+                "selection" | "search" => {
+                    let index = if case == "selection" { 0 } else { 1 };
+                    expected_cells[index].fg = theme.selection_foreground;
+                    expected_cells[index].bg = theme.selection_background;
+                }
+                "cursor" => {
+                    expected_cells[1].fg = theme.background;
+                    expected_cells[1].bg = theme.cursor;
+                }
+                _ => {}
+            }
+            for span in &spans {
+                let text: String = cells[span.clone()].iter().map(Cell::text).collect();
+                for expected in &mut expected_cells[span.clone()] {
+                    expected.text.fill(0);
+                }
+                expected_cells[span.start].text[..text.len()].copy_from_slice(text.as_bytes());
+            }
+            let (actual, _) = node(&mut renderer, &scene, &font, context);
+            let expected = reference(
+                &Scene {
+                    cells: &expected_cells,
+                    ..scene
+                },
+                &font,
+                context,
+            );
+            assert_render_eq(
+                cache_gpu,
+                &actual,
+                &expected,
+                &scene,
+                output,
+                &format!("ligature-{case}-{scale}"),
+            );
+            if case == "background" {
+                assert_ligature_layout(
+                    gpu,
+                    &actual,
+                    &expected,
+                    &scene,
+                    &spans,
+                    output,
+                    &format!("ligature-gpu-background-{scale}"),
+                );
+            }
+        }
+    }
 }
 
 fn validate_cache(
@@ -440,13 +684,59 @@ fn validate_cache(
         }
         let (_, stats) = node(&mut renderer, &self::scene(&cells, theme), &font, context);
         assert!(
-            stats.cached_glyphs <= 4096,
-            "Glyph cache exceeded its limit"
+            stats.cached_shapes <= 4096 && stats.cached_shape_bytes <= 1024 * 1024,
+            "Shape cache exceeded its limits"
         );
         if iteration > 12 {
-            assert_eq!(stats.cached_glyphs, 4096);
+            assert_eq!(stats.cached_shapes, 4096);
         }
     }
+    // Long, unique ASCII runs must reach the byte budget before the entry limit.
+    renderer.clear();
+    let mut evicted_cells = Vec::new();
+    for iteration in 0..160 {
+        for row in 0..8 {
+            let mut word = format!("{:08X}", iteration * 8 + row);
+            word.push_str(&"X".repeat(32));
+            for (target, ch) in cells[row * 40..(row + 1) * 40].iter_mut().zip(word.chars()) {
+                *target = cell(&ch.to_string(), theme, 0);
+            }
+        }
+        let (_, stats) = node(&mut renderer, &self::scene(&cells, theme), &font, context);
+        assert!(
+            stats.cached_shape_bytes <= 1024 * 1024,
+            "Long runs exceeded the shape cache budget"
+        );
+        if iteration == 0 {
+            evicted_cells = cells.clone();
+        }
+        if iteration == 159 {
+            assert!(
+                stats.cached_shapes < 1280,
+                "Byte budget did not evict long runs"
+            );
+        }
+    }
+    let scene = self::scene(&evicted_cells, theme);
+    let cached = node(&mut renderer, &scene, &font, context).0;
+    let fresh = node(&mut Renderer::new(), &scene, &font, context).0;
+    assert_render_eq(gpu, &cached, &fresh, &scene, output, "cache-evicted-runs");
+
+    // A single run can exceed the entire cache budget. It must still produce
+    // every glyph without being retained in the cache.
+    renderer.clear();
+    let oversized = vec![cell("X", theme, 0); u16::MAX as usize];
+    let mut oversized_scene = self::scene(&oversized, theme);
+    oversized_scene.frame.cols = u16::MAX;
+    oversized_scene.frame.rows = 1;
+    let (large, stats) = node(&mut renderer, &oversized_scene, &font, context);
+    fn glyphs(node: &gsk::RenderNode) -> usize {
+        node.downcast_ref::<gsk::TextNode>()
+            .map_or(0, |text| text.num_glyphs() as usize)
+            + node.children().iter().map(glyphs).sum::<usize>()
+    }
+    assert_eq!(glyphs(&large), oversized.len(), "Oversized run lost text");
+    assert_eq!((stats.cached_shapes, stats.cached_shape_bytes), (0, 0));
 }
 
 fn validate_scroll_cache(
@@ -746,6 +1036,7 @@ fn main() -> anyhow::Result<()> {
     }
     let font = pango::FontDescription::from_string("Monospace 12");
     validate_overlapping_fallbacks(&gpu, &font, &context);
+    validate_ligatures(&gpu, cache_gpu, &context, &options.output);
     validate_cache(cache_gpu, &font, &context, &options.output);
     validate_scroll_cache(cache_gpu, &font, &context, &options.output);
     validate_geometry(&gpu, &font, &context);
@@ -754,9 +1045,10 @@ fn main() -> anyhow::Result<()> {
         serde_json::to_string_pretty(&json!({
             "gtk_renderer": gpu.type_().name(), "cache_renderer": cache_gpu.type_().name(),
             "glyph_cases": cases,
-            "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded glyph cache",
+            "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
                        "font and context changes", "fractional blocks", "selection and search",
-                       "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order"]
+                       "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
+                       "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts"]
         }))?,
     )?;
     println!(
