@@ -6,6 +6,14 @@ mod cursor {
     pub(super) fn source_id(cursor: &Cursor) -> Option<u32> {
         cursor.source.borrow().as_ref().map(glib::SourceId::as_raw)
     }
+
+    pub(super) fn timing(cursor: &Cursor) -> (Instant, i64) {
+        let source = cursor.source.borrow();
+        let source = glib::MainContext::default()
+            .find_source_by_id(source.as_ref().unwrap())
+            .unwrap();
+        (cursor.deadline.get(), source.ready_time())
+    }
 }
 #[allow(dead_code)]
 #[path = "../src/render.rs"]
@@ -724,27 +732,15 @@ fn validate_cursor_lifecycle(output: &Path) {
     // Text input must restart blinking even with identical terminal coordinates.
     cursor.restart();
     assert!(cursor.visible() && cursor.running());
-    // Activity close to an old deadline must keep the cursor visible for the
-    // complete new half-cycle, even when the old source wakes in between.
-    fn pump(duration: Duration) {
-        let end = Instant::now() + duration;
-        while Instant::now() < end {
-            glib::MainContext::default().iteration(false);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
+    // Leave the original source pending while activity resets the deadline.
+    // Holding the main loop also covers an overdue source after a scheduling
+    // delay. Observe the first hidden phase instead of sampling a narrow window.
     cursor.restart();
-    pump(Duration::from_millis(80));
-    assert!(cursor.visible());
+    std::thread::sleep(Duration::from_millis(80));
     let pending = cursor::source_id(&cursor);
     let activity = Instant::now();
     cursor.restart();
     assert_eq!(cursor::source_id(&cursor), pending);
-    pump(Duration::from_millis(75));
-    assert!(
-        cursor.visible(),
-        "Old deadline hid the cursor after new activity"
-    );
     wait(|| !cursor.visible());
     assert!(
         activity.elapsed() >= Duration::from_millis(100),
@@ -765,24 +761,42 @@ fn validate_cursor_lifecycle(output: &Path) {
         );
     }
 
+    // Colors, scrollback and pointer changes must not reset the blink phase.
+    let timing = cursor::timing(&cursor);
+    frame.background = [1, 2, 3];
+    frame.foreground = [4, 5, 6];
+    frame.cursor = [7, 8, 9];
+    frame.scrollback.total = 100;
+    frame.mouse_shape = mouse_shape::POINTER;
+    cursor.update(frame, false);
+    assert_eq!(cursor::source_id(&cursor), pending);
+    assert_eq!(cursor::timing(&cursor), timing);
+    assert_eq!(area.cursor().unwrap().name().as_deref(), Some("pointer"));
+
     // Timing changes take effect with a source pending, and never send daemon
-    // defaults while the effective enablement stays true.
-    settings.set_gtk_cursor_blink_time(800);
-    pump(Duration::from_millis(80));
-    let shortened = Instant::now();
-    settings.set_gtk_cursor_blink_time(200);
+    // defaults while the effective enablement stays true. Check the scheduled
+    // times directly so late callback delivery cannot fail an upper time bound.
+    for cycle in [800, 200, 800] {
+        let before = (Instant::now(), glib::monotonic_time());
+        settings.set_gtk_cursor_blink_time(cycle);
+        let after = (Instant::now(), glib::monotonic_time());
+        let (deadline, ready_time) = cursor::timing(&cursor);
+        let half_cycle = Duration::from_millis(cycle as u64 / 2);
+        assert!(
+            (before.0 + half_cycle..=after.0 + half_cycle).contains(&deadline),
+            "Timing preference did not reset the blink deadline"
+        );
+        // The whole-millisecond GLib timeout rounds up by less than 1 ms.
+        let micros = half_cycle.as_micros() as i64;
+        assert!(
+            (before.1 + micros..=after.1 + micros + 1000).contains(&ready_time),
+            "Timing preference did not reschedule the pending source"
+        );
+        assert!(cursor.visible());
+    }
+    let lengthened_deadline = cursor::timing(&cursor).0;
     wait(|| !cursor.visible());
-    assert!(
-        shortened.elapsed() < Duration::from_millis(300),
-        "Shortened preference retained the old deadline"
-    );
-    settings.set_gtk_cursor_blink_time(800);
-    pump(Duration::from_millis(180));
-    assert!(
-        cursor.visible(),
-        "Lengthened preference retained an old deadline"
-    );
-    wait(|| !cursor.visible());
+    assert!(Instant::now() >= lengthened_deadline);
     settings.set_gtk_cursor_blink_timeout(20);
     settings.set_gtk_cursor_blink_timeout(10);
     assert!(
