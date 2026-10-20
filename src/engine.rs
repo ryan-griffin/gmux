@@ -1258,7 +1258,7 @@ mod tests {
                         })
                     };
                     for mode in [SelectionMode::Word, SelectionMode::Line] {
-                        for origin in [0, 11, 13, 17, 36, 47] {
+                        for origin in [0, 11, 13, 17, 36, 47, limit] {
                             for endpoint in base..base + engine.cells.len() {
                                 let predicted = preview.range(
                                     &ScreenSnapshot {
@@ -1333,15 +1333,37 @@ mod tests {
     }
 
     #[test]
-    fn line_selection_includes_blank_rows_and_margins() {
+    fn line_selection_skips_empty_rows_but_includes_them_in_drags() {
         let mut engine = Engine::new().unwrap();
         engine.resize(16, 4, 8, 16).unwrap();
         engine.write(b"one\r\n  next  \r\n\r\n");
         engine.select((5, 1), (3, 2), SelectionMode::Line).unwrap();
         assert_eq!(engine.selection(), Some((16, 47)));
+        assert_eq!(engine.copy().unwrap(), "  next");
+        engine.select((5, 1), (15, 1), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((16, 31)));
         engine.clear_selection();
         engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), None);
+        assert_eq!(engine.copy().unwrap(), "");
+        assert_eq!(engine.selection_origin(), Some(35));
+        engine.select((3, 2), (15, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), None);
+        engine.select((3, 2), (5, 1), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((16, 47)));
+        engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), None);
+        engine.select((3, 2), (3, 3), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), Some((32, 63)));
+        engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), None);
+        engine.write(b"\x1b[3;1Hnew");
+        engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
         assert_eq!(engine.selection(), Some((32, 47)));
+        assert_eq!(engine.copy().unwrap(), "new");
+        engine.write(b"\r\x1b[2K");
+        engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
+        assert_eq!(engine.selection(), None);
     }
 
     #[test]

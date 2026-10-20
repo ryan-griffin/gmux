@@ -312,6 +312,19 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
             repeat_click(5, 1, 1)
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
 
+            # Empty rows must stay unselected in both the immediate preview and
+            # delayed engine replies, including after reversing a line drag.
+            proxy.pause()
+            repeat_click(5, 5, 3, hold=True)
+            assert rpc("renderer-info", pane=pane)["viewport"]["selection"] is None
+            assert Atspi.Text.get_n_selections(text_iface) == 0
+            move_cell(3, 2)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [2 * cols, 6 * cols - 1])
+            move_cell(5, 5)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
+            resume_selection(None)
+            assert Atspi.Text.get_n_selections(text_iface) == 0
+
             # Mouse-reporting applications keep repeat clicks unless Shift is held.
             mouse_probe = temp / "mouse.py"
             mouse_result = temp / "mouse-events"
