@@ -3,10 +3,16 @@ use crate::{session::ScreenSnapshot, transport::SelectionMode};
 
 type Span = (usize, usize);
 
+#[derive(Clone, Copy)]
+struct Unit {
+    range: Span,
+    empty: bool,
+}
+
 #[derive(Default)]
 pub struct Preview {
     key: Option<(u64, u16, u16, u64, SelectionMode)>,
-    bounds: [Option<Span>; 2],
+    bounds: [Option<Unit>; 2],
 }
 
 impl Preview {
@@ -37,17 +43,22 @@ impl Preview {
         }
         let base = screen.frame.scrollback.offset as usize * cols;
         let limit = base + screen.cells.len() - 1;
-        let mut unit = |from: usize, toward: usize, slot: usize| -> Option<Span> {
+        let mut unit = |from: usize, toward: usize, slot: usize| -> Option<Unit> {
             // An offscreen anchor is enough to select through the viewport edge.
             if from < base || from > limit {
-                return Some((from, from));
+                return Some(Unit {
+                    range: (from, from),
+                    empty: false,
+                });
             }
-            for &(start, end) in self.bounds.iter().flatten() {
+            for &unit in self.bounds.iter().flatten() {
+                let (start, end) = unit.range;
                 if (start..=end).contains(&from) {
-                    return Some((start, end));
+                    return Some(unit);
                 }
             }
             let index = from - base;
+            let mut empty = false;
             let range = if mode == SelectionMode::Line {
                 let mut first = index / cols;
                 let mut last = first;
@@ -57,10 +68,16 @@ impl Preview {
                 while (last + 1) * cols < screen.cells.len() && wrapped(screen, last) {
                     last += 1;
                 }
-                Some((
-                    first * cols,
-                    ((last + 1) * cols - 1).min(screen.cells.len() - 1),
-                ))
+                let start = first * cols;
+                let end = ((last + 1) * cols - 1).min(screen.cells.len() - 1);
+                empty = !screen.cells[start..=end]
+                    .iter()
+                    .any(|cell| cell.text[0] != 0);
+                Some(if empty {
+                    (index / cols * cols, (index / cols + 1) * cols - 1)
+                } else {
+                    (start, end)
+                })
             } else {
                 let target = toward.clamp(base, limit) - base;
                 let mut point = index;
@@ -92,12 +109,21 @@ impl Preview {
                     }
                 }
             }?;
-            let range = (base + range.0, base + range.1);
-            self.bounds[slot] = Some(range);
-            Some(range)
+            let unit = Unit {
+                range: (base + range.0, base + range.1),
+                empty,
+            };
+            self.bounds[slot] = Some(unit);
+            Some(unit)
         };
         let anchor = unit(origin, endpoint, 0)?;
         let current = unit(endpoint, origin, 1)?;
+        // Empty rows can extend a line drag, but cannot start a selection alone.
+        if anchor.empty && current.empty && anchor.range == current.range {
+            return None;
+        }
+        let anchor = anchor.range;
+        let current = current.range;
         Some((anchor.0.min(current.0), anchor.1.max(current.1)))
     }
 }

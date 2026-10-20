@@ -69,6 +69,7 @@ typedef struct {
     SelectionBounds anchor, current;
     uint64_t generation;
     uint8_t mode, valid;
+    bool anchor_empty, current_empty;
 } SelectionCache;
 
 struct GmuxEngine {
@@ -881,13 +882,14 @@ static GhosttyPoint selection_point(uint64_t index, uint16_t cols) {
         .value.coordinate={(uint16_t)(index % cols), (uint32_t)(index / cols)}};
 }
 static int selection_unit(GmuxEngine *e, uint64_t from, uint64_t toward, uint16_t cols,
-    uint8_t mode, SelectionBounds *out) {
+    uint8_t mode, SelectionBounds *out, bool *empty) {
     SelectionCache *cache = &e->selection_cache;
+    *empty = false;
     if ((cache->valid & 1) && from >= cache->anchor.start && from <= cache->anchor.end) {
-        *out = cache->anchor; return GHOSTTY_SUCCESS;
+        *out = cache->anchor; *empty = cache->anchor_empty; return GHOSTTY_SUCCESS;
     }
     if ((cache->valid & 2) && from >= cache->current.start && from <= cache->current.end) {
-        *out = cache->current; return GHOSTTY_SUCCESS;
+        *out = cache->current; *empty = cache->current_empty; return GHOSTTY_SUCCESS;
     }
     GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
     if (ghostty_terminal_grid_ref(e->terminal, selection_point(from, cols), &ref)) return GHOSTTY_INVALID_VALUE;
@@ -908,6 +910,7 @@ static int selection_unit(GmuxEngine *e, uint64_t from, uint64_t toward, uint16_
         result = ghostty_terminal_select_line(e->terminal, &options, &selection);
         if (result == GHOSTTY_NO_VALUE) {
             selection.start = selection.end = ref;
+            *empty = true;
             result = GHOSTTY_SUCCESS;
         }
     }
@@ -943,19 +946,21 @@ int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uin
     uint64_t origin = (uint64_t)anchor.y * cols + anchor.x;
     uint64_t endpoint = (uint64_t)ey * cols + ex;
     SelectionBounds a, b;
-    int result = selection_unit(e, origin, endpoint, cols, mode, &a);
+    bool a_empty, b_empty;
+    int result = selection_unit(e, origin, endpoint, cols, mode, &a, &a_empty);
     if (!result) {
-        cache->anchor = a; cache->valid |= 1;
-        result = selection_unit(e, endpoint, origin, cols, mode, &b);
+        cache->anchor = a; cache->anchor_empty = a_empty; cache->valid |= 1;
+        result = selection_unit(e, endpoint, origin, cols, mode, &b, &b_empty);
     }
-    if (result == GHOSTTY_NO_VALUE) {
-        // No word remains between the pointer and the tracked click. Clear the
-        // visible range while retaining the click for the next drag movement.
+    if (result == GHOSTTY_NO_VALUE ||
+        (!result && a_empty && b_empty && a.start == b.start)) {
+        // Empty rows extend line drags, but cannot start a selection alone.
+        // Retain the tracked click for the next drag movement.
         clear_selection_bounds(e);
         return 0;
     }
     if (result) return -1;
-    cache->current = b; cache->valid |= 2;
+    cache->current = b; cache->current_empty = b_empty; cache->valid |= 2;
     start = selection_point(a.start < b.start ? a.start : b.start, cols);
     end = selection_point(a.end > b.end ? a.end : b.end, cols);
     if (track_selection_point(e, &e->selection_start, start)) return -1;
