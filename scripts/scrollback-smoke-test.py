@@ -19,6 +19,7 @@ ghostty_revision = runpy.run_path(str(root / "scripts/bootstrap-ghostty.py"))["R
 unicode_line = "你好 e\u0301 🦀 wrapped history " * 6
 colored_output = ("\\033[31;44mINDEX\\033[38;5;201;48;5;22mEXTENDED\\033[0m\\n"
                   "\\033[1;3;4;9;38;2;12;34;56;48;2;78;90;123m" + unicode_line + "\\033[0m\\n"
+                  "\\033[4:2;53;58;2;200;30;70mDOUBLE\\033[4:3mCURLY\\033[4:4mDOT\\033[4:5mDASH\\033[0m\\n"
                   "\\033[0mPLAIN_OUTPUT\\n")
 
 
@@ -53,20 +54,20 @@ class History:
             if header["meta"]["id"] == self.pane and header["frame"] is not None:
                 frame = header["frame"]
                 cells = body[4 + header_size:]
-                assert len(cells) == len(header["rows"]) * frame["cols"] * 71
+                assert len(cells) == len(header["rows"]) * frame["cols"] * 75
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells = {}
                 self.frame = frame
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):
-                        start = (index * frame["cols"] + col) * 71
-                        cell = cells[start:start + 71]
+                        start = (index * frame["cols"] + col) * 75
+                        cell = cells[start:start + 75]
                         text = cell[:64].split(b"\0", 1)[0].decode()
                         fg, bg, flags = bytes(cell[64:67]), bytes(cell[67:70]), cell[70]
                         # The formatter emits background-only blanks as spaces.
                         if not text and bg != bytes(frame["background"]) and flags & 64 == 0:
                             text = " "
-                        self.cells[row, col] = (text, fg, bg, flags)
+                        self.cells[row, col] = (text, fg, bg, flags, cell[71], bytes(cell[72:75]))
             if header["meta"]["id"] == self.pane and predicate(header):
                 return header
 
@@ -131,7 +132,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         for marker, fg, bg, flags in [
             ("INDEX", bytes([192, 28, 40]), bytes([30, 120, 228]), 0),
             ("EXTENDED", bytes([255, 0, 255]), bytes([0, 95, 0]), 0),
-            ("你好", bytes([12, 34, 56]), bytes([78, 90, 123]), 27),
+            ("你好", bytes([12, 34, 56]), bytes([78, 90, 123]), 19),
             ("PLAIN_OUTPUT", bytes([255, 255, 255]), bytes([28, 28, 31]), 0),
             ("SHELL_READY", bytes([255, 255, 255]), bytes([28, 28, 31]), 0),
         ]:
@@ -139,7 +140,11 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
                       if text[index:index + len(marker)] == list(marker)]
             assert starts, marker
             for start in starts:
-                assert all(cell[1:] == (fg, bg, flags) for cell in cells[start:start + len(marker)]), marker
+                assert all(cell[1:4] == (fg, bg, flags) for cell in cells[start:start + len(marker)]), marker
+
+        for marker, style in [("DOUBLE", 2), ("CURLY", 3), ("DOT", 4), ("DASH", 5)]:
+            start = next(index for index in range(len(cells)) if text[index:index + len(marker)] == list(marker))
+            assert all(cell[4:] == (style | 8 | 16, bytes([200, 30, 70])) for cell in cells[start:start + len(marker)]), marker
 
     with scenario("Stop restores tabs and history into new shells"):
         daemon = start()
@@ -169,7 +174,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         assert after[:len(before)] == before, "Restored cell rendition differs from captured history"
         assert_colors(after)
         for cell in after[len(before):]:
-            assert cell[1:] == (bytes([255, 255, 255]), bytes([28, 28, 31]), 0), "Saved rendition bled into the fresh shell"
+            assert cell[1:] == (bytes([255, 255, 255]), bytes([28, 28, 31]), 0, 0, bytes(3)), "Saved rendition bled into the fresh shell"
         send(pane, "printf 'NEW_PROCESS_INPUT\\n'")
         wait_for(lambda: "NEW_PROCESS_INPUT" in fixture.rpc("read", pane=pane)["text"])
         stop(daemon)
@@ -275,7 +280,7 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         after = rendition(pane)
         assert after[:len(before)] == before
         assert_colors(after)
-        assert all(cell[1:] == (bytes([255, 255, 255]), bytes([28, 28, 31]), 0) for cell in after[len(before):])
+        assert all(cell[1:] == (bytes([255, 255, 255]), bytes([28, 28, 31]), 0, 0, bytes(3)) for cell in after[len(before):])
         saved = json.loads(session_path.read_text())
         path = fixture.config / "scrollback" / saved["scrollback"][str(pane)]
         assert path.exists()

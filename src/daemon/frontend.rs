@@ -495,8 +495,9 @@ impl Daemon {
             StreamCommand::Theme { theme } => {
                 view.set_theme(&theme);
             }
-            StreamCommand::Style { style } => {
+            StreamCommand::Style { style, blink } => {
                 view.set_cursor_style(style)?;
+                view.set_cursor_blink(blink)?;
             }
             command => session.with_view(view, |engine| -> anyhow::Result<()> {
                 // Search navigation uses this client's current viewport metadata.

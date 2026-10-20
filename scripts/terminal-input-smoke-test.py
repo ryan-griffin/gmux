@@ -73,6 +73,70 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             assert rpc("renderer-info")["display"] == "GdkWaylandDisplay"
             rpc("screenshot", path=str(artifacts / "terminal-input-initial.png"))
 
+            # The probe consumes input without moving the terminal cursor. This
+            # isolates GTK activity resets from cursor-motion-driven resets.
+            appearance_probe = temp / "appearance.py"
+            appearance_control = temp / "appearance-control"
+            appearance_events = temp / "appearance-events"
+            appearance_done = temp / "appearance-done"
+            appearance_applied = temp / "appearance-applied"
+            appearance_control.write_bytes(b'\x1b[1 q\x1b]22;default\x07')
+            appearance_probe.write_text("""import os, select, sys, termios, tty
+from pathlib import Path
+control, events, done, applied = map(Path, sys.argv[1:])
+old = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    previous = None
+    os.write(1, b'\\x1b]2;APPEARANCE_READY\\x07')
+    while True:
+        command = control.read_bytes()
+        if command == b'stop':
+            break
+        if command != previous:
+            os.write(1, command)
+            applied.write_bytes(command)
+            previous = command
+        if select.select([0], [], [], .01)[0]:
+            with events.open('ab') as output:
+                output.write(os.read(0, 4096))
+finally:
+    os.write(1, b'\\x1b[0 q\\x1b[?25h\\x1b]22;\\x07')
+    termios.tcsetattr(0, termios.TCSANOW, old)
+done.touch()
+""")
+            rpc("send", pane=pane, text="python3 " + " ".join(map(shlex.quote,
+                map(str, [appearance_probe, appearance_control, appearance_events, appearance_done, appearance_applied]))), paste=True, enter=True)
+            def appearance(predicate=lambda state: True):
+                state = rpc("renderer-info", pane=pane)["viewport"]
+                return state if predicate(state) else None
+            wait_for(lambda: appearance(lambda s: s["mouse_shape"] == 0 and s["pointer_name"] == "default"))
+            for sequence, predicate in [
+                (b'\x1b[2 q\x1b]22;crosshair\x07', lambda s: s["mouse_shape"] == 7 and s["pointer_name"] == "crosshair" and not s["cursor_blink_running"]),
+                (b'\x1b]22;unknown-name\x07', lambda s: s["mouse_shape"] == 7 and s["pointer_name"] == "crosshair"),
+                (b'\x1b]22;\x07', lambda s: s["mouse_shape"] == 8 and s["pointer_name"] == "text"),
+                (b'\x1b[?2026h\x1b]22;zoom-in\x07', lambda s: s["mouse_shape"] == 32 and s["pointer_name"] == "zoom-in"),
+                (b'\x1b[?2026l\x1b]22;\x07', lambda s: s["mouse_shape"] == 8 and s["pointer_name"] == "text"),
+                (b'\x1b[1 q\x1b[?25l', lambda s: not s["cursor_blink_running"]),
+                (b'\x1b[?25h', lambda s: s["cursor_blink_running"]),
+            ]:
+                appearance_control.write_bytes(sequence)
+                wait_for(lambda: appearance_applied.read_bytes() == sequence)
+                wait_for(lambda: appearance(predicate))
+            wait_for(lambda: appearance(lambda s: not s["cursor_phase_visible"]))
+            native.key(Gdk.KEY_a, True)
+            native.key(Gdk.KEY_a, False)
+            wait_for(lambda: appearance_events.exists() and b'a' in appearance_events.read_bytes())
+            assert appearance()["cursor_phase_visible"], "IME commit must restore cursor without movement"
+            wait_for(lambda: appearance(lambda s: not s["cursor_phase_visible"]))
+            native.set_clipboard_text("PASTE_ACTIVITY")
+            rpc("action", name="paste")
+            wait_for(lambda: b'PASTE_ACTIVITY' in appearance_events.read_bytes(), context=GLib.MainContext.default())
+            assert appearance()["cursor_phase_visible"], "Clipboard paste must restore cursor without movement"
+            appearance_control.write_bytes(b'stop')
+            wait_for(appearance_done.is_file)
+            wait_for(lambda: appearance(lambda s: s["pointer_name"] == "text"))
+
             # Raw and paste requests must both submit Enter through GTK and the daemon.
             for client in (True, False):
                 for paste in (False, True):

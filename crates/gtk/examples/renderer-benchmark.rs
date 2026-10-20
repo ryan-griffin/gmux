@@ -38,7 +38,8 @@ fn cell(text: &str, fg: [u8; 3], bg: [u8; 3], flags: u8) -> Cell {
     let mut cell = Cell {
         fg,
         bg,
-        flags,
+        flags: flags & !8,
+        decoration: u8::from(flags & 8 != 0),
         ..Cell::default()
     };
     cell.text[..text.len()].copy_from_slice(text.as_bytes());
@@ -122,8 +123,22 @@ fn main() -> anyhow::Result<()> {
         ..Frame::default()
     };
     let mut results = Vec::new();
-    for fixture_name in ["ascii", "mixed", "tui", "fallback", "ligatures", "unique"] {
-        for workload in ["static", "single-row", "full-screen", "all-rows"] {
+    for fixture_name in [
+        "ascii",
+        "mixed",
+        "tui",
+        "fallback",
+        "ligatures",
+        "unique",
+        "decorations",
+    ] {
+        for workload in [
+            "static",
+            "single-row",
+            "full-screen",
+            "all-rows",
+            "cursor-blink",
+        ] {
             let mut renderer = Renderer::new();
             let mut cells = fixture(options.cols, options.rows, theme, fixture_name != "ascii");
             if fixture_name == "ligatures" {
@@ -166,6 +181,12 @@ fn main() -> anyhow::Result<()> {
                     };
                 }
             }
+            if fixture_name == "decorations" {
+                for (index, cell) in cells.iter_mut().enumerate() {
+                    cell.decoration = (1 + (index / options.cols as usize) % 5) as u8 | 8 | 16;
+                    cell.underline_color = theme.palette[1 + (index / options.cols as usize) % 7];
+                }
+            }
             let highlights = vec![0; cells.len()];
             let mut prepare = Vec::new();
             let mut complete = Vec::new();
@@ -176,7 +197,7 @@ fn main() -> anyhow::Result<()> {
             let mut cached_shape_bytes = 0;
             let mut pixels = vec![0; width as usize * height as usize * 4];
             for iteration in 0..options.frames + 5 {
-                if workload != "static" {
+                if !matches!(workload, "static" | "cursor-blink") {
                     if workload == "full-screen" {
                         cells.rotate_left(options.cols as usize);
                     }
@@ -228,6 +249,13 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                let mut frame = frame;
+                if workload == "cursor-blink" {
+                    frame.cursor_visible = (iteration % 2) as u8;
+                    frame.cursor_style = 1;
+                    frame.cursor_x = options.cols / 2;
+                    frame.cursor_y = options.rows / 2;
+                }
                 let scene = Scene {
                     frame,
                     cells: &cells,
@@ -239,7 +267,7 @@ fn main() -> anyhow::Result<()> {
                     theme,
                     selection: None,
                     matches: &highlights,
-                    focused: false,
+                    focused: workload == "cursor-blink",
                     exited: false,
                 };
                 let started = Instant::now();

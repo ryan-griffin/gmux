@@ -6,6 +6,9 @@ pub struct Cell {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub flags: u8,
+    /// Underline style in bits 0-2, overline in bit 3, explicit underline color in bit 4.
+    pub decoration: u8,
+    pub underline_color: [u8; 3],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -23,6 +26,8 @@ pub struct Frame {
     pub cursor_y: u16,
     pub cursor_visible: u8,
     pub cursor_style: u8,
+    pub cursor_blink: u8,
+    pub mouse_shape: u8,
     pub background: [u8; 3],
     pub foreground: [u8; 3],
     pub cursor: [u8; 3],
@@ -35,6 +40,8 @@ impl Default for Cell {
             fg: [0; 3],
             bg: [0; 3],
             flags: 0,
+            decoration: 0,
+            underline_color: [0; 3],
         }
     }
 }

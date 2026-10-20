@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 23:
+handshake. The current protocol version is 24:
 
 ```json
-{"version":23,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":24,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -164,7 +164,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":23,"daemon":"returned-identity"}
+{"method":"attach","version":24,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -204,9 +204,21 @@ number, or zero after acknowledgement. Send that sequence as `through` in
 the boolean `unread` field to indicate whether alerts remain.
 
 For each row listed in the header, there are `frame.cols` cells in column order.
-Each cell has 71 bytes: 64 bytes of zero-padded UTF-8 text, three RGB foreground
-bytes, three RGB background bytes, and one flags byte. The flag bits are bold,
-italic, faint, underline, strike, invisible, and a wide-character continuation.
+Each cell has 75 bytes: 64 bytes of zero-padded UTF-8 text, three RGB foreground
+bytes, three RGB background bytes, one flags byte, one decoration byte, and three
+RGB underline-color bytes. Flag bits 0, 1, 2, 4, and 5 mean bold, italic, faint,
+strike, and invisible. Bits 6 and 7 mark wide-character spacer tails and heads;
+bit 3 is reserved. Decoration bits 0-2 encode no underline, single, double, curly,
+dotted, or dashed as 0-5. Bit 3 enables overline. Bit 4 selects the independent
+underline color; otherwise the underline follows the displayed text color.
+
+Frames include `cursor_blink`, the effective Ghostty blink state, and `mouse_shape`,
+the pinned Ghostty W3C pointer-shape enum. Shape 8 is text and shape 0 is the
+ordinary pointer. OSC 22 with an empty name restores text; unknown names leave
+the previous shape intact. Pointer changes remain live during synchronized-output
+holds. The `style` stream command takes `style` and `blink`
+to configure per-view cursor defaults. Explicit program changes take precedence
+until a program reset selects these defaults again.
 The Rust `transport::Header` and `Packet::read` expose the complete header and
 validate packet dimensions and row indices before decoding cells.
 

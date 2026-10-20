@@ -434,6 +434,10 @@ impl Renderer {
                         ),
                     );
                 }
+                // Ghostty paints underlines and overlines below glyphs so
+                // contrasting colors cannot cover descenders or tall ink.
+                append_decorations(&background, scene, cells, base, y, 0);
+                append_decorations(&background, scene, cells, base, y, 2);
                 row.background = background.to_node();
                 let row_snapshot = gtk::Snapshot::new();
                 let mut x = 0;
@@ -441,7 +445,7 @@ impl Renderer {
                     let cell = &cells[x];
                     let text = cell.text();
                     let has_glyph = !text.is_empty() && text != " ";
-                    if cell.flags & 32 != 0 || !has_glyph && cell.flags & (8 | 16) == 0 {
+                    if cell.flags & 32 != 0 || !has_glyph {
                         x += 1;
                         continue;
                     }
@@ -496,7 +500,7 @@ impl Renderer {
                             // layout, baseline, and terminal-defined visual order.
                             while end < limit
                                 && ascii_cell(&cells[end])
-                                && cells[end].flags == cell.flags
+                                && cells[end].flags & (1 | 2 | 4) == cell.flags & (1 | 2 | 4)
                                 && scene.foreground(base + end, &cells[end]) == (rgb, alpha)
                             {
                                 self.text.push(cells[end].text[0] as char);
@@ -524,46 +528,8 @@ impl Renderer {
                     }
                 }
                 stats.text_nodes += batch.flush(&row_snapshot);
-                // Decorations share long runs. Keeping them outside the glyph
-                // batch avoids one text node per underlined or struck-out cell.
-                for flag in [8, 16] {
-                    let mut start = 0;
-                    while start < cells.len() {
-                        let cell = &cells[start];
-                        if cell.flags & flag == 0 || cell.flags & 32 != 0 {
-                            start += 1;
-                            continue;
-                        }
-                        let (rgb, alpha) = scene.foreground(base + start, cell);
-                        let mut end = start + 1;
-                        while end < cells.len()
-                            && cells[end].flags & flag != 0
-                            && cells[end].flags & 32 == 0
-                            && scene.foreground(base + end, &cells[end]) == (rgb, alpha)
-                        {
-                            end += 1;
-                        }
-                        let line_y = if flag == 8 {
-                            scene.metrics.1 - 2.0
-                        } else {
-                            scene.metrics.1 / 2.0
-                        };
-                        append_row_rect(
-                            &row_snapshot,
-                            scene,
-                            y as f64 * scene.metrics.1,
-                            rgb,
-                            alpha,
-                            (
-                                start as f64 * scene.metrics.0,
-                                line_y,
-                                (end - start) as f64 * scene.metrics.0,
-                                1.0,
-                            ),
-                        );
-                        start = end;
-                    }
-                }
+                // Strikethrough stays above the glyphs, matching Ghostty.
+                append_decorations(&row_snapshot, scene, cells, base, y, 1);
                 row.foreground = row_snapshot.to_node();
                 row.cells.clear();
                 row.cells.extend_from_slice(cells);
@@ -794,4 +760,133 @@ fn append_row_rect(
         alpha,
         (left, top, right - left, bottom - top),
     );
+}
+
+// kind: underline, strikethrough, overline. Explicit underline colors remain
+// independent of selection and cursor text colors, including black.
+fn decoration(
+    scene: &Scene<'_>,
+    index: usize,
+    cell: &Cell,
+    kind: u8,
+) -> Option<(u8, [u8; 3], f32)> {
+    if cell.flags & 32 != 0 {
+        return None;
+    }
+    let style = match kind {
+        0 => cell.decoration & 7,
+        1 => u8::from(cell.flags & 16 != 0),
+        _ => u8::from(cell.decoration & 8 != 0),
+    };
+    if style == 0 {
+        return None;
+    }
+    let (mut rgb, alpha) = scene.foreground(index, cell);
+    if kind == 0 && cell.decoration & 16 != 0 {
+        rgb = cell.underline_color;
+    }
+    Some((style, rgb, alpha))
+}
+
+fn append_decoration(
+    snapshot: &gtk::Snapshot,
+    scene: &Scene<'_>,
+    row: usize,
+    start: usize,
+    end: usize,
+    kind: u8,
+    (style, rgb, alpha): (u8, [u8; 3], f32),
+) {
+    let (cw, ch) = scene.metrics;
+    let row_y = row as f64 * ch;
+    let x = start as f64 * cw;
+    let width = (end - start) as f64 * cw;
+    let line_y = match kind {
+        0 => ch - 2.0,
+        1 => ch / 2.0,
+        _ => 0.0,
+    };
+    let line = |left, top, width, height| {
+        append_row_rect(
+            snapshot,
+            scene,
+            row_y,
+            rgb,
+            alpha,
+            (left, top, width, height),
+        );
+    };
+    if kind != 0 || style == 1 {
+        line(x, line_y, width, 1.0);
+    } else if style == 2 {
+        line(x, ch - 4.0, width, 1.0);
+        line(x, line_y, width, 1.0);
+    } else if style == 3 {
+        // One smooth path per run. Clip at the run bounds so a color or
+        // selection change cannot paint over the neighboring decoration.
+        // Anchor the wave to columns so its phase survives run boundaries.
+        let path = gsk::PathBuilder::new();
+        let period = cw.max(4.0);
+        let mut left = (x / period).floor() * period;
+        let center = ch - 2.5;
+        path.move_to(left as f32, center as f32);
+        while left < x + width {
+            path.cubic_to(
+                (left + period / 4.0) as f32,
+                (center - 2.0) as f32,
+                (left + period / 4.0) as f32,
+                (center - 2.0) as f32,
+                (left + period / 2.0) as f32,
+                center as f32,
+            );
+            path.cubic_to(
+                (left + period * 0.75) as f32,
+                (center + 2.0) as f32,
+                (left + period * 0.75) as f32,
+                (center + 2.0) as f32,
+                (left + period) as f32,
+                center as f32,
+            );
+            left += period;
+        }
+        snapshot.push_clip(&graphene::Rect::new(x as f32, 0.0, width as f32, ch as f32));
+        snapshot.append_stroke(&path.to_path(), &gsk::Stroke::new(1.0), &rgba(rgb, alpha));
+        snapshot.pop();
+    } else {
+        // Device-aligned dots and dashes stay crisp at fractional pane origins.
+        let unit = if style == 4 { 1.0 } else { 3.0 };
+        let period = unit * 2.0;
+        let mut left = (x / period).floor() * period;
+        while left < x + width {
+            let begin = left.max(x);
+            let last = (left + unit).min(x + width);
+            if last > begin {
+                line(begin, line_y, last - begin, 1.0);
+            }
+            left += period;
+        }
+    }
+}
+
+fn append_decorations(
+    snapshot: &gtk::Snapshot,
+    scene: &Scene<'_>,
+    cells: &[Cell],
+    base: usize,
+    y: usize,
+    kind: u8,
+) {
+    let mut start = 0;
+    while start < cells.len() {
+        let Some(style) = decoration(scene, base + start, &cells[start], kind) else {
+            start += 1;
+            continue;
+        };
+        let mut end = start + 1;
+        while end < cells.len() && decoration(scene, base + end, &cells[end], kind) == Some(style) {
+            end += 1;
+        }
+        append_decoration(snapshot, scene, y, start, end, kind, style);
+        start = end;
+    }
 }

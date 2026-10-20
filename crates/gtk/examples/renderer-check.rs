@@ -1,4 +1,6 @@
 //! Check terminal rendering against GTK's independent Pango layout drawing.
+#[path = "../src/terminal/cursor.rs"]
+mod cursor;
 #[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
@@ -23,6 +25,9 @@ struct Options {
     /// Use the selected GTK backend for cache pixels instead of the Cairo oracle.
     #[arg(long, value_enum, default_value_t = CacheBackend::Cairo)]
     cache_renderer: CacheBackend,
+    /// Run the native focus checks driven by renderer-smoke-test.py.
+    #[arg(long)]
+    cursor_lifecycle: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -43,7 +48,8 @@ fn cell(text: &str, theme: Theme, flags: u8) -> Cell {
     let mut cell = Cell {
         fg: theme.foreground,
         bg: theme.background,
-        flags,
+        flags: flags & !8,
+        decoration: u8::from(flags & 8 != 0),
         ..Cell::default()
     };
     cell.text[..text.len()].copy_from_slice(text.as_bytes());
@@ -171,7 +177,7 @@ fn reference(
             snapshot.restore();
         }
         for (flag, line_y) in [(8, ch - 2.0), (16, ch / 2.0)] {
-            if cell.flags & flag != 0 {
+            if (flag == 8 && cell.decoration & 7 != 0) || (flag == 16 && cell.flags & 16 != 0) {
                 // Reference snapping is expressed in global device coordinates.
                 let left =
                     ((x + scene.origin.0) * scene.scale).round() / scene.scale - scene.origin.0;
@@ -580,6 +586,353 @@ fn validate_ligatures(
     }
 }
 
+fn validate_cursor_lifecycle(output: &Path) {
+    fn paint(area: &gtk::DrawingArea, rgb: [u8; 3]) {
+        area.set_draw_func(move |_, cr, _, _| {
+            cr.set_source_rgb(
+                rgb[0] as f64 / 255.0,
+                rgb[1] as f64 / 255.0,
+                rgb[2] as f64 / 255.0,
+            );
+            cr.paint().unwrap();
+        });
+    }
+    let mut serial = 0;
+    let mut activate = |window: &gtk::Window, rgb: [u8; 3]| {
+        window.present();
+        serial += 1;
+        let temporary = output.join("cursor-activation.tmp");
+        std::fs::write(&temporary, json!({"serial":serial,"color":rgb}).to_string()).unwrap();
+        std::fs::rename(temporary, output.join("cursor-activation.json")).unwrap();
+        wait(|| {
+            std::fs::read_to_string(output.join("cursor-activated"))
+                .ok()
+                .as_deref()
+                == Some(&serial.to_string())
+        });
+    };
+    use std::time::{Duration, Instant};
+    #[track_caller]
+    fn wait(predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !predicate() {
+            if Instant::now() >= deadline {
+                fn dump(widget: &gtk::Widget) {
+                    eprintln!(
+                        "{} mapped={} visible={} allocation={}x{} focus={} active={:?}",
+                        widget.type_().name(),
+                        widget.is_mapped(),
+                        widget.is_visible(),
+                        widget.width(),
+                        widget.height(),
+                        widget.has_focus(),
+                        widget.downcast_ref::<gtk::Window>().map(|w| w.is_active())
+                    );
+                    let mut child = widget.first_child();
+                    while let Some(widget) = child {
+                        dump(&widget);
+                        child = widget.next_sibling();
+                    }
+                }
+                for window in gtk::Window::list_toplevels() {
+                    dump(&window);
+                }
+                panic!("Cursor lifecycle transition timed out");
+            }
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let area = gtk::DrawingArea::builder()
+        .focusable(true)
+        .content_width(200)
+        .content_height(50)
+        .vexpand(true)
+        .build();
+    let click = gtk::GestureClick::new();
+    let weak = area.downgrade();
+    click.connect_pressed(move |_, _, _, _| {
+        if let Some(area) = weak.upgrade() {
+            area.grab_focus();
+        }
+    });
+    area.add_controller(click);
+    paint(&area, [60, 120, 180]);
+    area.set_cursor_from_name(Some("text"));
+    let settings = area.settings();
+    let old = (
+        settings.is_gtk_cursor_blink(),
+        settings.gtk_cursor_blink_time(),
+        settings.gtk_cursor_blink_timeout(),
+    );
+    settings.set_gtk_cursor_blink(true);
+    settings.set_gtk_cursor_blink_time(200);
+    settings.set_gtk_cursor_blink_timeout(10);
+    let cursor = cursor::Cursor::new(&area, |_| {});
+    let mut frame = Frame {
+        cols: 80,
+        rows: 24,
+        cursor_visible: 1,
+        cursor_blink: 1,
+        mouse_shape: 0,
+        ..Frame::default()
+    };
+    cursor.update(frame, false);
+    assert_eq!(
+        area.cursor().unwrap().name().as_deref(),
+        Some("default"),
+        "First viewport must apply explicit OSC 22 default"
+    );
+    assert!(!cursor.running());
+    let other = gtk::DrawingArea::builder()
+        .focusable(true)
+        .content_width(200)
+        .content_height(50)
+        .vexpand(true)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&area);
+    content.append(&other);
+    let window = gtk::Window::builder()
+        .child(&content)
+        .default_width(200)
+        .default_height(100)
+        .build();
+    area.grab_focus();
+    activate(&window, [60, 120, 180]);
+    wait(|| cursor.running());
+    wait(|| !cursor.visible());
+    // Text input must restart blinking even with identical terminal coordinates.
+    cursor.restart();
+    assert!(cursor.visible() && cursor.running());
+    frame.cursor_blink = 0;
+    cursor.update(frame, false);
+    assert!(cursor.visible() && !cursor.running());
+    frame.cursor_blink = 1;
+    frame.cursor_visible = 0;
+    cursor.update(frame, false);
+    assert!(!cursor.running());
+    frame.cursor_visible = 1;
+    cursor.update(frame, false);
+    assert!(cursor.running());
+    other.grab_focus();
+    wait(|| !cursor.running());
+    assert!(cursor.visible());
+    area.grab_focus();
+    wait(|| cursor.running());
+    window.set_visible(false);
+    assert!(!cursor.running());
+    area.grab_focus();
+    activate(&window, [60, 120, 180]);
+    wait(|| cursor.running());
+    let cover = gtk::Window::builder()
+        .default_width(100)
+        .default_height(100)
+        .build();
+    let cover_area = gtk::DrawingArea::new();
+    paint(&cover_area, [180, 100, 60]);
+    cover.set_child(Some(&cover_area));
+    activate(&cover, [180, 100, 60]);
+    wait(|| !window.is_active());
+    assert!(
+        !cursor.running(),
+        "An inactive window must stop its blink source"
+    );
+    cover.destroy();
+    area.grab_focus();
+    activate(&window, [60, 120, 180]);
+    wait(|| cursor.running());
+    settings.set_gtk_cursor_blink(false);
+    assert!(!cursor.running() && cursor.visible());
+    settings.set_gtk_cursor_blink(true);
+    assert!(cursor.running());
+
+    settings.set_gtk_cursor_blink_timeout(1);
+    wait(|| !cursor.running());
+    assert!(cursor.visible());
+    cursor.restart();
+    assert!(cursor.running());
+    cursor.update(frame, true);
+    assert!(!cursor.running());
+    cursor.update(frame, false);
+    assert!(cursor.running());
+    frame.mouse_shape = 255;
+    cursor.update(frame, false);
+    assert_eq!(area.cursor().unwrap().name().as_deref(), Some("text"));
+    let weak = std::rc::Rc::downgrade(&cursor);
+    drop(cursor);
+    assert!(
+        weak.upgrade().is_none(),
+        "Blink source must not retain its owner"
+    );
+    window.destroy();
+    settings.set_gtk_cursor_blink(old.0);
+    settings.set_gtk_cursor_blink_time(old.1);
+    settings.set_gtk_cursor_blink_timeout(old.2);
+}
+
+fn validate_decoration_patterns(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    let theme = Theme::adwaita(true);
+    let grid = |decoration, flags| {
+        vec![
+            Cell {
+                fg: [255; 3],
+                bg: [0; 3],
+                decoration,
+                flags,
+                ..Cell::default()
+            };
+            6
+        ]
+    };
+    let check = |cells: &[Cell]| {
+        let mut s = scene(cells, theme);
+        s.frame.cols = 6;
+        s.frame.rows = 1;
+        s.frame.background = [0; 3];
+        s.width = 60;
+        s.height = 24;
+        let texture = render(gpu, &node(&mut Renderer::new(), &s, font, context).0, &s);
+        pixels(&texture)
+    };
+    for style in [1, 2, 4, 5, 8] {
+        let data = check(&grid(style, 0));
+        for y in 0..24 {
+            for x in 0..60 {
+                let expected = match style {
+                    1 => y == 22,
+                    2 => y == 20 || y == 22,
+                    4 => y == 22 && x % 2 == 0,
+                    5 => y == 22 && x % 6 < 3,
+                    _ => y == 0, // Overline is at the top, with no underline.
+                };
+                assert_eq!(
+                    data[(y * 60 + x) * 4],
+                    if expected { 255 } else { 0 },
+                    "Decoration {style}, {x},{y}"
+                );
+            }
+        }
+    }
+    let data = check(&grid(3, 0));
+    let mut extents = Vec::new();
+    for x in 1..59 {
+        let ink: Vec<_> = (0..24).filter(|&y| data[(y * 60 + x) * 4] > 20).collect();
+        assert!(!ink.is_empty(), "Curly underline has a gap at column {x}");
+        assert!(
+            ink.iter().all(|&y| (19..24).contains(&y)),
+            "Wave must stay in the underline band"
+        );
+        extents.push((*ink.first().unwrap(), *ink.last().unwrap()));
+    }
+    assert!(
+        extents.windows(2).any(|pair| pair[0] != pair[1]),
+        "Curly underline must change vertical position"
+    );
+    assert!(extents.iter().any(|&(top, _)| top == 19));
+    assert!(extents.iter().any(|&(_, bottom)| bottom == 23));
+    let faint = check(&grid(1 | 8, 4));
+    assert!((127..=128).contains(&faint[22 * 60 * 4]));
+    assert!((127..=128).contains(&faint[0]));
+    let invisible = check(&grid(3 | 8, 32));
+    assert!(
+        invisible
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[..3] == [0; 3])
+    );
+}
+
+fn validate_decorations(gpu: &gsk::Renderer, context: &pango::Context, output: &Path) {
+    let theme = Theme::adwaita(true);
+    fn configured(cells: &[Cell], theme: Theme, scale: f64) -> Scene<'_> {
+        let mut s = scene(cells, theme);
+        s.scale = scale;
+        s.origin = (0.25, 0.5);
+        s.metrics = (12.0, 20.0);
+        s.width = 480;
+        s
+    }
+    let font = pango::FontDescription::from_string("Monospace 16");
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let mut glyphs = vec![cell(" ", theme, 0); 40 * 8];
+        for (index, ch) in "gypqjgypqj".chars().enumerate() {
+            glyphs[index] = Cell {
+                fg: [255; 3],
+                ..cell(&ch.to_string(), theme, 0)
+            };
+        }
+        let s = configured(&glyphs, theme, scale);
+        let plain = render(gpu, &node(&mut Renderer::new(), &s, &font, context).0, &s);
+        let plain_pixels = pixels(&plain);
+        for style in 1..=5 {
+            let mut decorated = glyphs.clone();
+            for c in &mut decorated[..10] {
+                c.decoration = style | 16;
+                c.underline_color = [255, 0, 0];
+            }
+            let s = configured(&decorated, theme, scale);
+            let actual_texture = render(gpu, &node(&mut Renderer::new(), &s, &font, context).0, &s);
+            let actual_pixels = pixels(&actual_texture);
+            let mut blanks = decorated.clone();
+            for c in &mut blanks {
+                c.text = [0; 64];
+            }
+            let blank_scene = configured(&blanks, theme, scale);
+            let mask = render(
+                gpu,
+                &node(&mut Renderer::new(), &blank_scene, &font, context).0,
+                &blank_scene,
+            );
+            let mask_pixels = pixels(&mask);
+            let mut intersections = 0;
+            for ((glyph, line), actual) in plain_pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(mask_pixels.as_chunks::<4>().0)
+                .zip(actual_pixels.as_chunks::<4>().0)
+            {
+                // Opaque descender ink must cover the contrasting underline.
+                // The separate blank scene proves these are actual intersections.
+                if *glyph == [255; 4] && line[2] > 180 && line[1] < 80 {
+                    intersections += 1;
+                    if actual != glyph {
+                        actual_texture
+                            .save_to_png(output.join(format!("descender-{style}-{scale}.png")))
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        actual, glyph,
+                        "Underline {style} covered descender at scale {scale}"
+                    );
+                }
+            }
+            assert!(
+                intersections > 0,
+                "Fixture must overlap underline {style} and descenders at {scale}"
+            );
+            let s = configured(&decorated, theme, scale);
+            let mut renderer = Renderer::new();
+            node(&mut renderer, &s, &font, context);
+            let (_, stats) = node(&mut renderer, &s, &font, context);
+            assert_eq!(stats.rebuilt_rows, 0);
+            let mut changed = decorated.clone();
+            changed[0].underline_color = [0, 255, 0];
+            let s = configured(&changed, theme, scale);
+            let (cached, stats) = node(&mut renderer, &s, &font, context);
+            assert_eq!(stats.rebuilt_rows, 1);
+            let fresh = node(&mut Renderer::new(), &s, &font, context).0;
+            assert_render_eq(gpu, &cached, &fresh, &s, output, "decoration-color-update");
+        }
+    }
+}
+
 fn validate_cache(
     gpu: &gsk::Renderer,
     font: &pango::FontDescription,
@@ -603,9 +956,15 @@ fn validate_cache(
         ("block", 1),
         ("move", 2),
         ("cursor-color", 1),
+        ("block-blink-off", 1),
+        ("block-blink-on", 1),
         ("unfocused", 1),
         ("bar", 0),
+        ("bar-blink-off", 0),
+        ("bar-blink-on", 0),
         ("underline", 0),
+        ("underline-blink-off", 0),
+        ("underline-blink-on", 0),
         ("hidden", 0),
         ("font", 8),
         ("context", 8),
@@ -627,8 +986,17 @@ fn validate_cache(
             }
             "move" => scene.frame.cursor_y = 3,
             "cursor-color" => scene.frame.cursor = [255, 0, 0],
+            "block-blink-off" | "bar-blink-off" | "underline-blink-off" => {
+                scene.frame.cursor_visible = 0
+            }
+            "block-blink-on" | "bar-blink-on" | "underline-blink-on" => {
+                scene.frame.cursor_visible = 1
+            }
             "unfocused" => scene.focused = false,
-            "bar" => scene.frame.cursor_style = 0,
+            "bar" => {
+                scene.focused = true;
+                scene.frame.cursor_style = 0;
+            }
             "underline" => scene.frame.cursor_style = 2,
             "hidden" => scene.frame.cursor_visible = 0,
             "font" => font.set_size(16 * pango::SCALE),
@@ -969,6 +1337,10 @@ fn main() -> anyhow::Result<()> {
     let options = Options::parse();
     std::fs::create_dir_all(&options.output)?;
     gtk::init()?;
+    if options.cursor_lifecycle {
+        validate_cursor_lifecycle(&options.output);
+    }
+
     let window = gtk::Window::new();
     window.present();
     let gpu = window.renderer().unwrap();
@@ -1040,14 +1412,17 @@ fn main() -> anyhow::Result<()> {
     validate_cache(cache_gpu, &font, &context, &options.output);
     validate_scroll_cache(cache_gpu, &font, &context, &options.output);
     validate_geometry(&gpu, &font, &context);
+    validate_decorations(cache_gpu, &context, &options.output);
+    validate_decoration_patterns(cache_gpu, &font, &context);
     std::fs::write(
         options.output.join("checks.json"),
         serde_json::to_string_pretty(&json!({
             "gtk_renderer": gpu.type_().name(), "cache_renderer": cache_gpu.type_().name(),
+            "cursor_lifecycle": options.cursor_lifecycle,
             "glyph_cases": cases,
             "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
                        "font and context changes", "fractional blocks", "selection and search",
-                       "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
+                       "distinct underline patterns and overline geometry", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
                        "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts"]
         }))?,
     )?;

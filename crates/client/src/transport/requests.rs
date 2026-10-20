@@ -175,6 +175,7 @@ pub enum StreamCommand {
     },
     Style {
         style: CursorStyle,
+        blink: bool,
     },
     Resize {
         cols: u16,
