@@ -1,4 +1,4 @@
-use gmux_client::Frame;
+use gmux_client::{Frame, cells::mouse_shape};
 use gtk::{glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
@@ -14,11 +14,13 @@ pub(super) struct Cursor {
     settings_handlers: RefCell<Vec<glib::SignalHandlerId>>,
     window_handler: RefCell<Option<(gtk::Window, glib::SignalHandlerId)>>,
     source: RefCell<Option<glib::SourceId>>,
+    default_enabled: Cell<bool>,
     frame: Cell<Frame>,
     pointer: Cell<Option<u8>>,
     exited: Cell<bool>,
     visible: Cell<bool>,
     started: Cell<Instant>,
+    deadline: Cell<Instant>,
 }
 
 impl Cursor {
@@ -27,17 +29,22 @@ impl Cursor {
         defaults: impl Fn(bool) + 'static,
     ) -> Rc<Self> {
         let widget = widget.as_ref();
+        let settings = widget.settings();
+        let default_blink =
+            settings.is_gtk_cursor_blink() && settings.gtk_cursor_blink_timeout() > 0;
         let cursor = Rc::new(Self {
             widget: widget.downgrade(),
-            settings: widget.settings(),
+            settings,
             settings_handlers: RefCell::new(Vec::new()),
             window_handler: RefCell::new(None),
             source: RefCell::new(None),
+            default_enabled: Cell::new(default_blink),
             frame: Cell::new(Frame::default()),
             pointer: Cell::new(None),
             exited: Cell::new(false),
             visible: Cell::new(true),
             started: Cell::new(Instant::now()),
+            deadline: Cell::new(Instant::now()),
         });
         let defaults = Rc::new(defaults);
         for property in [
@@ -51,7 +58,15 @@ impl Cursor {
                 .settings
                 .connect_notify_local(Some(property), move |_, _| {
                     if let Some(cursor) = weak.upgrade() {
-                        defaults(cursor.default_blink());
+                        notify_default(
+                            &cursor.default_enabled,
+                            cursor.settings.is_gtk_cursor_blink(),
+                            cursor.settings.gtk_cursor_blink_timeout(),
+                            |blink| defaults(blink),
+                        );
+                        // Preferences are infrequent. Replace the pending
+                        // timeout so shorter and longer timings apply at once.
+                        cursor.stop();
                         cursor.restart();
                     }
                 });
@@ -122,7 +137,7 @@ impl Cursor {
         if self.pointer.replace(Some(frame.mouse_shape)) != Some(frame.mouse_shape)
             && let Some(widget) = self.widget.upgrade()
         {
-            widget.set_cursor_from_name(Some(pointer_name(frame.mouse_shape)));
+            widget.set_cursor_from_name(Some(mouse_shape::name(frame.mouse_shape)));
         }
         let cursor = |f: Frame| {
             (
@@ -142,11 +157,10 @@ impl Cursor {
     }
 
     pub(super) fn restart(self: &Rc<Self>) {
-        if let Some(source) = self.source.borrow_mut().take() {
-            source.remove();
-        }
         self.set_visible(true);
-        self.started.set(Instant::now());
+        let now = Instant::now();
+        self.started.set(now);
+        self.deadline.set(now + self.half_cycle());
         self.schedule();
     }
 
@@ -177,26 +191,56 @@ impl Cursor {
             })
     }
 
+    fn half_cycle(&self) -> Duration {
+        Duration::from_millis((self.settings.gtk_cursor_blink_time().max(2) / 2) as u64)
+    }
+
+    fn stop(&self) {
+        if let Some(source) = self.source.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
     fn schedule(self: &Rc<Self>) {
-        let remaining = Duration::from_secs(self.settings.gtk_cursor_blink_timeout().max(0) as u64)
-            .saturating_sub(self.started.get().elapsed());
-        if !self.eligible() || remaining.is_zero() {
+        let now = Instant::now();
+        let expires = self.started.get()
+            + Duration::from_secs(self.settings.gtk_cursor_blink_timeout().max(0) as u64);
+        if !self.eligible() || now >= expires {
+            self.stop();
             self.set_visible(true);
             return;
         }
-        let half_cycle =
-            Duration::from_millis((self.settings.gtk_cursor_blink_time().max(2) / 2) as u64);
+        // Input extends the desired deadline without replacing a pending source.
+        // Its earlier wake will rearm instead of hiding the cursor too soon.
+        if self.running() {
+            return;
+        }
+        let delay = self
+            .deadline
+            .get()
+            .min(expires)
+            .saturating_duration_since(now);
+        // GLib takes whole milliseconds. Round up to avoid repeated early wakes.
+        let delay = Duration::from_millis(delay.as_nanos().div_ceil(1_000_000) as u64);
         let weak = Rc::downgrade(self);
-        *self.source.borrow_mut() = Some(glib::timeout_add_local_once(
-            half_cycle.min(remaining),
-            move || {
-                if let Some(cursor) = weak.upgrade() {
-                    cursor.source.borrow_mut().take();
+        *self.source.borrow_mut() = Some(glib::timeout_add_local_once(delay, move || {
+            if let Some(cursor) = weak.upgrade() {
+                cursor.source.borrow_mut().take();
+                let now = Instant::now();
+                if now >= cursor.deadline.get()
+                    && now
+                        < cursor.started.get()
+                            + Duration::from_secs(
+                                cursor.settings.gtk_cursor_blink_timeout().max(0) as u64
+                            )
+                    && cursor.eligible()
+                {
                     cursor.set_visible(!cursor.visible.get());
-                    cursor.schedule();
+                    cursor.deadline.set(now + cursor.half_cycle());
                 }
-            },
-        ));
+                cursor.schedule();
+            }
+        }));
     }
 }
 
@@ -214,44 +258,39 @@ impl Drop for Cursor {
     }
 }
 
-// Same order as the pinned GhosttyMouseShape C enum. GTK uses W3C names and
-// provides native fallbacks when a cursor theme lacks a particular shape.
-pub(super) fn pointer_name(shape: u8) -> &'static str {
-    const NAMES: &[&str] = &[
-        "default",
-        "context-menu",
-        "help",
-        "pointer",
-        "progress",
-        "wait",
-        "cell",
-        "crosshair",
-        "text",
-        "vertical-text",
-        "alias",
-        "copy",
-        "move",
-        "no-drop",
-        "not-allowed",
-        "grab",
-        "grabbing",
-        "all-scroll",
-        "col-resize",
-        "row-resize",
-        "n-resize",
-        "e-resize",
-        "s-resize",
-        "w-resize",
-        "ne-resize",
-        "nw-resize",
-        "se-resize",
-        "sw-resize",
-        "ew-resize",
-        "ns-resize",
-        "nesw-resize",
-        "nwse-resize",
-        "zoom-in",
-        "zoom-out",
-    ];
-    NAMES.get(shape as usize).copied().unwrap_or("text")
+fn notify_default(current: &Cell<bool>, enabled: bool, timeout: i32, notify: impl FnOnce(bool)) {
+    let effective = enabled && timeout > 0;
+    if current.replace(effective) != effective {
+        notify(effective);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_notify_only_effective_changes() {
+        let current = Cell::new(true);
+        let mut notifications = Vec::new();
+        // Positive timing changes, repeated notifications, timeout zero while
+        // disabled, and enabling while timeout remains zero must not transmit.
+        for (enabled, timeout) in [
+            (true, 20),
+            (true, 1),
+            (true, 0),
+            (true, 0),
+            (false, 0),
+            (false, 10),
+            (true, 10),
+            (false, 10),
+            (true, 0),
+            (true, 10),
+        ] {
+            notify_default(&current, enabled, timeout, |value| {
+                notifications.push(value)
+            });
+        }
+        assert_eq!(notifications, [false, true, false, true]);
+    }
 }

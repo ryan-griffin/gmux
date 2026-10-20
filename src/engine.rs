@@ -1960,6 +1960,7 @@ mod tests {
 
     #[test]
     fn decoration_styles_colors_resets_and_held_frames() {
+        use gmux_client::cells::{decoration, underline};
         let mut e = Engine::new().unwrap();
         let dark = Theme::adwaita(true);
         e.set_theme(&dark).unwrap();
@@ -1968,15 +1969,22 @@ mod tests {
         );
         e.snapshot().unwrap();
         assert_eq!(
-            e.cells[..6]
-                .iter()
-                .map(|c| c.decoration & 7)
-                .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 0]
+            e.cells[..6].iter().map(Cell::underline).collect::<Vec<_>>(),
+            [
+                underline::SINGLE,
+                underline::DOUBLE,
+                underline::CURLY,
+                underline::DOTTED,
+                underline::DASHED,
+                underline::NONE
+            ]
         );
-        assert_eq!(e.cells[0].decoration & 16, 0);
+        assert!(!e.cells[0].has_underline_color());
         assert_eq!(e.cells[1].underline_color, dark.palette[4]);
-        assert_eq!(e.cells[2].decoration, 3 | 8 | 16);
+        assert_eq!(
+            e.cells[2].decoration,
+            underline::CURLY | decoration::OVERLINE | decoration::UNDERLINE_COLOR
+        );
         assert_eq!(e.cells[2].underline_color, [1, 2, 3]);
         assert_eq!(e.cells[5].decoration, 0);
         e.write(b"\x1b]4;4;#123456\x07");
@@ -1991,10 +1999,13 @@ mod tests {
         e.write(b"\r\x1b[?2026h\x1b[4:5;58;2;0;0;0mZ");
         e.snapshot().unwrap();
         assert_eq!(e.cells[0].text(), "A");
-        assert_eq!(e.cells[0].decoration, 1);
+        assert_eq!(e.cells[0].decoration, underline::SINGLE);
         e.write(b"\x1b[?2026l");
         e.snapshot().unwrap();
-        assert_eq!(e.cells[0].decoration, 5 | 16);
+        assert_eq!(
+            e.cells[0].decoration,
+            underline::DASHED | decoration::UNDERLINE_COLOR
+        );
         assert_eq!(e.cells[0].underline_color, [0; 3]);
     }
 
@@ -2036,16 +2047,17 @@ mod tests {
 
     #[test]
     fn mouse_shape_defaults_unknown_names_reset_and_sync_output() {
+        use gmux_client::cells::mouse_shape;
         let mut e = Engine::new().unwrap();
         for (sequence, shape) in [
-            ("", 8),
-            ("\x1b]22;pointer\x07", 3),
-            ("\x1b]22;unknown-name\x07", 3),
-            ("\x1b]22;default\x1b\\", 0),
-            ("\x1b]22;\x07", 8),
-            ("\x1b]22;zoom-in\x07", 32),
-            ("\x1b[?2026h\x1b]22;crosshair\x07", 7),
-            ("\x1b[?2026l", 7),
+            ("", mouse_shape::TEXT),
+            ("\x1b]22;pointer\x07", mouse_shape::POINTER),
+            ("\x1b]22;unknown-name\x07", mouse_shape::POINTER),
+            ("\x1b]22;default\x1b\\", mouse_shape::DEFAULT),
+            ("\x1b]22;\x07", mouse_shape::TEXT),
+            ("\x1b]22;zoom-in\x07", mouse_shape::ZOOM_IN),
+            ("\x1b[?2026h\x1b]22;crosshair\x07", mouse_shape::CROSSHAIR),
+            ("\x1b[?2026l", mouse_shape::CROSSHAIR),
         ] {
             e.write(sequence.as_bytes());
             e.snapshot().unwrap();
@@ -2053,7 +2065,7 @@ mod tests {
         }
         e.write(b"\rOLD\x1b[?2026h\rNEW\x1b]22;pointer\x07");
         e.snapshot().unwrap();
-        assert_eq!(e.frame.mouse_shape, 3);
+        assert_eq!(e.frame.mouse_shape, mouse_shape::POINTER);
         assert_eq!(e.cells[0].text(), "O");
         e.write(b"\x1b[?2026l");
         e.snapshot().unwrap();
