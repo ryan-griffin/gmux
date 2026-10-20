@@ -191,6 +191,12 @@ contains pane `meta`, an optional `frame`, changed `rows`, and optional executio
 errors. A full viewport arrives on subscription; later packets contain changed
 rows. Metadata-only packets have no cell data.
 
+`scroll-to` takes an absolute history `row` and an increasing `serial`. Viewport
+replies acknowledge the last applied serial as `scroll_serial`. The Rust client
+coalesces repeated targets while a viewport reply is outstanding. Commands that
+depend on the viewport flush the queued target first. Apply row deltas from
+older replies too, since later packets depend on them.
+
 Send the connection command `{"method":"ping"}` to check that the daemon's
 event loop is responding. It replies with a zero-length record, four zero bytes,
 without changing pane state or an in-progress paste. The Rust session client sends

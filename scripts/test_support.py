@@ -186,6 +186,7 @@ class DelayedViewport:
         self.socket_path = str(socket_path)
         self.proxy_path = str(proxy_path)
         self.delay = 0
+        self.reply_bytes = 0
         self.closed = threading.Event()
         self.forwarding = threading.Event()
         self.forwarding.set()
@@ -205,6 +206,7 @@ class DelayedViewport:
             try:
                 while data := source.recv(65536):
                     if delayed:
+                        self.reply_bytes += len(data)
                         self.forwarding.wait()
                     if self.closed.wait(self.delay if delayed else 0):
                         return

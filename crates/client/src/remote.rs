@@ -511,6 +511,7 @@ impl SessionManager {
             text_revision: 0,
             read_through: 0,
             scroll_serial: ValueCell::new(0),
+            scroll_sent: ValueCell::new(0),
             scroll_acknowledged: 0,
             pending_scroll: ValueCell::new(None),
             find: crate::search::FindState::default(),
@@ -612,7 +613,9 @@ impl SessionManager {
                                 previous.copy_from_slice(next);
                             }
                             session.frame = frame;
-                            session.scroll_acknowledged = packet.header.scroll_serial;
+                            session.scroll_acknowledged =
+                                session.scroll_acknowledged.max(packet.header.scroll_serial);
+                            session.flush_scroll();
                             if !packet.header.rows.is_empty() {
                                 session.revision = session.revision.wrapping_add(1);
                             }
@@ -683,6 +686,7 @@ pub struct RemoteSession {
     text_revision: u64,
     read_through: u64,
     scroll_serial: ValueCell<u64>,
+    scroll_sent: ValueCell<u64>,
     scroll_acknowledged: u64,
     pending_scroll: ValueCell<Option<u64>>,
     find: crate::search::FindState,
@@ -703,6 +707,16 @@ impl RemoteSession {
         crate::cells::viewport_text(self.frame, &self.cells)
     }
     fn command(&self, command: StreamCommand) -> anyhow::Result<()> {
+        // Key releases and appearance updates do not move the viewport. Keep
+        // coalescing through them; other commands follow the latest scroll.
+        if !matches!(
+            command,
+            StreamCommand::Key { release: true, .. }
+                | StreamCommand::Theme { .. }
+                | StreamCommand::Style { .. }
+        ) {
+            self.send_scroll()?;
+        }
         self.connection
             .send(StreamRequest::pane(self.id(), command))
     }
@@ -848,27 +862,31 @@ impl RemoteSession {
     pub fn selection(&self) -> Option<(u64, u64)> {
         self.selection
     }
-    pub fn scroll(&self, delta: isize, bottom: bool) {
-        if let Err(e) = self.command(StreamCommand::Scroll { delta, bottom }) {
-            eprintln!("{e}");
-        }
-    }
     pub fn scroll_to(&self, row: u64) {
         self.scroll_serial.set(self.scroll_serial.get() + 1);
         self.pending_scroll.set(Some(row));
         self.flush_scroll();
     }
     fn flush_scroll(&self) {
-        if let Some(row) = self.pending_scroll.get()
-            && self
-                .command(StreamCommand::ScrollTo {
+        // A writable command socket does not imply a responsive viewport.
+        // Keep only the latest target while an earlier scroll is in flight.
+        if self.scroll_acknowledged >= self.scroll_sent.get() {
+            let _ = self.send_scroll();
+        }
+    }
+    fn send_scroll(&self) -> anyhow::Result<()> {
+        if let Some(row) = self.pending_scroll.get() {
+            self.connection.send(StreamRequest::pane(
+                self.id(),
+                StreamCommand::ScrollTo {
                     row,
                     serial: self.scroll_serial.get(),
-                })
-                .is_ok()
-        {
+                },
+            ))?;
+            self.scroll_sent.set(self.scroll_serial.get());
             self.pending_scroll.set(None);
         }
+        Ok(())
     }
     pub fn scroll_pending(&self) -> bool {
         self.scroll_acknowledged < self.scroll_serial.get()
@@ -1202,6 +1220,7 @@ mod tests {
             text_revision: 0,
             read_through: 0,
             scroll_serial: ValueCell::new(0),
+            scroll_sent: ValueCell::new(0),
             scroll_acknowledged: 0,
             pending_scroll: ValueCell::new(None),
             find: crate::search::FindState::default(),
@@ -1747,6 +1766,153 @@ mod tests {
         assert_eq!((screen.frame.cols, screen.frame.rows), (4, 1));
         assert_eq!(screen.cells.len(), 4);
     }
+    #[test]
+    fn rapid_scroll_reversals_wait_for_the_viewport_and_send_only_the_latest_target() {
+        let (mut manager, sender, session) = manager();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(128);
+        let connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        manager.connection = connection.clone();
+        session.borrow_mut().connection = connection;
+
+        session.borrow().scroll_to(10);
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"scroll-to","pane":1,"row":10,"serial":1})
+        );
+        let mut queued = 1;
+        // The writer stays writable while viewport replies are delayed. Neither
+        // direction changes nor polls should enqueue obsolete scroll targets.
+        for index in 0..120 {
+            session
+                .borrow()
+                .scroll_to(if index % 2 == 0 { 80 } else { 20 });
+            session.borrow().set_theme(&Theme::adwaita(true)).unwrap();
+            session
+                .borrow()
+                .set_cursor_style(CursorStyle::Block, false)
+                .unwrap();
+            session.borrow().key("a", b'a' as u32, 0, true, "").unwrap();
+            manager.poll();
+            let commands: Vec<_> = receiver.try_iter().map(wire).collect();
+            let scrolls = commands
+                .iter()
+                .filter(|c| c["method"] == "scroll-to")
+                .count();
+            queued += scrolls;
+            assert_eq!(commands.len() - scrolls, 3);
+        }
+        assert_eq!(queued, 1);
+
+        let reply = |serial, frame| {
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: session.borrow().meta.clone(),
+                        frame,
+                        scroll_serial: serial,
+                        ..Header::default()
+                    },
+                    cells: vec![],
+                }))
+                .unwrap();
+        };
+        // Metadata and earlier frames do not acknowledge the outstanding scroll.
+        reply(1, None);
+        let mut cell = Cell::default();
+        cell.text[0] = b'x';
+        send_frame(
+            &sender,
+            &session,
+            session.borrow().frame,
+            vec![0],
+            vec![cell; 2],
+            None,
+        );
+        manager.poll();
+        assert!(receiver.try_recv().is_err());
+        assert!(session.borrow().scroll_pending());
+
+        reply(1, Some(session.borrow().frame));
+        manager.poll();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"scroll-to","pane":1,"row":20,"serial":121})
+        );
+        assert!(session.borrow().scroll_pending());
+        reply(1, Some(session.borrow().frame));
+        manager.poll();
+        assert!(receiver.try_recv().is_err());
+        assert!(session.borrow().scroll_pending());
+
+        let mut frame = session.borrow().frame;
+        frame.scrollback.offset = 20;
+        reply(121, Some(frame));
+        assert!(manager.poll()[&1].changed);
+        assert!(!session.borrow().scroll_pending());
+        assert_eq!(session.borrow().snapshot().frame.scrollback.offset, 20);
+        // Later packets can omit unchanged rows from older viewport replies.
+        assert_eq!(session.borrow().snapshot().cells[0].text(), "x");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn deferred_scroll_preserves_command_order_without_blocking_other_panes() {
+        let (mut manager, _sender, session) = manager();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(8);
+        let connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        manager.connection = connection.clone();
+        session.borrow_mut().connection = connection;
+        let mut meta = session.borrow().meta.clone();
+        meta.id = 2;
+        manager.metadata.insert(2, meta);
+        let other = manager.attach(2, &Theme::adwaita(true)).unwrap();
+
+        session.borrow().scroll_to(10);
+        session.borrow().scroll_to(20);
+        other.borrow().scroll_to(30);
+        session
+            .borrow()
+            .key("", b'a' as u32, 0, false, "a")
+            .unwrap();
+        session.borrow().scroll_to(40);
+        session.borrow().paste("paste").unwrap();
+
+        let commands: Vec<_> = receiver.try_iter().take(5).map(wire).collect();
+        assert_eq!(commands.len(), 5);
+        assert_eq!(
+            commands[0],
+            json!({"method":"scroll-to","pane":1,"row":10,"serial":1})
+        );
+        assert_eq!(
+            commands[1],
+            json!({"method":"scroll-to","pane":2,"row":30,"serial":1})
+        );
+        assert_eq!(
+            commands[2],
+            json!({"method":"scroll-to","pane":1,"row":20,"serial":2})
+        );
+        assert_eq!(commands[3]["method"], "key");
+        assert_eq!(
+            commands[4],
+            json!({"method":"scroll-to","pane":1,"row":40,"serial":3})
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Outgoing::Paste { pane: Some(1), text, .. } if text == "paste"
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn scroll_requests_coalesce_under_backpressure_and_ignore_stale_acknowledgements() {
         let (mut manager, sender, session) = manager();

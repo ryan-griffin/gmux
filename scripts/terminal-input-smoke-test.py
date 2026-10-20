@@ -479,6 +479,66 @@ finally:
                 time.sleep(.25)
                 assert wait_for(viewport)["scrollback"]["offset"] == offset, "Selection scrolling must stop"
 
+            # Hold viewport replies while native touchpad input repeatedly
+            # reverses. The scrollbar must retain the latest local target until
+            # the matching viewport arrives, including through older replies.
+            native.move(left + cw * 6.5, (viewport_top + viewport_bottom) / 2)
+            proxy.pause()
+            proxy.delay = .015
+            reply_bytes = proxy.reply_bytes
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerAxis",
+                        "(ddu)", (0.0, 20 * row_height, 4))
+            time.sleep(.1)
+            for index in range(40):
+                native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerAxis",
+                            "(ddu)", (0.0, (-1 if index % 2 == 0 else 1) * 3 * row_height, 4))
+                time.sleep(.02)
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerAxis",
+                        "(ddu)", (0.0, 0.0, 1))
+            state = rpc("renderer-info", pane=pane)["viewport"]
+            target = round(state["scrollbar"]["value"] / row_height)
+            assert state["scroll_pending"] and 0 < target < state["scrollback"]["total"] - state["rows"], state
+            started = time.monotonic()
+            proxy.resume()
+
+            def scroll_settled():
+                state = rpc("renderer-info", pane=pane)["viewport"]
+                assert round(state["scrollbar"]["value"] / row_height) == target, ("A stale viewport reset the scrollbar", target, state)
+                return state if not state["scroll_pending"] and state["scrollback"]["offset"] == target else None
+
+            wait_for(scroll_settled)
+            report = dict(settle_ms=(time.monotonic() - started) * 1000,
+                          reply_bytes=proxy.reply_bytes - reply_bytes, target=target)
+            # The first target and the final target need at most two full grids,
+            # plus room for packet headers and metadata. Older targets add no grids.
+            reply_budget = 2 * state["cols"] * state["rows"] * 75 + 65536
+            assert report["reply_bytes"] <= reply_budget, ("Obsolete scroll targets queued viewport data", report, reply_budget)
+            (artifacts / "scroll-sync.json").write_text(json.dumps(report, indent=2) + "\n")
+            print("Rapid scroll reversals: " + json.dumps(report), flush=True)
+            proxy.delay = 0
+            for _ in range(12):
+                page(Gdk.KEY_Page_Up)
+            wait_for(lambda: viewport(lambda state: state["scrollback"]["offset"] == 0))
+
+            # Page shortcuts share the same pending target as pointer input.
+            proxy.pause()
+            native.key(Gdk.KEY_Shift_L, True)
+            for index in range(21):
+                symbol = Gdk.KEY_Page_Down if index % 2 == 0 else Gdk.KEY_Page_Up
+                native.key(symbol, True)
+                native.key(symbol, False)
+                time.sleep(.02)
+            native.key(Gdk.KEY_Shift_L, False)
+            time.sleep(.05)
+            state = rpc("renderer-info", pane=pane)["viewport"]
+            target = min(state["rows"], state["scrollback"]["total"] - state["rows"])
+            assert state["scroll_pending"] and round(state["scrollbar"]["value"] / row_height) == target, state
+            proxy.resume()
+            wait_for(scroll_settled)
+            for _ in range(12):
+                page(Gdk.KEY_Page_Up)
+            wait_for(lambda: viewport(lambda state: state["scrollback"]["offset"] == 0))
+
             native.move(left + cw / 2, (top + bottom) / 2)
             native.button(True)
             time.sleep(.05)
@@ -634,6 +694,7 @@ finally:
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
                   "wide-glyph geometry, double/triple-click selection, line dragging, and Shift selection in mouse-reporting applications, "
+                  "rapid touchpad and keyboard scroll reversals with delayed replies and a stable scrollbar target, "
                   "stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
                   "fast edge drags during overscroll without viewport bouncing, "
                   "edge and release cancellation, "
