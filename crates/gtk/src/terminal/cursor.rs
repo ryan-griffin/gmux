@@ -6,6 +6,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct CursorState {
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+    style: u8,
+    visible: u8,
+    blink: u8,
+}
+
+impl From<Frame> for CursorState {
+    fn from(frame: Frame) -> Self {
+        Self {
+            x: frame.cursor_x,
+            y: frame.cursor_y,
+            cols: frame.cols,
+            rows: frame.rows,
+            style: frame.cursor_style,
+            visible: frame.cursor_visible,
+            blink: frame.cursor_blink,
+        }
+    }
+}
+
 /// One sleeping source per eligible pane, scheduled only for the next blink.
 /// All signal closures and the source hold weak references to this owner.
 pub(super) struct Cursor {
@@ -15,7 +40,7 @@ pub(super) struct Cursor {
     window_handler: RefCell<Option<(gtk::Window, glib::SignalHandlerId)>>,
     source: RefCell<Option<glib::SourceId>>,
     default_enabled: Cell<bool>,
-    frame: Cell<Frame>,
+    state: Cell<CursorState>,
     pointer: Cell<Option<u8>>,
     exited: Cell<bool>,
     visible: Cell<bool>,
@@ -39,7 +64,7 @@ impl Cursor {
             window_handler: RefCell::new(None),
             source: RefCell::new(None),
             default_enabled: Cell::new(default_blink),
-            frame: Cell::new(Frame::default()),
+            state: Cell::new(CursorState::default()),
             pointer: Cell::new(None),
             exited: Cell::new(false),
             visible: Cell::new(true),
@@ -133,25 +158,15 @@ impl Cursor {
     }
 
     pub(super) fn update(self: &Rc<Self>, frame: Frame, exited: bool) {
-        let previous = self.frame.replace(frame);
+        let state = CursorState::from(frame);
+        let previous = self.state.replace(state);
         if self.pointer.replace(Some(frame.mouse_shape)) != Some(frame.mouse_shape)
             && let Some(widget) = self.widget.upgrade()
         {
             widget.set_cursor_from_name(Some(mouse_shape::name(frame.mouse_shape)));
         }
-        let cursor = |f: Frame| {
-            (
-                f.cursor_x,
-                f.cursor_y,
-                f.cursor_style,
-                f.cursor_visible,
-                f.cursor_blink,
-                f.cols,
-                f.rows,
-            )
-        };
         let was_exited = self.exited.replace(exited);
-        if cursor(previous) != cursor(frame) || was_exited != exited {
+        if previous != state || was_exited != exited {
             self.restart();
         }
     }
@@ -174,12 +189,12 @@ impl Cursor {
     }
 
     fn eligible(&self) -> bool {
-        let frame = self.frame.get();
+        let state = self.state.get();
         self.default_blink()
-            && frame.cursor_blink != 0
-            && frame.cursor_visible != 0
-            && frame.cursor_x < frame.cols
-            && frame.cursor_y < frame.rows
+            && state.blink != 0
+            && state.visible != 0
+            && state.x < state.cols
+            && state.y < state.rows
             && !self.exited.get()
             && self.widget.upgrade().is_some_and(|widget| {
                 widget.is_mapped()
