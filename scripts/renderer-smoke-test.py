@@ -43,7 +43,8 @@ for result in report["results"]:
     assert re.search(r"^\s+text:\s+[1-9]", info, re.MULTILINE), info
     rows = dict(static=0, **{"single-row": 1, "full-screen": 1, "all-rows": report["rows"]})
     assert result["rebuilt_rows"] == report["frames"] * rows[result["workload"]], result
-    assert result["cached_glyphs"] <= 4096, result
+    assert result["cached_shapes"] <= 4096, result
+    assert result["cached_shape_bytes"] <= 1024 * 1024, result
 
 print(f"PASS: {report['gtk_renderer']}, {len(checks['glyph_cases'])} independent glyph comparisons, "
       + ", ".join(checks["checks"]) + f", cache oracle {checks['cache_renderer']}"

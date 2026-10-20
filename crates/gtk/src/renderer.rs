@@ -1,7 +1,10 @@
 use crate::render::{self, Rect};
 use gmux_client::{Cell, Frame, theme::Theme};
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    rc::Rc,
+};
 
 pub struct Scene<'a> {
     pub frame: Frame,
@@ -94,44 +97,58 @@ struct GlyphRun {
     ink: (i32, i32),
 }
 
-fn shape(cell: &Cell, font: &pango::FontDescription, context: &pango::Context) -> Vec<GlyphRun> {
+fn shape(
+    text: &str,
+    flags: u8,
+    cell_width: f64,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) -> Vec<GlyphRun> {
     let layout = pango::Layout::new(context);
     let mut font = font.clone();
-    if cell.flags & 1 != 0 {
+    if flags & 1 != 0 {
         font.set_weight(pango::Weight::Bold);
     }
-    if cell.flags & 2 != 0 {
+    if flags & 2 != 0 {
         font.set_style(pango::Style::Italic);
     }
     layout.set_font_description(Some(&font));
-    layout.set_text(cell.text());
-    let mut result = Vec::new();
+    layout.set_text(text);
+    let ascii = text.is_ascii();
+    let mut result = Vec::with_capacity(1);
     let mut iter = layout.iter();
     loop {
         if let Some(run) = iter.run_readonly() {
-            let (ink, logical) = iter.run_extents();
-            let mut x = logical.x();
+            let item = run.item();
+            // ASCII clusters move to grid positions, so their old extents are
+            // unnecessary. Unicode clusters preserve their original geometry.
+            let extents = (!ascii).then(|| iter.run_extents());
+            let mut x = extents.as_ref().map_or(0, |(_, logical)| logical.x());
             let baseline = iter.run_baseline() + pango::SCALE;
-            let glyphs = run
-                .glyph_string()
-                .glyph_info()
-                .iter()
-                .map(|info| {
-                    let mut info = *info;
-                    let geometry = info.geometry_mut();
-                    let advance = geometry.width();
-                    geometry.set_x_offset(x + geometry.x_offset());
-                    geometry.set_y_offset(baseline + geometry.y_offset());
-                    // Exact cell offsets prevent fractional advances from
-                    // accumulating when several clusters share a text node.
-                    geometry.set_width(0);
-                    x += advance;
-                    info
-                })
-                .collect();
+            let mut glyphs = run.glyph_string();
+            let mut cluster = -1;
+            for index in 0..glyphs.num_glyphs() as usize {
+                let next_cluster = glyphs.log_clusters()[index];
+                if ascii && next_cluster != cluster {
+                    // Anchor each shaped cluster to its terminal column. A
+                    // ligature can span cells; glyphs within it keep their
+                    // offsets and advances. Kerning cannot shift later cells.
+                    x = ((item.offset() + next_cluster) as f64 * cell_width * pango::SCALE as f64)
+                        as i32;
+                    cluster = next_cluster;
+                }
+                let geometry = glyphs.glyph_info_mut()[index].geometry_mut();
+                let advance = geometry.width();
+                geometry.set_x_offset(x + geometry.x_offset());
+                geometry.set_y_offset(baseline + geometry.y_offset());
+                geometry.set_width(0);
+                x += advance;
+            }
+            let run_font = item.analysis().font();
+            let ink = extents.map_or_else(|| glyphs.extents(&run_font).0, |(ink, _)| ink);
             result.push(GlyphRun {
-                font: run.item().analysis().font(),
-                glyphs,
+                font: run_font,
+                glyphs: glyphs.glyph_info().to_vec(),
                 ink: (ink.x(), ink.x().saturating_add(ink.width())),
             });
         }
@@ -142,32 +159,65 @@ fn shape(cell: &Cell, font: &pango::FontDescription, context: &pango::Context) -
     result
 }
 
-const MAX_GLYPHS: usize = 4096;
-type GlyphKey = ([u8; 64], u8);
+const MAX_SHAPES: usize = 4096;
+const MAX_SHAPE_BYTES: usize = 1024 * 1024;
 
-#[derive(Default)]
-struct GlyphCache {
-    entries: HashMap<GlyphKey, Vec<GlyphRun>>,
-    order: VecDeque<GlyphKey>,
+struct CachedShape {
+    runs: Rc<[GlyphRun]>,
+    bytes: usize,
 }
 
-impl GlyphCache {
+#[derive(Default)]
+struct ShapeCache {
+    entries: [HashMap<Rc<str>, CachedShape>; 4],
+    order: VecDeque<(Rc<str>, usize)>,
+    bytes: usize,
+}
+
+impl ShapeCache {
     fn get(
         &mut self,
-        cell: &Cell,
+        text: &str,
+        flags: u8,
+        cell_width: f64,
         font: &pango::FontDescription,
         context: &pango::Context,
-    ) -> &[GlyphRun] {
-        let key = (cell.text, cell.flags & 3);
-        // Evict one cluster at a time instead of clearing the entire cache
-        // during Unicode-heavy output. Cached row nodes retain their fonts.
-        if self.entries.len() == MAX_GLYPHS && !self.entries.contains_key(&key) {
-            self.entries.remove(&self.order.pop_front().unwrap());
+    ) -> Rc<[GlyphRun]> {
+        let style = (flags & 3) as usize;
+        if let Some(cached) = self.entries[style].get(text) {
+            return cached.runs.clone();
         }
-        self.entries.entry(key).or_insert_with(|| {
-            self.order.push_back(key);
-            shape(cell, font, context)
-        })
+        let runs: Rc<[GlyphRun]> = shape(text, flags, cell_width, font, context).into();
+        // Bound variable-length keys and glyph arrays as well as entry
+        // count. Font objects are shared with Pango and retained row nodes.
+        let bytes = text.len()
+            + 2 * size_of::<usize>()
+            + size_of::<(Rc<str>, CachedShape)>()
+            + size_of::<(Rc<str>, usize)>()
+            + 2 * size_of::<usize>()
+            + runs.len() * size_of::<GlyphRun>()
+            + runs
+                .iter()
+                .map(|run| run.glyphs.capacity() * size_of::<pango::GlyphInfo>())
+                .sum::<usize>();
+        if bytes > MAX_SHAPE_BYTES {
+            return runs;
+        }
+        while self.order.len() == MAX_SHAPES || self.bytes + bytes > MAX_SHAPE_BYTES {
+            let (key, style) = self.order.pop_front().unwrap();
+            self.bytes -= self.entries[style].remove(&key).unwrap().bytes;
+        }
+        let key = Rc::<str>::from(text);
+        self.order.push_back((key.clone(), style));
+        self.entries[style].insert(
+            key,
+            CachedShape {
+                runs: runs.clone(),
+                bytes,
+            },
+        );
+        self.bytes += bytes;
+        runs
     }
 }
 
@@ -176,13 +226,15 @@ struct FontKey {
     description: pango::FontDescription,
     context: pango::Context,
     serial: u32,
+    cell_width: f64,
 }
 
 #[derive(Default)]
 pub struct RenderStats {
     pub rebuilt_rows: usize,
     pub text_nodes: usize,
-    pub cached_glyphs: usize,
+    pub cached_shapes: usize,
+    pub cached_shape_bytes: usize,
 }
 
 #[derive(PartialEq)]
@@ -208,7 +260,8 @@ struct CachedRow {
 #[derive(Default)]
 pub struct Renderer {
     font: Option<FontKey>,
-    glyphs: GlyphCache,
+    shapes: ShapeCache,
+    text: String,
     batches: TextBatches,
     appearance: Option<Appearance>,
     rows: Vec<CachedRow>,
@@ -220,7 +273,8 @@ impl Renderer {
     }
 
     pub fn clear(&mut self) {
-        self.glyphs = GlyphCache::default();
+        self.shapes = ShapeCache::default();
+        self.text = String::new();
         self.batches = TextBatches::default();
         self.font = None;
         self.rows.clear();
@@ -276,12 +330,14 @@ impl Renderer {
             previous.description != *font
                 || previous.context != *context
                 || previous.serial != context.serial()
+                || previous.cell_width != scene.metrics.0
         }) {
             self.clear();
             self.font = Some(FontKey {
                 description: font.clone(),
                 context: context.clone(),
                 serial: context.serial(),
+                cell_width: scene.metrics.0,
             });
         }
         let appearance = Appearance {
@@ -380,10 +436,13 @@ impl Renderer {
                 }
                 row.background = background.to_node();
                 let row_snapshot = gtk::Snapshot::new();
-                for (x, cell) in cells.iter().enumerate() {
+                let mut x = 0;
+                while x < cells.len() {
+                    let cell = &cells[x];
                     let text = cell.text();
                     let has_glyph = !text.is_empty() && text != " ";
                     if cell.flags & 32 != 0 || !has_glyph && cell.flags & (8 | 16) == 0 {
+                        x += 1;
                         continue;
                     }
                     let rect = (
@@ -411,7 +470,47 @@ impl Renderer {
                             )
                         });
                     if has_glyph && !graphic {
-                        for run in self.glyphs.get(cell, font, context) {
+                        let mut end = x + 1;
+                        let text = if ascii_cell(cell) {
+                            self.text.clear();
+                            self.text.push(cell.text[0] as char);
+                            // Keep selection and block cursors as shaping
+                            // boundaries even when foreground colors match.
+                            let mut limit = cells.len();
+                            for (start, last) in [
+                                selection,
+                                cursor.map(|(start, width, _)| (start, start + width - 1)),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                if x < start {
+                                    limit = limit.min(start);
+                                } else if x <= last {
+                                    limit = limit.min(last + 1);
+                                }
+                            }
+                            // Whitespace separates reusable words and operator
+                            // sequences. Backgrounds paint separately and do not
+                            // split shaping. Unicode clusters keep their own
+                            // layout, baseline, and terminal-defined visual order.
+                            while end < limit
+                                && ascii_cell(&cells[end])
+                                && cells[end].flags == cell.flags
+                                && scene.foreground(base + end, &cells[end]) == (rgb, alpha)
+                            {
+                                self.text.push(cells[end].text[0] as char);
+                                end += 1;
+                            }
+                            &self.text
+                        } else {
+                            text
+                        };
+                        for run in self
+                            .shapes
+                            .get(text, cell.flags, scene.metrics.0, font, context)
+                            .iter()
+                        {
                             stats.text_nodes += batch.append(
                                 &row_snapshot,
                                 run,
@@ -419,6 +518,9 @@ impl Renderer {
                                 (rect.0 * pango::SCALE as f64) as i32,
                             );
                         }
+                        x = end;
+                    } else {
+                        x += 1;
                     }
                 }
                 stats.text_nodes += batch.flush(&row_snapshot);
@@ -505,9 +607,14 @@ impl Renderer {
                 },
             );
         }
-        stats.cached_glyphs = self.glyphs.entries.len();
+        stats.cached_shapes = self.shapes.order.len();
+        stats.cached_shape_bytes = self.shapes.bytes;
         stats
     }
+}
+
+fn ascii_cell(cell: &Cell) -> bool {
+    cell.flags & (32 | 64) == 0 && (b'!'..=b'~').contains(&cell.text[0]) && cell.text[1] == 0
 }
 
 #[derive(Default)]

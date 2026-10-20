@@ -10,10 +10,20 @@ glyphs share text nodes across font fallback changes when their ink does not
 overlap. Cell graphics flush pending text batches to preserve paint order.
 Backgrounds precede text; decorations and cursors use cell geometry.
 
+Adjacent printable ASCII cells with matching text styles and foreground colors
+shape together, enabling the selected font's default ligatures and contextual
+substitutions. Whitespace, style and foreground color changes, selection boundaries,
+block cursors, and row ends separate these runs. Background colors paint separately
+and do not split shaping. Each shaped cluster starts at its terminal column, so
+ligatures preserve cursor and selection geometry. Unicode cells retain independent
+shaping for combining characters, fallback fonts, and wide glyphs.
+
 Output, selection, search highlights, and block cursors invalidate affected rows.
 Font, Pango context, cell metrics, theme, and pixel alignment changes invalidate
 the relevant caches. Scrolling reuses rows after comparing overlapping content.
-The glyph cache holds at most 4096 clusters per pane.
+The shape cache holds at most 4096 entries per pane, with a 1 MiB budget for keys,
+glyph arrays, and entry payloads. Larger shapes render without entering the cache.
+Shared Pango fonts and spare hash-table capacity are outside that payload budget.
 
 Borders, blocks, decorations, and cursor edges snap to device pixels, including
 fractional scales and pane positions. Block cursors span both cells of a wide
@@ -40,7 +50,11 @@ GSK_RENDERER=gl python3 scripts/check.py --native --skip-build --only renderer
 `renderer-check` compares text nodes against independent Pango layout drawing
 and checks cell graphics, styles, selection, cursors, fractional alignment,
 and retained rows. Cache comparisons use exact pixels from a Cairo renderer.
+An included synthetic OpenType font checks multi-cell ligatures, contextual
+substitutions, and boundaries without relying on installed programming fonts.
 The selected GTK backend still handles the glyph and geometry checks.
+Ligature checks compare each operator against independent Pango drawing on that
+backend as well as exact pixels from the cache reference.
 Vulkan texture rendering can produce transient pixel differences between
 identical scenes, so it is unsuitable as the default cache reference.
 
@@ -65,8 +79,14 @@ GTK_A11Y=none GSK_RENDERER=vulkan dbus-run-session -- \
   --output artifacts/renderer-benchmark
 ```
 
+Use `--font 'JetBrains Mono 12'` to measure an installed ligature font. The code
+fixture includes common programming operators alongside the other workloads.
+The unique-text fixture changes identifiers on every update to measure shaping
+when the text is absent from the cache.
+
 The benchmark records scene preparation separately from rendering and texture
-readback, plus row rebuilds and glyph-cache entries. Readback forces completion;
-these timings include texture allocation and CPU readback, and exclude PTY
-parsing, transport, and window composition. They do not measure application FPS.
+readback, plus row rebuilds, shape-cache entries, and cache payload bytes.
+Readback forces completion; these timings include texture allocation and CPU
+readback, and exclude PTY parsing, transport, and window composition. They do not
+measure application FPS.
 See [performance](performance.md) for process and input-latency measurements.

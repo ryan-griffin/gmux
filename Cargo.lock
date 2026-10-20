@@ -552,6 +552,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "libc",
+ "pango",
  "serde",
  "serde_json",
 ]
