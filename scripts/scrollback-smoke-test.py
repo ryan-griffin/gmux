@@ -54,9 +54,13 @@ class History:
             if header["meta"]["id"] == self.pane and header["frame"] is not None:
                 frame = header["frame"]
                 cells = body[4 + header_size:]
-                assert len(cells) == len(header["rows"]) * frame["cols"] * 75
+                assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * frame["cols"] * 75
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells = {}
+                shift = header.get("row_shift", 0)
+                if shift:
+                    self.cells = {(row, col): cell for (old_row, col), cell in self.cells.items()
+                                  if 0 <= (row := old_row - shift) < frame["rows"]}
                 self.frame = frame
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):

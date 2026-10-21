@@ -26,6 +26,10 @@ use std::{
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default for tests that do not report a display interval.
+#[cfg(test)]
+const SCROLL_CADENCE: Duration = transport::DEFAULT_FRAME_INTERVAL;
+const CACHED_SCROLL_SETTLE: Duration = Duration::from_millis(100);
 const PING: &[u8] = b"{\"method\":\"ping\"}\n";
 
 struct Heartbeat {
@@ -208,6 +212,8 @@ pub struct SessionManager {
     git_subscription_pending: bool,
     visible: HashSet<u64>,
     subscription_pending: bool,
+    frame_interval: Duration,
+    frame_interval_sent: bool,
     pending_reads: HashMap<u64, u64>,
     wake: ipc::Wake,
     disconnected: bool,
@@ -367,6 +373,8 @@ impl SessionManager {
             git_subscription_pending: false,
             visible: HashSet::new(),
             subscription_pending: false,
+            frame_interval: transport::DEFAULT_FRAME_INTERVAL,
+            frame_interval_sent: true,
             pending_reads: HashMap::new(),
             wake,
             disconnected: false,
@@ -401,6 +409,19 @@ impl SessionManager {
         self.connection
             .send(StreamRequest::connection(StreamCommand::Focused { active }))
     }
+    pub fn set_frame_interval(&mut self, interval: Duration) {
+        let interval = interval.clamp(Duration::from_millis(1), Duration::from_secs(1));
+        if self.frame_interval == interval {
+            return;
+        }
+        self.frame_interval = interval;
+        self.frame_interval_sent = false;
+        for session in self.sessions.values() {
+            session.borrow_mut().scroll_cadence = interval;
+        }
+        let _ = self.subscribe();
+        self.wake.notify();
+    }
     pub fn install_metadata(&mut self, metadata: &[Metadata], revision: u64) {
         // Control replies can arrive before older queued stream snapshots.
         // Those snapshots must not remove metadata for newly created panes.
@@ -419,6 +440,11 @@ impl SessionManager {
     }
     pub fn set_visible(&mut self, ids: HashSet<u64>) -> anyhow::Result<()> {
         if self.visible != ids {
+            for (id, session) in &self.sessions {
+                if !ids.contains(id) {
+                    session.borrow_mut().clear_cache();
+                }
+            }
             self.visible = ids;
             self.subscription_pending = true;
         }
@@ -442,6 +468,13 @@ impl SessionManager {
         self.subscribe()
     }
     fn subscribe(&mut self) -> anyhow::Result<()> {
+        if !self.frame_interval_sent {
+            self.connection
+                .send(StreamRequest::connection(StreamCommand::FrameInterval {
+                    micros: self.frame_interval.as_micros() as u32,
+                }))?;
+            self.frame_interval_sent = true;
+        }
         if self.subscription_pending {
             self.connection
                 .send(StreamRequest::connection(StreamCommand::Subscribe {
@@ -512,7 +545,9 @@ impl SessionManager {
             read_through: 0,
             scroll_serial: ValueCell::new(0),
             scroll_sent: ValueCell::new(0),
+            scroll_sent_at: ValueCell::new(Instant::now()),
             scroll_acknowledged: 0,
+            scroll_cadence: self.frame_interval,
             pending_scroll: ValueCell::new(None),
             find: crate::search::FindState::default(),
             selection: None,
@@ -520,6 +555,12 @@ impl SessionManager {
             selection_acknowledged: 0,
             selection_origin: None,
             row_flags: vec![0; 24],
+            cache: crate::scroll_cache::RowCache::default(),
+            prediction: None,
+            scroll_target: None,
+            wake: self.wake.clone(),
+            scroll_defer_until: ValueCell::new(None),
+            scroll_retry_pending: ValueCell::new(false),
         }));
         self.sessions.insert(id, handle.clone());
         Ok(handle)
@@ -529,7 +570,11 @@ impl SessionManager {
         let _ = self.subscribe();
         self.flush_reads();
         for session in self.sessions.values() {
-            session.borrow().flush_scroll();
+            let session = session.borrow();
+            // Writer progress wakes the manager. Until then, a full queue
+            // must not keep an expired deadline spinning the UI event loop.
+            session.scroll_retry_pending.set(false);
+            session.flush_scroll();
         }
         let mut updates: HashMap<u64, SessionUpdate> = HashMap::new();
         for _ in 0..256 {
@@ -577,8 +622,70 @@ impl SessionManager {
                             session.meta.directory != packet.header.meta.directory;
                         session.meta = packet.header.meta;
                         update.unread = Some(session.unread());
+                        let invalidated = packet.header.generation != 0
+                            && session.cache.invalidate(packet.header.generation);
+                        if invalidated {
+                            session.scroll_defer_until.set(None);
+                            if session.prediction.take().is_some() {
+                                session.revision = session.revision.wrapping_add(1);
+                                session.text_revision = session.text_revision.wrapping_add(1);
+                                update.changed = true;
+                            }
+                        }
+                        let removed = if packet.header.generation != 0 {
+                            session.cache.rebase(packet.header.cache_origin)
+                        } else {
+                            0
+                        };
+                        if !invalidated && removed != 0 {
+                            if let Some(prediction) = &mut session.prediction {
+                                if prediction.frame.scrollback.offset < removed {
+                                    session.prediction = None;
+                                } else {
+                                    prediction.frame.scrollback.offset -= removed;
+                                    prediction.frame.scrollback.total =
+                                        prediction.frame.scrollback.total.saturating_sub(removed);
+                                }
+                                session.revision = session.revision.wrapping_add(1);
+                                session.text_revision = session.text_revision.wrapping_add(1);
+                                update.changed = true;
+                            }
+                            if let Some(target) = session.scroll_target {
+                                let target = target.saturating_sub(removed);
+                                session.scroll_target = Some(target);
+                                session.pending_scroll.set(Some(target));
+                                session.scroll_serial.set(session.scroll_serial.get() + 1);
+                                session.scroll_defer_until.set(None);
+                            }
+                        }
+                        if let Some(end) = packet.header.cache_valid_before {
+                            session.cache.truncate(end);
+                            if session
+                                .scroll_target
+                                .is_some_and(|row| !session.cache.has_margin(session.frame, row))
+                            {
+                                session.scroll_defer_until.set(None);
+                            }
+                            if let Some(prediction) = &session.prediction {
+                                let start = prediction.frame.scrollback.offset;
+                                if start + prediction.frame.rows as u64 > end {
+                                    session.prediction = None;
+                                    session.revision = session.revision.wrapping_add(1);
+                                    session.text_revision = session.text_revision.wrapping_add(1);
+                                    update.changed = true;
+                                }
+                            }
+                        }
                         if let Some(find) = packet.header.find {
                             update.changed |= session.find != find;
+                            if (find.total != 0 || find.pending)
+                                && session.prediction.take().is_some()
+                            {
+                                session.scroll_defer_until.set(None);
+                                session.revision = session.revision.wrapping_add(1);
+                                session.text_revision = session.text_revision.wrapping_add(1);
+                                update.changed = true;
+                            }
                             session.find = find;
                         }
                         // Preserve the local prediction until the daemon has
@@ -592,12 +699,23 @@ impl SessionManager {
                         }
                         if let Some(frame) = packet.header.frame {
                             let mut text_changed = (frame.cols, frame.rows)
-                                != (session.frame.cols, session.frame.rows);
+                                != (session.frame.cols, session.frame.rows)
+                                || packet.header.row_shift != 0;
                             session
                                 .cells
                                 .resize(frame.cols as usize * frame.rows as usize, Cell::default());
                             session.row_flags.resize(frame.rows as usize, 0);
                             let cols = frame.cols as usize;
+                            crate::scroll_cache::shift(
+                                &mut session.cells,
+                                cols,
+                                packet.header.row_shift,
+                            );
+                            crate::scroll_cache::shift(
+                                &mut session.row_flags,
+                                1,
+                                packet.header.row_shift,
+                            );
                             for (index, row) in packet.header.rows.iter().enumerate() {
                                 let flags =
                                     packet.header.row_flags.get(index).copied().unwrap_or(0);
@@ -613,10 +731,49 @@ impl SessionManager {
                                 previous.copy_from_slice(next);
                             }
                             session.frame = frame;
+                            if self.visible.contains(&id)
+                                && (packet.header.cache.is_some() || !session.cache.is_empty())
+                            {
+                                if session.cache.configure(packet.header.generation, frame) {
+                                    session.scroll_defer_until.set(None);
+                                    if session.prediction.take().is_some() {
+                                        text_changed = true;
+                                    }
+                                }
+                                if let Some(cache) = packet.header.cache {
+                                    session.cache.insert(
+                                        cache.start,
+                                        &packet.cells[packet.header.rows.len() * cols..],
+                                        &cache.row_flags,
+                                    );
+                                }
+                                // Include unchanged visible rows too. Supplemental
+                                // history never substitutes for authoritative deltas.
+                                let RemoteSession {
+                                    cache,
+                                    cells,
+                                    row_flags,
+                                    ..
+                                } = &mut *session;
+                                cache.insert(frame.scrollback.offset, cells, row_flags);
+                            }
                             session.scroll_acknowledged =
                                 session.scroll_acknowledged.max(packet.header.scroll_serial);
-                            session.flush_scroll();
-                            if !packet.header.rows.is_empty() {
+                            let mut prediction_changed = false;
+                            if !session.scroll_pending() {
+                                session.scroll_target = None;
+                                if session.prediction.take().is_some() {
+                                    text_changed = true;
+                                    prediction_changed = true;
+                                }
+                            } else if let Some(target) = session.scroll_target {
+                                prediction_changed = session.predict(target);
+                                text_changed |= prediction_changed;
+                            }
+                            if !packet.header.rows.is_empty()
+                                || packet.header.row_shift != 0
+                                || prediction_changed
+                            {
                                 session.revision = session.revision.wrapping_add(1);
                             }
                             if text_changed {
@@ -624,6 +781,7 @@ impl SessionManager {
                             }
                             update.changed = true;
                         }
+                        session.flush_scroll();
                         if packet.header.copy.is_some() {
                             update.copy = packet.header.copy;
                         }
@@ -649,6 +807,15 @@ impl SessionManager {
     }
     pub fn disconnected(&self) -> bool {
         self.disconnected
+    }
+    /// Earliest release time among sessions with a coalesced scroll target,
+    /// so the interface can wake and forward scrolling after a fixed cadence
+    /// even when viewport replies are delayed.
+    pub fn next_scroll(&self) -> Option<Instant> {
+        self.sessions
+            .values()
+            .filter_map(|session| session.borrow().scroll_release())
+            .min()
     }
     pub fn disconnect_error(&self) -> Option<&anyhow::Error> {
         self.disconnect_error.as_ref()
@@ -687,13 +854,26 @@ pub struct RemoteSession {
     read_through: u64,
     scroll_serial: ValueCell<u64>,
     scroll_sent: ValueCell<u64>,
+    scroll_sent_at: ValueCell<Instant>,
     scroll_acknowledged: u64,
+    scroll_cadence: Duration,
     pending_scroll: ValueCell<Option<u64>>,
     find: crate::search::FindState,
     selection: Option<(u64, u64)>,
     selection_serial: ValueCell<u64>,
     selection_acknowledged: u64,
     selection_origin: Option<u64>,
+    row_flags: Vec<u8>,
+    cache: crate::scroll_cache::RowCache,
+    prediction: Option<Prediction>,
+    scroll_target: Option<u64>,
+    wake: ipc::Wake,
+    scroll_defer_until: ValueCell<Option<Instant>>,
+    scroll_retry_pending: ValueCell<bool>,
+}
+struct Prediction {
+    frame: Frame,
+    cells: Vec<Cell>,
     row_flags: Vec<u8>,
 }
 impl RemoteSession {
@@ -704,7 +884,8 @@ impl RemoteSession {
             .map_or("", |git| git.branch.as_str())
     }
     pub fn text(&self) -> String {
-        crate::cells::viewport_text(self.frame, &self.cells)
+        let screen = self.snapshot();
+        crate::cells::viewport_text(screen.frame, screen.cells)
     }
     fn command(&self, command: StreamCommand) -> anyhow::Result<()> {
         // Key releases and appearance updates do not move the viewport. Keep
@@ -856,46 +1037,154 @@ impl RemoteSession {
             .then_some(self.selection_origin)
             .flatten()
     }
-    pub fn clear_screen(&self) -> anyhow::Result<()> {
-        self.command(StreamCommand::ClearScreen)
+    pub fn clear_screen(&mut self) -> anyhow::Result<()> {
+        self.command(StreamCommand::ClearScreen)?;
+        self.clear_cache();
+        Ok(())
     }
     pub fn selection(&self) -> Option<(u64, u64)> {
         self.selection
     }
-    pub fn scroll_to(&self, row: u64) {
+    pub fn scroll_to(&mut self, row: u64) {
+        self.scroll_target = Some(row);
+        let predicted = self.predict(row);
+        if predicted {
+            self.revision = self.revision.wrapping_add(1);
+            self.text_revision = self.text_revision.wrapping_add(1);
+        }
         self.scroll_serial.set(self.scroll_serial.get() + 1);
         self.pending_scroll.set(Some(row));
+        // Returning to the live bottom needs the daemon's current cursor state,
+        // which may be absent from a historical viewport. Skip the cache debounce.
+        let at_bottom = row
+            >= self
+                .frame
+                .scrollback
+                .total
+                .saturating_sub(self.frame.scrollback.len);
+        self.scroll_defer_until.set(
+            (predicted
+                && !at_bottom
+                && (self.cache.has_margin(self.frame, row)
+                    || self.scroll_acknowledged < self.scroll_sent.get()))
+            .then(|| Instant::now() + CACHED_SCROLL_SETTLE),
+        );
         self.flush_scroll();
+        // The preceding write wake may have already been consumed. Schedule
+        // this target's deadline even if no further input or reply arrives.
+        if self.pending_scroll.get().is_some() {
+            self.wake.notify();
+        }
+    }
+    fn predict(&mut self, row: u64) -> bool {
+        // Search highlights are viewport-relative and remain authoritative.
+        if self.find.total != 0 || self.find.pending {
+            self.prediction = None;
+            return false;
+        }
+        let row = row.min(
+            self.frame
+                .scrollback
+                .total
+                .saturating_sub(self.frame.scrollback.len),
+        );
+        let mut prediction = self.prediction.take().unwrap_or_else(|| Prediction {
+            frame: self.frame,
+            cells: Vec::new(),
+            row_flags: Vec::new(),
+        });
+        if !self.cache.copy_view(
+            row,
+            self.frame.rows as usize,
+            &mut prediction.cells,
+            &mut prediction.row_flags,
+        ) {
+            // Keep a previously drawn prediction through older replies. An
+            // uncached destination waits for authoritative rows.
+            if !prediction.cells.is_empty() {
+                self.prediction = Some(prediction);
+            }
+            return false;
+        }
+        prediction.frame = self.frame;
+        let cursor_row = self.frame.scrollback.offset + self.frame.cursor_y as u64;
+        prediction.frame.cursor_visible *=
+            u8::from(cursor_row >= row && cursor_row < row + self.frame.rows as u64);
+        prediction.frame.cursor_y = cursor_row.saturating_sub(row).min(u16::MAX as u64) as u16;
+        prediction.frame.scrollback.offset = row;
+        self.prediction = Some(prediction);
+        true
+    }
+    fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.prediction = None;
+        self.scroll_defer_until.set(None);
     }
     fn flush_scroll(&self) {
-        // A writable command socket does not imply a responsive viewport.
-        // Keep only the latest target while an earlier scroll is in flight.
-        if self.scroll_acknowledged >= self.scroll_sent.get() {
+        if self
+            .scroll_defer_until
+            .get()
+            .is_some_and(|at| Instant::now() < at)
+        {
+            return;
+        }
+        // A writable command socket does not imply a responsive viewport, so
+        // the latest target coalesces while an earlier scroll is in flight.
+        // Waiting for every acknowledgement paces scrolling at one update per
+        // round-trip and freezes the viewport on remote links, so the coalesced
+        // target releases after the scroll cadence instead.
+        if self.scroll_acknowledged >= self.scroll_sent.get()
+            || self.scroll_sent_at.get().elapsed() >= self.scroll_cadence
+        {
             let _ = self.send_scroll();
         }
     }
     fn send_scroll(&self) -> anyhow::Result<()> {
         if let Some(row) = self.pending_scroll.get() {
-            self.connection.send(StreamRequest::pane(
+            let sent = self.connection.send(StreamRequest::pane(
                 self.id(),
                 StreamCommand::ScrollTo {
                     row,
                     serial: self.scroll_serial.get(),
                 },
-            ))?;
+            ));
+            self.scroll_retry_pending.set(sent.is_err());
+            sent?;
             self.scroll_sent.set(self.scroll_serial.get());
+            self.scroll_sent_at.set(Instant::now());
             self.pending_scroll.set(None);
+            self.scroll_defer_until.set(None);
         }
         Ok(())
+    }
+    /// When a coalesced scroll target would release without another event,
+    /// unless a fresh acknowledgement clears the wait first.
+    fn scroll_release(&self) -> Option<Instant> {
+        self.pending_scroll.get()?;
+        if self.scroll_retry_pending.get() {
+            return None;
+        }
+        if let Some(at) = self.scroll_defer_until.get() {
+            return Some(at);
+        }
+        if self.scroll_acknowledged >= self.scroll_sent.get() {
+            return None;
+        }
+        Some(self.scroll_sent_at.get() + self.scroll_cadence)
     }
     pub fn scroll_pending(&self) -> bool {
         self.scroll_acknowledged < self.scroll_serial.get()
     }
+    pub fn scroll_cache_bytes(&self) -> usize {
+        self.cache.retained_bytes()
+    }
     pub fn set_cursor_style(&self, style: CursorStyle, blink: bool) -> anyhow::Result<()> {
         self.command(StreamCommand::Style { style, blink })
     }
-    pub fn set_theme(&self, theme: &Theme) -> anyhow::Result<()> {
-        self.command(StreamCommand::Theme { theme: *theme })
+    pub fn set_theme(&mut self, theme: &Theme) -> anyhow::Result<()> {
+        self.command(StreamCommand::Theme { theme: *theme })?;
+        self.clear_cache();
+        Ok(())
     }
     pub fn resize(
         &mut self,
@@ -914,9 +1203,21 @@ impl RemoteSession {
             width,
             height,
         })?;
+        if (cols, rows) != (self.frame.cols, self.frame.rows) {
+            self.clear_cache();
+        }
         Ok(())
     }
     pub fn snapshot(&self) -> ScreenSnapshot<'_> {
+        if let Some(prediction) = &self.prediction {
+            return ScreenSnapshot {
+                frame: prediction.frame,
+                cells: &prediction.cells,
+                row_flags: &prediction.row_flags,
+                revision: self.revision,
+                text_revision: self.text_revision,
+            };
+        }
         ScreenSnapshot {
             frame: self.frame,
             cells: &self.cells,
@@ -1197,6 +1498,7 @@ mod tests {
             socket: socket.into(),
         });
         let (sender, receiver) = incoming::channel(incoming::MAX_BYTES, 64);
+        let wake = ipc::Wake::new().unwrap();
         let session = Rc::new(RefCell::new(RemoteSession {
             connection: connection.clone(),
             git: None,
@@ -1221,7 +1523,9 @@ mod tests {
             read_through: 0,
             scroll_serial: ValueCell::new(0),
             scroll_sent: ValueCell::new(0),
+            scroll_sent_at: ValueCell::new(Instant::now()),
             scroll_acknowledged: 0,
+            scroll_cadence: SCROLL_CADENCE,
             pending_scroll: ValueCell::new(None),
             find: crate::search::FindState::default(),
             selection: None,
@@ -1229,6 +1533,12 @@ mod tests {
             selection_acknowledged: 0,
             selection_origin: None,
             row_flags: vec![0; 2],
+            cache: crate::scroll_cache::RowCache::default(),
+            prediction: None,
+            scroll_target: None,
+            wake: wake.clone(),
+            scroll_defer_until: ValueCell::new(None),
+            scroll_retry_pending: ValueCell::new(false),
         }));
         (
             SessionManager {
@@ -1244,8 +1554,10 @@ mod tests {
                 git_subscription_pending: false,
                 visible: HashSet::new(),
                 subscription_pending: false,
+                frame_interval: transport::DEFAULT_FRAME_INTERVAL,
+                frame_interval_sent: true,
                 pending_reads: HashMap::new(),
-                wake: ipc::Wake::new().unwrap(),
+                wake,
                 disconnected: false,
                 disconnect_error: None,
                 state: None,
@@ -1767,7 +2079,379 @@ mod tests {
         assert_eq!(screen.cells.len(), 4);
     }
     #[test]
-    fn rapid_scroll_reversals_wait_for_the_viewport_and_send_only_the_latest_target() {
+    fn output_and_pruning_preserve_predictions_until_their_rows_change() {
+        let (mut manager, sender, handle) = manager();
+        manager.visible.insert(1);
+        let (commands, _outgoing) = mpsc::sync_channel(32);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        manager.connection = connection.clone();
+        handle.borrow_mut().connection = connection;
+        let frame = Frame {
+            cols: 2,
+            rows: 2,
+            scrollback: crate::Scrollback {
+                total: 20,
+                offset: 4,
+                len: 2,
+            },
+            ..Frame::default()
+        };
+        let row = |value| {
+            let mut cell = Cell::default();
+            cell.text[0] = value;
+            [cell; 2]
+        };
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: handle.borrow().meta.clone(),
+                    frame: Some(frame),
+                    generation: 1,
+                    rows: vec![0, 1],
+                    cache: Some(transport::CachedRows {
+                        start: 0,
+                        row_flags: vec![0; 10],
+                    }),
+                    ..Header::default()
+                },
+                cells: row(b'e')
+                    .into_iter()
+                    .chain(row(b'f'))
+                    .chain((b'a'..=b'j').flat_map(row))
+                    .collect(),
+            }))
+            .unwrap();
+        manager.poll();
+        handle.borrow_mut().scroll_to(3);
+        let send = |origin, valid, frame| {
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: handle.borrow().meta.clone(),
+                        generation: 1,
+                        cache_origin: origin,
+                        cache_valid_before: Some(valid),
+                        frame,
+                        ..Header::default()
+                    },
+                    cells: vec![],
+                }))
+                .unwrap()
+        };
+        send(0, 8, None);
+        manager.poll();
+        assert_eq!(handle.borrow().snapshot().cells[0].text(), "d");
+        send(
+            2,
+            6,
+            Some(Frame {
+                scrollback: crate::Scrollback {
+                    total: 18,
+                    offset: 2,
+                    len: 2,
+                },
+                ..frame
+            }),
+        );
+        manager.poll();
+        assert_eq!(handle.borrow().snapshot().frame.scrollback.offset, 1);
+        assert_eq!(handle.borrow().snapshot().cells[0].text(), "d");
+        // Copy and selection metadata omit cache state and must not reset its origin.
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: handle.borrow().meta.clone(),
+                    ..Header::default()
+                },
+                cells: vec![],
+            }))
+            .unwrap();
+        manager.poll();
+        assert_eq!(handle.borrow().snapshot().cells[0].text(), "d");
+        send(2, 2, None);
+        assert!(manager.poll()[&1].changed);
+        assert!(handle.borrow().prediction.is_none());
+        handle.borrow_mut().clear_cache();
+        handle.borrow_mut().scroll_to(10);
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: handle.borrow().meta.clone(),
+                    generation: 2,
+                    cache_origin: 100,
+                    frame: Some(frame),
+                    ..Header::default()
+                },
+                cells: vec![],
+            }))
+            .unwrap();
+        manager.poll();
+        assert_eq!(
+            handle.borrow().scroll_target,
+            Some(10),
+            "A new generation's origin cannot rebase a target from an unknown cache"
+        );
+    }
+
+    #[test]
+    fn cached_edge_requests_coalesce_during_refill_but_misses_keep_pipelining() {
+        let (mut manager, _sender, handle) = manager();
+        let (commands, outgoing) = mpsc::sync_channel(8);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut session = handle.borrow_mut();
+        session.connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        session.frame.scrollback = crate::Scrollback {
+            total: 20,
+            offset: 4,
+            len: 2,
+        };
+        let frame = session.frame;
+        session.cache.configure(1, frame);
+        session.cache.insert(4, &[Cell::default(); 6], &[0; 3]);
+        session.scroll_to(4);
+        assert_eq!(wire(outgoing.try_recv().unwrap())["row"], 4);
+        session.scroll_to(5);
+        assert_eq!(session.snapshot().frame.scrollback.offset, 5);
+        assert!(outgoing.try_recv().is_err());
+        assert!(session.scroll_defer_until.get().is_some());
+        session.scroll_to(10);
+        assert!(session.scroll_defer_until.get().is_none());
+        session
+            .scroll_sent_at
+            .set(Instant::now() - session.scroll_cadence);
+        drop(session);
+        manager.poll();
+        assert_eq!(wire(outgoing.try_recv().unwrap())["row"], 10);
+        assert!(handle.borrow().scroll_pending());
+    }
+
+    #[test]
+    fn returning_to_the_live_bottom_does_not_debounce_cursor_synchronization() {
+        let (_manager, _sender, handle) = manager();
+        let (commands, outgoing) = mpsc::sync_channel(8);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut session = handle.borrow_mut();
+        session.connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        session.frame.scrollback = crate::Scrollback {
+            total: 20,
+            offset: 4,
+            len: 2,
+        };
+        session.frame.cursor_visible = 0;
+        let frame = session.frame;
+        session.cache.configure(1, frame);
+        session.cache.insert(10, &[Cell::default(); 20], &[0; 10]);
+        session.scroll_to(16);
+        assert_eq!(session.snapshot().frame.scrollback.offset, 16);
+        assert!(session.scroll_defer_until.get().is_some());
+        assert!(outgoing.try_recv().is_err());
+        session.scroll_to(18);
+        assert_eq!(session.snapshot().frame.scrollback.offset, 18);
+        assert!(
+            session.scroll_defer_until.get().is_none(),
+            "The live cursor must not wait for cache settle"
+        );
+        assert_eq!(
+            wire(outgoing.try_recv().unwrap()),
+            json!({"method":"scroll-to", "pane":1, "row":18, "serial":2})
+        );
+    }
+
+    #[test]
+    fn display_interval_changes_update_scroll_pacing_and_retry_after_backpressure() {
+        let (mut manager, _sender, handle) = manager();
+        let (commands, outgoing) = mpsc::sync_channel(1);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        manager.connection = connection.clone();
+        handle.borrow_mut().connection = connection;
+        manager.set_focused(true).unwrap();
+        manager.set_frame_interval(Duration::from_micros(4167));
+        assert_eq!(handle.borrow().scroll_cadence, Duration::from_micros(4167));
+        assert_eq!(wire(outgoing.try_recv().unwrap())["method"], "focused");
+        manager.poll();
+        assert_eq!(
+            wire(outgoing.try_recv().unwrap()),
+            json!({"method":"frame-interval", "micros":4167})
+        );
+        assert!(manager.frame_interval_sent);
+    }
+
+    #[test]
+    fn cached_scrolling_is_immediate_and_reconciles_ordered_deltas_and_invalidations() {
+        let (mut manager, sender, handle) = manager();
+        manager.visible.insert(1);
+        let (commands, receiver) = mpsc::sync_channel(32);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        manager.connection = connection.clone();
+        handle.borrow_mut().connection = connection;
+        let row = |value: u8| {
+            let mut cell = Cell::default();
+            cell.text[0] = value;
+            cell.decoration = underline::CURLY;
+            vec![cell; 2]
+        };
+        let frame = Frame {
+            cols: 2,
+            rows: 2,
+            scrollback: crate::Scrollback {
+                total: 20,
+                offset: 4,
+                len: 2,
+            },
+            cursor_visible: 1,
+            cursor_y: 1,
+            ..Frame::default()
+        };
+        let send = |offset, serial, generation, shift, rows, cells, cache| {
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: handle.borrow().meta.clone(),
+                        frame: Some(Frame {
+                            scrollback: crate::Scrollback {
+                                offset,
+                                ..frame.scrollback
+                            },
+                            ..frame
+                        }),
+                        scroll_serial: serial,
+                        generation,
+                        row_shift: shift,
+                        rows,
+                        cache,
+                        ..Header::default()
+                    },
+                    cells,
+                }))
+                .unwrap();
+        };
+        let mut initial = [row(b'e'), row(b'f')].concat();
+        initial.extend((b'a'..=b'j').flat_map(row));
+        send(
+            4,
+            0,
+            1,
+            0,
+            vec![0, 1],
+            initial,
+            Some(transport::CachedRows {
+                start: 0,
+                row_flags: vec![0; 10],
+            }),
+        );
+        manager.poll();
+        for target in [3, 6, 2, 5] {
+            handle.borrow_mut().scroll_to(target);
+            let session = handle.borrow();
+            let screen = session.snapshot();
+            assert_eq!(screen.frame.scrollback.offset, target);
+            assert_eq!(
+                &screen.cells[0].text().as_bytes()[0..1],
+                &[b'a' + target as u8]
+            );
+            assert_eq!(screen.cells[0].decoration, underline::CURLY);
+            assert!(session.scroll_pending());
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "Cached reversals should not stream intermediate targets"
+        );
+        assert!(manager.next_scroll().is_some());
+        handle
+            .borrow()
+            .scroll_defer_until
+            .set(Some(Instant::now() - Duration::from_millis(1)));
+        manager.poll();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"scroll-to","pane":1,"row":5,"serial":4})
+        );
+        // This old viewport shifts the canonical grid to [d,e]. It must
+        // not shift the locally predicted [f,g] or lose the delta dependency.
+        send(3, 1, 1, -1, vec![0], row(b'd'), None);
+        manager.poll();
+        assert_eq!(handle.borrow().snapshot().frame.scrollback.offset, 5);
+        assert_eq!(handle.borrow().snapshot().cells[0].text(), "f");
+        send(
+            5,
+            4,
+            1,
+            0,
+            vec![0, 1],
+            [row(b'f'), row(b'g')].concat(),
+            None,
+        );
+        manager.poll();
+        assert!(!handle.borrow().scroll_pending());
+        assert!(handle.borrow().prediction.is_none());
+        assert_eq!(handle.borrow().text(), "ff\ngg");
+        handle.borrow_mut().scroll_to(4);
+        assert_eq!(handle.borrow().snapshot().cells[0].text(), "e");
+        handle.borrow().copy().unwrap();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"scroll-to","pane":1,"row":4,"serial":5})
+        );
+        assert_eq!(wire(receiver.try_recv().unwrap())["method"], "copy");
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: handle.borrow().meta.clone(),
+                    generation: 2,
+                    ..Header::default()
+                },
+                cells: Vec::new(),
+            }))
+            .unwrap();
+        assert!(manager.poll()[&1].changed);
+        assert!(
+            handle.borrow().prediction.is_none(),
+            "Metadata-only invalidation must discard predicted rows"
+        );
+        // New output may trim/reflow history even if total and size are
+        // unchanged. A new generation must discard every old row.
+        send(
+            4,
+            5,
+            2,
+            0,
+            vec![0, 1],
+            [row(b'x'), row(b'y')].concat(),
+            None,
+        );
+        manager.poll();
+        handle.borrow_mut().scroll_to(2);
+        assert!(handle.borrow().prediction.is_none());
+        assert_eq!(handle.borrow().text(), "xx\nyy");
+        manager.set_visible(HashSet::new()).unwrap();
+        assert!(handle.borrow().cache.is_empty());
+    }
+
+    #[test]
+    fn rapid_scroll_events_pipeline_before_viewport_replies_arrive() {
         let (mut manager, sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(128);
@@ -1778,36 +2462,15 @@ mod tests {
         });
         manager.connection = connection.clone();
         session.borrow_mut().connection = connection;
+        // The full cadence is longer than any test runtime, so the release in
+        // the dedicated cadence test is the only deadline path.
+        session.borrow_mut().scroll_cadence = Duration::from_secs(600);
 
-        session.borrow().scroll_to(10);
+        session.borrow_mut().scroll_to(10);
         assert_eq!(
             wire(receiver.try_recv().unwrap()),
             json!({"method":"scroll-to","pane":1,"row":10,"serial":1})
         );
-        let mut queued = 1;
-        // The writer stays writable while viewport replies are delayed. Neither
-        // direction changes nor polls should enqueue obsolete scroll targets.
-        for index in 0..120 {
-            session
-                .borrow()
-                .scroll_to(if index % 2 == 0 { 80 } else { 20 });
-            session.borrow().set_theme(&Theme::adwaita(true)).unwrap();
-            session
-                .borrow()
-                .set_cursor_style(CursorStyle::Block, false)
-                .unwrap();
-            session.borrow().key("a", b'a' as u32, 0, true, "").unwrap();
-            manager.poll();
-            let commands: Vec<_> = receiver.try_iter().map(wire).collect();
-            let scrolls = commands
-                .iter()
-                .filter(|c| c["method"] == "scroll-to")
-                .count();
-            queued += scrolls;
-            assert_eq!(commands.len() - scrolls, 3);
-        }
-        assert_eq!(queued, 1);
-
         let reply = |serial, frame| {
             sender
                 .send(Ok(Packet {
@@ -1821,8 +2484,40 @@ mod tests {
                 }))
                 .unwrap();
         };
-        // Metadata and earlier frames do not acknowledge the outstanding scroll.
-        reply(1, None);
+        // A responsive viewport acknowledges each scroll before the next wheel
+        // event arrives: scrolling streams at input rate instead of pacing at
+        // one update per round-trip.
+        for (serial, index) in (1..).zip(0..120) {
+            let row = if index % 2 == 0 { 80 } else { 20 };
+            reply(serial, Some(session.borrow().frame));
+            manager.poll();
+            session.borrow_mut().scroll_to(row);
+            session
+                .borrow_mut()
+                .set_theme(&Theme::adwaita(true))
+                .unwrap();
+            session
+                .borrow()
+                .set_cursor_style(CursorStyle::Block, false)
+                .unwrap();
+            session.borrow().key("a", b'a' as u32, 0, true, "").unwrap();
+            manager.poll();
+            let commands: Vec<_> = receiver.try_iter().map(wire).collect();
+            assert_eq!(commands.len(), 4);
+            assert_eq!(
+                commands[0],
+                json!({"method":"scroll-to","pane":1,"row":row,"serial":serial + 1})
+            );
+            assert_eq!(commands[1]["method"], "theme");
+            assert_eq!(commands[2]["method"], "style");
+            assert_eq!(commands[3]["method"], "key");
+        }
+        assert!(session.borrow().scroll_pending());
+        assert!(manager.next_scroll().is_none());
+        assert!(receiver.try_recv().is_err());
+
+        // Replays and older serials never acknowledge the latest target, and
+        // acknowledgements must not re-send settled scrolls.
         let mut cell = Cell::default();
         cell.text[0] = b'x';
         send_frame(
@@ -1834,20 +2529,9 @@ mod tests {
             None,
         );
         manager.poll();
-        assert!(receiver.try_recv().is_err());
         assert!(session.borrow().scroll_pending());
-
-        reply(1, Some(session.borrow().frame));
-        manager.poll();
-        assert_eq!(
-            wire(receiver.try_recv().unwrap()),
-            json!({"method":"scroll-to","pane":1,"row":20,"serial":121})
-        );
-        assert!(session.borrow().scroll_pending());
-        reply(1, Some(session.borrow().frame));
-        manager.poll();
-        assert!(receiver.try_recv().is_err());
-        assert!(session.borrow().scroll_pending());
+        assert_eq!(session.borrow().snapshot().cells[0].text(), "x");
+        assert!(manager.next_scroll().is_none());
 
         let mut frame = session.borrow().frame;
         frame.scrollback.offset = 20;
@@ -1855,16 +2539,103 @@ mod tests {
         assert!(manager.poll()[&1].changed);
         assert!(!session.borrow().scroll_pending());
         assert_eq!(session.borrow().snapshot().frame.scrollback.offset, 20);
-        // Later packets can omit unchanged rows from older viewport replies.
-        assert_eq!(session.borrow().snapshot().cells[0].text(), "x");
         assert!(receiver.try_recv().is_err());
     }
 
     #[test]
-    fn deferred_scroll_preserves_command_order_without_blocking_other_panes() {
+    fn a_coalesced_scroll_target_releases_at_the_cadence_without_responses() {
         let (mut manager, _sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(8);
+        let connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        manager.connection = connection.clone();
+        session.borrow_mut().connection = connection;
+
+        session.borrow_mut().scroll_to(10);
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"scroll-to","pane":1,"row":10,"serial":1})
+        );
+        // While the scroll is outstanding, further wheel events only coalesce
+        // into the latest target...
+        manager.wake.drain();
+        session.borrow_mut().scroll_to(20);
+        session.borrow_mut().scroll_to(30);
+        {
+            use std::os::fd::AsRawFd;
+            let mut event = libc::pollfd {
+                fd: manager.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut event, 1, 0) },
+                1,
+                "A deferred target must wake the interface to schedule its deadline"
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            manager.next_scroll(),
+            Some(session.borrow().scroll_sent_at.get() + SCROLL_CADENCE)
+        );
+        // ...and release after the cadence expires with no response in sight,
+        // so a slow viewport can never freeze scrolling on repeated targets.
+        session
+            .borrow_mut()
+            .scroll_sent_at
+            .set(Instant::now() - SCROLL_CADENCE);
+        manager.poll();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"scroll-to","pane":1,"row":30,"serial":3})
+        );
+        assert!(session.borrow().scroll_pending());
+        assert!(manager.next_scroll().is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn queue_backpressure_suspends_expired_scroll_deadlines_until_progress() {
+        let (mut manager, _sender, session) = manager();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        manager.connection = connection.clone();
+        session.borrow_mut().connection = connection;
+        session.borrow_mut().scroll_to(10);
+        session.borrow_mut().scroll_to(20);
+        session
+            .borrow()
+            .scroll_sent_at
+            .set(Instant::now() - SCROLL_CADENCE);
+        manager.poll();
+        assert!(session.borrow().scroll_pending());
+        assert!(
+            manager.next_scroll().is_none(),
+            "A full queue must not arm an expired timer"
+        );
+        assert_eq!(wire(receiver.try_recv().unwrap())["row"], 10);
+        // The writer wakes the manager after releasing a queue slot.
+        manager.wake.notify();
+        manager.poll();
+        assert_eq!(wire(receiver.try_recv().unwrap())["row"], 20);
+        assert!(manager.next_scroll().is_none());
+    }
+
+    #[test]
+    fn commands_follow_the_latest_scroll_target_under_backpressure() {
+        let (mut manager, _sender, session) = manager();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(2);
         let connection = Rc::new(Connection {
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1877,39 +2648,34 @@ mod tests {
         manager.metadata.insert(2, meta);
         let other = manager.attach(2, &Theme::adwaita(true)).unwrap();
 
-        session.borrow().scroll_to(10);
-        session.borrow().scroll_to(20);
-        other.borrow().scroll_to(30);
+        // Fill the command queue and coalesce wheel events into the latest
+        // target. Other panes and queued commands keep their order.
+        other.borrow_mut().scroll_to(30);
         session
             .borrow()
-            .key("", b'a' as u32, 0, false, "a")
+            .key("a", b'a' as u32, 0, false, "a")
             .unwrap();
-        session.borrow().scroll_to(40);
-        session.borrow().paste("paste").unwrap();
-
-        let commands: Vec<_> = receiver.try_iter().take(5).map(wire).collect();
-        assert_eq!(commands.len(), 5);
+        session.borrow_mut().scroll_to(10);
+        session.borrow_mut().scroll_to(20);
+        assert!(session.borrow().scroll_pending());
         assert_eq!(
-            commands[0],
-            json!({"method":"scroll-to","pane":1,"row":10,"serial":1})
-        );
-        assert_eq!(
-            commands[1],
+            wire(receiver.try_recv().unwrap()),
             json!({"method":"scroll-to","pane":2,"row":30,"serial":1})
         );
+        assert_eq!(wire(receiver.try_recv().unwrap())["method"], "key");
+        // The next command releases the coalesced target ahead of itself so
+        // viewport-dependent input never overtakes older scrolls.
+        session
+            .borrow()
+            .key("b", b'b' as u32, 0, false, "b")
+            .unwrap();
+        let commands: Vec<_> = receiver.try_iter().take(2).map(wire).collect();
+        assert_eq!(commands.len(), 2);
         assert_eq!(
-            commands[2],
+            commands[0],
             json!({"method":"scroll-to","pane":1,"row":20,"serial":2})
         );
-        assert_eq!(commands[3]["method"], "key");
-        assert_eq!(
-            commands[4],
-            json!({"method":"scroll-to","pane":1,"row":40,"serial":3})
-        );
-        assert!(matches!(
-            receiver.try_recv().unwrap(),
-            Outgoing::Paste { pane: Some(1), text, .. } if text == "paste"
-        ));
+        assert_eq!(commands[1]["method"], "key");
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1928,8 +2694,8 @@ mod tests {
         });
         manager.connection = connection.clone();
         session.borrow_mut().connection = connection;
-        session.borrow().scroll_to(10);
-        session.borrow().scroll_to(20);
+        session.borrow_mut().scroll_to(10);
+        session.borrow_mut().scroll_to(20);
         assert!(session.borrow().scroll_pending());
         assert_eq!(wire(receiver.try_recv().unwrap())["method"], "input");
         manager.poll();

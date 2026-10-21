@@ -65,7 +65,6 @@ pub fn run() -> anyhow::Result<()> {
     let mut saving: Option<PendingControl> = None;
     let mut controls = VecDeque::new();
     let mut next_metadata = Instant::now();
-    let mut next_frame = Instant::now();
     let mut quit_at = None;
     let mut fds = Vec::new();
     let mut pane_indices = Vec::new();
@@ -138,7 +137,6 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         let attached = daemon.frontends.values().any(|f| f.attached);
-        let pending = daemon.updates_pending();
         let held = daemon.sessions.values().any(TerminalSession::render_held);
         let mut deadline = quit_at;
         for next in [
@@ -150,7 +148,7 @@ pub fn run() -> anyhow::Result<()> {
                 .any(Frontend::input_pending)
                 .then_some(now),
             attached.then_some(next_metadata),
-            pending.then_some(next_frame),
+            daemon.next_update(),
             held.then_some(now + Duration::from_millis(100)),
             daemon
                 .git
@@ -162,8 +160,17 @@ pub fn run() -> anyhow::Result<()> {
         {
             deadline = Some(deadline.map_or(next, |current| current.min(next)));
         }
-        let timeout = poll_timeout(deadline, now);
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        let timeout = poll_timeout(deadline, Instant::now());
+        let result = unsafe {
+            libc::ppoll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                timeout
+                    .as_ref()
+                    .map_or(std::ptr::null(), std::ptr::from_ref),
+                std::ptr::null(),
+            )
+        };
         if result < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -341,15 +348,11 @@ pub fn run() -> anyhow::Result<()> {
         {
             git.poll();
         }
-        if (Instant::now() >= next_frame && daemon.updates_pending())
+        if daemon.next_update().is_some_and(|at| Instant::now() >= at)
             || metadata_due
             || !exited.is_empty()
         {
-            // Only viewport and search work consume the interval. Metadata
-            // packets alone must not postpone the next visible response.
-            if daemon.updates(metadata_due) {
-                next_frame = Instant::now() + Duration::from_millis(16);
-            }
+            daemon.updates(metadata_due);
         } else {
             daemon.flush_frontends();
         }

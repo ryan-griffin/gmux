@@ -71,6 +71,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             native.click_color((30, 90, 180))
             wait_for(lambda: rpc("renderer-info", pane=pane)["window_active"])
             assert rpc("renderer-info")["display"] == "GdkWaylandDisplay"
+            expected_interval = 1_000_000 / int(os.environ.get("GMUX_TEST_REFRESH_RATE", "60"))
+            wait_for(lambda: abs(rpc("renderer-info")["frame_interval_us"] - expected_interval) < 500)
             rpc("screenshot", path=str(artifacts / "terminal-input-initial.png"))
 
             # The probe consumes input without moving the terminal cursor. This
@@ -483,38 +485,80 @@ finally:
             # reverses. The scrollbar must retain the latest local target until
             # the matching viewport arrives, including through older replies.
             native.move(left + cw * 6.5, (viewport_top + viewport_bottom) / 2)
+            assert 0 < state["scroll_cache_bytes"] <= 2 * 1024 * 1024, state
+            # Keep changing the live screen while viewing immutable history.
+            # Cache prediction must survive updates received before replies pause.
+            live_stop = temp / "live-stop"
+            live_ready = temp / "live-ready"
+            live_probe = temp / "live-output.py"
+            live_probe.write_text("import os, time\nfrom pathlib import Path\n"
+                f"stop, ready = Path({str(live_stop)!r}), Path({str(live_ready)!r})\n"
+                "deadline = time.monotonic() + 5\nready.touch()\n"
+                "while not stop.exists() and time.monotonic() < deadline:\n"
+                "    os.write(1, b'\\x1b7\\x1b[999;1Hlive output\\x1b8')\n"
+                "    time.sleep(.01)\n")
+            rpc("send", pane=pane, text=f"python3 {shlex.quote(str(live_probe))} &", paste=True, enter=True)
+            wait_for(live_ready.exists)
+            time.sleep(.2)
             proxy.pause()
             proxy.delay = .015
             reply_bytes = proxy.reply_bytes
+            reply_cell_bytes = proxy.reply_cell_bytes
             native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerAxis",
                         "(ddu)", (0.0, 20 * row_height, 4))
             time.sleep(.1)
+            local_scroll_ms = []
             for index in range(40):
+                event_started = time.monotonic()
                 native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerAxis",
                             "(ddu)", (0.0, (-1 if index % 2 == 0 else 1) * 3 * row_height, 4))
+                observed = []
+                def predicted():
+                    state = rpc("renderer-info", pane=pane)["viewport"]
+                    observed[:] = [state]
+                    target = int(state["scrollbar"]["value"] / row_height + .5)
+                    return state if state["scrollback"]["offset"] == target else None
+                try:
+                    wait_for(predicted, timeout=1)
+                except AssertionError as error:
+                    raise AssertionError(("Cached content must move while replies are held", observed)) from error
+                local_scroll_ms.append((time.monotonic() - event_started) * 1000)
                 time.sleep(.02)
             native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerAxis",
                         "(ddu)", (0.0, 0.0, 1))
-            state = rpc("renderer-info", pane=pane)["viewport"]
-            target = round(state["scrollbar"]["value"] / row_height)
+            # GTK can finish kinetic motion after the final axis event. Let
+            # that local motion settle while authoritative replies stay held.
+            gesture = dict(value=None, since=time.monotonic())
+            def gesture_stopped():
+                state = rpc("renderer-info", pane=pane)["viewport"]
+                value = state["scrollbar"]["value"]
+                if value != gesture["value"]:
+                    gesture.update(value=value, since=time.monotonic())
+                return state if time.monotonic() - gesture["since"] >= .1 else None
+            state = wait_for(gesture_stopped, timeout=3)
+            target = int(state["scrollbar"]["value"] / row_height + .5)
             assert state["scroll_pending"] and 0 < target < state["scrollback"]["total"] - state["rows"], state
             started = time.monotonic()
             proxy.resume()
 
             def scroll_settled():
                 state = rpc("renderer-info", pane=pane)["viewport"]
-                assert round(state["scrollbar"]["value"] / row_height) == target, ("A stale viewport reset the scrollbar", target, state)
+                assert int(state["scrollbar"]["value"] / row_height + .5) == target, ("A stale viewport reset the scrollbar", target, state)
                 return state if not state["scroll_pending"] and state["scrollback"]["offset"] == target else None
 
             wait_for(scroll_settled)
             report = dict(settle_ms=(time.monotonic() - started) * 1000,
-                          reply_bytes=proxy.reply_bytes - reply_bytes, target=target)
-            # The first target and the final target need at most two full grids,
-            # plus room for packet headers and metadata. Older targets add no grids.
-            reply_budget = 2 * state["cols"] * state["rows"] * 75 + 65536
-            assert report["reply_bytes"] <= reply_budget, ("Obsolete scroll targets queued viewport data", report, reply_budget)
+                          reply_bytes=proxy.reply_bytes - reply_bytes, target=target,
+                          reply_cell_bytes=proxy.reply_cell_bytes - reply_cell_bytes,
+                          local_scroll_p95_ms=sorted(local_scroll_ms)[37],
+                          cache_bytes=state["scroll_cache_bytes"])
+            # Output still delivers cache boundaries and metadata. Bound the
+            # cell payload independently of how long live output continues.
+            reply_budget = 2 * state["cols"] * state["rows"] * 75
+            assert report["reply_cell_bytes"] <= reply_budget, ("Obsolete scroll targets queued viewport data", report, reply_budget)
             (artifacts / "scroll-sync.json").write_text(json.dumps(report, indent=2) + "\n")
             print("Rapid scroll reversals: " + json.dumps(report), flush=True)
+            live_stop.touch()
             proxy.delay = 0
             for _ in range(12):
                 page(Gdk.KEY_Page_Up)
@@ -532,7 +576,7 @@ finally:
             time.sleep(.05)
             state = rpc("renderer-info", pane=pane)["viewport"]
             target = min(state["rows"], state["scrollback"]["total"] - state["rows"])
-            assert state["scroll_pending"] and round(state["scrollbar"]["value"] / row_height) == target, state
+            assert state["scroll_pending"] and int(state["scrollbar"]["value"] / row_height + .5) == target, state
             proxy.resume()
             wait_for(scroll_settled)
             for _ in range(12):

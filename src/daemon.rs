@@ -61,14 +61,13 @@ impl NotificationQueue {
     }
 }
 
-fn poll_timeout(deadline: Option<Instant>, now: Instant) -> i32 {
-    deadline.map_or(-1, |deadline| {
-        // A positive fraction of a millisecond must still sleep, not spin.
-        deadline
-            .saturating_duration_since(now)
-            .as_nanos()
-            .div_ceil(1_000_000)
-            .min(i32::MAX as u128) as i32
+fn poll_timeout(deadline: Option<Instant>, now: Instant) -> Option<libc::timespec> {
+    deadline.map(|deadline| {
+        let remaining = deadline.saturating_duration_since(now);
+        libc::timespec {
+            tv_sec: remaining.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+            tv_nsec: remaining.subsec_nanos() as libc::c_long,
+        }
     })
 }
 
@@ -503,18 +502,18 @@ mod tests {
     }
 
     #[test]
-    fn poll_deadlines_round_up_positive_waits_and_bound_long_waits() {
+    fn poll_deadlines_preserve_submillisecond_waits_without_spinning() {
         let now = Instant::now();
-        assert_eq!(poll_timeout(None, now), -1);
-        assert_eq!(poll_timeout(Some(now), now), 0);
-        assert_eq!(poll_timeout(Some(now - Duration::from_millis(1)), now), 0);
+        assert!(poll_timeout(None, now).is_none());
+        let past = poll_timeout(Some(now - Duration::from_millis(1)), now).unwrap();
+        assert_eq!((past.tv_sec, past.tv_nsec), (0, 0));
         for (duration, expected) in [
-            (Duration::from_nanos(1), 1),
-            (Duration::from_millis(1), 1),
-            (Duration::from_micros(1001), 2),
-            (Duration::from_millis(i32::MAX as u64 + 1), i32::MAX),
+            (Duration::from_nanos(1), (0, 1)),
+            (Duration::from_micros(4167), (0, 4_167_000)),
+            (Duration::new(2, 123), (2, 123)),
         ] {
-            assert_eq!(poll_timeout(Some(now + duration), now), expected);
+            let timeout = poll_timeout(Some(now + duration), now).unwrap();
+            assert_eq!((timeout.tv_sec, timeout.tv_nsec), expected);
         }
     }
 

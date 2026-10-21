@@ -85,6 +85,9 @@ pub enum StreamCommand {
         remote: bool,
     },
     Ping,
+    FrameInterval {
+        micros: u32,
+    },
     Focused {
         active: bool,
     },

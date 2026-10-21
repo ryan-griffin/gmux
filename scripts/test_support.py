@@ -187,11 +187,38 @@ class DelayedViewport:
         self.proxy_path = str(proxy_path)
         self.delay = 0
         self.reply_bytes = 0
+        self.reply_cell_bytes = 0
+        self._reply_prefix = bytearray()
+        self._reply_remaining = 0
         self.closed = threading.Event()
         self.forwarding = threading.Event()
         self.forwarding.set()
         self.sockets = []
         self.threads = []
+
+    def _count_reply_cells(self, data):
+        """Count cell payloads without retaining terminal text or whole packets."""
+        data = memoryview(data)
+        while data:
+            if self._reply_remaining:
+                count = min(len(data), self._reply_remaining)
+                self._reply_remaining -= count
+                data = data[count:]
+                continue
+            count = min(len(data), (4 if len(self._reply_prefix) < 4 else 8) - len(self._reply_prefix))
+            self._reply_prefix.extend(data[:count])
+            data = data[count:]
+            if len(self._reply_prefix) < 4:
+                continue
+            size = int.from_bytes(self._reply_prefix[:4], "little")
+            if size == 0:
+                self._reply_prefix.clear()
+            elif len(self._reply_prefix) == 8:
+                header = int.from_bytes(self._reply_prefix[4:], "little")
+                assert 4 <= size <= 16 * 1024 * 1024 and header <= size - 4
+                self.reply_cell_bytes += size - 4 - header
+                self._reply_remaining = size - 4
+                self._reply_prefix.clear()
 
     def __enter__(self):
         import socket
@@ -207,6 +234,7 @@ class DelayedViewport:
                 while data := source.recv(65536):
                     if delayed:
                         self.reply_bytes += len(data)
+                        self._count_reply_cells(data)
                         self.forwarding.wait()
                     if self.closed.wait(self.delay if delayed else 0):
                         return
