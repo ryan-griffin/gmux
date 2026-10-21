@@ -605,6 +605,13 @@ impl Ui {
         drop(tabs);
         self.refresh_sidebar();
     }
+    pub(super) fn tab_progress(&self, tab: &Tab) -> Option<gmux_client::progress::PaneProgress> {
+        gmux_client::progress::representative(
+            tab.panes
+                .iter()
+                .map(|(&id, pane)| (self.sessions.borrow().pane_ref(id).id, pane.progress())),
+        )
+    }
     pub(super) fn refresh_metadata(self: &Rc<Self>) {
         for w in self.tabs.borrow_mut().iter_mut() {
             machine::update_tab(w, &self.sessions.borrow());

@@ -68,6 +68,7 @@ pub struct Terminal {
     pub area: TerminalCanvas,
     pub title: gtk::Label,
     title_bar: gtk::CenterBox,
+    progress: crate::progress::PaneProgress,
     status: gtk::Label,
     size_label: gtk::Label,
     size_revealer: gtk::Revealer,
@@ -147,6 +148,8 @@ impl Terminal {
         title.add_css_class("caption");
         title.set_tooltip_text(Some(&directory.display().to_string()));
         toolbar.set_center_widget(Some(&title));
+        let progress = crate::progress::PaneProgress::new(session.borrow().id());
+        progress.update(session.borrow().progress());
         let close = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .tooltip_text("Close Pane (Ctrl+Shift+W)")
@@ -203,6 +206,9 @@ impl Terminal {
             .hexpand(true)
             .vexpand(true)
             .build();
+        canvas.add_overlay(&progress.bar);
+        canvas.set_measure_overlay(&progress.bar, false);
+        canvas.set_clip_overlay(&progress.bar, true);
         let size_label = gtk::Label::new(None);
         size_label.add_css_class("pane-size");
         let size_revealer = gtk::Revealer::builder()
@@ -240,6 +246,7 @@ impl Terminal {
             area,
             title,
             title_bar: toolbar,
+            progress,
             status,
             size_label,
             size_revealer,
@@ -493,7 +500,13 @@ impl Terminal {
     pub fn text(&self) -> String {
         self.session.borrow().text()
     }
+    pub fn progress(&self) -> gmux_client::progress::Progress {
+        self.session.borrow().progress()
+    }
     pub fn tick(self: &Rc<Self>, update: &SessionUpdate) {
+        if update.progress_changed {
+            self.progress.update(self.progress());
+        }
         if let Some(error) = &update.error {
             self.show_status(error);
         }

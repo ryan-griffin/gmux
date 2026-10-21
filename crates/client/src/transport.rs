@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 26;
+pub const VERSION: u32 = 27;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -29,6 +29,7 @@ pub struct Metadata {
     /// Sequence of the most recent unread alert; zero after acknowledgement.
     pub unread_sequence: u64,
     pub busy: bool,
+    pub progress: crate::progress::Progress,
     pub modes: [bool; 2],
 }
 
@@ -301,6 +302,7 @@ mod tests {
                     exited: false,
                     unread_sequence: 0,
                     busy: false,
+                    progress: Default::default(),
                     modes: [false, true],
                 },
                 scroll_serial: 42,
@@ -429,6 +431,29 @@ mod tests {
         let mut reader = &bytes[..];
         assert_eq!(Packet::read(&mut reader).unwrap().header.scroll_serial, 42);
         assert_eq!(reader, HEARTBEAT_REPLY);
+    }
+
+    #[test]
+    fn progress_is_required_and_validated_in_stream_and_control_metadata() {
+        use serde_json::json;
+        let mut header = serde_json::to_value(Header::default()).unwrap();
+        for progress in [
+            json!({"state":"error","percentage":101}),
+            json!({"state":2,"percentage":0}),
+            json!({"state":"inactive","percentage":42}),
+            json!({"state":"paused"}),
+            serde_json::Value::Null,
+        ] {
+            header["meta"]["progress"] = progress;
+            let json = serde_json::to_vec(&header).unwrap();
+            let mut bytes = ((json.len() + 4) as u32).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&json);
+            assert!(Packet::read(&mut bytes.as_slice()).is_err());
+            assert!(serde_json::from_value::<Metadata>(header["meta"].clone()).is_err());
+        }
+        header["meta"].as_object_mut().unwrap().remove("progress");
+        assert!(serde_json::from_value::<Header>(header).is_err());
     }
 
     #[test]

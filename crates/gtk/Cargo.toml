@@ -38,3 +38,7 @@ test = false
 [[example]]
 name = "accessible-terminal-benchmark"
 test = false
+
+[[example]]
+name = "progress-check"
+test = false

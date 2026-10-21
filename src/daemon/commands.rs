@@ -140,6 +140,7 @@ impl Daemon {
                             "title": session.title(),
                             "directory": session.directory(),
                             "exited": session.exited(),
+                            "progress": session.progress(),
                             "unread": self.unread.contains_key(&session.id()),
                         })
                     })
@@ -150,6 +151,8 @@ impl Daemon {
                     "reference": TabRef { daemon: self.id, id: tab.id },
                     "name": tab.name,
                     "unread": ids.iter().any(|id| self.unread.contains_key(id)),
+                    "progress": gmux_client::progress::representative(ids.iter().filter_map(|id|
+                        self.sessions.get(id).map(|s| (*id, s.progress())))),
                     "layout": tab.layout,
                     "panes": panes,
                 })

@@ -527,11 +527,13 @@ impl Ui {
                         "reference": self.sessions.borrow().tab_ref(tab.id),
                         "visible": self.tab_is_visible(tab),
                         "active_pane": self.sessions.borrow().pane_ref(tab.active).id, "unread": !tab.unread.is_empty(),
+                        "progress": self.tab_progress(tab),
                         "layout": self.sessions.borrow().raw_layout(&tab.layout.borrow()),
                         "panes": tab.layout.borrow().ids().iter().filter_map(|id| tab.panes.get(id))
                             .map(|pane| json!({"id": self.sessions.borrow().pane_ref(pane.id).id, "title": pane.title.text().to_string(),
                                 "reference": self.sessions.borrow().pane_ref(pane.id),
                                 "directory": pane.directory(), "exited": pane.exited(),
+                                "progress": pane.progress(),
                                 "unread": tab.unread.contains(&pane.id)})).collect::<Vec<_>>()
                     })).collect::<Vec<_>>()
                 }))

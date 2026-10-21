@@ -432,7 +432,12 @@ impl SessionManager {
         self.metadata.clear();
         for meta in metadata {
             if let Some(session) = self.sessions.get(&meta.id) {
-                session.borrow_mut().meta = meta.clone();
+                let mut session = session.borrow_mut();
+                // A separate control reply can predate queued progress reports.
+                // Once attached, the ordered stream owns live progress delivery.
+                let progress = session.meta.progress;
+                session.meta = meta.clone();
+                session.meta.progress = progress;
             } else {
                 self.metadata.insert(meta.id, meta.clone());
             }
@@ -620,6 +625,8 @@ impl SessionManager {
                         let update = updates.entry(id).or_default();
                         update.directory_changed |=
                             session.meta.directory != packet.header.meta.directory;
+                        update.progress_changed |=
+                            session.meta.progress != packet.header.meta.progress;
                         session.meta = packet.header.meta;
                         update.unread = Some(session.unread());
                         let invalidated = packet.header.generation != 0
@@ -915,6 +922,9 @@ impl RemoteSession {
     }
     pub fn unread(&self) -> bool {
         self.meta.unread_sequence > self.read_through
+    }
+    pub fn progress(&self) -> crate::progress::Progress {
+        self.meta.progress
     }
     pub fn busy(&self) -> bool {
         self.meta.busy
@@ -1510,6 +1520,7 @@ mod tests {
                 exited: false,
                 unread_sequence: 0,
                 busy: false,
+                progress: Default::default(),
                 modes: [false; 2],
             },
             frame: Frame {
@@ -1755,6 +1766,78 @@ mod tests {
             serde_json::from_slice::<Value>(&bytes).unwrap(),
             json!({"method":"git-subscribe","panes":[1]})
         );
+    }
+
+    #[test]
+    fn progress_changes_are_metadata_only() {
+        let (mut manager, sender, session) = manager();
+        // Metadata must also leave a populated history cache and its active
+        // prediction alone, rather than only preserving an empty live viewport.
+        manager.visible.insert(1);
+        let (commands, _outgoing) = mpsc::sync_channel(8);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        manager.connection = connection.clone();
+        {
+            let mut session = session.borrow_mut();
+            session.connection = connection;
+            session.frame.scrollback = crate::Scrollback {
+                total: 20,
+                offset: 4,
+                len: 2,
+            };
+            let frame = session.frame;
+            session.cache.configure(1, frame);
+            session.cache.insert(0, &[Cell::default(); 20], &[0; 10]);
+            session.scroll_to(3);
+        }
+        let before = session.borrow();
+        let revision = before.snapshot().revision;
+        let text_revision = before.snapshot().text_revision;
+        let frame = before.snapshot().frame;
+        let cache_bytes = before.cache.retained_bytes();
+        drop(before);
+        let mut meta = session.borrow().meta.clone();
+        for state in [
+            crate::progress::ProgressState::Determinate,
+            crate::progress::ProgressState::Error,
+            crate::progress::ProgressState::Paused,
+            crate::progress::ProgressState::Indeterminate,
+            crate::progress::ProgressState::Inactive,
+        ] {
+            meta.progress.apply(state, Some(42));
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: meta.clone(),
+                        ..Header::default()
+                    },
+                    cells: vec![],
+                }))
+                .unwrap();
+            let updates = manager.poll();
+            assert!(updates[&1].progress_changed);
+            assert!(!updates[&1].changed);
+            let borrowed = session.borrow();
+            assert_eq!(borrowed.progress(), meta.progress);
+            assert_eq!(borrowed.snapshot().revision, revision);
+            assert_eq!(borrowed.snapshot().text_revision, text_revision);
+            assert!(borrowed.snapshot().frame == frame);
+            assert!(borrowed.prediction.is_some());
+            assert_eq!(borrowed.cache.retained_bytes(), cache_bytes);
+            assert!(borrowed.snapshot().cells == [Cell::default(); 4]);
+            assert!(!borrowed.unread());
+            assert!(!borrowed.busy());
+            drop(borrowed);
+            let mut stale = meta.clone();
+            stale.progress = Default::default();
+            manager.install_metadata(&[stale], 1);
+            assert_eq!(session.borrow().progress(), meta.progress);
+        }
     }
 
     #[test]

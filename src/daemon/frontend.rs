@@ -54,6 +54,7 @@ pub(super) struct Frontend {
     pub(super) sizes: HashMap<u64, TerminalSize>,
     pub(super) focused: bool,
     pub(super) changed: HashSet<u64>,
+    pub(super) metadata_changed: HashSet<u64>,
     terminal_changed: HashSet<u64>,
     frame_interval: Duration,
     next_frame: Instant,
@@ -95,6 +96,7 @@ impl Frontend {
             sizes: HashMap::new(),
             focused: false,
             changed: HashSet::new(),
+            metadata_changed: HashSet::new(),
             terminal_changed: HashSet::new(),
             frame_interval: transport::DEFAULT_FRAME_INTERVAL,
             next_frame: Instant::now(),
@@ -579,6 +581,8 @@ impl Daemon {
             .filter(|frontend| frontend.attached)
             .filter_map(|frontend| {
                 let pending = !self.changed.is_empty()
+                    || !self.metadata_changed.is_empty()
+                    || !frontend.metadata_changed.is_empty()
                     || !self.notifications.is_empty()
                     || !self.errors.is_empty()
                     || !frontend.changed.is_empty()
@@ -623,6 +627,9 @@ impl Daemon {
                 .terminal_changed
                 .extend(self.changed.iter().copied());
             frontend
+                .metadata_changed
+                .extend(self.metadata_changed.iter().copied());
+            frontend
                 .errors
                 .extend(self.errors.iter().map(|(&id, error)| (id, error.clone())));
         }
@@ -657,6 +664,7 @@ impl Daemon {
         notifications.retain(|id, _| self.sessions.contains_key(id));
         self.notifications = notifications;
         self.changed.clear();
+        self.metadata_changed.clear();
         self.errors.clear();
         if self.frontends.len() != before {
             self.git_dirty = true;
@@ -677,6 +685,7 @@ impl Daemon {
                     exited: false,
                     unread_sequence: 0,
                     busy: false,
+                    progress: Default::default(),
                     modes: [false; 2],
                 },
                 ..Header::default()
@@ -739,6 +748,7 @@ impl Daemon {
             let screen =
                 frontend.visible.contains(&id) && (changed || !frontend.screens.contains_key(&id));
             if !metadata_due
+                && !frontend.metadata_changed.contains(&id)
                 && !changed
                 && !screen
                 && notify.is_empty()
@@ -960,6 +970,10 @@ impl Daemon {
                     serial: selection_serial,
                 },
             );
+            let progress_changed = frontend
+                .metadata
+                .get(&id)
+                .is_some_and(|previous| previous.progress != meta.progress);
             frontend.metadata.insert(id, meta.clone());
             frontend
                 .sent_scroll_serials
@@ -1016,10 +1030,11 @@ impl Daemon {
                 },
                 cells,
             })?;
-            frame_activity |= viewport_changed;
+            frame_activity |= viewport_changed || progress_changed;
         }
         frontend.changed.clear();
         frontend.terminal_changed.clear();
+        frontend.metadata_changed.clear();
         frontend.flush()?;
         Ok(frame_activity)
     }
@@ -1028,6 +1043,65 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_dirty_ids_survive_a_skipped_frontend_deadline() {
+        // Exercise the fan-out and due filter without PTYs, snapshots or sleeps.
+        // Actual progress values/expiry delivery are covered by the stream smoke.
+        let mut daemon = Daemon {
+            sessions: HashMap::new(),
+            id: DaemonId::generate().unwrap(),
+            remote_access: Default::default(),
+            state: Default::default(),
+            frontends: HashMap::new(),
+            next_frontend: 0,
+            revision: 0,
+            changed: HashSet::new(),
+            metadata_changed: HashSet::from([1]),
+            notifications: HashMap::new(),
+            errors: HashMap::new(),
+            unread: HashMap::new(),
+            alert_sequence: 0,
+            quitting: false,
+            snapshots: 0,
+            sent_rows: 0,
+            started: Instant::now(),
+            pending_write: None,
+            checkpointed: false,
+            git: None,
+            git_dirty: false,
+        };
+        let (mut fast, _fast_peer) = connection();
+        let (mut slow, _slow_peer) = connection();
+        fast.attached = true;
+        slow.attached = true;
+        fast.state_revision = Some(0);
+        slow.state_revision = Some(0);
+        slow.next_frame = Instant::now() + Duration::from_secs(60);
+        let slow_deadline = slow.next_frame;
+        daemon.frontends = HashMap::from([(1, fast), (2, slow)]);
+        daemon.updates(false);
+        assert!(daemon.metadata_changed.is_empty());
+        assert!(daemon.frontends[&1].metadata_changed.is_empty());
+        assert_eq!(daemon.frontends[&2].metadata_changed, HashSet::from([1]));
+        assert_eq!(daemon.next_update(), Some(slow_deadline));
+        // Another connection's pass must not drain the slower pending value.
+        daemon.updates(false);
+        assert_eq!(daemon.frontends[&2].metadata_changed, HashSet::from([1]));
+        daemon.frontends.get_mut(&2).unwrap().next_frame = Instant::now();
+        daemon.updates(false);
+        assert!(daemon.frontends[&2].metadata_changed.is_empty());
+        assert!(daemon.next_update().is_none());
+        daemon
+            .frontends
+            .get_mut(&2)
+            .unwrap()
+            .metadata_changed
+            .insert(1);
+        daemon.close(1);
+        assert!(daemon.frontends[&2].metadata_changed.is_empty());
+        assert_eq!((daemon.snapshots, daemon.sent_rows), (0, 0));
+    }
 
     fn client(size: TerminalSize) -> (Frontend, UnixStream) {
         let (socket, peer) = UnixStream::pair().unwrap();
