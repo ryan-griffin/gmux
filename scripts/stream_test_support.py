@@ -50,6 +50,7 @@ class Client:
         self.cells = {}
         self.git = {}
         self.frame = None
+        self.links = dict(targets=[], spans=[])
         self.heartbeats = 0
         self.send("attach", version=PROTOCOL_VERSION, daemon=hello["daemon"])
         self.send("subscribe", panes=[pane])
@@ -82,11 +83,14 @@ class Client:
                 frame = header["frame"]
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells.clear()
+                    self.links = dict(targets=[], spans=[])
                 shift = header.get("row_shift", 0)
                 if shift:
                     self.cells = {(row, col): self.cells.get((row + shift, col), " ")
                                   for row in range(frame["rows"]) for col in range(frame["cols"])}
                 self.frame = frame
+                if "hyperlinks" in header:
+                    self.links = header["hyperlinks"]
                 cells = body[4 + header_size:]
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):

@@ -3,6 +3,10 @@ use crate::{Cell, Frame};
 pub struct ScreenSnapshot<'a> {
     pub frame: Frame,
     pub cells: &'a [Cell],
+    /// OSC 8 targets captured with this frame; empty for cached scroll previews.
+    pub hyperlinks: &'a crate::hyperlinks::Hyperlinks,
+    /// Opaque token that changes with the map, dimensions or prediction state.
+    pub hyperlink_revision: u64,
     /// Bit zero marks a soft wrap to the next row.
     pub row_flags: &'a [u8],
     pub revision: u64,

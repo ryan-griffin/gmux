@@ -91,6 +91,7 @@ fn scene(cells: &[Cell], theme: Theme) -> Scene<'_> {
         height: 192,
         theme,
         selection: None,
+        hovered_link: None,
         matches: &[],
         focused: true,
         exited: false,
@@ -772,6 +773,14 @@ fn validate_cursor_lifecycle(output: &Path) {
     assert_eq!(cursor::source_id(&cursor), pending);
     assert_eq!(cursor::timing(&cursor), timing);
     assert_eq!(area.cursor().unwrap().name().as_deref(), Some("pointer"));
+    cursor.set_link_hover(true);
+    frame.mouse_shape = gmux_client::cells::mouse_shape::CROSSHAIR;
+    cursor.update(frame, false);
+    assert_eq!(area.cursor().unwrap().name().as_deref(), Some("pointer"));
+    cursor.set_link_hover(false);
+    assert_eq!(area.cursor().unwrap().name().as_deref(), Some("crosshair"));
+    cursor.update(frame, false);
+    assert_eq!(area.cursor().unwrap().name().as_deref(), Some("crosshair"));
 
     // Timing changes take effect with a source pending, and never send daemon
     // defaults while the effective enablement stays true. Check the scheduled
@@ -1120,6 +1129,109 @@ fn validate_batched_patterns(
             output,
             &format!("batched-patterns-{scale}"),
         );
+    }
+}
+
+fn validate_link_hover(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+    output: &Path,
+) {
+    let theme = Theme::adwaita(true);
+    let mut cells = fixture(theme);
+    for (index, cell) in cells.iter_mut().enumerate() {
+        cell.decoration = (index % 6) as u8 | decoration::OVERLINE;
+        if index % 3 != 0 {
+            cell.decoration |= decoration::UNDERLINE_COLOR;
+            cell.underline_color = if index % 3 == 1 {
+                [240, 77, 151]
+            } else {
+                [0; 3]
+            };
+        }
+        // Decorations include linked blanks, concealed cells and faint text.
+        cell.flags = [0, 4, 32][index / 6 % 3];
+    }
+    cells[38] = cell("界", theme, 0);
+    cells[39] = cell("", theme, 64);
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let mut renderer = Renderer::new();
+        let mut scene = scene(&cells, theme);
+        scene.scale = scale;
+        scene.origin = (0.25, 0.5);
+        scene.metrics.1 = 21.3;
+        scene.selection = Some((36, 44));
+        scene.frame.cursor_visible = 1;
+        scene.frame.cursor_style = 1;
+        scene.frame.cursor_x = 4;
+        let (_, warm) = node(&mut renderer, &scene, font, context);
+        let mut previous = None;
+        // Enter, stay within one span, cross wrapped rows, change span, leave.
+        for (step, range) in [
+            Some((1, 22)),
+            Some((1, 22)),
+            Some((35, 47)),
+            Some((95, 100)),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            scene.hovered_link = range;
+            let (actual, stats) = node(&mut renderer, &scene, font, context);
+            assert_eq!(stats.rebuilt_rows, 0, "Hover must retain glyph rows");
+            assert_eq!(stats.text_nodes, 0);
+            assert_eq!(stats.cached_shapes, warm.cached_shapes);
+            assert_eq!(stats.cached_shape_bytes, warm.cached_shape_bytes);
+            let rows = |span: Option<(usize, usize)>, y: usize| {
+                span.and_then(|(start, end)| {
+                    (start < (y + 1) * 40 && end > y * 40).then(|| {
+                        (
+                            start.saturating_sub(y * 40),
+                            end.saturating_sub(y * 40).min(40),
+                        )
+                    })
+                })
+            };
+            assert_eq!(
+                stats.background_rows,
+                (0..8)
+                    .filter(|&y| rows(previous, y) != rows(range, y))
+                    .count()
+            );
+            let mut expected_cells = cells.clone();
+            if let Some((start, end)) = range {
+                // Declare the pinned Ghostty mapping for NONE/SINGLE/DOUBLE/
+                // CURLY/DOTTED/DASHED; normal SGR rendering is the pixel oracle.
+                for cell in &mut expected_cells[start..end] {
+                    cell.decoration = (cell.decoration & !decoration::UNDERLINE_MASK)
+                        | [
+                            underline::SINGLE,
+                            underline::DOUBLE,
+                            underline::SINGLE,
+                            underline::SINGLE,
+                            underline::SINGLE,
+                            underline::SINGLE,
+                        ][cell.underline() as usize];
+                }
+            }
+            let expected_scene = Scene {
+                cells: &expected_cells,
+                hovered_link: None,
+                ..scene
+            };
+            let expected = node(&mut Renderer::new(), &expected_scene, font, context).0;
+            assert_render_eq(
+                gpu,
+                &actual,
+                &expected,
+                &scene,
+                output,
+                &format!("link-hover-{scale}-{step}"),
+            );
+            previous = range;
+        }
     }
 }
 
@@ -1700,6 +1812,7 @@ fn main() -> anyhow::Result<()> {
     validate_decoration_patterns(cache_gpu, &font, &context);
     validate_batched_patterns(cache_gpu, &font, &context, &options.output);
     validate_batched_patterns(&gpu, &font, &context, &options.output);
+    validate_link_hover(cache_gpu, &font, &context, &options.output);
     std::fs::write(
         options.output.join("checks.json"),
         serde_json::to_string_pretty(&json!({
@@ -1707,7 +1820,7 @@ fn main() -> anyhow::Result<()> {
             "cursor_lifecycle": options.cursor_lifecycle,
             "glyph_cases": cases,
             "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
-                       "font and context changes", "fractional blocks", "selection and search",
+                       "font and context changes", "fractional blocks", "selection and search", "link hover SGR pixels and glyph cache retention",
                        "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
                        "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts"]
         }))?,

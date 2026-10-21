@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 27:
+handshake. The current protocol version is 28:
 
 ```json
-{"version":27,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":28,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -121,6 +121,9 @@ Local and TCP control connections support these methods:
   `enter` to append a carriage return and submit the text as a command.
   `enter` works with both raw input and paste handling.
 - `read` returns a pane's visible terminal contents in `text`.
+- `links` returns `frame` and `hyperlinks` for the daemon's default viewport.
+  `gmux links --pane ID` prints the same JSON. This inspection does not select
+  a frontend's scrolled view; use its stream snapshot or `gmux-gtk links` for that.
 - `notify` delivers `message` to clients viewing `pane` and records an unread alert.
 - `stop` checkpoints history, stops the addressed daemon, and terminates all of
   its terminal processes. `quit` belongs to the GTK app API.
@@ -164,7 +167,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":27,"daemon":"returned-identity"}
+{"method":"attach","version":28,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -218,6 +221,37 @@ cells. The daemon prefetches nearby rows while browsing and sends only missing
 parts as the window moves. Immutable history can be prefetched during output.
 Live screen prefetch waits for 100 ms without output. Synchronized-output holds
 suspend prefetching.
+
+A frame can carry a replacement `hyperlinks` object with `targets`, an array of
+OSC 8 URI strings, and `spans`, sorted disjoint `[start, end, target_index]`
+ranges. Start is inclusive and end is exclusive, in row-major displayed cell
+indices. Wide continuations are included. Adjacent ranges with one target may
+cross a wrapped row. The target comes from Ghostty's grid-reference API, not
+from the printed text. For example, `{"targets":["https://example.org/"],"spans":[[0,5,0]]}`
+links the first five displayed cells.
+
+Apply the replacement atomically with the packet's frame and row deltas.
+An absent map keeps the displayed map; an empty map clears it. Reset maps on a
+new connection or grid size unless the packet supplies a replacement. A map
+requires a frame, but a target-only change can arrive with no changed rows.
+Targets are captured with each client's viewport, including synchronized-output
+holds. Hover and activation can resolve locally through
+`ScreenSnapshot::hyperlinks.target_at(cell)`, without socket requests. Consumers
+should retain the map and geometry they actually display before accepting link
+actions, and refresh stationary hover when that displayed snapshot changes.
+Locally predicted scroll snapshots expose an empty map until an authoritative
+viewport is displayed. Their opaque hyperlink revision differs from the
+authoritative snapshot, including when a late reply leaves prediction active.
+Supplemental cached rows carry no targets. Hyperlink spans always index the
+frame's viewport, not appended cached rows; apply a replacement after the
+packet's row shift and row deltas without shifting the map separately.
+
+Maps allow at most 16,384 spans and targets, 16 KiB per URI and 256 KiB of total
+URI bytes. Invalid UTF-8, control characters, lookup failures or exceeded native
+capture limits produce an empty map for the entire viewport. The decoder rejects
+malformed map indices, overlapping or out-of-grid ranges and oversized maps.
+Reusable Rust maps bound retained URI capacity to 256 KiB; target and span
+vectors have the same count limits. Empty transitions release map allocations.
 
 `scroll-to` takes an absolute history `row` and an increasing `serial`. Viewport
 replies acknowledge the last applied serial as `scroll_serial`. The Rust client

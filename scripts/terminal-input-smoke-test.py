@@ -6,7 +6,7 @@ headless Mutter compositor with XWayland disabled and a private PipeWire server.
 """
 import json
 from functools import partial
-from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport, create_tab_when_connected
+from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport, create_tab_when_connected, assert_stays
 import os
 from pathlib import Path
 from test_support import AccessibilityFixture
@@ -19,7 +19,8 @@ import time
 import gi
 gi.require_version("Atspi", "2.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Atspi, Gdk, GLib
+gi.require_version("Gtk", "4.0")
+from gi.repository import Atspi, Gdk, GLib, Gtk
 
 from daemon_test_support import stop_daemon
 from wayland_test_support import ensure_wayland_session, WaylandInput, REMOTE
@@ -46,8 +47,21 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     (config / "clients/gtk/settings.json").write_text(json.dumps(dict(
         local_daemon_enabled=True, use_system_font=False, font="Monospace", font_size=12, appearance="dark",
         show_sidebar=False, desktop_notifications=False)))
+    # A private URI scheme records literal argv. No browser or shell handles targets.
+    data_home = temp / "data"
+    applications = data_home / "applications"
+    applications.mkdir(parents=True)
+    launches = temp / "uri-launches"
+    handler = temp / "uri-handler"
+    handler.write_text("#!/usr/bin/python3\nimport json, sys\nfrom pathlib import Path\np = Path(" + repr(str(launches)) + ")\nwith p.open('a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+    handler.chmod(0o700)
+    (applications / "gmux-osc8-test.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=Gmux OSC 8 test\nNoDisplay=true\n"
+        f"Exec={handler} %u\nMimeType=x-scheme-handler/gmux-test-osc8;\n")
+    (temp / "config/mimeapps.list").write_text(
+        "[Default Applications]\nx-scheme-handler/gmux-test-osc8=gmux-osc8-test.desktop\n")
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
-               GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
+               GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"), XDG_DATA_HOME=str(data_home))
     app = daemon = None
     pane = None
 
@@ -135,6 +149,182 @@ done.touch()
             rpc("action", name="paste")
             wait_for(lambda: b'PASTE_ACTIVITY' in appearance_events.read_bytes(), context=GLib.MainContext.default())
             assert appearance()["cursor_phase_visible"], "Clipboard paste must restore cursor without movement"
+            # All hyperlink hit tests use the last painted grid, including delayed replies.
+            first_uri = "gmux-test-osc8://actual/first?literal=$(touch%20never);x=1"
+            second_uri = "gmux-test-osc8://actual/second"
+            def link_frame(uri, prefix=b''):
+                return prefix + b'\x1b[H\x1b[2J\x1b[48;2;39;91;173m\x1b[58;2;240;77;151m\x1b]8;;' + uri.encode() + b'\x07label \xe7\x95\x8c wrapped\x1b]8;;\x07\x1b[0m'
+            def apply_links(sequence):
+                appearance_control.write_bytes(sequence)
+                wait_for(lambda: appearance_applied.read_bytes() == sequence)
+            def displayed_uri():
+                targets = rpc("links", pane=pane)["hyperlinks"]["targets"]
+                return targets[0] if targets else None
+            def launched():
+                return [json.loads(line)[0] for line in launches.read_text().splitlines()] if launches.exists() else []
+            def link_click(*modifiers):
+                for key in modifiers:
+                    native.key(key, True)
+                native.button(True)
+                native.button(False)
+                for key in reversed(modifiers):
+                    native.key(key, False)
+            apply_links(link_frame(first_uri, b'\x1b]22;crosshair\x07'))
+            wait_for(lambda: displayed_uri() == first_uri)
+            geometry = appearance()
+            lx, ly, _, _ = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((39, 91, 173)))
+            native.move(lx + 7.5 * geometry["cell_width"], ly + .5 * geometry["cell_height"])
+            wait_for(lambda: appearance(lambda state: state["pointer_name"] == "pointer"))
+            assert not launched(), "Hover must never launch"
+            def underline(visible):
+                return bool(native.frame(timeout=.1, fresh=False).color_bounds((240, 77, 151))) == visible
+            wait_for(lambda: underline(False))
+            # Modifier-only changes repaint underlines without pointer movement.
+            native.key(Gdk.KEY_Control_L, True)
+            wait_for(lambda: underline(True))
+            for extra in [Gdk.KEY_Shift_L, Gdk.KEY_Alt_L]:
+                native.key(extra, True)
+                wait_for(lambda: underline(False))
+                native.key(extra, False)
+                wait_for(lambda: underline(True))
+            native.key(Gdk.KEY_Control_R, True)
+            native.key(Gdk.KEY_Control_L, False)
+            wait_for(lambda: underline(True))
+            native.key(Gdk.KEY_Control_R, False)
+            wait_for(lambda: underline(False))
+            # The window tracker also updates a hovered, unfocused terminal.
+            rpc("action", name="find")
+            wait_for(lambda: not appearance()["focused"])
+            native.key(Gdk.KEY_Control_L, True)
+            wait_for(lambda: underline(True))
+            native.key(Gdk.KEY_Control_L, False)
+            wait_for(lambda: underline(False))
+            rpc("action", name="find")
+            rpc("focus", pane=pane)
+            # Ctrl may already be held when this window receives focus. Its
+            # release, or a second modifier, must still clear stationary hover.
+            Gtk.init()
+            for extra in [None, Gdk.KEY_Shift_L]:
+                native.key(Gdk.KEY_Control_L, True)
+                wait_for(lambda: underline(True))
+                probe_window = Gtk.Window(title="External modifier focus")
+                probe_window.set_default_size(180, 100)
+                probe_area = Gtk.DrawingArea()
+                probe_area.set_draw_func(lambda _, cr, w, h: (cr.set_source_rgb(36/255, 161/255, 99/255), cr.paint()))
+                probe_window.set_child(probe_area)
+                try:
+                    probe_window.present()
+                    wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((36, 161, 99)), context=GLib.MainContext.default())
+                    wait_for(lambda: not rpc("renderer-info", pane=pane)["window_active"], context=GLib.MainContext.default())
+                    wait_for(lambda: underline(False))
+                    native.click_color((36, 161, 99))
+                    native.key(Gdk.KEY_Control_L, False)
+                    native.key(Gdk.KEY_Control_L, True)
+                    # Enter this terminal while the external window still owns
+                    # keyboard focus, then return focus without moving again.
+                    native.move(lx + 7.5 * geometry["cell_width"], ly + .5 * geometry["cell_height"])
+                finally:
+                    probe_window.destroy()
+                wait_for(lambda: rpc("renderer-info", pane=pane)["window_active"], context=GLib.MainContext.default())
+                wait_for(lambda: underline(True))
+                if extra is not None:
+                    native.key(extra, True)
+                else:
+                    native.key(Gdk.KEY_Control_L, False)
+                wait_for(lambda: underline(False))
+                if extra is not None:
+                    native.key(extra, False)
+                    native.key(Gdk.KEY_Control_L, False)
+                    wait_for(lambda: underline(False))
+            link_click()
+            link_click(Gdk.KEY_Control_L, Gdk.KEY_Shift_L)
+            link_click(Gdk.KEY_Control_L, Gdk.KEY_Alt_L)
+            assert not launched(), "Only Ctrl alone opens a link"
+            # The contextual copy uses the OSC target, including a wide continuation.
+            native.key(Gdk.KEY_Control_L, True)
+            wait_for(lambda: underline(True))
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)", (273, True))
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)", (273, False))
+            item = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
+                if obj.get_process_id() == app.pid and obj.get_name() == "Copy Link Address"), None))
+            wait_for(lambda: underline(False))
+            Atspi.Action.do_action(item.get_action_iface(), 0)
+            wait_for(lambda: native.clipboard_text() == first_uri)
+            wait_for(lambda: underline(True))
+            native.key(Gdk.KEY_Control_L, False)
+            link_click(Gdk.KEY_Control_L)
+            wait_for(lambda: launched() == [first_uri])
+            # While replies are paused, a click must still open the displayed old target.
+            proxy.pause()
+            before = proxy.reply_bytes
+            apply_links(link_frame(second_uri))
+            wait_for(lambda: proxy.reply_bytes > before)
+            assert displayed_uri() == first_uri
+            link_click(Gdk.KEY_Control_L)
+            wait_for(lambda: launched() == [first_uri, first_uri])
+            proxy.resume()
+            wait_for(lambda: displayed_uri() == second_uri)
+            wait_for(lambda: appearance(lambda state: state["pointer_name"] == "pointer"))
+            # A same-text target change inside a hold stays hidden until release.
+            apply_links(link_frame(first_uri, b'\x1b[?2026h'))
+            assert displayed_uri() == second_uri
+            link_click(Gdk.KEY_Control_L)
+            wait_for(lambda: launched()[-1] == second_uri)
+            apply_links(b'\x1b[?2026l')
+            wait_for(lambda: displayed_uri() == first_uri)
+            # Mouse reporting keeps ordinary clicks; Ctrl remains an explicit link gesture.
+            apply_links(b'\x1b[?1000h\x1b[?1006h')
+            before = len(launched())
+            link_click()
+            wait_for(lambda: b'\x1b[<' in appearance_events.read_bytes())
+            assert len(launched()) == before
+            link_click(Gdk.KEY_Control_L)
+            wait_for(lambda: len(launched()) == before + 1)
+            # Removal updates a stationary hover and releases the displayed map.
+            native.key(Gdk.KEY_Control_L, True)
+            wait_for(lambda: underline(True))
+            apply_links(b'\x1b[?1000l\x1b[?1006l\x1b[H\x1b[2Jlabel \xe7\x95\x8c wrapped')
+            wait_for(lambda: displayed_uri() is None)
+            wait_for(lambda: appearance(lambda state: state["pointer_name"] == "crosshair"))
+            wait_for(lambda: underline(False))
+            native.key(Gdk.KEY_Control_L, False)
+            # Cached previews have no targets, even when their text and target
+            # positions match the old authoritative grid. Keep the pointer still.
+            linked_row = b'\x1b]8;;' + first_uri.encode() + b'\x07label \xe7\x95\x8c wrapped\x1b]8;;\x07\r\n'
+            apply_links(b'\x1b[H\x1b[2J\x1b[3J\x1b[58;2;240;77;151m' + linked_row * (appearance()["rows"] * 3) + b'\x1b[0m')
+            wait_for(lambda: displayed_uri() == first_uri)
+            wait_for(lambda: appearance(lambda state: state["scroll_cache_bytes"] > 0 and state["pointer_name"] == "pointer"))
+            old_offset = appearance()["scrollback"]["offset"]
+            proxy.pause()
+            native.key(Gdk.KEY_Shift_L, True)
+            native.key(Gdk.KEY_Page_Up, True)
+            native.key(Gdk.KEY_Page_Up, False)
+            native.key(Gdk.KEY_Shift_L, False)
+            wait_for(lambda: appearance(lambda state: state["scroll_pending"] and state["scrollback"]["offset"] < old_offset))
+            wait_for(lambda: displayed_uri() is None)
+            wait_for(lambda: appearance(lambda state: state["pointer_name"] == "crosshair"))
+            before = len(launched())
+            native.key(Gdk.KEY_Control_L, True)
+            wait_for(lambda: underline(False))
+            native.button(True)
+            native.button(False)
+            assert_stays(lambda: len(launched()) == before and underline(False), .2,
+                         message="A cached preview must not underline or open an authoritative URI")
+            proxy.resume()
+            wait_for(lambda: appearance(lambda state: not state["scroll_pending"]))
+            wait_for(lambda: displayed_uri() == first_uri)
+            wait_for(lambda: appearance(lambda state: state["pointer_name"] == "pointer"))
+            wait_for(lambda: underline(True))
+            native.key(Gdk.KEY_Control_L, False)
+            wait_for(lambda: underline(False))
+            native.key(Gdk.KEY_Shift_L, True)
+            native.key(Gdk.KEY_Page_Down, True)
+            native.key(Gdk.KEY_Page_Down, False)
+            native.key(Gdk.KEY_Shift_L, False)
+            wait_for(lambda: appearance(lambda state: not state["scroll_pending"] and
+                state["scrollback"]["offset"] == state["scrollback"]["total"] - state["scrollback"]["len"]))
+            apply_links(b'\x1b[H\x1b[2J\x1b[3Jplain')
+            wait_for(lambda: displayed_uri() is None)
             appearance_control.write_bytes(b'stop')
             wait_for(appearance_done.is_file)
             wait_for(lambda: appearance(lambda s: s["pointer_name"] == "text"))
@@ -735,6 +925,7 @@ finally:
             wait_for(lambda: expected_hash in rpc("read", pane=pane)["text"], context=GLib.MainContext.default())
             assert rpc("status")["local_clients"] and app.poll() is None
             print("PASS: native Wayland keyboard input, Kitty modifier presses/releases with both sides and Caps Lock, "
+                  "OSC 8 hover/copy/Ctrl-click through an isolated URI handler with held and delayed frames, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
                   "wide-glyph geometry, double/triple-click selection, line dragging, and Shift selection in mouse-reporting applications, "

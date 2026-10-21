@@ -21,6 +21,10 @@ impl Packet {
                 .as_ref()
                 .map_or(0, |git| git.directory.capacity() + git.branch.capacity())
             + header.rows.capacity() * size_of::<u16>()
+            + header
+                .hyperlinks
+                .as_ref()
+                .map_or(0, crate::hyperlinks::Hyperlinks::memory_size)
             + header.row_flags.capacity()
             + header
                 .cache

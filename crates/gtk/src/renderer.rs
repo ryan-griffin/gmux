@@ -20,6 +20,8 @@ pub struct Scene<'a> {
     pub height: i32,
     pub theme: Theme,
     pub selection: Option<(usize, usize)>,
+    /// Half-open range from the hyperlink map captured with this frame.
+    pub hovered_link: Option<(usize, usize)>,
     pub matches: &'a [u8],
     pub focused: bool,
     pub exited: bool,
@@ -236,6 +238,7 @@ struct FontKey {
 #[derive(Default)]
 pub struct RenderStats {
     pub rebuilt_rows: usize,
+    pub background_rows: usize,
     pub text_nodes: usize,
     pub cached_shapes: usize,
     pub cached_shape_bytes: usize,
@@ -256,6 +259,7 @@ struct CachedRow {
     highlights: Vec<u8>,
     selection: Option<(usize, usize)>,
     cursor: Option<(usize, usize, [u8; 3])>,
+    hovered_link: Option<(u16, u16)>,
     pixel_phase: f64,
     background: Option<gsk::RenderNode>,
     foreground: Option<gsk::RenderNode>,
@@ -389,17 +393,27 @@ impl Renderer {
             let row = &mut self.rows[y];
             // Rectangle snapping depends on the row's position in device pixels.
             let pixel_phase = (y as f64 * scene.metrics.1 * scene.scale).fract();
-            if row.cells != cells
+            let rebuild = row.cells != cells
                 || row.highlights != highlights
                 || row.selection != selection
                 || row.cursor != cursor
-                || row.pixel_phase != pixel_phase
-            {
+                || row.pixel_phase != pixel_phase;
+            let hovered_link = scene.hovered_link.and_then(|(start, end)| {
+                (start < base + cells.len() && end > base).then(|| {
+                    (
+                        // Both row-local endpoints fit Frame::cols, including
+                        // the half-open end at the maximum 65535 columns.
+                        start.saturating_sub(base) as u16,
+                        end.saturating_sub(base).min(cells.len()) as u16,
+                    )
+                })
+            });
+            let mut flags = 0;
+            if rebuild || row.hovered_link != hovered_link {
                 let background = gtk::Snapshot::new();
                 // Adjacent backgrounds share a node, which keeps full-screen
                 // applications from creating one color node for every cell.
                 let mut decorations = 0;
-                let mut flags = 0;
                 let mut x = 0;
                 while x < cells.len() {
                     decorations |= cells[x].decoration;
@@ -446,7 +460,7 @@ impl Renderer {
                 }
                 // Ghostty paints underlines and overlines below glyphs so
                 // contrasting colors cannot cover descenders or tall ink.
-                if decorations & decoration::UNDERLINE_MASK != 0 {
+                if decorations & decoration::UNDERLINE_MASK != 0 || hovered_link.is_some() {
                     append_decorations(
                         &background,
                         scene,
@@ -467,6 +481,10 @@ impl Renderer {
                     );
                 }
                 row.background = background.to_node();
+                row.hovered_link = hovered_link;
+                stats.background_rows += 1;
+            }
+            if rebuild {
                 let row_snapshot = gtk::Snapshot::new();
                 let mut x = 0;
                 while x < cells.len() {
@@ -822,7 +840,22 @@ fn decoration(
         return None;
     }
     let style = match kind {
-        DecorationKind::Underline => cell.underline(),
+        DecorationKind::Underline => {
+            if scene
+                .hovered_link
+                .is_some_and(|(start, end)| (start..end).contains(&index))
+            {
+                // Pinned Ghostty uses a double line only for an existing single
+                // underline. Other styles become single while the link is active.
+                if cell.underline() == underline::SINGLE {
+                    underline::DOUBLE
+                } else {
+                    underline::SINGLE
+                }
+            } else {
+                cell.underline()
+            }
+        }
         DecorationKind::Strike => u8::from(cell.flags & 16 != 0),
         DecorationKind::Overline => u8::from(cell.overline()),
     };

@@ -35,7 +35,14 @@ a daemon style update. Only mapped, focused panes in the active window
 schedule a blink source, and program cursor visibility and blink modes stop it.
 Block cursor transitions rebuild only the cursor row; bar and underline cursors
 reuse all row nodes. OSC 22 pointer shapes apply to the terminal canvas through
-GTK's native W3C cursor names.
+GTK's native W3C cursor names. OSC 8 hover uses the
+same pointer owner, so leaving a link restores the current OSC 22 request even
+when the frame's pointer code is unchanged. Sparse hyperlink maps sit beside
+the fixed cells. GTK captures the map and geometry after painting, and link
+hover with Ctrl changes only affected row backgrounds and decorations, retaining
+glyph nodes and shaped text. The active captured span uses Ghostty's single/double
+underline rule with the program's underline color, opacity and concealment.
+Link hit testing and styling add no socket requests and copy no URI strings.
 
 Font, Pango context, cell metrics, theme, and pixel alignment changes invalidate
 the relevant caches. Scrolling reuses rows after comparing overlapping content.

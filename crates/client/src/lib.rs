@@ -4,6 +4,7 @@ pub use cells::{Cell, Frame, Scrollback};
 pub mod connection;
 pub mod connections;
 pub mod control;
+pub mod hyperlinks;
 mod incoming;
 pub mod ipc;
 pub mod local;

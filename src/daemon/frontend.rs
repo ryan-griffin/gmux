@@ -20,6 +20,7 @@ pub(super) struct SentScreen {
     cached: std::ops::Range<u64>,
     cache_active: bool,
     prefetch_at: Option<Instant>,
+    pub(super) hyperlinks: gmux_client::hyperlinks::Hyperlinks,
 }
 pub(super) struct SentSelection {
     range: Option<(u64, u64)>,
@@ -777,6 +778,7 @@ impl Daemon {
             let mut cache_valid_before = None;
             let mut cache = None;
             let mut cache_invalidated = false;
+            let mut hyperlinks = None;
             let (frame, find, selection, selection_origin) = if screen
                 || frontend.views.contains_key(&id)
             {
@@ -923,7 +925,14 @@ impl Daemon {
                                 old.prefetch_at = None;
                             }
                         }
-                        let send = full
+                        if old.hyperlinks != engine.hyperlinks
+                            || (full && !engine.hyperlinks.spans.is_empty())
+                        {
+                            old.hyperlinks.clone_from(&engine.hyperlinks);
+                            hyperlinks = Some(engine.hyperlinks.clone());
+                        }
+                        let send = hyperlinks.is_some()
+                            || full
                             || !rows.is_empty()
                             || old.frame != frame
                             || cache.is_some()
@@ -996,6 +1005,7 @@ impl Daemon {
                         selection_serial,
                         selection_origin,
                         row_flags: Vec::new(),
+                        hyperlinks: None,
                         copy: Some(text),
                         ..Header::default()
                     },
@@ -1008,6 +1018,7 @@ impl Daemon {
                     state: None,
                     meta,
                     frame,
+                    hyperlinks,
                     scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
                     generation,
                     cache_origin,

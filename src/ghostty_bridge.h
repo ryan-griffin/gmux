@@ -11,6 +11,10 @@
 #define GMUX_PROGRESS_INDETERMINATE 3
 #define GMUX_PROGRESS_PAUSED 4
 
+#define GMUX_LINK_MAX_URI_BYTES (16u * 1024)
+#define GMUX_LINK_MAX_TARGET_BYTES (256u * 1024)
+#define GMUX_LINK_MAX_SPANS 16384u
+
 #define GMUX_UNDERLINE_NONE 0
 #define GMUX_UNDERLINE_SINGLE 1
 #define GMUX_UNDERLINE_DOUBLE 2
@@ -142,6 +146,11 @@ int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_
 int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCell *cells, size_t cap, uint8_t *row_flags);
 GmuxHistory gmux_engine_history_state(GmuxEngine *engine);
 int gmux_engine_styled_rows(GmuxEngine *engine, uint32_t start, size_t rows, GmuxCell *cells, size_t cols, uint8_t *flags);
+// Targets first (end == 0), then sorted spans, borrowed for each callback.
+typedef void (*GmuxLinkFn)(void *userdata, uint32_t start, uint32_t end,
+    uint32_t target, const uint8_t *uri, size_t len);
+void gmux_engine_links(GmuxEngine *engine, GmuxLinkFn visit, void *userdata);
+uint64_t gmux_engine_links_revision(GmuxEngine *engine);
 int gmux_engine_selection_origin(GmuxEngine *engine, uint64_t *origin);
 void gmux_engine_scroll(GmuxEngine *engine, intptr_t delta, bool bottom);
 void gmux_engine_scroll_to(GmuxEngine *engine, uint64_t row);

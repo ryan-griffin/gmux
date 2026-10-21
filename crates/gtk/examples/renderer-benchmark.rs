@@ -278,6 +278,7 @@ fn main() -> anyhow::Result<()> {
                     height,
                     theme,
                     selection: None,
+                    hovered_link: None,
                     matches: &highlights,
                     focused: workload == "cursor-blink",
                     exited: false,

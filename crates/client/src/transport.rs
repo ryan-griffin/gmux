@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 27;
+pub const VERSION: u32 = 28;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -68,6 +68,9 @@ pub struct Header {
     /// Extra history rows, stored after the viewport's changed cells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CachedRows>,
+    /// Replacement map for this frame; absent keeps the displayed map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyperlinks: Option<crate::hyperlinks::Hyperlinks>,
     pub rows: Vec<u16>,
     /// Flags corresponding to `rows`; empty means every changed row is unwrapped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -168,6 +171,10 @@ impl Packet {
                     && header.row_flags.iter().all(|flags| flags & !1 == 0)),
             "Invalid viewport row flags"
         );
+        anyhow::ensure!(
+            header.hyperlinks.is_none() || header.frame.is_some(),
+            "Hyperlinks require a frame"
+        );
         let expected = if let Some(frame) = header.frame {
             let cols = frame.cols as usize;
             let rows = frame.rows as usize;
@@ -215,6 +222,9 @@ impl Packet {
             } else {
                 0
             };
+            if let Some(links) = &header.hyperlinks {
+                links.validate(cols * rows)?;
+            }
             (header.rows.len() + cached) * cols
         } else {
             anyhow::ensure!(
@@ -517,6 +527,88 @@ mod tests {
         encoded[..4].copy_from_slice(&size.to_le_bytes());
         encoded[8] = b'!';
         assert!(Packet::read(&mut encoded.as_slice()).is_err());
+    }
+
+    #[test]
+    fn malformed_link_indexes_ranges_and_budgets_are_rejected_before_cells() {
+        use crate::hyperlinks::{Hyperlinks, MAX_SPANS, MAX_TARGET_BYTES, MAX_URI_BYTES};
+        let mut packet = packet();
+        for spans in [
+            vec![[0, 0, 0]],
+            vec![[2, 1, 0]],
+            vec![[0, 7, 0]],
+            vec![[0, 2, 1]],
+            vec![[1, 3, 0], [2, 4, 0]],
+            vec![[3, 4, 0], [0, 1, 0]],
+            vec![[0, 1, 0]; MAX_SPANS + 1],
+        ] {
+            packet.header.hyperlinks = Some(Hyperlinks {
+                targets: vec!["test:target".into()],
+                spans,
+            });
+            let mut bytes = Vec::new();
+            packet.encode_into(&mut bytes).unwrap();
+            assert!(Packet::read(&mut bytes.as_slice()).is_err());
+        }
+        for targets in [
+            vec![String::new()],
+            vec!["test:bad\nuri".into()],
+            vec!["x".repeat(MAX_URI_BYTES + 1)],
+            vec!["x".repeat(MAX_URI_BYTES); MAX_TARGET_BYTES / MAX_URI_BYTES + 1],
+        ] {
+            packet.header.hyperlinks = Some(Hyperlinks {
+                spans: (0..targets.len())
+                    .map(|i| [i as u32, i as u32 + 1, i as u32])
+                    .collect(),
+                targets,
+            });
+            let mut bytes = Vec::new();
+            packet.encode_into(&mut bytes).unwrap();
+            assert!(Packet::read(&mut bytes.as_slice()).is_err());
+        }
+        packet.header.hyperlinks = Some(Hyperlinks {
+            targets: vec!["test:actual".into()],
+            spans: vec![[0, 6, 0]],
+        });
+        let mut bytes = Vec::new();
+        packet.encode_into(&mut bytes).unwrap();
+        let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.header.hyperlinks, packet.header.hyperlinks);
+        packet.header.frame = None;
+        packet.header.rows.clear();
+        packet.header.row_flags.clear();
+        packet.cells.clear();
+        bytes.clear();
+        packet.encode_into(&mut bytes).unwrap();
+        assert!(Packet::read(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn link_ranges_address_the_viewport_and_not_appended_cached_rows() {
+        use crate::hyperlinks::Hyperlinks;
+        let mut packet = packet();
+        packet.header.generation = 1;
+        packet.header.cache = Some(CachedRows {
+            start: 0,
+            row_flags: vec![0; 10],
+        });
+        packet.cells.extend(vec![Cell::default(); 20]);
+        packet.header.hyperlinks = Some(Hyperlinks {
+            targets: vec!["test:viewport".into()],
+            spans: vec![[0, 6, 0]],
+        });
+        let mut bytes = Vec::new();
+        packet.encode_into(&mut bytes).unwrap();
+        let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.cells.len(), 22);
+        assert_eq!(
+            decoded.header.hyperlinks.unwrap().target_at(5),
+            Some("test:viewport")
+        );
+        packet.header.hyperlinks.as_mut().unwrap().spans[0][1] = 7;
+        bytes.clear();
+        packet.encode_into(&mut bytes).unwrap();
+        assert!(Packet::read(&mut bytes.as_slice()).is_err());
     }
 
     struct Fragmented<'a> {

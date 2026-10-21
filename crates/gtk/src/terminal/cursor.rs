@@ -1,5 +1,5 @@
 use gmux_client::{Frame, cells::mouse_shape};
-use gtk::{glib, prelude::*};
+use gtk::{gdk, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -42,6 +42,10 @@ pub(super) struct Cursor {
     default_enabled: Cell<bool>,
     state: Cell<CursorState>,
     pointer: Cell<Option<u8>>,
+    requested_pointer: Cell<u8>,
+    link_hover: Cell<bool>,
+    link_cursor: Option<gdk::Cursor>,
+    terminal_cursor: RefCell<Option<gdk::Cursor>>,
     exited: Cell<bool>,
     visible: Cell<bool>,
     started: Cell<Instant>,
@@ -66,11 +70,16 @@ impl Cursor {
             default_enabled: Cell::new(default_blink),
             state: Cell::new(CursorState::default()),
             pointer: Cell::new(None),
+            requested_pointer: Cell::new(mouse_shape::TEXT),
+            link_hover: Cell::new(false),
+            link_cursor: gdk::Cursor::from_name("pointer", None),
+            terminal_cursor: RefCell::new(gdk::Cursor::from_name("text", None)),
             exited: Cell::new(false),
             visible: Cell::new(true),
             started: Cell::new(Instant::now()),
             deadline: Cell::new(Instant::now()),
         });
+        cursor.update_pointer();
         let defaults = Rc::new(defaults);
         for property in [
             "gtk-cursor-blink",
@@ -160,17 +169,37 @@ impl Cursor {
     pub(super) fn update(self: &Rc<Self>, frame: Frame, exited: bool) {
         let state = CursorState::from(frame);
         let previous = self.state.replace(state);
-        if self.pointer.replace(Some(frame.mouse_shape)) != Some(frame.mouse_shape)
-            && let Some(widget) = self.widget.upgrade()
-        {
-            widget.set_cursor_from_name(Some(mouse_shape::name(frame.mouse_shape)));
+        if self.requested_pointer.replace(frame.mouse_shape) != frame.mouse_shape {
+            *self.terminal_cursor.borrow_mut() =
+                gdk::Cursor::from_name(mouse_shape::name(frame.mouse_shape), None);
         }
+        self.update_pointer();
         let was_exited = self.exited.replace(exited);
         if previous != state || was_exited != exited {
             self.restart();
         }
     }
 
+    pub(super) fn set_link_hover(&self, hover: bool) {
+        self.link_hover.set(hover);
+        self.update_pointer();
+    }
+    fn update_pointer(&self) {
+        let shape = if self.link_hover.get() {
+            mouse_shape::POINTER
+        } else {
+            self.requested_pointer.get()
+        };
+        if self.pointer.replace(Some(shape)) != Some(shape)
+            && let Some(widget) = self.widget.upgrade()
+        {
+            if self.link_hover.get() {
+                widget.set_cursor(self.link_cursor.as_ref());
+            } else {
+                widget.set_cursor(self.terminal_cursor.borrow().as_ref());
+            }
+        }
+    }
     pub(super) fn restart(self: &Rc<Self>) {
         self.set_visible(true);
         let now = Instant::now();

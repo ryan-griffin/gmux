@@ -347,6 +347,7 @@ impl Daemon {
                 };
                 Ok(json!({"text":text}))
             }
+            ExecutionRequest::Links { pane: id } => self.sessions.get_mut(&id).unwrap().links(),
             ExecutionRequest::Read { pane: id } => {
                 Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
             }
