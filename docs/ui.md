@@ -162,3 +162,13 @@ The `screenshot` socket command builds a fresh window snapshot because an
 occluded window can have a paused frame clock and a stale `GtkWidgetPaintable`.
 `capture_window` in `crates/gtk/src/app/backend.rs` uses a scoped deprecated GTK CSS call
 for the window background and frame. This is separate from terminal rendering.
+
+## Terminal progress
+
+OSC 9;4 reports appear as thin native progress bars directly below pane headers,
+or at the top of the terminal when headers are hidden. The bars overlay content
+without resizing the terminal. Error bars use red and paused bars use the warning
+color; accessible values name the state. Indeterminate bars animate
+only while mapped. Progress appears only in panes. CLI and socket status also
+report progress, including a representative pane for each tab. See
+[terminal progress](progress.md) for status fields and script usage.

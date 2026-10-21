@@ -27,6 +27,8 @@ cargo clippy --locked -p gmux-core -p gmux-client --all-targets -- -D warnings
 ```sh
 python3 scripts/check.py --list
 python3 scripts/check.py --only daemon scrollback
+python3 scripts/check.py --headless --only progress
+python3 scripts/check.py --native --only progress-ui
 python3 scripts/check.py --native --skip-build --only renderer multi-window
 ```
 

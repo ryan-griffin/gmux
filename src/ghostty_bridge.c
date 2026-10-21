@@ -351,6 +351,22 @@ static void notify(GhosttyTerminal t, void *ud, const GhosttyTerminalDesktopNoti
     GhosttyString s = n->body.len ? n->body : n->title;
     e->callback(e->userdata, 1, (const uint8_t *)s.ptr, s.len);
 }
+static void progress_report(GhosttyTerminal t, void *ud, const GhosttyTerminalProgressReport *report) {
+    (void)t;
+    if (report->size < offsetof(GhosttyTerminalProgressReport, progress) + sizeof(report->progress)) return;
+    uint8_t state;
+    switch (report->state) {
+        case GHOSTTY_TERMINAL_PROGRESS_STATE_REMOVE: state = GMUX_PROGRESS_INACTIVE; break;
+        case GHOSTTY_TERMINAL_PROGRESS_STATE_SET: state = GMUX_PROGRESS_DETERMINATE; break;
+        case GHOSTTY_TERMINAL_PROGRESS_STATE_ERROR: state = GMUX_PROGRESS_ERROR; break;
+        case GHOSTTY_TERMINAL_PROGRESS_STATE_INDETERMINATE: state = GMUX_PROGRESS_INDETERMINATE; break;
+        case GHOSTTY_TERMINAL_PROGRESS_STATE_PAUSE: state = GMUX_PROGRESS_PAUSED; break;
+        default: return;
+    }
+    const uint8_t data[] = {state, (uint8_t)report->progress};
+    GmuxEngine *e = ud;
+    e->callback(e->userdata, 4, data, sizeof(data));
+}
 static bool color_scheme(GhosttyTerminal t, void *ud, GhosttyColorScheme *out) {
     (void)t;
     GmuxEngine *e = ud;
@@ -400,6 +416,7 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, notify);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
+    ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, progress_report);
     // Track only a bounded unfinished sequence for shutdown snapshots.
     size_t continuation_max = 64 * 1024;
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,

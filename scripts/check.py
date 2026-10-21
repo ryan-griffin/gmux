@@ -7,8 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-HEADLESS = ["serve", "daemon", "ownership", "remote", "git", "multi-client", "frontend-input", "scrollback"]
-DESKTOP = ["local-execution", "smoke", "multi-window", "remote-window", "remotes-ui", "terminal-input", "notifications", "renderer"]
+HEADLESS = ["serve", "daemon", "ownership", "remote", "git", "multi-client", "frontend-input", "scrollback", "progress"]
+DESKTOP = ["local-execution", "smoke", "multi-window", "remote-window", "remotes-ui", "terminal-input", "notifications", "renderer", "progress-ui"]
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--native", action="store_true")

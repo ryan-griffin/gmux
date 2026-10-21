@@ -98,6 +98,7 @@ struct Daemon {
     next_frontend: u64,
     revision: u64,
     changed: HashSet<u64>,
+    metadata_changed: HashSet<u64>,
     notifications: HashMap<u64, NotificationQueue>,
     errors: HashMap<u64, String>,
     unread: HashMap<u64, u64>,
@@ -160,6 +161,7 @@ impl Daemon {
             next_frontend: 0,
             revision: 0,
             changed: HashSet::new(),
+            metadata_changed: HashSet::new(),
             notifications: HashMap::new(),
             errors: HashMap::new(),
             unread: HashMap::new(),
@@ -266,6 +268,7 @@ impl Daemon {
             exited: session.exited(),
             unread_sequence,
             busy: session.busy(),
+            progress: session.progress(),
             modes: [session.mode(0), session.mode(1004)],
         }
     }
@@ -297,7 +300,9 @@ impl Daemon {
         self.notifications.remove(&id);
         self.errors.remove(&id);
         self.changed.remove(&id);
+        self.metadata_changed.remove(&id);
         for frontend in self.frontends.values_mut() {
+            frontend.metadata_changed.remove(&id);
             frontend.git_panes.remove(&id);
             frontend.git_sent.remove(&id);
             frontend.visible.remove(&id);
@@ -477,6 +482,7 @@ mod tests {
                     exited: false,
                     unread_sequence: 1,
                     busy: false,
+                    progress: Default::default(),
                     modes: [false; 2],
                 },
                 frame: Some(Frame {
@@ -550,6 +556,7 @@ mod tests {
                         exited: false,
                         unread_sequence: 0,
                         busy: false,
+                        progress: Default::default(),
                         modes: [false; 2],
                     },
                     frame: Some(Frame {

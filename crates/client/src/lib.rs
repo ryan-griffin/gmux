@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod local;
 pub mod model;
 pub mod network;
+pub mod progress;
 pub mod remote;
 pub mod scroll_cache;
 pub mod search;

@@ -149,6 +149,11 @@ pub fn run() -> anyhow::Result<()> {
                 .then_some(now),
             attached.then_some(next_metadata),
             daemon.next_update(),
+            daemon
+                .sessions
+                .values()
+                .filter_map(TerminalSession::progress_deadline)
+                .min(),
             held.then_some(now + Duration::from_millis(100)),
             daemon
                 .git
@@ -312,12 +317,20 @@ pub fn run() -> anyhow::Result<()> {
                 .filter(|(_, events)| events & libc::POLLOUT != 0)
                 .map(|_| id)
         }));
+        ready.extend(daemon.sessions.iter().filter_map(|(&id, s)| {
+            s.progress_deadline()
+                .is_some_and(|at| Instant::now() >= at)
+                .then_some(id)
+        }));
         exited.clear();
         for id in ready.drain() {
             let Some(session) = daemon.sessions.get_mut(&id) else {
                 continue;
             };
             let update = session.poll();
+            if update.progress_changed {
+                daemon.metadata_changed.insert(id);
+            }
             daemon.git_dirty |= update.directory_changed && daemon.git.is_some();
             if update.changed {
                 daemon.changed.insert(id);
@@ -374,6 +387,7 @@ pub fn run() -> anyhow::Result<()> {
         }
         if daemon.frontends.is_empty() {
             daemon.changed.clear();
+            daemon.metadata_changed.clear();
             daemon.errors.clear();
         }
     }

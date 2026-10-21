@@ -16,6 +16,7 @@ pub struct SessionUpdate {
     pub exited: bool,
     pub directory_changed: bool,
     pub git_changed: bool,
+    pub progress_changed: bool,
     pub unread: Option<bool>,
     pub error: Option<String>,
     pub notifications: Vec<String>,

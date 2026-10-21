@@ -51,6 +51,12 @@ pub(crate) struct TerminalSession {
 }
 
 impl TerminalSession {
+    pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
+        self.engine.progress()
+    }
+    pub(crate) fn progress_deadline(&self) -> Option<Instant> {
+        self.engine.progress_deadline()
+    }
     pub(crate) fn use_view_appearance(
         &mut self,
         view: &crate::engine::EngineView,
@@ -284,6 +290,10 @@ impl TerminalSession {
             pty.child = None;
             self.exited = true;
         }
+        if self.exited {
+            self.engine.clear_progress();
+        }
+        update.progress_changed = self.engine.take_progress_changed();
         update.exited = self.exited;
         update
     }
@@ -546,6 +556,24 @@ mod tests {
         let update = session.poll();
         assert!(update.error.is_none(), "{:?}", update.error);
         update.notifications.iter().any(|message| message == text)
+    }
+
+    #[test]
+    fn progress_is_cleared_on_process_exit() {
+        let directory = TestDirectory::new();
+        let mut session = start(
+            1,
+            &directory.0,
+            "stty -echo; printf '\\033]9;4;1;42\\007'; IFS= read -r line",
+        );
+        wait_for(|| {
+            session.poll();
+            session.progress().active()
+        });
+        session.send_text("exit", true).unwrap();
+        wait_for(|| session.poll().exited);
+        assert_eq!(session.progress(), Default::default());
+        assert!(session.progress_deadline().is_none());
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod commands;
 mod find_field;
 mod font;
 mod menu;
+mod progress;
 mod render;
 mod renderer;
 mod settings;
@@ -42,7 +43,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// List tabs, pane IDs, working directories, and unread indicators.
+    /// List tabs, panes, working directories, progress, and unread indicators.
     ///
     /// With GTK open and no --connection, include all connections in the active window.
     List,

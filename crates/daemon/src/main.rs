@@ -28,7 +28,7 @@ enum Command {
     Serve(ServeOptions),
     /// Inspect the daemon's identity, connections, and execution statistics.
     Status,
-    /// List tabs, pane IDs, working directories, and unread indicators.
+    /// List tabs, panes, working directories, progress, and unread indicators.
     List,
     /// Create a terminal tab.
     New {

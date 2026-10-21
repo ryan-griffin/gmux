@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 26:
+handshake. The current protocol version is 27:
 
 ```json
-{"version":26,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":27,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -164,7 +164,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":26,"daemon":"returned-identity"}
+{"method":"attach","version":27,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -177,7 +177,7 @@ focused view controls a pane's PTY size.
 
 Use `input` with a byte array to write terminal input, or `key`, `mouse`, and
 `paste` for terminal-aware input. `focused` declares the connection's focus.
-`frame-interval` sets this connection's viewport and search pacing with a
+`frame-interval` sets this connection's viewport, search, and progress pacing with a
 `micros` integer from 1,000 to 1,000,000. It defaults to 16,000. GTK updates it
 from the display frame clock; one client's interval does not pace another client.
 `scroll`, `scroll-to`, `find`, `find-advance`, `select`, `clear-selection`,
@@ -241,6 +241,14 @@ without changing pane state or an in-progress paste. The Rust session client sen
 a ping every ten seconds and closes streams that deliver no replies or output for
 thirty seconds. Heartbeat replies do not wake the UI. `Packet::read_message`
 returns None for these records; `Packet::read` skips them.
+
+Pane metadata includes required `progress` with named `state` and a validated
+integer `percentage` from 0 through 100. States are `inactive`, `determinate`,
+`error`, `indeterminate`, and `paused`; inactive requires zero. The stream
+sends progress changes without a frame or rows. State snapshots and `metadata`
+include the retained latest progress, including for hidden panes. `list` also
+includes each pane's progress and each tab's selected source pane and progress.
+See [terminal progress](progress.md) for transitions, expiry, and selection.
 
 Pane metadata uses `unread_sequence` for the newest unread alert's sequence
 number, or zero after acknowledgement. Send that sequence as `through` in

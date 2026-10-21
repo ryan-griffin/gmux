@@ -60,6 +60,7 @@ struct Events {
     notifications: Vec<String>,
     title_changed: bool,
     directory_changed: bool,
+    progress: crate::progress::RetainedProgress,
 }
 unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usize) {
     // The C engine calls synchronously on the thread owning the session.
@@ -77,6 +78,21 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
             .push(String::from_utf8_lossy(bytes).into_owned()),
         2 => events.title_changed = true,
         3 => events.directory_changed = true,
+        4 if bytes.len() == 2 => {
+            use gmux_client::progress::ProgressState;
+            let state = match u32::from(bytes[0]) {
+                GMUX_PROGRESS_INACTIVE => ProgressState::Inactive,
+                GMUX_PROGRESS_DETERMINATE => ProgressState::Determinate,
+                GMUX_PROGRESS_ERROR => ProgressState::Error,
+                GMUX_PROGRESS_INDETERMINATE => ProgressState::Indeterminate,
+                GMUX_PROGRESS_PAUSED => ProgressState::Paused,
+                _ => return,
+            };
+            let percentage = (bytes[1] <= 100).then_some(bytes[1]);
+            events
+                .progress
+                .report(state, percentage, std::time::Instant::now());
+        }
         _ => {}
     }
 }
@@ -332,6 +348,18 @@ impl Engine {
         };
         anyhow::ensure!(result == 0, "Ghostty theme update failed ({result})");
         Ok(())
+    }
+    pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
+        self.events.progress.value
+    }
+    pub(crate) fn progress_deadline(&self) -> Option<std::time::Instant> {
+        self.events.progress.deadline
+    }
+    pub(crate) fn clear_progress(&mut self) {
+        self.events.progress.clear();
+    }
+    pub(crate) fn take_progress_changed(&mut self) -> bool {
+        self.events.progress.take_changed(std::time::Instant::now())
     }
     pub fn write(&mut self, bytes: &[u8]) {
         self.revision = self.revision.wrapping_add(1);
@@ -2302,3 +2330,76 @@ mod tests {
 
 #[cfg(test)]
 mod search_tests;
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use gmux_client::progress::{Progress, ProgressState::*};
+    #[test]
+    fn pinned_reports_resolve_values_reset_and_do_not_modify_viewport() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"visible text");
+        engine.snapshot().unwrap();
+        let cells = engine.cells.clone();
+        let frame = engine.frame;
+        for (sequence, state, percentage) in [
+            ("\x1b]9;4;1;42\x07", Determinate, 42),
+            ("\x1b]9;4;2\x1b\\", Error, 42),
+            ("\x1b]9;4;4;81\x07", Paused, 81),
+            ("\x1b]9;4;3;5\x07", Indeterminate, 81),
+            ("\x1b]9;4;4\x07", Paused, 81),
+            ("\x1b]9;4;0;99\x07", Inactive, 0),
+            ("\x1b]9;4;1\x07", Determinate, 0),
+            ("\x1b]9;4;1;999\x07", Determinate, 100),
+            ("\x1b]9;4;1;invalid\x07", Determinate, 0),
+        ] {
+            // Fragmented input always goes through the pinned parser.
+            for byte in sequence.bytes() {
+                engine.write(&[byte]);
+            }
+            assert_eq!(
+                (engine.progress().state(), engine.progress().percentage()),
+                (state, percentage)
+            );
+            assert!(!engine.snapshot().unwrap());
+            assert!(engine.cells == cells);
+            assert!(engine.frame == frame);
+        }
+        engine.write(b"\x1b[!p"); // DECSTR is not RIS.
+        assert!(engine.progress().active());
+        engine.write(b"\x1bc");
+        assert_eq!(engine.progress(), Progress::default());
+        assert!(engine.progress_deadline().is_none());
+    }
+    #[test]
+    fn progress_is_independent_of_a_held_viewport() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"before");
+        engine.snapshot().unwrap();
+        let cells = engine.cells.clone();
+        engine.write(b"\x1b[?2026h\x1b]9;4;1;57\x07after");
+        assert_eq!(engine.progress().percentage(), 57);
+        engine.snapshot().unwrap();
+        assert!(engine.cells == cells);
+        engine.write(b"\x1b[?2026l");
+        engine.snapshot().unwrap();
+        assert!(engine.text().unwrap().contains("beforeafter"));
+        assert_eq!(engine.progress().percentage(), 57);
+    }
+
+    #[test]
+    fn mixed_text_and_reports_and_fresh_history_restore() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"\x1b]9;4;1;42\x07mixed text");
+        engine.snapshot().unwrap();
+        assert_eq!(engine.progress().percentage(), 42);
+        assert!(engine.text().unwrap().contains("mixed text"));
+        let checkpoint = engine.checkpoint().unwrap();
+        let mut fresh = Engine::new().unwrap();
+        fresh.restore_history(&checkpoint).unwrap();
+        assert_eq!(fresh.progress(), Progress::default());
+        assert!(fresh.progress_deadline().is_none());
+        fresh.snapshot().unwrap();
+        assert!(fresh.text().unwrap().contains("mixed text"));
+    }
+}

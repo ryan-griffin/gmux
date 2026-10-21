@@ -40,12 +40,14 @@ layout topology or other live windows' choices.
 
 The daemon reads nonblocking PTYs in one `ppoll` loop, with a 512 KiB read budget
 per ready pane and an 8 MiB pending-input limit per pane. An idle detached daemon
-blocks in `ppoll`. Signals, sockets, and disk-worker completions wake it.
-Each connection paces viewport batches independently. GTK reports its display's
-refresh interval; other clients default to 16 ms. Submillisecond deadlines retain
-their precision, and metadata is refreshed once a second. Dirty viewport extraction, visible presentation changes, and
-incremental history-search batches restart the frame interval. Metadata packets
-and passes without that work do not postpone the next visible response. Hidden
+blocks in `ppoll`. Signals, sockets, disk-worker completions, and the nearest
+active progress expiry deadline wake it. Each connection paces viewport batches
+independently. GTK reports its display's refresh interval; other clients default
+to 16 ms. Submillisecond deadlines retain their precision, and metadata is
+refreshed once a second. Dirty viewport extraction, visible presentation changes,
+incremental history-search batches, and changed progress reports restart the
+connection's frame interval. Other metadata packets and passes without that
+work do not postpone the next visible response. Hidden
 panes keep parsing output without extracting viewports.
 
 Output preserves cached scrollback rows and invalidates the previously mutable
@@ -108,7 +110,7 @@ Build and install the frontend and daemon from the same revision.
 
 Explicit Quit and orderly daemon shutdown checkpoint primary-screen text history.
 A restart restores tabs and directories with fresh shells. Commands, jobs,
-terminal modes, hyperlinks, and alternate-screen contents do not resume.
+terminal modes, progress, hyperlinks, and alternate-screen contents do not resume.
 Unicode, wrapped lines, colors, and text attributes survive. Indexed and default
 colors follow the current theme; explicit RGB colors retain their values.
 
@@ -196,3 +198,11 @@ suppresses them for the focused pane while its window is active.
 While detached, the daemon queues up to 64 alerts per pane within a 512 KiB text
 budget. Queued alerts arrive on reconnect. Unread state and queued messages stay
 in memory and do not survive daemon restarts.
+
+## Progress reports
+
+The daemon retains each execution's latest OSC 9;4 state across frontend detach
+and reconnect. Identical reports refresh a 15-second deadline without another
+progress broadcast. Reset, exit, removal, and expiry clear it. Progress is
+independent of busy checks and unread alerts. See [terminal progress](progress.md)
+for script usage, status fields, and the tab selection rule.

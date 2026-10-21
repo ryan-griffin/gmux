@@ -7,3 +7,5 @@ mod persistence;
 mod scrollback;
 mod session;
 mod title;
+
+mod progress;
