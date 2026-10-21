@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 /// Public commands whose CLI pane selector can be inherited from GMUX_PANE.
 pub fn pane_method(method: &str) -> bool {
-    matches!(method, "split" | "close" | "send" | "read" | "notify")
+    matches!(
+        method,
+        "split" | "close" | "send" | "read" | "links" | "notify"
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,6 +41,9 @@ pub enum ExecutionRequest {
         tab: u64,
     },
     Read {
+        pane: u64,
+    },
+    Links {
         pane: u64,
     },
     Send {
@@ -149,6 +155,9 @@ pub enum PaneRequest {
     Read {
         pane: Option<u64>,
     },
+    Links {
+        pane: Option<u64>,
+    },
     Send {
         pane: Option<u64>,
         text: String,
@@ -211,6 +220,7 @@ impl Request {
                     ExecutionRequest::Split { pane: id, .. }
                     | ExecutionRequest::Close { pane: id }
                     | ExecutionRequest::Read { pane: id }
+                    | ExecutionRequest::Links { pane: id }
                     | ExecutionRequest::Send { pane: id, .. }
                     | ExecutionRequest::Notify { pane: id, .. }
                     | ExecutionRequest::Metadata { pane: id }
@@ -369,6 +379,9 @@ impl PaneRequest {
         mut resolve_pane: impl FnMut(Option<u64>) -> anyhow::Result<u64>,
     ) -> anyhow::Result<ExecutionRequest> {
         Ok(match self {
+            Self::Links { pane } => ExecutionRequest::Links {
+                pane: resolve_pane(pane)?,
+            },
             Self::Read { pane } => ExecutionRequest::Read {
                 pane: resolve_pane(pane)?,
             },

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "ghostty_links.h"
 
 // Explicit conversion keeps wire values independent of upstream enum ordering.
 static uint8_t mouse_shape_code(GhosttyMouseShape shape) {
@@ -136,6 +137,9 @@ struct GmuxEngine {
     uint64_t hold_started_ms;
     GmuxView *views;
     bool view_held;
+    Links links, held_links;
+    LinkScratch link_scratch;
+    uint64_t link_revision;
     bool clear_pending;
     Appearance appearance, applied;
     int appearance_error;
@@ -151,6 +155,7 @@ struct GmuxView {
     GhosttyTerminalScrollbar scrollbar;
     GhosttyTrackedGridRef viewport, selection_start, selection_end, selection_anchor;
     SelectionCache selection_cache;
+    Links links;
     bool held_used;
     bool captured;
     bool active;
@@ -219,6 +224,7 @@ void gmux_engine_view_set_active(GmuxView *v, bool active) {
         ghostty_tracked_grid_ref_free(v->history.anchor); v->history.anchor=NULL;
         ghostty_tracked_grid_ref_free(v->history.previous); v->history.previous=NULL;
         v->history.state.generation=0;
+        links_free(&v->links);
     }
 }
 void gmux_engine_view_free(GmuxView *v) {
@@ -235,6 +241,7 @@ void gmux_engine_view_free(GmuxView *v) {
     ghostty_tracked_grid_ref_free(v->history.anchor);
     ghostty_tracked_grid_ref_free(v->history.previous);
     ghostty_render_state_free(v->render);
+    links_free(&v->links);
     free(v);
 }
 void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
@@ -244,6 +251,7 @@ void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
     e->appearance_error=apply_appearance(e, &v->appearance);
     v->held_used=e->held && v->captured; e->view_held=e->held;
     if (v->held_used) {
+        Links links=e->held_links; e->held_links=v->links; v->links=links;
         GhosttyRenderState render=e->render; e->render=v->render; v->render=render;
         GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
     }
@@ -265,6 +273,7 @@ void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
         }
     }
     if (v->held_used) {
+        Links links=e->held_links; e->held_links=v->links; v->links=links;
         GhosttyRenderState render=e->render; e->render=v->render; v->render=render;
         GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
     }
@@ -282,13 +291,23 @@ static uint64_t now_ms(void) {
     return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
 }
 
+static void end_render_hold(GmuxEngine *e) {
+    e->held=false;
+    e->links.valid=false;
+    links_free(&e->link_scratch.spare);
+    links_free(&e->held_links);
+    for (GmuxView *v=e->views; v; v=v->next) links_free(&v->links);
+}
+
 static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
     GmuxEngine *e = ud;
     if (held) {
         // Capture at the exact start of the hold, even if the same PTY chunk
         // contains the next frame. Keep it visible until that frame is complete.
         if (ghostty_render_state_update(e->render, terminal)) return;
+        e->links.valid=false;
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
+        links_capture(terminal, e->render, e->iterator, &e->held_links, &e->link_scratch, ++e->link_revision, false);
         for (GmuxView *v=e->views; v; v=v->next) {
             if (!v->active) continue;
             gmux_engine_view_enter(e, v);
@@ -303,6 +322,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
                 !ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground) &&
                 !ghostty_render_state_update(v->render, terminal) &&
                 !ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &v->scrollbar)) {
+                links_capture(terminal, v->render, e->iterator, &v->links, &e->link_scratch, ++e->link_revision, false);
                 v->captured=true;
             } else {
                 // An unsuccessful update may leave an incomplete cache.
@@ -312,14 +332,15 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         }
         e->hold_started_ms = now_ms();
     }
-    e->held = held;
+    if (held) e->held=true;
+    else end_render_hold(e);
 }
 
 bool gmux_engine_expire_render_hold(GmuxEngine *e) {
     if (!e->held || now_ms() - e->hold_started_ms < 1000) return false;
     GhosttyTerminalModeConfig mode = {.mode = GHOSTTY_MODE_SYNC_OUTPUT, .value = false};
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_MODE, &mode);
-    e->held = false;
+    end_render_hold(e);
     return true;
 }
 
@@ -389,6 +410,9 @@ void gmux_engine_free(GmuxEngine *e) {
     ghostty_render_state_row_iterator_free(e->iterator);
     ghostty_render_state_free(e->render);
     ghostty_terminal_free(e->terminal);
+    links_free(&e->links);
+    links_free(&e->held_links);
+    links_scratch_free(&e->link_scratch);
     free(e);
 }
 GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
@@ -650,7 +674,7 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
     }
     GhosttyTerminalModeConfig hold = {.mode = GHOSTTY_MODE_SYNC_OUTPUT, .value = false};
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_MODE, &hold);
-    e->held = false;
+    end_render_hold(e);
     // ED2 can move prompt rows into history, so erase history afterwards.
     const char clear[] = "\x1b[2J\x1b[3J\x1b[H";
     e->text_generation++;
@@ -869,6 +893,9 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
                 replacement_text(cell);
         }
     }
+    if (!e->held && (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE || !e->links.valid))
+        links_capture(e->terminal, e->render, e->iterator, &e->links, &e->link_scratch,
+            ++e->link_revision, dirty == GHOSTTY_RENDER_STATE_DIRTY_PARTIAL);
     ghostty_render_state_clean(e->render);
     return dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE;
 }
@@ -1188,4 +1215,20 @@ int gmux_engine_copy(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
     options.emit=GHOSTTY_FORMATTER_FORMAT_PLAIN; options.unwrap=true; options.trim=true; options.selection=&selection;
     GhosttyResult result=ghostty_terminal_selection_format_buf(e->terminal, options, out, cap, written);
     return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
+}
+
+void gmux_engine_links(GmuxEngine *e, GmuxLinkFn visit, void *userdata) {
+    const Links *links=e->held ? &e->held_links : &e->links;
+    for (size_t i=0; i<links->targets_len; i++) {
+        const LinkTarget *target=&links->targets[i];
+        visit(userdata, 0, 0, (uint32_t)i, links->bytes+target->offset, target->len);
+    }
+    for (size_t i=0; i<links->spans_len; i++) {
+        const LinkSpan *span=&links->spans[i];
+        visit(userdata, span->start, span->end, span->target, NULL, 0);
+    }
+}
+
+uint64_t gmux_engine_links_revision(GmuxEngine *e) {
+    return (e->held ? &e->held_links : &e->links)->revision;
 }

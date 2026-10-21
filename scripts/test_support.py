@@ -21,7 +21,7 @@ def rpc(socket_path, method, /, *, timeout=21, check=True, client=True, env=None
         if check:
             assert "error" not in reply, reply
         return reply
-    client_methods = {"new", "split", "close", "close-tab", "rename", "reset-name", "list", "read", "send",
+    client_methods = {"new", "split", "close", "close-tab", "rename", "reset-name", "list", "read", "links", "send",
         "workspace-add", "workspace-edit", "workspace-remove", "move", "focus", "filter", "windows", "new-window",
         "detach", "renderer-info", "search-tabs", "screenshot", "resize", "action", "_state", "_command",
         "_desktop-save", "_desktop-tab"}

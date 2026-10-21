@@ -44,6 +44,14 @@ given explicit binary paths.
 
 `--skip-smoke` runs Rust, build, and linkage checks without smoke suites.
 
+The `hyperlinks` headless suite checks OSC 8 maps through the daemon, including
+target-only packets, independent viewports, holds, reconnect and clear. It also
+compiles a native ownership check for hold release, timeout and host clear.
+The native `terminal-input` suite installs a private test URI handler and checks
+hover, contextual copy and modifier-click against delayed and held frames. It
+never launches a browser. The renderer suite checks shared hover/OSC 22 pointer
+ownership alongside fractional alignment, retained rows and cursor scheduling.
+
 ## Native prerequisites
 
 The native suites need PyGObject and these installed components:

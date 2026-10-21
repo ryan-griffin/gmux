@@ -61,6 +61,31 @@ targets the clicked pane. Use Shift+right-click to open it while an application
 captures mouse input; the Menu key and Shift+F10 also open it. Tab context menus
 target the clicked tab.
 
+OSC 8 links use their explicit target, which can differ from the printed text.
+The pointer changes over a link and its tooltip shows the target. Holding Ctrl
+underlines the captured span, including wrapped lines. Text with a single SGR
+underline changes to double; other underline styles change to single while active.
+Underline colors are preserved and the original styling returns on release or
+leaving the link. Separate spans with the same target are not highlighted together;
+the viewport map stores targets, not OSC 8 logical link IDs. Ctrl+primary-click
+opens it with the platform URI launcher. Other modifiers keep terminal input and
+selection behavior. Copy Link Address appears in the context menu for a link;
+the Menu key or Shift+F10 targets the displayed terminal cursor. Shift+secondary-click
+still opens Terminal Actions when a program captures mouse input. A menu keeps
+the address captured when it opened, even if output changes underneath it.
+
+Link actions follow the last painted viewport, including its scroll position,
+wide glyphs, wraps and synchronized-output holds. Each window has its own view.
+Locally cached scroll previews temporarily have no link actions or tooltips;
+links return when the matching authoritative viewport is displayed.
+Plain text URL detection and file-path inference are not provided. Reconnecting
+to a running daemon preserves OSC 8 links; restored text history after restarting
+the daemon does not restore links.
+
+`gmux-gtk links --pane ID` prints the displayed GTK frame and its sparse link map.
+With no running GTK client it falls back to the daemon's default viewport, like
+`gmux links --pane ID`. Neither command opens a target.
+
 Arrow navigation keeps focus in the sidebar. Clicking a tab or pressing Enter
 activates it and focuses its terminal. Application shortcuts consume key presses
 and releases before terminal encoding.

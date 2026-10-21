@@ -87,3 +87,26 @@ This benchmark isolates text construction for ASCII and Unicode grids. It
 compares fresh allocation, retained-buffer rebuilds, and color-only row updates.
 It excludes GTK, transport, rendering, and AT-SPI delivery. Timings are calibrated
 batch means per operation, not individual input-latency percentiles.
+
+## OSC 8 snapshots
+
+The native probe measures unchanged snapshots and identical first-row rewrites
+on an 80 × 24 grid with 20 rows of ordinary text, one repeated short target, or
+one repeated 1,500-byte target. It reports process CPU per snapshot, bridge
+allocation calls, URI lookups and retained link capacity before and after clear.
+The counters exclude allocations inside the shared Ghostty library.
+
+```sh
+mkdir -p artifacts
+cc -O2 -std=c11 -DGMUX_BENCH_INCREMENTAL -I.deps/ghostty/include -Isrc \
+  scripts/hyperlink-benchmark.c -L.deps/ghostty/lib \
+  -Wl,-rpath,"$PWD/.deps/ghostty/lib" -Wl,--wrap=malloc \
+  -Wl,--wrap=calloc -Wl,--wrap=realloc \
+  -Wl,--wrap=ghostty_grid_ref_hyperlink_uri -lghostty-vt \
+  -o artifacts/hyperlink-benchmark
+artifacts/hyperlink-benchmark long-output 1000
+```
+
+Use matching compiler flags and Ghostty builds when comparing revisions. This
+probe does not measure frontend input latency or physical display latency.
+Use the renderer benchmark separately to check row rebuilds and drawing costs.

@@ -6,63 +6,105 @@ const CONTROL: u16 = 1 << 1;
 const ALT: u16 = 1 << 2;
 const SUPER: u16 = 1 << 3;
 const CAPS_LOCK: u16 = 1 << 4;
+// Action-only modifiers, removed before encoding terminal input.
+const META: u16 = 1 << 5;
+const HYPER: u16 = 1 << 6;
 
 #[derive(Default)]
 pub(crate) struct KeyboardModifiers {
     // Two bits per modifier, in protocol order: Shift L/R, Control L/R,
-    // Alt L/R, Super L/R. Each pair preserves the other side on release.
-    held: u8,
+    // Alt L/R, Super L/R, Meta L/R, Hyper L/R. Each pair preserves the other
+    // side on release; Meta/Hyper do not change VT input encoding.
+    held: u16,
     encoded: u16,
     caps_lock: Option<bool>,
+    extra_modifiers: bool,
 }
 
 impl KeyboardModifiers {
-    pub(crate) fn install(window: &impl IsA<gtk::Window>) -> Rc<RefCell<Self>> {
+    pub(crate) fn install(
+        window: &impl IsA<gtk::Window>,
+        keyboard: Rc<RefCell<Self>>,
+        changed: impl Fn(bool) + 'static,
+    ) {
         let window = window.as_ref();
-        let keyboard = Rc::new(RefCell::new(Self::default()));
+        let changed = Rc::new(changed);
         // Track the whole window so shortcuts and focus changes between panes
         // cannot hide a modifier press or release from the next terminal.
         let controller = gtk::EventControllerKey::new();
         controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let pressed = keyboard.clone();
-        controller.connect_key_pressed(move |_, key, _, modifiers| {
+        let press_changed = changed.clone();
+        controller.connect_key_pressed(move |controller, key, _, modifiers| {
+            let before = pressed.borrow().links_active();
             pressed.borrow_mut().update(key, modifiers, false);
+            let active = pressed.borrow().links_active();
+            // A pointer can enter with Ctrl already held, without this window
+            // observing its press. Always publish modifier events, including
+            // releases whose before/after encoded states are both empty.
+            if before != active || modifier_event(controller) {
+                press_changed(active);
+            }
             glib::Propagation::Proceed
         });
         let released = keyboard.clone();
-        controller.connect_key_released(move |_, key, _, modifiers| {
+        let release_changed = changed.clone();
+        controller.connect_key_released(move |controller, key, _, modifiers| {
+            let before = released.borrow().links_active();
             released.borrow_mut().update(key, modifiers, true);
+            let active = released.borrow().links_active();
+            if before != active || modifier_event(controller) {
+                release_changed(active);
+            }
         });
         window.add_controller(controller);
         let focus = keyboard.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
                 *focus.borrow_mut() = Self::default();
+                changed(false);
             }
         });
-        keyboard
+    }
+
+    fn links_active(&self) -> bool {
+        !self.extra_modifiers && self.encoded & (SHIFT | CONTROL | ALT | SUPER) == CONTROL
     }
 
     fn update(&mut self, key: gdk::Key, modifiers: gdk::ModifierType, release: bool) -> u16 {
         let mut encoded = mods(modifiers);
-        for (group, mask) in [SHIFT, CONTROL, ALT, SUPER].into_iter().enumerate() {
+        for (mask, flag) in [
+            (gdk::ModifierType::META_MASK, META),
+            (gdk::ModifierType::HYPER_MASK, HYPER),
+        ] {
+            if modifiers.contains(mask) {
+                encoded |= flag;
+            }
+        }
+        for (group, mask) in [SHIFT, CONTROL, ALT, SUPER, META, HYPER]
+            .into_iter()
+            .enumerate()
+        {
             if encoded & mask == 0 {
                 self.held &= !(3 << (2 * group));
             }
         }
         let modifier = match key {
-            gdk::Key::Shift_L => Some((SHIFT, false)),
-            gdk::Key::Shift_R => Some((SHIFT, true)),
-            gdk::Key::Control_L => Some((CONTROL, false)),
-            gdk::Key::Control_R => Some((CONTROL, true)),
-            gdk::Key::Alt_L => Some((ALT, false)),
-            gdk::Key::Alt_R => Some((ALT, true)),
-            gdk::Key::Super_L => Some((SUPER, false)),
-            gdk::Key::Super_R => Some((SUPER, true)),
+            gdk::Key::Shift_L => Some((0, SHIFT, false)),
+            gdk::Key::Shift_R => Some((0, SHIFT, true)),
+            gdk::Key::Control_L => Some((1, CONTROL, false)),
+            gdk::Key::Control_R => Some((1, CONTROL, true)),
+            gdk::Key::Alt_L => Some((2, ALT, false)),
+            gdk::Key::Alt_R => Some((2, ALT, true)),
+            gdk::Key::Super_L => Some((3, SUPER, false)),
+            gdk::Key::Super_R => Some((3, SUPER, true)),
+            gdk::Key::Meta_L => Some((4, META, false)),
+            gdk::Key::Meta_R => Some((4, META, true)),
+            gdk::Key::Hyper_L => Some((5, HYPER, false)),
+            gdk::Key::Hyper_R => Some((5, HYPER, true)),
             _ => None,
         };
-        if let Some((mask, right)) = modifier {
-            let group = mask.trailing_zeros();
+        if let Some((group, mask, right)) = modifier {
             let sides = 3 << (2 * group);
             let side = 1 << (2 * group + u32::from(right));
             // GTK reports state before this event. If another side was held
@@ -91,6 +133,8 @@ impl KeyboardModifiers {
                 self.caps_lock = Some(encoded & CAPS_LOCK != 0);
             }
         }
+        self.extra_modifiers = encoded & (META | HYPER) != 0;
+        encoded &= !(META | HYPER);
         self.encoded = encoded;
         encoded
     }
@@ -110,6 +154,43 @@ impl Terminal {
                 t.paste();
             }
         });
+        let weak = Rc::downgrade(self);
+        self.copy_link_action.connect_activate(move |_, parameter| {
+            if let Some(t) = weak.upgrade()
+                && let Some(uri) = parameter.and_then(|value| value.str())
+            {
+                t.area.clipboard().set_text(uri);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.context_menu.connect_closed(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.refresh_link_hover();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.area
+            .connect_query_tooltip(move |_, x, y, keyboard, tooltip| {
+                let Some(t) = weak.upgrade() else {
+                    return false;
+                };
+                let displayed = t.displayed_links.borrow();
+                let (x, y) = if keyboard {
+                    let frame = displayed.frame;
+                    (
+                        frame.cursor_x as f64 * displayed.metrics.0,
+                        frame.cursor_y as f64 * displayed.metrics.1,
+                    )
+                } else {
+                    (x as f64, y as f64)
+                };
+                if let Some(uri) = displayed.target_at(x, y) {
+                    tooltip.set_text(Some(uri));
+                    true
+                } else {
+                    false
+                }
+            });
         let middle = gtk::GestureClick::new();
         middle.set_button(2);
         let weak = Rc::downgrade(self);
@@ -214,11 +295,11 @@ impl Terminal {
                 return glib::Propagation::Proceed;
             }
             if crate::menu::context_menu_shortcut(key, modifiers) {
-                let (cw, ch) = t.metrics.get();
-                let session = t.session.borrow();
-                let frame = session.snapshot().frame;
+                let displayed = t.displayed_links.borrow();
+                let (cw, ch) = displayed.metrics;
+                let frame = displayed.frame;
                 let position = (frame.cursor_x as f64 * cw, frame.cursor_y as f64 * ch);
-                drop(session);
+                drop(displayed);
                 t.show_context_menu(position.0, position.1);
                 return glib::Propagation::Stop;
             }
@@ -256,11 +337,7 @@ impl Terminal {
                 return glib::Propagation::Stop;
             }
             // Modifier presses precede copy accelerators and must retain selection.
-            let modifier = controller.current_event().is_some_and(|event| {
-                event
-                    .downcast_ref::<gdk::KeyEvent>()
-                    .is_some_and(|key| key.is_modifier())
-            });
+            let modifier = modifier_event(controller);
             if !modifier {
                 t.stop_selection_drag();
                 if t.selection.borrow_mut().take().is_some() {
@@ -309,6 +386,13 @@ impl Terminal {
                 if t.context_menu.is_visible() {
                     return;
                 }
+                // Ctrl alone explicitly opens an OSC 8 target. Other clicks
+                // retain selection and terminal mouse-reporting behavior.
+                if gesture.current_button() == 1 && link_modifiers(state) && t.open_link(x, y) {
+                    t.stop_selection_drag();
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    return;
+                }
                 if gesture.current_button() == 3
                     && (state.contains(gdk::ModifierType::SHIFT_MASK)
                         || !t.session.borrow().mode(0))
@@ -352,9 +436,25 @@ impl Terminal {
             {
                 t.mouse_position.set((x, y));
                 let state = controller.current_event_state();
+                t.link_modifiers_changed(link_modifiers(state));
                 if !state.contains(gdk::ModifierType::SHIFT_MASK) && t.session.borrow().mode(0) {
                     t.mouse(2, t.mouse_pressed.get(), state);
                 }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        motion.connect_enter(move |controller, x, y| {
+            if let Some(t) = weak.upgrade() {
+                t.pointer_inside.set(true);
+                t.mouse_position.set((x, y));
+                t.link_modifiers_changed(link_modifiers(controller.current_event_state()));
+            }
+        });
+        let weak = Rc::downgrade(self);
+        motion.connect_leave(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.pointer_inside.set(false);
+                t.refresh_link_hover();
             }
         });
         self.area.add_controller(motion);
@@ -454,6 +554,8 @@ impl Terminal {
         self.area.connect_unmap(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.stop_selection_drag();
+                t.pointer_inside.set(false);
+                t.refresh_link_hover();
             }
         });
     }
@@ -502,6 +604,9 @@ impl Terminal {
     }
 }
 
+fn link_modifiers(modifiers: gdk::ModifierType) -> bool {
+    crate::menu::shortcut_modifiers(modifiers) == gdk::ModifierType::CONTROL_MASK
+}
 fn scroll_shortcut(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<bool> {
     if crate::menu::shortcut_modifiers(modifiers) != gdk::ModifierType::SHIFT_MASK {
         return None;
@@ -524,6 +629,14 @@ fn application_shortcut(
                 .iter()
                 .any(|&(key, modifiers)| event.matches(key, modifiers) != gdk::KeyMatch::None)
         })
+}
+
+fn modifier_event(controller: &gtk::EventControllerKey) -> bool {
+    controller.current_event().is_some_and(|event| {
+        event
+            .downcast_ref::<gdk::KeyEvent>()
+            .is_some_and(|key| key.is_modifier())
+    })
 }
 pub(super) fn mods(m: gdk::ModifierType) -> u16 {
     [
@@ -640,5 +753,66 @@ mod tests {
         assert_eq!(keyboard.update(gdk::Key::Shift_L, control, false), 3);
         assert_eq!(keyboard.update(gdk::Key::a, control, false), 2);
         assert_eq!(keyboard.held, 0);
+    }
+
+    #[test]
+    fn link_modifiers_follow_after_event_state_and_ignore_lock_bits() {
+        let mut keyboard = KeyboardModifiers::default();
+        let control = gdk::ModifierType::CONTROL_MASK;
+        keyboard.update(gdk::Key::Control_L, gdk::ModifierType::empty(), false);
+        assert!(keyboard.links_active());
+        keyboard.update(gdk::Key::Control_R, control, false);
+        keyboard.update(gdk::Key::Control_L, control, true);
+        assert!(keyboard.links_active());
+        for extra in [
+            gdk::ModifierType::SHIFT_MASK,
+            gdk::ModifierType::ALT_MASK,
+            gdk::ModifierType::SUPER_MASK,
+            gdk::ModifierType::META_MASK,
+            gdk::ModifierType::HYPER_MASK,
+        ] {
+            keyboard.update(gdk::Key::a, control | extra, false);
+            assert!(!keyboard.links_active());
+        }
+        keyboard.update(gdk::Key::a, control | gdk::ModifierType::LOCK_MASK, false);
+        assert!(keyboard.links_active());
+        keyboard.update(gdk::Key::Control_R, control, true);
+        assert!(!keyboard.links_active());
+    }
+
+    #[test]
+    fn meta_and_hyper_sides_update_link_actions_without_changing_vt_modifiers() {
+        let control = gdk::ModifierType::CONTROL_MASK;
+        for (left, right, mask) in [
+            (
+                gdk::Key::Meta_L,
+                gdk::Key::Meta_R,
+                gdk::ModifierType::META_MASK,
+            ),
+            (
+                gdk::Key::Hyper_L,
+                gdk::Key::Hyper_R,
+                gdk::ModifierType::HYPER_MASK,
+            ),
+        ] {
+            let mut keyboard = KeyboardModifiers::default();
+            keyboard.update(gdk::Key::Control_L, gdk::ModifierType::empty(), false);
+            assert_eq!(keyboard.update(left, control, false), CONTROL);
+            assert!(!keyboard.links_active());
+            assert_eq!(keyboard.update(left, control | mask, true), CONTROL);
+            assert!(keyboard.links_active());
+            keyboard.update(left, control, false);
+            keyboard.update(right, control | mask, false);
+            keyboard.update(left, control | mask, true);
+            assert!(!keyboard.links_active());
+            assert_eq!(keyboard.update(right, control | mask, true), CONTROL);
+            assert!(keyboard.links_active());
+            // Infer the opposite side when focus arrived after its press.
+            keyboard.update(right, control | mask, false);
+            keyboard.update(right, control | mask, true);
+            assert!(!keyboard.links_active());
+            keyboard.update(left, control | mask, true);
+            assert!(keyboard.links_active());
+        }
     }
 }

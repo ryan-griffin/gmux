@@ -31,6 +31,10 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const SCROLL_CADENCE: Duration = transport::DEFAULT_FRAME_INTERVAL;
 const CACHED_SCROLL_SETTLE: Duration = Duration::from_millis(100);
 const PING: &[u8] = b"{\"method\":\"ping\"}\n";
+static NO_HYPERLINKS: crate::hyperlinks::Hyperlinks = crate::hyperlinks::Hyperlinks {
+    targets: Vec::new(),
+    spans: Vec::new(),
+};
 
 struct Heartbeat {
     interval: Duration,
@@ -560,6 +564,8 @@ impl SessionManager {
             selection_acknowledged: 0,
             selection_origin: None,
             row_flags: vec![0; 24],
+            hyperlinks: Default::default(),
+            hyperlink_revision: 0,
             cache: crate::scroll_cache::RowCache::default(),
             prediction: None,
             scroll_target: None,
@@ -705,9 +711,10 @@ impl SessionManager {
                             session.selection_acknowledged = packet.header.selection_serial;
                         }
                         if let Some(frame) = packet.header.frame {
-                            let mut text_changed = (frame.cols, frame.rows)
-                                != (session.frame.cols, session.frame.rows)
-                                || packet.header.row_shift != 0;
+                            let dimensions_changed = (frame.cols, frame.rows)
+                                != (session.frame.cols, session.frame.rows);
+                            let mut text_changed =
+                                dimensions_changed || packet.header.row_shift != 0;
                             session
                                 .cells
                                 .resize(frame.cols as usize * frame.rows as usize, Cell::default());
@@ -736,6 +743,15 @@ impl SessionManager {
                                 text_changed = text_changed
                                     || previous.iter().zip(next).any(|(a, b)| !a.text_eq(b));
                                 previous.copy_from_slice(next);
+                            }
+                            if packet.header.hyperlinks.is_some() || dimensions_changed {
+                                session.hyperlink_revision =
+                                    session.hyperlink_revision.wrapping_add(1);
+                            }
+                            if let Some(links) = packet.header.hyperlinks {
+                                session.hyperlinks = links;
+                            } else if dimensions_changed {
+                                session.hyperlinks = Default::default();
                             }
                             session.frame = frame;
                             if self.visible.contains(&id)
@@ -871,6 +887,8 @@ pub struct RemoteSession {
     selection_acknowledged: u64,
     selection_origin: Option<u64>,
     row_flags: Vec<u8>,
+    hyperlinks: crate::hyperlinks::Hyperlinks,
+    hyperlink_revision: u64,
     cache: crate::scroll_cache::RowCache,
     prediction: Option<Prediction>,
     scroll_target: Option<u64>,
@@ -1219,11 +1237,16 @@ impl RemoteSession {
         Ok(())
     }
     pub fn snapshot(&self) -> ScreenSnapshot<'_> {
+        // Cached rows carry no URI targets. Include prediction in the displayed
+        // revision so every entry/exit refreshes hover, even without a new map.
+        let hyperlink_revision = self.hyperlink_revision.wrapping_mul(2);
         if let Some(prediction) = &self.prediction {
             return ScreenSnapshot {
                 frame: prediction.frame,
                 cells: &prediction.cells,
                 row_flags: &prediction.row_flags,
+                hyperlinks: &NO_HYPERLINKS,
+                hyperlink_revision: hyperlink_revision | 1,
                 revision: self.revision,
                 text_revision: self.text_revision,
             };
@@ -1232,6 +1255,8 @@ impl RemoteSession {
             frame: self.frame,
             cells: &self.cells,
             row_flags: &self.row_flags,
+            hyperlinks: &self.hyperlinks,
+            hyperlink_revision,
             revision: self.revision,
             text_revision: self.text_revision,
         }
@@ -1544,6 +1569,8 @@ mod tests {
             selection_acknowledged: 0,
             selection_origin: None,
             row_flags: vec![0; 2],
+            hyperlinks: Default::default(),
+            hyperlink_revision: 0,
             cache: crate::scroll_cache::RowCache::default(),
             prediction: None,
             scroll_target: None,
@@ -1576,6 +1603,308 @@ mod tests {
             sender,
             session,
         )
+    }
+
+    #[test]
+    fn link_only_frames_and_late_scroll_replies_keep_displayed_targets_atomic() {
+        use crate::hyperlinks::Hyperlinks;
+        let (mut first, sender, session) = manager();
+        let (mut second, other_sender, other) = manager();
+        let send = |sender: &incoming::Sender, handle: &SessionHandle, serial, uri: &str| {
+            let mut frame = handle.borrow().frame;
+            frame.scrollback.offset = serial;
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: handle.borrow().meta.clone(),
+                        frame: Some(frame),
+                        scroll_serial: serial,
+                        hyperlinks: Some(Hyperlinks {
+                            targets: vec![uri.into()],
+                            spans: vec![[0, 2, 0]],
+                        }),
+                        ..Header::default()
+                    },
+                    cells: vec![],
+                }))
+                .unwrap();
+        };
+        send(&sender, &session, 2, "test:newer-scroll");
+        send(&other_sender, &other, 7, "test:other-client");
+        first.poll();
+        second.poll();
+        // No hover request can race: even an earlier scroll reply's targets
+        // describe exactly the viewport installed from that packet.
+        send(&sender, &session, 1, "test:late-scroll");
+        assert!(first.poll()[&1].changed);
+        let screen = session.borrow();
+        assert_eq!(screen.snapshot().frame.scrollback.offset, 1);
+        assert_eq!(
+            screen.snapshot().hyperlinks.target_at(1),
+            Some("test:late-scroll")
+        );
+        assert_eq!(screen.snapshot().revision, 0);
+        assert_eq!(screen.snapshot().text_revision, 0);
+        assert_eq!(
+            other.borrow().snapshot().hyperlinks.target_at(1),
+            Some("test:other-client")
+        );
+        drop(screen);
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: session.borrow().meta.clone(),
+                    frame: Some(session.borrow().frame),
+                    hyperlinks: Some(Hyperlinks::default()),
+                    ..Header::default()
+                },
+                cells: vec![],
+            }))
+            .unwrap();
+        first.poll();
+        assert_eq!(session.borrow().snapshot().hyperlinks.memory_size(), 0);
+        send(&sender, &session, 3, "test:before-resize");
+        first.poll();
+        let link_revision = session.borrow().snapshot().hyperlink_revision;
+        let mut resized = session.borrow().frame;
+        resized.cols = 3;
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: session.borrow().meta.clone(),
+                    frame: Some(resized),
+                    ..Header::default()
+                },
+                cells: vec![],
+            }))
+            .unwrap();
+        assert!(first.poll()[&1].changed);
+        {
+            let screen = session.borrow();
+            let snapshot = screen.snapshot();
+            assert_eq!(snapshot.frame.cols, 3);
+            assert_eq!(snapshot.hyperlinks.memory_size(), 0);
+            assert_ne!(snapshot.hyperlink_revision, link_revision);
+            assert_eq!(snapshot.text_revision, 1);
+            assert_eq!(snapshot.revision, 0);
+        }
+        let (_, _, fresh) = manager();
+        assert_eq!(fresh.borrow().snapshot().hyperlinks.target_at(0), None);
+    }
+
+    #[test]
+    fn cached_predictions_hide_links_until_the_canonical_view_is_displayed() {
+        use crate::hyperlinks::Hyperlinks;
+        let (mut manager, sender, handle) = manager();
+        manager.visible.insert(1);
+        let (commands, _receiver) = mpsc::sync_channel(32);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = Rc::new(Connection {
+            commands,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        });
+        manager.connection = connection.clone();
+        handle.borrow_mut().connection = connection;
+        let frame = Frame {
+            cols: 2,
+            rows: 2,
+            scrollback: crate::Scrollback {
+                total: 20,
+                offset: 4,
+                len: 2,
+            },
+            ..Frame::default()
+        };
+        let header = |offset, serial| Header {
+            frame: Some(Frame {
+                scrollback: crate::Scrollback {
+                    offset,
+                    ..frame.scrollback
+                },
+                ..frame
+            }),
+            scroll_serial: serial,
+            generation: 1,
+            ..Header::default()
+        };
+        let row = |value| {
+            let mut cell = Cell::default();
+            cell.text[0] = value;
+            vec![cell; 2]
+        };
+        let links = |uri: &str| {
+            Some(Hyperlinks {
+                targets: vec![uri.into()],
+                spans: vec![[0, 4, 0]],
+            })
+        };
+        let cache = || {
+            Some(transport::CachedRows {
+                start: 0,
+                row_flags: vec![0; 10],
+            })
+        };
+        let send = |mut header: Header, cells| {
+            header.meta = handle.borrow().meta.clone();
+            sender.send(Ok(Packet { header, cells })).unwrap();
+        };
+        let initial = || [row(b'e'), row(b'f'), (b'a'..=b'j').flat_map(row).collect()].concat();
+        send(
+            Header {
+                rows: vec![0, 1],
+                cache: cache(),
+                hyperlinks: links("test:initial"),
+                ..header(4, 0)
+            },
+            initial(),
+        );
+        manager.poll();
+        let authoritative_revision = handle.borrow().snapshot().hyperlink_revision;
+        handle.borrow_mut().scroll_to(5);
+        let predicted_revision = handle.borrow().snapshot().hyperlink_revision;
+        assert_ne!(predicted_revision, authoritative_revision);
+        assert_eq!(handle.borrow().snapshot().hyperlinks.memory_size(), 0);
+
+        // Older canonical deltas and map-only replies cannot lend targets to
+        // the retained prediction, including shifted rows with new targets.
+        send(
+            Header {
+                row_shift: -1,
+                rows: vec![0],
+                hyperlinks: links("test:shifted"),
+                ..header(3, 0)
+            },
+            row(b'd'),
+        );
+        manager.poll();
+        let cells = handle.borrow().snapshot().cells.to_vec();
+        send(
+            Header {
+                hyperlinks: links("test:map-only"),
+                ..header(3, 0)
+            },
+            vec![],
+        );
+        manager.poll();
+        {
+            let session = handle.borrow();
+            let screen = session.snapshot();
+            assert_eq!(screen.frame.scrollback.offset, 5);
+            assert!(screen.cells == cells);
+            assert_eq!(screen.hyperlinks.memory_size(), 0);
+            assert_eq!(session.frame.scrollback.offset, 3);
+            assert_eq!(session.cells[0].text(), "d");
+            assert_eq!(session.hyperlinks.target_at(0), Some("test:map-only"));
+        }
+        send(
+            Header {
+                rows: vec![0, 1],
+                hyperlinks: links("test:matched"),
+                ..header(5, 1)
+            },
+            [row(b'f'), row(b'g')].concat(),
+        );
+        manager.poll();
+        assert!(handle.borrow().prediction.is_none());
+        assert_eq!(
+            handle.borrow().snapshot().hyperlinks.target_at(0),
+            Some("test:matched")
+        );
+        assert_ne!(
+            handle.borrow().snapshot().hyperlink_revision,
+            predicted_revision
+        );
+
+        // Completion without a new map still changes displayed map identity.
+        handle.borrow_mut().scroll_to(4);
+        send(
+            Header {
+                rows: vec![0, 1],
+                hyperlinks: links("test:four"),
+                ..header(4, 1)
+            },
+            [row(b'e'), row(b'f')].concat(),
+        );
+        manager.poll();
+        assert_eq!(handle.borrow().snapshot().hyperlinks.memory_size(), 0);
+        let before_ack = handle.borrow().snapshot().hyperlink_revision;
+        send(header(4, 2), vec![]);
+        manager.poll();
+        let canonical_revision = handle.borrow().snapshot().hyperlink_revision;
+        assert_ne!(canonical_revision, before_ack);
+        assert_eq!(
+            handle.borrow().snapshot().hyperlinks.target_at(0),
+            Some("test:four")
+        );
+
+        // Metadata-only generation and truncation invalidation restore the
+        // canonical frame/map together; neither needs a map-bearing reply.
+        handle.borrow_mut().scroll_to(3);
+        assert_eq!(handle.borrow().snapshot().hyperlinks.memory_size(), 0);
+        send(
+            Header {
+                generation: 2,
+                ..Header::default()
+            },
+            vec![],
+        );
+        manager.poll();
+        assert_eq!(
+            handle.borrow().snapshot().hyperlink_revision,
+            canonical_revision
+        );
+        assert_eq!(handle.borrow().snapshot().frame.scrollback.offset, 4);
+        assert_eq!(
+            handle.borrow().snapshot().hyperlinks.target_at(0),
+            Some("test:four")
+        );
+        for resize in [false, true] {
+            send(
+                Header {
+                    generation: 2,
+                    cache: cache(),
+                    ..header(4, 3)
+                },
+                (b'a'..=b'j').flat_map(row).collect(),
+            );
+            manager.poll();
+            handle.borrow_mut().scroll_to(3);
+            assert!(handle.borrow().prediction.is_some());
+            let predicted_revision = handle.borrow().snapshot().hyperlink_revision;
+            assert_eq!(handle.borrow().snapshot().hyperlinks.memory_size(), 0);
+            if resize {
+                handle.borrow_mut().resize(3, 2, 0, 0, 0, 0).unwrap();
+            } else {
+                send(
+                    Header {
+                        generation: 2,
+                        cache_valid_before: Some(4),
+                        ..Header::default()
+                    },
+                    vec![],
+                );
+                manager.poll();
+            }
+            let session = handle.borrow();
+            let screen = session.snapshot();
+            assert!(session.prediction.is_none());
+            assert_ne!(screen.hyperlink_revision, predicted_revision);
+            assert_eq!(screen.frame.scrollback.offset, 4);
+            assert_eq!(screen.hyperlinks.target_at(0), Some("test:four"));
+        }
+        send(
+            Header {
+                generation: 3,
+                frame: Some(Frame { cols: 3, ..frame }),
+                rows: vec![0, 1],
+                ..header(4, 4)
+            },
+            vec![Cell::default(); 6],
+        );
+        manager.poll();
+        assert_eq!(handle.borrow().snapshot().frame.cols, 3);
+        assert_eq!(handle.borrow().snapshot().hyperlinks.memory_size(), 0);
     }
 
     #[test]

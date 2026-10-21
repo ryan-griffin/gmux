@@ -96,6 +96,11 @@ enum Command {
         #[arg(long, env = "GMUX_PANE")]
         pane: Option<u64>,
     },
+    /// Read OSC 8 targets and ranges from the displayed GTK viewport.
+    Links {
+        #[arg(long, env = "GMUX_PANE")]
+        pane: Option<u64>,
+    },
     /// Deliver a notification to clients viewing a pane.
     Notify {
         message: String,
@@ -368,6 +373,7 @@ fn main() -> anyhow::Result<()> {
                 paste: true,
                 enter,
             })?,
+            Command::Links { pane } => serde_json::to_value(PaneRequest::Links { pane })?,
             Command::Read { pane } => serde_json::to_value(PaneRequest::Read { pane })?,
             Command::Notify { message, pane } => {
                 serde_json::to_value(PaneRequest::Notify { message, pane })?

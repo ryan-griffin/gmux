@@ -75,6 +75,12 @@ pub struct Terminal {
     scroller: gtk::ScrolledWindow,
     context_menu: gtk::PopoverMenu,
     copy_action: gio::SimpleAction,
+    copy_link_action: gio::SimpleAction,
+    link_menu: gio::Menu,
+    displayed_links: RefCell<links::DisplayedLinks>,
+    pointer_inside: ValueCell<bool>,
+    link_modifiers: ValueCell<bool>,
+    link_hover: ValueCell<Option<(usize, usize)>>,
     paste_action: gio::SimpleAction,
     session: SessionHandle,
     selection: RefCell<Option<(usize, usize)>>,
@@ -108,6 +114,7 @@ pub struct Terminal {
 }
 mod cursor;
 mod input;
+mod links;
 pub(crate) use input::KeyboardModifiers;
 use input::mods;
 
@@ -162,8 +169,7 @@ impl Terminal {
         content.append(&toolbar);
         let area = TerminalCanvas::new();
         area.add_css_class("terminal-canvas");
-        area.set_cursor_from_name(Some("text"));
-        area.set_tooltip_text(Some("Terminal"));
+        area.set_has_tooltip(true);
         area.update_property(&[gtk::accessible::Property::Label("Terminal")]);
         let menu = gio::Menu::new();
         for entries in CONTEXT_MENU_SECTIONS {
@@ -181,6 +187,8 @@ impl Terminal {
             }
             menu.append_section(None, &section);
         }
+        let link_menu = gio::Menu::new();
+        menu.prepend_section(None, &link_menu);
         let context_menu = gtk::PopoverMenu::from_model(Some(&menu));
         crate::menu::setup_popover(&context_menu, "Terminal Actions");
         context_menu.set_has_arrow(false);
@@ -190,7 +198,10 @@ impl Terminal {
         context_menu.set_parent(&area);
         let copy_action = gio::SimpleAction::new("copy", None);
         let paste_action = gio::SimpleAction::new("paste", None);
+        let copy_link_action =
+            gio::SimpleAction::new("copy-link", Some(&String::static_variant_type()));
         let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&copy_link_action);
         actions.add_action(&copy_action);
         actions.add_action(&paste_action);
         area.insert_action_group("terminal", Some(&actions));
@@ -253,6 +264,12 @@ impl Terminal {
             scroller,
             context_menu,
             copy_action,
+            copy_link_action,
+            link_menu,
+            displayed_links: RefCell::new(links::DisplayedLinks::default()),
+            pointer_inside: ValueCell::new(false),
+            link_modifiers: ValueCell::new(false),
+            link_hover: ValueCell::new(None),
             paste_action,
             session,
             selection: RefCell::new(None),
@@ -447,6 +464,18 @@ impl Terminal {
     }
     fn show_context_menu(&self, x: f64, y: f64) {
         self.area.grab_focus();
+        let link = self
+            .displayed_links
+            .borrow()
+            .target_at(x, y)
+            .map(str::to_owned);
+        self.link_menu.remove_all();
+        if let Some(uri) = &link {
+            let item = gio::MenuItem::new(Some("Copy Link _Address"), None);
+            item.set_action_and_target_value(Some("terminal.copy-link"), Some(&uri.to_variant()));
+            self.link_menu.append_item(&item);
+        }
+        self.copy_link_action.set_enabled(link.is_some());
         self.copy_action
             .set_enabled(self.selection.borrow().is_some());
         self.paste_action.set_enabled(
@@ -462,6 +491,7 @@ impl Terminal {
             1,
         )));
         self.context_menu.popup();
+        self.refresh_link_hover();
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         self.session.borrow().send(bytes)
@@ -857,11 +887,32 @@ impl Terminal {
             height,
             theme: self.theme.get(),
             selection,
+            hovered_link: self.hovered_link(e.hyperlinks, e.frame, (cw, ch)),
             matches,
             focused: self.area.has_focus(),
             exited,
         };
         draw(&mut self.renderer.borrow_mut(), &scene, &font, &context);
+        // This span is already painted. Refresh pointer state below without
+        // scheduling another frame just because the displayed map changed.
+        self.link_hover.set(scene.hovered_link);
+        let tooltip_changed = {
+            let mut displayed = self.displayed_links.borrow_mut();
+            let changed = displayed.revision != Some(e.hyperlink_revision);
+            let geometry_changed = displayed.metrics != (cw, ch)
+                || (displayed.frame.cols, displayed.frame.rows) != (e.frame.cols, e.frame.rows);
+            if changed {
+                displayed.links.clone_from(e.hyperlinks);
+                displayed.revision = Some(e.hyperlink_revision);
+            }
+            displayed.frame = e.frame;
+            displayed.metrics = (cw, ch);
+            changed || geometry_changed
+        };
+        self.refresh_link_hover();
+        if tooltip_changed && self.pointer_inside.get() {
+            self.area.trigger_tooltip_query();
+        }
         if scene.cursor_visible() {
             self.im.set_cursor_location(&gdk::Rectangle::new(
                 (e.frame.cursor_x as f64 * cw) as i32,

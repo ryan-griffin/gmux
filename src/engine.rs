@@ -105,8 +105,12 @@ pub struct Engine {
     pub frame: Frame,
     pub cells: Vec<Cell>,
     pub row_flags: Vec<u8>,
+    pub hyperlinks: gmux_client::hyperlinks::Hyperlinks,
     held_cells: Vec<Cell>,
     held_row_flags: Vec<u8>,
+    held_hyperlinks: gmux_client::hyperlinks::Hyperlinks,
+    link_revision: u64,
+    held_link_revision: u64,
     size: (u16, u16),
     find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
@@ -194,6 +198,10 @@ impl Engine {
         unsafe { gmux_engine_view_enter(self.raw.as_ptr(), view.raw.as_ptr()) }
         self.swap_view(view);
         let held = self.mode(2026);
+        if !held {
+            self.held_hyperlinks = Default::default();
+            self.held_link_revision = 0;
+        }
         if held {
             // Every held snapshot extracts all rows, so one scratch buffer
             // serves every view while preserving the normal incremental cells.
@@ -202,12 +210,16 @@ impl Engine {
             std::mem::swap(&mut self.cells, &mut self.held_cells);
             std::mem::swap(&mut self.row_flags, &mut self.held_row_flags);
             std::mem::swap(&mut self.frame, &mut view.held_frame);
+            std::mem::swap(&mut self.hyperlinks, &mut self.held_hyperlinks);
+            std::mem::swap(&mut self.link_revision, &mut self.held_link_revision);
         }
         let result = f(self);
         if held {
             std::mem::swap(&mut self.cells, &mut self.held_cells);
             std::mem::swap(&mut self.row_flags, &mut self.held_row_flags);
             std::mem::swap(&mut self.frame, &mut view.held_frame);
+            std::mem::swap(&mut self.hyperlinks, &mut self.held_hyperlinks);
+            std::mem::swap(&mut self.link_revision, &mut self.held_link_revision);
         }
         self.swap_view(view);
         unsafe { gmux_engine_view_leave(self.raw.as_ptr(), view.raw.as_ptr()) }
@@ -314,11 +326,15 @@ impl Engine {
             frame: Frame::default(),
             cells: vec![Cell::default(); 80 * 24],
             row_flags: vec![0; 24],
+            hyperlinks: Default::default(),
             size: (80, 24),
             find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
             held_cells: Vec::new(),
             held_row_flags: Vec::new(),
+            held_hyperlinks: Default::default(),
+            link_revision: 0,
+            held_link_revision: 0,
         };
         engine.set_theme(&Theme::adwaita(true))?;
         engine.set_cursor_style(CursorStyle::default())?;
@@ -393,6 +409,65 @@ impl Engine {
         };
         anyhow::ensure!(result >= 0, "Ghostty render-state update failed");
         self.history = unsafe { gmux_engine_history_state(self.raw.as_ptr()) };
+        if !self.mode(2026) {
+            self.held_hyperlinks = Default::default();
+            self.held_link_revision = 0;
+        }
+        // The C snapshot owns hold-time targets. Never resolve a held cell
+        // against the terminal's newer, hidden grid.
+        let revision = unsafe { gmux_engine_links_revision(self.raw.as_ptr()) };
+        if revision == self.link_revision {
+            return Ok(result != 0);
+        }
+        self.link_revision = revision;
+        let mut links = std::mem::take(&mut self.hyperlinks);
+        links.spans.clear();
+        struct Capture<'a> {
+            links: &'a mut gmux_client::hyperlinks::Hyperlinks,
+            targets: usize,
+        }
+        unsafe extern "C" fn collect(
+            ud: *mut c_void,
+            start: u32,
+            end: u32,
+            target: u32,
+            uri: *const u8,
+            len: usize,
+        ) {
+            let capture = unsafe { &mut *ud.cast::<Capture<'_>>() };
+            if end == 0 {
+                let bytes = unsafe { std::slice::from_raw_parts(uri, len) };
+                let text = std::str::from_utf8(bytes).unwrap_or("");
+                let index = capture.targets;
+                if let Some(previous) = capture.links.targets.get_mut(index) {
+                    previous.clear();
+                    previous.push_str(text);
+                } else {
+                    capture.links.targets.push(text.to_owned());
+                }
+                capture.targets += 1;
+            } else {
+                capture.links.spans.push([start, end, target]);
+            }
+        }
+        let mut capture = Capture {
+            links: &mut links,
+            targets: 0,
+        };
+        unsafe {
+            gmux_engine_links(
+                self.raw.as_ptr(),
+                Some(collect),
+                (&mut capture as *mut Capture<'_>).cast(),
+            )
+        };
+        let targets = capture.targets;
+        links.targets.truncate(targets);
+        if links.spans.is_empty() || links.validate(self.cells.len()).is_err() {
+            links = Default::default();
+        }
+        links.bound_capacity();
+        self.hyperlinks = links;
         Ok(result != 0)
     }
     pub(crate) fn cache_rows(
@@ -1422,6 +1497,8 @@ mod tests {
                             for endpoint in base..base + engine.cells.len() {
                                 let predicted = preview.range(
                                     &ScreenSnapshot {
+                                        hyperlinks: &Default::default(),
+                                        hyperlink_revision: 0,
                                         frame: engine.frame,
                                         cells: &engine.cells,
                                         row_flags: &engine.row_flags,
@@ -2403,3 +2480,6 @@ mod progress_tests {
         assert!(fresh.text().unwrap().contains("mixed text"));
     }
 }
+
+#[cfg(test)]
+mod hyperlink_tests;

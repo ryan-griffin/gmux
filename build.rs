@@ -44,7 +44,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         )
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
-        .allowlist_var("GMUX_(UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS)_.*")
+        .allowlist_var("GMUX_(UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK)_.*")
         .allowlist_function("gmux_engine_.*")
         .allowlist_function("gmux_checkpoint_history")
         .use_core()
@@ -75,16 +75,17 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
     // Check every named protocol code against the toolkit-free client values.
     // The C implementation maps pinned Ghostty enum names explicitly.
     for (prefix, module) in [
-        ("GMUX_UNDERLINE_", "underline"),
-        ("GMUX_MOUSE_SHAPE_", "mouse_shape"),
-        ("GMUX_DECORATION_", "decoration"),
+        ("GMUX_UNDERLINE_", "cells::underline"),
+        ("GMUX_MOUSE_SHAPE_", "cells::mouse_shape"),
+        ("GMUX_DECORATION_", "cells::decoration"),
+        ("GMUX_LINK_", "hyperlinks"),
     ] {
         let mut checked = 0;
         for line in generated.lines() {
             if let Some(rest) = line.strip_prefix(&format!("pub const {prefix}")) {
                 let (name, _) = rest.split_once(':').unwrap();
                 declarations.push_str(&format!(
-                    "const _: () = assert!({prefix}{name} == gmux_client::cells::{module}::{name} as u32);\n"
+                    "const _: () = assert!({prefix}{name} == gmux_client::{module}::{name} as u32);\n"
                 ));
                 checked += 1;
             }
@@ -101,6 +102,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=src/ghostty_bridge.c");
     println!("cargo:rerun-if-changed=src/ghostty_bridge.h");
+    println!("cargo:rerun-if-changed=src/ghostty_links.h");
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREFIX");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=scripts/bootstrap-ghostty.py");

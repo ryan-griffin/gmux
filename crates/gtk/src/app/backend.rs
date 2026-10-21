@@ -567,6 +567,12 @@ impl Ui {
                 self.set_filter(filter);
                 Ok(json!({"ok": true}))
             }
+            PublicRequest::Pane(PaneRequest::Links { pane }) => {
+                let id = pane
+                    .map(|id| self.sessions.borrow().default_handle(id))
+                    .transpose()?;
+                Ok(self.pane(id)?.links())
+            }
             PublicRequest::Pane(PaneRequest::Send {
                 pane,
                 text,
