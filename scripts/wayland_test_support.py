@@ -94,7 +94,8 @@ def _run(script, arguments):
             processes.append(subprocess.Popen(["wireplumber", "--profile=video-only"], stdout=log, stderr=log))
             processes.append(subprocess.Popen([
                 "mutter", "--headless", "--wayland", "--no-x11",
-                "--virtual-monitor=1280x960@60", "--wayland-display=gmux-test",
+                "--virtual-monitor=1280x960@" + os.environ.get("GMUX_TEST_REFRESH_RATE", "60"),
+                "--wayland-display=gmux-test",
             ], stdout=log, stderr=log))
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             def ready():

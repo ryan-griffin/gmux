@@ -22,6 +22,10 @@ impl Packet {
                 .map_or(0, |git| git.directory.capacity() + git.branch.capacity())
             + header.rows.capacity() * size_of::<u16>()
             + header.row_flags.capacity()
+            + header
+                .cache
+                .as_ref()
+                .map_or(0, |cache| cache.row_flags.capacity())
             + header.notifications.capacity() * size_of::<String>()
             + header
                 .notifications

@@ -85,6 +85,10 @@ typedef struct {
 
 typedef struct GmuxEngine GmuxEngine;
 typedef struct GmuxView GmuxView;
+typedef struct {
+    uint64_t generation;
+    uint64_t origin;
+} GmuxHistory;
 // Per-frontend rendering, scroll anchors, and selections over one terminal.
 GmuxView *gmux_engine_view_new(GmuxEngine *engine);
 void gmux_engine_view_free(GmuxView *view);
@@ -130,6 +134,8 @@ void gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
 int gmux_engine_cursor_style(GmuxEngine *engine, uint8_t style);
 int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch);
 int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCell *cells, size_t cap, uint8_t *row_flags);
+GmuxHistory gmux_engine_history_state(GmuxEngine *engine);
+int gmux_engine_styled_rows(GmuxEngine *engine, uint32_t start, size_t rows, GmuxCell *cells, size_t cols, uint8_t *flags);
 int gmux_engine_selection_origin(GmuxEngine *engine, uint64_t *origin);
 void gmux_engine_scroll(GmuxEngine *engine, intptr_t delta, bool bottom);
 void gmux_engine_scroll_to(GmuxEngine *engine, uint64_t row);

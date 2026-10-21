@@ -497,6 +497,7 @@ impl Ui {
                     "window_scale": self.window.scale_factor(),
                     "window_size": [self.window.width(), self.window.height()],
                     "frame_counter": self.window.frame_clock().map(|clock| clock.frame_counter()),
+                    "frame_interval_us": self.sessions.borrow().frame_interval().as_micros(),
                     "viewport": pane.map(|pane| pane.renderer_geometry()),
                 }))
             }

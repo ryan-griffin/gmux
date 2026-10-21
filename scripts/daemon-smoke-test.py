@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         header = json.loads(body[4:4 + header_size])
         cells = body[4 + header_size:]
         if header["frame"]:
-            assert len(cells) == len(header["rows"]) * header["frame"]["cols"] * 75
+            assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header["frame"]["cols"] * 75
         else:
             assert not cells
         return header, cells

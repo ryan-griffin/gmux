@@ -59,6 +59,8 @@ inside this session. It uses Mutter's private RemoteDesktop and ScreenCast
 interfaces, so a Mutter update may require fixture changes.
 
 Use `GSK_RENDERER=vulkan`, `gl`, or `cairo` to select a rendering backend.
+Set `GMUX_TEST_REFRESH_RATE=144` to exercise the native suites on a 144 Hz
+virtual monitor; the default is 60 Hz.
 
 ## CI and failures
 

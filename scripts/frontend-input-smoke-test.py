@@ -26,10 +26,12 @@ def wire(method, **params):
 class Client:
     def __init__(self, fixture, pane):
         self.pane = pane
+        self.reply_bytes = self.viewport_rows = self.cache_rows = 0
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(6)
         self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
         self.send("attach", version=PROTOCOL_VERSION, daemon=fixture.rpc("_hello")["daemon"])
+        self.send("frame-interval", micros=args.frame_interval_us)
 
     def send(self, method, **params):
         self.socket.sendall(wire(method, pane=self.pane, **params))
@@ -48,8 +50,12 @@ class Client:
             size, = struct.unpack("<I", self.exact(4))
             assert 4 <= size <= 16 * 1024 * 1024
             body = self.exact(size)
+            self.reply_bytes += size + 4
             header_size, = struct.unpack("<I", body[:4])
             header = json.loads(body[4:4 + header_size])
+            if header["meta"]["id"] == self.pane and header["frame"]:
+                self.viewport_rows += len(header["rows"])
+                self.cache_rows += len((header.get("cache") or {}).get("row_flags", []))
             cells = body[4 + header_size:]
             text = b"".join(cells[i:i + 64].split(b"\0", 1)[0]
                             for i in range(0, len(cells), 75)).decode()
@@ -103,7 +109,11 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", type=Path)
 parser.add_argument("--measure", action="store_true", help="Report baseline timings without latency assertions")
 parser.add_argument("--report", type=Path)
+parser.add_argument("--frame-interval-us", type=int, default=16000)
 args = parser.parse_args()
+if not 1000 <= args.frame_interval_us <= 1_000_000:
+    parser.error("--frame-interval-us must be between 1000 and 1000000")
+cadence = args.frame_interval_us / 1_000_000
 binary = args.binary or cargo_binary("gmux")
 results = []
 
@@ -133,8 +143,15 @@ while True:
             time.sleep(.001)
         os.write(1, b"\\x1b]2;unchanged-done\\x07")
     elif key == b"h":
-        os.write(1, b"\\x1b[?1049l\\x1b[2J\\x1b[H" + b"history\\r\\n" * 2048
+        os.write(1, b"\\x1b[?1049l\\x1b[2J\\x1b[H" + b"".join(f"history{index:04}\\r\\n".encode() for index in range(2048))
                  + b"\\x1b]2;history-ready\\x07")
+    elif key == b"r":
+        for index in range(160):
+            os.write(1, f"row-output-{index:04}\\r\\n".encode())
+            time.sleep(.001)
+        os.write(1, b"\\x1b]2;rows-done\\x07")
+    elif key == b"w":
+        os.write(1, b"\\x1b7\\x1b[24;1Hhistory-edit\\x1b8\\x1b]2;history-edited\\x07")
     else:
         response += 1
         os.write(1, f"\\x1b[HPROBE{response:06d}".encode())
@@ -195,8 +212,48 @@ while True:
             start = time.monotonic()
             client.send("input", bytes=[ord("b")])
             client.until(streamed)
-            limit = int((time.monotonic() - start) / .016) + 3
+            limit = int((time.monotonic() - start) / cadence) + 3
             assert 2 <= len(frames) <= limit, f"Streaming output produced {len(frames)} viewport packets"
+        with scenario("connections independently follow high and low refresh intervals"):
+            slow = Client(fixture, pane)
+            try:
+                slow.send("subscribe", panes=[pane])
+                slow.until(lambda h, text: h["meta"]["id"] == pane and h["frame"])
+                client.send("frame-interval", micros=4167)
+                slow.send("frame-interval", micros=32000)
+                samples = {"fast": [], "slow": []}
+                errors = []
+                def receive(source, name):
+                    def update(header, text):
+                        if header["meta"]["id"] != pane or not header["frame"]:
+                            return False
+                        if "STREAM_DONE" in text:
+                            return bool(samples[name])
+                        if "STREAM" in text:
+                            samples[name].append(time.monotonic())
+                        return False
+                    try:
+                        source.until(update)
+                    except Exception as error:
+                        errors.append(error)
+                reader = threading.Thread(target=receive, args=(slow, "slow"))
+                reader.start()
+                client.send("input", bytes=[ord("b")])
+                receive(client, "fast")
+                reader.join(8)
+                assert not reader.is_alive() and not errors, errors
+                assert len(samples["fast"]) >= 2 * len(samples["slow"]) >= 4, samples
+                intervals = {name: statistics.median(b - a for a, b in zip(values, values[1:])) * 1000
+                             for name, values in samples.items()}
+                assert intervals["fast"] < 12, intervals
+                assert intervals["slow"] >= 24, intervals
+                report = dict(kind="display-pacing", packets={name: len(values) for name, values in samples.items()},
+                              median_interval_ms=intervals)
+                results.append(report)
+                print(json.dumps(report), flush=True)
+            finally:
+                slow.close()
+                client.send("frame-interval", micros=args.frame_interval_us)
         with scenario("repeated identical output still coalesces viewport extraction"):
             time.sleep(.025)
             before = fixture.rpc("status")["snapshots"]
@@ -205,7 +262,7 @@ while True:
             client.until(lambda h, text: h["meta"]["id"] == pane
                          and h["meta"]["title"] == "unchanged-done")
             snapshots = fixture.rpc("status")["snapshots"] - before
-            limit = int((time.monotonic() - start) / .016) + 4
+            limit = int((time.monotonic() - start) / cadence) + 4
             assert snapshots <= limit, f"Identical output extracted {snapshots} viewports"
         with scenario("search batches stay paced when no matches change the visible state"):
             client.send("input", bytes=[ord("h")])
@@ -220,8 +277,64 @@ while True:
             elapsed = time.monotonic() - start
             # Each turn scans at most 64 rows. Allow an immediate first batch
             # and an extra metadata pass, but require pacing for the rest.
-            minimum = ((history_rows + 63) // 64 - 2) * .016
+            minimum = ((history_rows + 63) // 64 - 2) * cadence
             assert elapsed >= minimum, dict(elapsed=elapsed, rows=history_rows, completed=completed)
+        with scenario("scrolling reuses overlapping rows and bounds history prefetch"):
+            client.send("find", query="")
+            base_row = history_rows // 3
+            client.send("scroll-to", row=base_row, serial=1)
+            initial = client.until(lambda h, text: h["meta"]["id"] == pane
+                                   and h["frame"] and h["scroll_serial"] == 1)
+            generation = initial["generation"]
+            before = client.reply_bytes, client.viewport_rows, client.cache_rows
+            rss = memory(daemon.pid)
+            started = time.monotonic()
+            for serial in range(2, 66):
+                client.send("scroll-to", row=base_row + serial - 1, serial=serial)
+                header = client.until(lambda h, text: h["meta"]["id"] == pane
+                                      and h["frame"] and h["scroll_serial"] == serial)
+                assert header["generation"] == generation, header
+                assert header.get("row_shift") == 1, header
+                assert header["rows"] == [header["frame"]["rows"] - 1], header
+            viewport_rows = client.viewport_rows - before[1]
+            cache_rows = client.cache_rows - before[2]
+            frame = header["frame"]
+            report = dict(kind="scroll-bandwidth", steps=64,
+                          frame_interval_us=args.frame_interval_us,
+                          elapsed_ms=(time.monotonic() - started) * 1000,
+                          reply_bytes=client.reply_bytes - before[0], viewport_rows=viewport_rows,
+                          cache_rows=cache_rows, full_grid_cell_bytes=64 * frame["cols"] * frame["rows"] * 75,
+                          daemon_rss_before_kib=rss["VmRSS"], daemon_rss_after_kib=memory(daemon.pid)["VmRSS"])
+            assert viewport_rows == 64, report
+            assert cache_rows <= 2 * frame["rows"] * 5, report
+            assert report["reply_bytes"] < report["full_grid_cell_bytes"] / 2, report
+            results.append(report)
+            print(json.dumps(report), flush=True)
+        with scenario("off-screen writes invalidate only mutable rows without sending a viewport"):
+            client.send("scroll-to", row=history_rows - frame["rows"] - 20, serial=100)
+            cached = client.until(lambda h, text: h["meta"]["id"] == pane
+                                  and h["frame"] and h["scroll_serial"] == 100)
+            assert cached.get("cache"), cached
+            client.send("input", bytes=[ord("w")])
+            edited = client.until(lambda h, text: h["meta"]["id"] == pane
+                                  and h["meta"]["title"] == "history-edited")
+            assert edited["frame"] is None and not edited["rows"], edited
+            assert edited["generation"] == cached["generation"], edited
+            assert edited["cache_valid_before"] == history_rows - frame["rows"], edited
+            generation = edited["generation"]
+        with scenario("scrolling preserves cached history during output without resending windows"):
+            frames = []
+            before = client.cache_rows
+            def scrolling_output(header, text):
+                if header["meta"]["id"] == pane and header["frame"]:
+                    assert header["generation"] == generation, header
+                    frames.append(header["frame"]["scrollback"]["offset"])
+                    client.send("scroll-to", row=base_row + len(frames), serial=1000 + len(frames))
+                return header["meta"]["id"] == pane and header["meta"]["title"] == "rows-done"
+            client.send("input", bytes=[ord("r")])
+            client.until(scrolling_output)
+            assert len(frames) >= 2, frames
+            assert client.cache_rows - before <= frame["rows"] * 10, client.cache_rows - before
     finally:
         client.close()
 

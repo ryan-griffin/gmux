@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gmux_client::connection::Connection;
@@ -68,6 +68,7 @@ pub struct Connections {
     snapshot: Option<CommandReply>,
     attached: HashSet<u64>,
     focused: Cell<bool>,
+    frame_interval: Duration,
     status_changed: bool,
 }
 pub struct Route {
@@ -164,6 +165,7 @@ impl Connections {
             snapshot: None,
             attached: HashSet::new(),
             focused: Cell::new(false),
+            frame_interval: gmux_client::transport::DEFAULT_FRAME_INTERVAL,
             status_changed: false,
         };
         let initial = hub.combined(CommandOutput::Done { ok: true }.into());
@@ -370,6 +372,13 @@ impl Connections {
         self.origins
             .values()
             .filter_map(|origin| origin.link.next_retry())
+            .min()
+    }
+    /// Earliest deadline among attached connections' coalesced scroll targets.
+    pub fn next_scroll(&self) -> Option<Instant> {
+        self.origins
+            .values()
+            .filter_map(|origin| origin.link.next_scroll())
             .min()
     }
     pub fn connect(&mut self, id: DaemonId) {
@@ -618,6 +627,20 @@ impl Connections {
         }
         Ok(())
     }
+    pub fn set_frame_interval(&mut self, interval: Duration) {
+        if self.frame_interval == interval {
+            return;
+        }
+        self.frame_interval = interval;
+        for origin in self.origins.values_mut() {
+            if let Some(manager) = origin.link.manager_mut() {
+                manager.set_frame_interval(interval);
+            }
+        }
+    }
+    pub fn frame_interval(&self) -> Duration {
+        self.frame_interval
+    }
     pub fn attach(&mut self, id: u64, theme: &Theme) -> anyhow::Result<SessionHandle> {
         let reference = self.pane_ref(id);
         let manager = self
@@ -779,6 +802,9 @@ impl Connections {
                         eprintln!("Could not set connection focus: {error}");
                     }
                     origin.revision = 0;
+                }
+                if let Some(manager) = origin.link.manager_mut() {
+                    manager.set_frame_interval(self.frame_interval);
                 }
             }
             for (id, update) in update.panes {

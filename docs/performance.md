@@ -47,6 +47,33 @@ and texture download for unchanged, single-row, scrolling, and full-screen
 updates. It reports median and p95 durations, row rebuild counts, and cache sizes.
 See [terminal rendering](renderer.md#benchmarks) for commands and timing limits.
 
+## Remote scrolling
+
+```sh
+cargo run --locked --release -p gmux-client --example scroll-benchmark \
+  > artifacts/scroll-latency.json
+cargo run --locked --release -p gmux-client --example scroll-benchmark -- 0 \
+  > artifacts/local-scroll-latency.json
+python3 scripts/frontend-input-smoke-test.py --binary target/release/gmux \
+  --frame-interval-us 6944 --report artifacts/frontend-input.json
+GMUX_TEST_REFRESH_RATE=144 python3 scripts/check.py --native --only terminal-input
+```
+
+The client benchmark compares cached and uncached viewport updates with a
+simulated reply delay, defaulting to 100 ms. Pass `0` for Unix socket timings
+without an added delay. It measures the session snapshot, excluding GTK
+and display presentation. The frontend-input suite measures wire bytes for 64
+single-row scrolls and reports daemon RSS before and after the trace. Its full-grid
+cell-byte count is a reference for sending one complete viewport per step. It
+also checks that connections with different display intervals remain independent
+and that output preserves unchanged history without repeatedly sending windows.
+
+The native suite pauses viewport replies during touchpad reversals and verifies
+that cached content follows the local scrollbar while live screen output continues.
+It also checks GTK's display interval. Its report includes observed
+input-to-snapshot timing, reply bytes, and retained history-cache bytes. This
+timing includes test IPC and excludes compositor presentation.
+
 ## Accessible text
 
 ```sh

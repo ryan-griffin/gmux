@@ -10,13 +10,14 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 24;
+pub const VERSION: u32 = 26;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 16 * 1024 * 1024;
 pub const CELL_BYTES: usize = 75;
+pub const DEFAULT_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
@@ -40,6 +41,12 @@ pub struct GitMetadata {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+pub struct CachedRows {
+    pub start: u64,
+    pub row_flags: Vec<u8>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
 pub struct Header {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<crate::control::CommandReply>,
@@ -48,6 +55,18 @@ pub struct Header {
     pub meta: Metadata,
     pub frame: Option<Frame>,
     pub scroll_serial: u64,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub cache_origin: u64,
+    /// Discard previously cached rows at or beyond this screen row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_valid_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub row_shift: i16,
+    /// Extra history rows, stored after the viewport's changed cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CachedRows>,
     pub rows: Vec<u16>,
     /// Flags corresponding to `rows`; empty means every changed row is unwrapped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -61,6 +80,10 @@ pub struct Header {
     #[serde(default)]
     pub selection_origin: Option<u64>,
     pub copy: Option<String>,
+}
+
+fn is_zero(value: &i16) -> bool {
+    *value == 0
 }
 
 pub struct Packet {
@@ -128,6 +151,16 @@ impl Packet {
             reader.read_exact(&mut bytes)?;
             serde_json::from_slice::<Header>(&bytes)?
         };
+        if let Some(end) = header.cache_valid_before {
+            anyhow::ensure!(
+                header.generation != 0
+                    && header.cache_origin.checked_add(end).is_some()
+                    && header
+                        .frame
+                        .is_none_or(|frame| end <= frame.scrollback.total),
+                "Invalid history cache boundary"
+            );
+        }
         anyhow::ensure!(
             header.row_flags.is_empty()
                 || (header.row_flags.len() == header.rows.len()
@@ -138,6 +171,13 @@ impl Packet {
             let cols = frame.cols as usize;
             let rows = frame.rows as usize;
             anyhow::ensure!(
+                header
+                    .cache_origin
+                    .checked_add(frame.scrollback.total)
+                    .is_some(),
+                "Invalid history origin"
+            );
+            anyhow::ensure!(
                 crate::viewport::valid(cols as u64, rows as u64),
                 "Invalid viewport dimensions"
             );
@@ -147,9 +187,39 @@ impl Packet {
                     && header.rows.iter().all(|r| (*r as usize) < rows),
                 "Invalid viewport row indices"
             );
-            header.rows.len() * cols
+            anyhow::ensure!(
+                (header.row_shift.unsigned_abs() as usize) < rows,
+                "Invalid viewport row shift"
+            );
+            let exposed = if header.row_shift > 0 {
+                rows - header.row_shift as usize..rows
+            } else {
+                0..header.row_shift.unsigned_abs() as usize
+            };
+            anyhow::ensure!(
+                exposed
+                    .into_iter()
+                    .all(|row| header.rows.binary_search(&(row as u16)).is_ok()),
+                "Missing exposed viewport rows"
+            );
+            let cached = if let Some(cache) = &header.cache {
+                anyhow::ensure!(
+                    cache.row_flags.len() <= crate::scroll_cache::capacity(cols)
+                        && cache.row_flags.iter().all(|flag| flag & !1 == 0)
+                        && cache.start <= frame.scrollback.total
+                        && cache.row_flags.len() as u64 <= frame.scrollback.total - cache.start,
+                    "Invalid cached rows"
+                );
+                cache.row_flags.len()
+            } else {
+                0
+            };
+            (header.rows.len() + cached) * cols
         } else {
-            anyhow::ensure!(header.rows.is_empty(), "Rows require a frame");
+            anyhow::ensure!(
+                header.rows.is_empty() && header.cache.is_none() && header.row_shift == 0,
+                "Rows require a frame"
+            );
             0
         };
         anyhow::ensure!(
@@ -254,6 +324,45 @@ mod tests {
             cells: vec![cell, Cell::default()],
         }
     }
+    #[test]
+    fn cached_rows_round_trip_and_invalid_scroll_storage_is_rejected() {
+        let mut packet = packet();
+        packet.header.generation = 1;
+        packet.header.cache_origin = 42;
+        packet.header.cache_valid_before = Some(200);
+        packet.header.row_shift = -1;
+        packet.header.rows = vec![0];
+        packet.header.cache = Some(CachedRows {
+            start: 196,
+            row_flags: vec![0, 1, 0],
+        });
+        packet.cells.resize(8, Cell::default());
+        let mut bytes = Vec::new();
+        packet.encode_into(&mut bytes).unwrap();
+        let decoded = Packet::read(&mut &bytes[..]).unwrap();
+        assert_eq!(decoded.cells.len(), 8);
+        assert_eq!(decoded.header.cache_origin, 42);
+        assert_eq!(decoded.header.cache_valid_before, Some(200));
+        assert_eq!(decoded.header.cache.unwrap().row_flags, [0, 1, 0]);
+        for (shift, start, flags) in [
+            (3, 196, vec![0]),
+            (-3, 196, vec![0]),
+            (0, u64::MAX, vec![0]),
+            (0, 499, vec![0, 0]),
+            (0, 0, vec![2]),
+            (0, 0, vec![0; crate::scroll_cache::MAX_ROWS + 1]),
+        ] {
+            packet.header.row_shift = shift;
+            packet.header.cache = Some(CachedRows {
+                start,
+                row_flags: flags,
+            });
+            bytes.clear();
+            packet.encode_into(&mut bytes).unwrap();
+            assert!(Packet::read(&mut &bytes[..]).is_err());
+        }
+    }
+
     #[test]
     fn binary_rows_round_trip_without_losing_cell_flags_or_unicode() {
         let packet = packet();

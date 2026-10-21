@@ -147,6 +147,10 @@ impl Connection {
             _ => None,
         }
     }
+    /// Earliest deadline among this connection's coalesced scroll targets.
+    pub fn next_scroll(&self) -> Option<Instant> {
+        self.manager().and_then(|manager| manager.next_scroll())
+    }
     pub fn status(&self) -> Status<'_> {
         match &self.state {
             State::Disconnected {

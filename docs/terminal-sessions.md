@@ -38,14 +38,21 @@ layout topology or other live windows' choices.
 
 ## Ownership and scheduling
 
-The daemon reads nonblocking PTYs in one `poll` loop, with a 512 KiB read budget
+The daemon reads nonblocking PTYs in one `ppoll` loop, with a 512 KiB read budget
 per ready pane and an 8 MiB pending-input limit per pane. An idle detached daemon
-blocks in `poll`. Signals, sockets, and disk-worker completions wake it.
-Attached views receive viewport batches at most every 16 ms and process metadata
-once a second. Dirty viewport extraction, visible presentation changes, and
+blocks in `ppoll`. Signals, sockets, and disk-worker completions wake it.
+Each connection paces viewport batches independently. GTK reports its display's
+refresh interval; other clients default to 16 ms. Submillisecond deadlines retain
+their precision, and metadata is refreshed once a second. Dirty viewport extraction, visible presentation changes, and
 incremental history-search batches restart the frame interval. Metadata packets
 and passes without that work do not postpone the next visible response. Hidden
 panes keep parsing output without extracting viewports.
+
+Output preserves cached scrollback rows and invalidates the previously mutable
+screen rows. Pruning advances the history origin without discarding surviving
+rows. Clears, reflow, screen switches, and palette or theme changes reset the
+cache. Immutable history can be prefetched during output; live screen prefetch
+waits for 100 ms of quiet.
 
 GTK owns rendering, fonts, the clipboard, and accessible text. An `eventfd` wakes
 the frontend when packets or requests arrive. Both sides process bounded batches

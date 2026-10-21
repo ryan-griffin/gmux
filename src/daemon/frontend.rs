@@ -13,6 +13,13 @@ pub(super) struct SentScreen {
     pub(super) frame: Frame,
     pub(super) cells: Vec<Cell>,
     pub(super) row_flags: Vec<u8>,
+    source_revision: Option<u64>,
+    generation: u64,
+    history_generation: u64,
+    cache_origin: u64,
+    cached: std::ops::Range<u64>,
+    cache_active: bool,
+    prefetch_at: Option<Instant>,
 }
 pub(super) struct SentSelection {
     range: Option<(u64, u64)>,
@@ -47,6 +54,9 @@ pub(super) struct Frontend {
     pub(super) sizes: HashMap<u64, TerminalSize>,
     pub(super) focused: bool,
     pub(super) changed: HashSet<u64>,
+    terminal_changed: HashSet<u64>,
+    frame_interval: Duration,
+    next_frame: Instant,
 }
 pub(super) struct Paste {
     pub(super) pane: u64,
@@ -85,6 +95,9 @@ impl Frontend {
             sizes: HashMap::new(),
             focused: false,
             changed: HashSet::new(),
+            terminal_changed: HashSet::new(),
+            frame_interval: transport::DEFAULT_FRAME_INTERVAL,
+            next_frame: Instant::now(),
         }
     }
     fn compact_output(&mut self) {
@@ -296,6 +309,15 @@ impl Daemon {
         if let StreamCommand::Ping = command {
             return frontend.queue_encoded(transport::HEARTBEAT_REPLY);
         }
+        if let StreamCommand::FrameInterval { micros } = command {
+            anyhow::ensure!(
+                (1_000..=1_000_000).contains(&micros),
+                "Invalid frame interval"
+            );
+            frontend.frame_interval = Duration::from_micros(micros as u64);
+            frontend.next_frame = Instant::now();
+            return Ok(());
+        }
         if let StreamCommand::Focused { active } = command {
             // Keep the last focused client as size owner while another app has focus.
             if active {
@@ -494,14 +516,29 @@ impl Daemon {
             }
             StreamCommand::Theme { theme } => {
                 view.set_theme(&theme);
+                if let Some(screen) = frontend.screens.get_mut(&id) {
+                    screen.source_revision = None;
+                }
             }
             StreamCommand::Style { style, blink } => {
                 view.set_cursor_style(style)?;
                 view.set_cursor_blink(blink)?;
             }
+            StreamCommand::Scroll { delta, bottom } => {
+                session.with_view(view, |engine| engine.scroll(delta, bottom));
+            }
+            StreamCommand::ScrollTo { row, serial } => {
+                let previous = frontend.scroll_serials.entry(id).or_default();
+                if serial >= *previous {
+                    session.with_view(view, |engine| engine.scroll_to(row));
+                    *previous = serial;
+                }
+            }
             command => session.with_view(view, |engine| -> anyhow::Result<()> {
                 // Search navigation uses this client's current viewport metadata.
-                engine.snapshot()?;
+                if matches!(command, StreamCommand::FindAdvance { .. }) {
+                    engine.snapshot()?;
+                }
                 match command {
                     StreamCommand::Copy => {
                         anyhow::ensure!(
@@ -525,11 +562,6 @@ impl Daemon {
                         frontend.selection_serials.insert(id, serial);
                         engine.clear_selection();
                     }
-                    StreamCommand::Scroll { delta, bottom } => engine.scroll(delta, bottom),
-                    StreamCommand::ScrollTo { row, serial } => {
-                        engine.scroll_to(row);
-                        frontend.scroll_serials.insert(id, serial);
-                    }
                     _ => unreachable!(),
                 }
                 Ok(())
@@ -541,13 +573,16 @@ impl Daemon {
         }
         Ok(())
     }
-    pub(super) fn updates_pending(&self) -> bool {
-        self.frontends.values().any(|frontend| {
-            frontend.attached
-                && (!self.changed.is_empty()
+    pub(super) fn next_update(&self) -> Option<Instant> {
+        self.frontends
+            .values()
+            .filter(|frontend| frontend.attached)
+            .filter_map(|frontend| {
+                let pending = !self.changed.is_empty()
                     || !self.notifications.is_empty()
                     || !self.errors.is_empty()
                     || !frontend.changed.is_empty()
+                    || !frontend.terminal_changed.is_empty()
                     || frontend.state_revision != Some(self.revision)
                     || (!frontend.git_panes.is_empty()
                         && frontend.git_revision
@@ -555,25 +590,49 @@ impl Daemon {
                     || frontend
                         .views
                         .values()
-                        .any(crate::engine::EngineView::find_pending))
-        })
+                        .any(crate::engine::EngineView::find_pending);
+                let prefetch = frontend
+                    .screens
+                    .values()
+                    .filter_map(|screen| screen.prefetch_at)
+                    .min()
+                    .map(|at| at.max(frontend.next_frame));
+                pending
+                    .then_some(frontend.next_frame)
+                    .into_iter()
+                    .chain(prefetch)
+                    .min()
+            })
+            .min()
     }
-    /// Return whether viewport or search work used the frame interval.
-    pub(super) fn updates(&mut self, metadata_due: bool) -> bool {
+    /// Publish each connection's due updates without coupling display intervals.
+    pub(super) fn updates(&mut self, metadata_due: bool) {
         let before = self.frontends.len();
-        let mut frame_activity = false;
         let mut ids: Vec<_> = self.frontends.keys().copied().collect();
         ids.sort_by_key(|id| (!self.frontends[id].focused, *id));
         // Every client receives the same execution revision. Serialize each transport snapshot once per broadcast.
         let mut state = None;
         // Deliver each alert once, preferring a focused client. All clients receive unread state.
         let mut notifications = std::mem::take(&mut self.notifications);
+        for frontend in self
+            .frontends
+            .values_mut()
+            .filter(|frontend| frontend.attached)
+        {
+            frontend
+                .terminal_changed
+                .extend(self.changed.iter().copied());
+            frontend
+                .errors
+                .extend(self.errors.iter().map(|(&id, error)| (id, error.clone())));
+        }
         for id in ids {
             let mut frontend = self.frontends.remove(&id).unwrap();
-            if !frontend.attached {
+            if !frontend.attached || (!metadata_due && Instant::now() < frontend.next_frame) {
                 self.frontends.insert(id, frontend);
                 continue;
             }
+            let started = Instant::now();
             let result = (|| {
                 if frontend.state_revision != Some(self.revision) {
                     let bytes = state
@@ -587,15 +646,16 @@ impl Daemon {
             })();
             match result {
                 Ok(active) => {
-                    frame_activity |= active;
+                    if active {
+                        frontend.next_frame = started + frontend.frame_interval;
+                    }
                     self.frontends.insert(id, frontend);
                 }
                 Err(error) => eprintln!("Detaching frontend: {error}"),
             }
         }
-        if !self.frontends.values().any(|f| f.attached) {
-            self.notifications = notifications;
-        }
+        notifications.retain(|id, _| self.sessions.contains_key(id));
+        self.notifications = notifications;
         self.changed.clear();
         self.errors.clear();
         if self.frontends.len() != before {
@@ -603,7 +663,6 @@ impl Daemon {
             // Keep handoff changes pending even if survivors were already sent a frame.
             self.resize_sessions(None);
         }
-        frame_activity
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -667,9 +726,12 @@ impl Daemon {
                 .remove(&id)
                 .or_else(|| self.errors.get(&id).cloned());
             let mut copy = frontend.clipboard.remove(&id);
-            let terminal_changed = self.changed.contains(&id);
+            let terminal_changed = frontend.terminal_changed.contains(&id);
             let changed = terminal_changed
                 || frontend.changed.contains(&id)
+                || frontend.screens.get(&id).is_some_and(|screen| {
+                    screen.prefetch_at.is_some_and(|at| at <= Instant::now())
+                })
                 || frontend
                     .views
                     .get(&id)
@@ -699,6 +761,12 @@ impl Daemon {
             let mut rows = Vec::new();
             let mut cells = Vec::new();
             let mut row_flags = Vec::new();
+            let mut row_shift = 0;
+            let mut generation = 0;
+            let mut cache_origin = 0;
+            let mut cache_valid_before = None;
+            let mut cache = None;
+            let mut cache_invalidated = false;
             let (frame, find, selection, selection_origin) = if screen
                 || frontend.views.contains_key(&id)
             {
@@ -728,14 +796,63 @@ impl Daemon {
                         let cols = frame.cols as usize;
                         let old = frontend.screens.entry(id).or_default();
                         let full = old.frame.cols != frame.cols || old.frame.rows != frame.rows;
+                        let same_content = old.source_revision == Some(engine.revision) && !full;
+                        let reset = full
+                            || old.source_revision.is_none()
+                            || old.history_generation != engine.history.generation;
+                        let removed = if reset {
+                            0
+                        } else {
+                            engine.history.origin.saturating_sub(old.cache_origin)
+                        };
+                        if reset {
+                            cache_invalidated = old.cache_active;
+                            old.generation = old.generation.wrapping_add(1).max(1);
+                            old.cached = 0..0;
+                        } else if !same_content || removed != 0 {
+                            let valid = old
+                                .frame
+                                .scrollback
+                                .total
+                                .saturating_sub(old.frame.rows as u64)
+                                .saturating_sub(removed)
+                                .min(frame.scrollback.total.saturating_sub(frame.rows as u64));
+                            cache_valid_before = old.cache_active.then_some(valid);
+                            old.cached = old.cached.start.saturating_sub(removed)
+                                ..old.cached.end.saturating_sub(removed).min(valid);
+                            if old.cached.start >= old.cached.end {
+                                old.cached = 0..0;
+                            }
+                        }
+                        if !same_content {
+                            old.prefetch_at = (!engine.mode(2026)
+                                && !gmux_client::scroll_cache::window(frame).is_empty())
+                            .then(|| Instant::now() + Duration::from_millis(100));
+                        }
+                        old.source_revision = Some(engine.revision);
+                        old.history_generation = engine.history.generation;
+                        old.cache_origin = engine.history.origin;
+                        generation = old.generation;
+                        cache_origin = old.cache_origin;
                         if full {
                             old.cells.resize(cells_snapshot.len(), Cell::default());
                             old.row_flags.resize(frame.rows as usize, 0);
                         }
+                        let delta = frame.scrollback.offset as i128
+                            - old.frame.scrollback.offset.saturating_sub(removed) as i128;
+                        if !reset && delta != 0 && delta.unsigned_abs() < frame.rows as u128 {
+                            row_shift = delta as i16;
+                            gmux_client::scroll_cache::shift(&mut old.cells, cols, row_shift);
+                            gmux_client::scroll_cache::shift(&mut old.row_flags, 1, row_shift);
+                        }
                         for (row, data) in cells_snapshot.chunks_exact(cols).enumerate() {
                             let previous = &mut old.cells[row * cols..(row + 1) * cols];
                             let flags = engine.row_flags[row];
-                            if full || *previous != *data || old.row_flags[row] != flags {
+                            let exposed = (row_shift > 0
+                                && row >= frame.rows as usize - row_shift as usize)
+                                || (row_shift < 0 && row < row_shift.unsigned_abs() as usize);
+                            if full || exposed || *previous != *data || old.row_flags[row] != flags
+                            {
                                 rows.push(row as u16);
                                 row_flags.push(flags);
                                 old.row_flags[row] = flags;
@@ -746,9 +863,61 @@ impl Daemon {
                         self.sent_rows += rows.len() as u64;
                         // A client can discard every row while detached; attachment always resends a full viewport.
                         let serial = frontend.scroll_serials.get(&id).copied().unwrap_or(0);
+                        // Immutable history remains useful during output. Only
+                        // prefetch live screen rows after output has settled.
+                        if !engine.mode(2026) {
+                            let quiet = old.prefetch_at.is_none_or(|at| at <= Instant::now());
+                            let mut wanted = gmux_client::scroll_cache::window(frame);
+                            let history_end =
+                                frame.scrollback.total.saturating_sub(frame.rows as u64);
+                            if !quiet {
+                                wanted.end = wanted.end.min(history_end);
+                            }
+                            if wanted.start > wanted.end {
+                                wanted.start = wanted.end;
+                            }
+                            let margin = frame.rows as u64 / 2;
+                            let near = frame
+                                .scrollback
+                                .offset
+                                .saturating_sub(margin)
+                                .max(wanted.start)
+                                ..(frame.scrollback.offset + frame.rows as u64 + margin)
+                                    .min(wanted.end);
+                            if !wanted.is_empty()
+                                && (old.cached.start > near.start || old.cached.end < near.end)
+                            {
+                                let missing = if old.cached.start <= wanted.start
+                                    && old.cached.end >= wanted.start
+                                {
+                                    old.cached.end..wanted.end
+                                } else if old.cached.end >= wanted.end
+                                    && old.cached.start <= wanted.end
+                                {
+                                    wanted.start..old.cached.start
+                                } else {
+                                    wanted.clone()
+                                };
+                                if !missing.is_empty() {
+                                    let (extra, flags) = engine.cache_rows(missing.clone())?;
+                                    cells.extend(extra);
+                                    cache = Some(transport::CachedRows {
+                                        start: missing.start,
+                                        row_flags: flags,
+                                    });
+                                    old.cache_active = true;
+                                }
+                                old.cached = wanted.clone();
+                            }
+                            if quiet || wanted.end < history_end {
+                                old.prefetch_at = None;
+                            }
+                        }
                         let send = full
                             || !rows.is_empty()
                             || old.frame != frame
+                            || cache.is_some()
+                            || removed != 0
                             || frontend.sent_scroll_serials.get(&id) != Some(&serial);
                         old.frame = frame;
                         send.then_some(frame)
@@ -771,6 +940,8 @@ impl Daemon {
             let selection_changed = previous.is_none_or(|sent| sent.range != selection);
             let selection_ack_changed = previous.is_none_or(|sent| sent.serial != selection_serial);
             if frame.is_none()
+                && !cache_invalidated
+                && cache_valid_before.is_none()
                 && !find_changed
                 && !selection_changed
                 && !selection_ack_changed
@@ -812,6 +983,7 @@ impl Daemon {
                         selection_origin,
                         row_flags: Vec::new(),
                         copy: Some(text),
+                        ..Header::default()
                     },
                     cells: Vec::new(),
                 })?;
@@ -823,6 +995,11 @@ impl Daemon {
                     meta,
                     frame,
                     scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
+                    generation,
+                    cache_origin,
+                    cache_valid_before,
+                    row_shift,
+                    cache,
                     rows,
                     row_flags: if row_flags.iter().any(|flags| *flags != 0) {
                         row_flags
@@ -842,6 +1019,7 @@ impl Daemon {
             frame_activity |= viewport_changed;
         }
         frontend.changed.clear();
+        frontend.terminal_changed.clear();
         frontend.flush()?;
         Ok(frame_activity)
     }

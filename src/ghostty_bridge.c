@@ -57,6 +57,38 @@ static uint8_t underline_code(GhosttySgrUnderline style) {
     }
 }
 
+static GhosttyColorRgb resolve_color(GhosttyStyleColor color, GhosttyColorRgb fallback,
+    const GhosttyRenderStateColors *colors) {
+    switch (color.tag) {
+        case GHOSTTY_STYLE_COLOR_PALETTE: return colors->palette[color.value.palette];
+        case GHOSTTY_STYLE_COLOR_RGB: return color.value.rgb;
+        default: return fallback;
+    }
+}
+static inline void cell_style(GmuxCell *cell, const GhosttyStyle *style,
+    const GhosttyRenderStateColors *colors) {
+    cell->flags = style->bold | (style->italic << 1) | (style->faint << 2) |
+        (style->strikethrough << 4) | (style->invisible << 5);
+    cell->decoration = underline_code(style->underline) |
+        (style->overline ? GMUX_DECORATION_OVERLINE : 0);
+    const GhosttyColorRgb *underline = NULL;
+    switch (style->underline_color.tag) {
+        case GHOSTTY_STYLE_COLOR_PALETTE:
+            underline = &colors->palette[style->underline_color.value.palette]; break;
+        case GHOSTTY_STYLE_COLOR_RGB:
+            underline = &style->underline_color.value.rgb; break;
+        default: break;
+    }
+    if (underline) {
+        cell->decoration |= GMUX_DECORATION_UNDERLINE_COLOR;
+        memcpy(cell->underline_color, underline, 3);
+    }
+}
+static void replacement_text(GmuxCell *cell) {
+    memset(cell->text, 0, sizeof(cell->text));
+    memcpy(cell->text, "\xef\xbf\xbd", 3);
+}
+
 // Keep the moving libghostty ABI on this side of the Rust boundary.
 typedef struct {
     uint8_t background[3], foreground[3], cursor[3], ansi[16][3];
@@ -71,6 +103,18 @@ typedef struct {
     uint8_t mode, valid;
     bool anchor_empty, current_empty;
 } SelectionCache;
+
+typedef struct {
+    GmuxHistory state;
+    GhosttyTrackedGridRef anchor, previous;
+    size_t history_rows;
+    uint16_t cols, rows;
+    GhosttyTerminalScreen screen;
+    GhosttyColorRgb foreground, background, palette[256];
+    bool reverse;
+    uint64_t reset;
+    uint64_t text_generation;
+} HistoryCache;
 
 struct GmuxEngine {
     GhosttyTerminal terminal;
@@ -95,6 +139,9 @@ struct GmuxEngine {
     bool clear_pending;
     Appearance appearance, applied;
     int appearance_error;
+    HistoryCache history;
+    HistoryCache *view_history;
+    uint64_t history_reset;
 };
 
 struct GmuxView {
@@ -108,6 +155,7 @@ struct GmuxView {
     bool captured;
     bool active;
     Appearance appearance;
+    HistoryCache history;
 };
 
 static int apply_appearance(GmuxEngine *e, const Appearance *appearance) {
@@ -168,6 +216,9 @@ void gmux_engine_view_set_active(GmuxView *v, bool active) {
     if (!active) {
         ghostty_render_state_free(v->render); v->render=NULL;
         v->captured=false;
+        ghostty_tracked_grid_ref_free(v->history.anchor); v->history.anchor=NULL;
+        ghostty_tracked_grid_ref_free(v->history.previous); v->history.previous=NULL;
+        v->history.state.generation=0;
     }
 }
 void gmux_engine_view_free(GmuxView *v) {
@@ -181,12 +232,15 @@ void gmux_engine_view_free(GmuxView *v) {
     ghostty_tracked_grid_ref_free(v->selection_start);
     ghostty_tracked_grid_ref_free(v->selection_end);
     ghostty_tracked_grid_ref_free(v->selection_anchor);
+    ghostty_tracked_grid_ref_free(v->history.anchor);
+    ghostty_tracked_grid_ref_free(v->history.previous);
     ghostty_render_state_free(v->render);
     free(v);
 }
 void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
     gmux_engine_expire_render_hold(e);
     swap_view(e, v);
+    e->view_history = &v->history;
     e->appearance_error=apply_appearance(e, &v->appearance);
     v->held_used=e->held && v->captured; e->view_held=e->held;
     if (v->held_used) {
@@ -215,6 +269,7 @@ void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
         GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
     }
     e->view_held=false;
+    e->view_history = NULL;
     // Restore the size owner's defaults before parsing PTY output or answering queries.
     e->appearance_error=apply_appearance(e, &e->appearance);
     swap_view(e, v);
@@ -308,6 +363,8 @@ void gmux_engine_free(GmuxEngine *e) {
     ghostty_tracked_grid_ref_free(e->selection_start);
     ghostty_tracked_grid_ref_free(e->selection_end);
     ghostty_tracked_grid_ref_free(e->selection_anchor);
+    ghostty_tracked_grid_ref_free(e->history.anchor);
+    ghostty_tracked_grid_ref_free(e->history.previous);
     ghostty_key_event_free(e->key);
     ghostty_mouse_event_free(e->mouse);
     ghostty_mouse_encoder_free(e->mouse_encoder);
@@ -580,6 +637,7 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
     // ED2 can move prompt rows into history, so erase history afterwards.
     const char clear[] = "\x1b[2J\x1b[3J\x1b[H";
     e->text_generation++;
+    e->history_reset++;
     ghostty_terminal_vt_write(e->terminal, (const uint8_t *)clear, sizeof(clear) - 1);
     gmux_engine_clear_selection(e);
     for (GmuxView *v = e->views; v; v = v->next) {
@@ -604,7 +662,10 @@ int gmux_engine_resize(GmuxEngine *e, uint16_t cols, uint16_t rows, uint32_t cw,
     uint16_t previous_cols = 0, previous_rows = 0;
     ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &previous_cols);
     ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ROWS, &previous_rows);
-    if (cols != previous_cols || rows != previous_rows) e->text_generation++;
+    if (cols != previous_cols || rows != previous_rows) {
+        e->text_generation++;
+        e->history_reset++;
+    }
     return ghostty_terminal_resize(e->terminal, cols, rows, cw, ch);
 }
 void gmux_engine_scroll(GmuxEngine *e, intptr_t delta, bool bottom) {
@@ -657,6 +718,71 @@ int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len, bool clipb
     paste.allow_unsafe = true;
     return ghostty_terminal_paste(e->terminal, &paste, NULL);
 }
+static int update_history_cache(GmuxEngine *e, const GmuxFrame *frame,
+    const GhosttyRenderStateColors *colors) {
+    HistoryCache *history = e->view_history ? e->view_history : &e->history;
+    GhosttyTerminalScreen screen;
+    GhosttyTerminalModeConfig reverse = {.mode = GHOSTTY_MODE_REVERSE_COLORS};
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen) ||
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_MODE, &reverse)) return -1;
+    bool reset = !history->state.generation || history->reset != e->history_reset ||
+        history->cols != frame->cols || history->rows != frame->rows || history->screen != screen ||
+        history->reverse != reverse.value ||
+        memcmp(&history->foreground, &colors->foreground, sizeof(history->foreground)) ||
+        memcmp(&history->background, &colors->background, sizeof(history->background)) ||
+        memcmp(history->palette, colors->palette, sizeof(history->palette));
+    if (!reset && history->text_generation == e->text_generation) return 0;
+    if (!reset && history->history_rows) {
+        // Two adjacent history rows distinguish pruning from references that
+        // collapse to the same fallback position after history is erased.
+        GhosttyPointCoordinate point, previous;
+        if (!history->anchor || ghostty_tracked_grid_ref_point(history->anchor,
+                GHOSTTY_POINT_TAG_SCREEN, &point) || point.y >= history->history_rows ||
+            point.y >= frame->scrollback.total - frame->rows ||
+            (history->history_rows == 1 && history->text_generation != e->text_generation) ||
+            (history->history_rows > 1 && (!history->previous ||
+                ghostty_tracked_grid_ref_point(history->previous, GHOSTTY_POINT_TAG_SCREEN, &previous) ||
+                previous.y + 1 != point.y))) {
+            reset = true;
+        } else {
+            history->state.origin += history->history_rows - 1 - point.y;
+        }
+    }
+    if (reset) {
+        if (++history->state.generation == 0) history->state.generation = 1;
+        history->state.origin = 0;
+    }
+    history->history_rows = frame->scrollback.total - frame->rows;
+    if (history->history_rows) {
+        if (history->history_rows > UINT32_MAX) return -1;
+        GhosttyPoint point = {.tag=GHOSTTY_POINT_TAG_SCREEN,
+            .value.coordinate={0, (uint32_t)(history->history_rows - 1)}};
+        if (history->anchor) {
+            if (ghostty_tracked_grid_ref_set(history->anchor, e->terminal, point)) return -1;
+        } else if (ghostty_terminal_grid_ref_track(e->terminal, point, &history->anchor)) return -1;
+    } else {
+        ghostty_tracked_grid_ref_free(history->anchor); history->anchor = NULL;
+    }
+    if (history->history_rows > 1) {
+        GhosttyPoint point = {.tag=GHOSTTY_POINT_TAG_SCREEN,
+            .value.coordinate={0, (uint32_t)(history->history_rows - 2)}};
+        if (history->previous) {
+            if (ghostty_tracked_grid_ref_set(history->previous, e->terminal, point)) return -1;
+        } else if (ghostty_terminal_grid_ref_track(e->terminal, point, &history->previous)) return -1;
+    } else {
+        ghostty_tracked_grid_ref_free(history->previous); history->previous = NULL;
+    }
+    history->cols = frame->cols; history->rows = frame->rows;
+    history->screen = screen; history->reverse = reverse.value;
+    history->reset = e->history_reset;
+    history->text_generation = e->text_generation;
+    history->foreground = colors->foreground; history->background = colors->background;
+    memcpy(history->palette, colors->palette, sizeof(history->palette));
+    return 0;
+}
+GmuxHistory gmux_engine_history_state(GmuxEngine *e) {
+    return (e->view_history ? e->view_history : &e->history)->state;
+}
 int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap, uint8_t *row_flags) {
     if (e->appearance_error) return -1;
     if (!e->view_held) gmux_engine_expire_render_hold(e);
@@ -673,6 +799,7 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
     GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
     GhosttyRenderStateCursor cursor = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
+    if (!e->held && update_history_cache(e, frame, &colors)) return -1;
     ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor);
     memcpy(frame->background, &colors.background, 3);
     memcpy(frame->foreground, &colors.foreground, 3);
@@ -712,22 +839,7 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
             if (style.inverse) { GhosttyColorRgb swap = fg; fg = bg; bg = swap; }
             memcpy(cell->fg, &fg, 3); memcpy(cell->bg, &bg, 3);
-            cell->flags = style.bold | (style.italic << 1) | (style.faint << 2) |
-                (style.strikethrough << 4) | (style.invisible << 5);
-            cell->decoration = underline_code(style.underline) |
-                (style.overline ? GMUX_DECORATION_OVERLINE : 0);
-            const GhosttyColorRgb *underline = NULL;
-            switch (style.underline_color.tag) {
-                case GHOSTTY_STYLE_COLOR_PALETTE:
-                    underline = &colors.palette[style.underline_color.value.palette]; break;
-                case GHOSTTY_STYLE_COLOR_RGB:
-                    underline = &style.underline_color.value.rgb; break;
-                default: break;
-            }
-            if (underline) {
-                cell->decoration |= GMUX_DECORATION_UNDERLINE_COLOR;
-                memcpy(cell->underline_color, underline, 3);
-            }
+            cell_style(cell, &style, &colors);
             GhosttyCell raw;
             GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
@@ -737,7 +849,7 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
             GhosttyBuffer buffer = {.ptr = (uint8_t *)cell->text, .cap = sizeof(cell->text) - 1};
             // A cluster too large for this cell is shown as a replacement character.
             if (ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buffer))
-                memcpy(cell->text, "\xef\xbf\xbd", 3);
+                replacement_text(cell);
         }
     }
     ghostty_render_state_clean(e->render);
@@ -839,6 +951,67 @@ static size_t utf8(uint32_t cp, uint8_t *out) {
     if (cp <= 0x7ff) { out[0] = 0xc0 | (cp >> 6); out[1] = 0x80 | (cp & 63); return 2; }
     if (cp <= 0xffff) { out[0] = 0xe0 | (cp >> 12); out[1] = 0x80 | ((cp >> 6)&63); out[2] = 0x80 | (cp&63); return 3; }
     out[0] = 0xf0 | (cp >> 18); out[1] = 0x80 | ((cp >> 12)&63); out[2] = 0x80 | ((cp >> 6)&63); out[3] = 0x80 | (cp&63); return 4;
+}
+int gmux_engine_styled_rows(GmuxEngine *e, uint32_t start, size_t rows,
+    GmuxCell *out, size_t cols, uint8_t *flags) {
+    // Read a bounded window without moving any client's viewport. Resolve the
+    // palette once for the batch, using the same rendition as viewport cells.
+    if (e->held || e->appearance_error) return -1;
+    uint16_t actual_cols = 0;
+    size_t total = 0;
+    GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &actual_cols) ||
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_TOTAL_ROWS, &total) ||
+        cols != actual_cols || start > total || rows > total - start ||
+        ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors)) return -1;
+    for (size_t index=0; index<rows; index++, out+=cols) {
+        GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN,
+            .value.coordinate = {.x=0, .y=start + (uint32_t)index}};
+        GhosttyRow row;
+        bool wrapped = false;
+        if (ghostty_terminal_grid_ref(e->terminal, point, &ref) ||
+            ghostty_grid_ref_row(&ref, &row) || ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, &wrapped)) return -1;
+        flags[index] = wrapped;
+        memset(out, 0, sizeof(*out) * cols);
+        for (size_t x=0; x<cols; x++) {
+            ref.x = x;
+            GmuxCell *cell = &out[x];
+            GhosttyCell raw;
+            GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+            GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+            if (ghostty_grid_ref_cell(&ref, &raw) || ghostty_grid_ref_style(&ref, &style) ||
+                ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide)) return -1;
+            GhosttyColorRgb fg = resolve_color(style.fg_color, colors.foreground, &colors);
+            GhosttyColorRgb bg = resolve_color(style.bg_color, colors.background, &colors);
+            GhosttyCellContentTag tag;
+            if (ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CONTENT_TAG, &tag)) return -1;
+            if (tag == GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE) {
+                uint8_t palette;
+                if (ghostty_cell_get(raw, GHOSTTY_CELL_DATA_COLOR_PALETTE, &palette)) return -1;
+                bg = colors.palette[palette];
+            } else if (tag == GHOSTTY_CELL_CONTENT_BG_COLOR_RGB) {
+                if (ghostty_cell_get(raw, GHOSTTY_CELL_DATA_COLOR_RGB, &bg)) return -1;
+            }
+            if (style.inverse) { GhosttyColorRgb swap = fg; fg = bg; bg = swap; }
+            memcpy(cell->fg, &fg, 3); memcpy(cell->bg, &bg, 3);
+            cell_style(cell, &style, &colors);
+            if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) cell->flags |= 64;
+            if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) cell->flags |= 128;
+            uint32_t cps[64]; size_t count=0, len=0;
+            if (ghostty_grid_ref_graphemes(&ref, cps, 64, &count)) {
+                replacement_text(cell); continue;
+            }
+            for (size_t i=0; i<count; i++) {
+                uint8_t bytes[4]; size_t n=utf8(cps[i], bytes);
+                if (len+n >= sizeof(cell->text)) {
+                    replacement_text(cell); break;
+                }
+                memcpy(cell->text+len, bytes, n); len+=n;
+            }
+        }
+    }
+    return 0;
 }
 int gmux_engine_history_row(GmuxEngine *e, uint32_t y, GmuxCell *out, size_t cols, bool *wrapped) {
     GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);

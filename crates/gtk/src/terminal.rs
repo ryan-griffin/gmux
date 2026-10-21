@@ -418,12 +418,8 @@ impl Terminal {
                     terminal.drag_scroll_timer.borrow_mut().take();
                     return glib::ControlFlow::Break;
                 }
-                // Wait for the viewport before requesting another scroll. GTK's
-                // adjustment callback queues the row through the session writer.
-                if !terminal.session.borrow().scroll_pending() {
-                    let adjustment = terminal.scroller.vadjustment();
-                    adjustment.set_value(adjustment.value() + delta);
-                }
+                let adjustment = terminal.scroller.vadjustment();
+                adjustment.set_value(adjustment.value() + delta);
                 glib::ControlFlow::Continue
             },
         ));
@@ -593,7 +589,7 @@ impl Terminal {
     pub fn refresh_theme(&self) {
         let theme = Theme::adwaita(adw::StyleManager::default().is_dark());
         let frame = {
-            let session = self.session.borrow();
+            let mut session = self.session.borrow_mut();
             if let Err(error) = session.set_theme(&theme) {
                 eprintln!("{error}");
                 return;
@@ -664,6 +660,7 @@ impl Terminal {
             "scale": scale, "origin": [origin.0, origin.1], "focused": self.area.has_focus(),
             "scrollback": session.snapshot().frame.scrollback,
             "scroll_pending": session.scroll_pending(),
+            "scroll_cache_bytes": session.scroll_cache_bytes(),
             "selection": *self.selection.borrow(),
             "selection_drag": self.drag_position.get().map(|position| serde_json::json!({
                 "anchor": self.selection_anchor.get(), "position": position,
@@ -692,7 +689,7 @@ impl Terminal {
         self.paste_from(&self.area.clipboard());
     }
     pub fn clear_screen(&self) {
-        if let Err(error) = self.session.borrow().clear_screen() {
+        if let Err(error) = self.session.borrow_mut().clear_screen() {
             self.show_status(&error.to_string());
             return;
         }

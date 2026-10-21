@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 24:
+handshake. The current protocol version is 26:
 
 ```json
-{"version":24,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":26,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -164,7 +164,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":24,"daemon":"returned-identity"}
+{"method":"attach","version":26,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -177,6 +177,9 @@ focused view controls a pane's PTY size.
 
 Use `input` with a byte array to write terminal input, or `key`, `mouse`, and
 `paste` for terminal-aware input. `focused` declares the connection's focus.
+`frame-interval` sets this connection's viewport and search pacing with a
+`micros` integer from 1,000 to 1,000,000. It defaults to 16,000. GTK updates it
+from the display frame clock; one client's interval does not pace another client.
 `scroll`, `scroll-to`, `find`, `find-advance`, `select`, `clear-selection`,
 `copy`, and `mark-read` operate on an explicit `pane`. `git-subscribe` chooses
 panes whose Git metadata the client needs. The Rust `transport::StreamCommand`
@@ -189,13 +192,48 @@ header length, then that many UTF-8 JSON bytes, then cell bytes. The header
 contains pane `meta`, an optional `frame`, changed `rows`, and optional execution
 `state`, Git metadata, notifications, search results, selection, copy text, or
 errors. A full viewport arrives on subscription; later packets contain changed
-rows. Metadata-only packets have no cell data.
+rows. Before applying changed rows, shift the previous viewport by `row_shift`
+rows, positive toward smaller viewport indices. Newly exposed rows are always
+included in `rows`. Apply the same shift to soft-wrap flags. Metadata-only
+packets have no cell data.
+
+`generation` identifies cached history for this pane and view. Clears, reflow,
+screen switches, and resolved palette or appearance changes advance it. Discard
+old cached rows when a nonzero generation changes, including on metadata-only
+packets. Zero means the packet does not report cache state.
+
+Within a generation, `cache_origin` counts rows pruned from the front. Identify
+cached rows by `cache_origin + row` so surviving rows retain their identity.
+Discard identities below the new origin and adjust pending local scroll targets
+by its advance. `cache_valid_before`, when present, invalidates previously cached
+rows at or beyond that screen row. Apply it before inserting the packet's viewport
+and supplemental rows. Ordinary output invalidates the previously mutable screen
+rows while preserving older history, even if the displayed viewport is unchanged.
+
+An optional
+`cache` object supplies a starting history row and `row_flags`, one flag per
+extra row. These cells follow the changed viewport cells in the packet. Cache
+rows preserve the viewport's resolved colors, decorations, graphemes, and wide
+cells. The daemon prefetches nearby rows while browsing and sends only missing
+parts as the window moves. Immutable history can be prefetched during output.
+Live screen prefetch waits for 100 ms without output. Synchronized-output holds
+suspend prefetching.
 
 `scroll-to` takes an absolute history `row` and an increasing `serial`. Viewport
 replies acknowledge the last applied serial as `scroll_serial`. The Rust client
-coalesces repeated targets while a viewport reply is outstanding. Commands that
-depend on the viewport flush the queued target first. Apply row deltas from
-older replies too, since later packets depend on them.
+draws cached history immediately. With a page of cached rows available on
+either side, it sends the final target after 100 ms without input. A refill already
+in flight also coalesces further cached targets. Returning to the live bottom
+skips this debounce so the daemon's current cursor state can arrive promptly.
+Near cache edges it requests a refill; cache misses pipeline at the connection's
+frame interval while replies are outstanding, without waiting for a network round
+trip. Commands that depend on the viewport flush the queued target first.
+Apply row deltas from older replies too, since later packets depend on them.
+Keep the latest local scroll target while reconciling older viewport replies.
+
+The history cache retains at most 512 rows and 2 MiB per visible pane, usually
+five screens. Hidden panes release their cache. Unknown rows and search
+highlights require an authoritative viewport reply.
 
 Send the connection command `{"method":"ping"}` to check that the daemon's
 event loop is responding. It replies with a zero-length record, four zero bytes,

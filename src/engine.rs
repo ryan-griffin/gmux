@@ -82,6 +82,8 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
 }
 
 pub struct Engine {
+    pub(crate) revision: u64,
+    pub(crate) history: GmuxHistory,
     raw: NonNull<GmuxEngine>,
     events: Box<Events>,
     pub frame: Frame,
@@ -286,6 +288,11 @@ impl Engine {
         })
         .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
         let mut engine = Self {
+            revision: 1,
+            history: GmuxHistory {
+                generation: 0,
+                origin: 0,
+            },
             raw,
             events,
             frame: Frame::default(),
@@ -327,6 +334,7 @@ impl Engine {
         Ok(())
     }
     pub fn write(&mut self, bytes: &[u8]) {
+        self.revision = self.revision.wrapping_add(1);
         unsafe { gmux_engine_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
         self.find.invalidate();
     }
@@ -334,6 +342,7 @@ impl Engine {
         let result = unsafe { gmux_engine_resize(self.raw.as_ptr(), cols, rows, cw, ch) };
         anyhow::ensure!(result == 0, "Ghostty resize failed ({result})");
         if self.size != (cols, rows) {
+            self.revision = self.revision.wrapping_add(1);
             self.row_flags.resize(rows as usize, 0);
             self.find.invalidate();
             self.find.pending = false;
@@ -355,7 +364,35 @@ impl Engine {
             )
         };
         anyhow::ensure!(result >= 0, "Ghostty render-state update failed");
+        self.history = unsafe { gmux_engine_history_state(self.raw.as_ptr()) };
         Ok(result != 0)
+    }
+    pub(crate) fn cache_rows(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> anyhow::Result<(Vec<Cell>, Vec<u8>)> {
+        let cols = self.frame.cols as usize;
+        let count = range
+            .end
+            .checked_sub(range.start)
+            .filter(|count| *count <= gmux_client::scroll_cache::capacity(cols) as u64)
+            .ok_or_else(|| anyhow::anyhow!("Invalid scrollback cache range"))?
+            as usize;
+        let start = u32::try_from(range.start)?;
+        let mut cells = vec![Cell::default(); count * cols];
+        let mut flags = vec![0; count];
+        let result = unsafe {
+            gmux_engine_styled_rows(
+                self.raw.as_ptr(),
+                start,
+                count,
+                cells.as_mut_ptr(),
+                cols,
+                flags.as_mut_ptr(),
+            )
+        };
+        anyhow::ensure!(result == 0, "Could not read scrollback rows");
+        Ok((cells, flags))
     }
     pub fn find(&mut self, query: &str) {
         self.find.set_query(query);
@@ -447,6 +484,7 @@ impl Engine {
             unsafe { gmux_engine_clear_screen(self.raw.as_ptr()) } == 0,
             "Clear Screen is unavailable while a full-screen application is using the terminal"
         );
+        self.revision = self.revision.wrapping_add(1);
         self.find.restart();
         Ok(())
     }
@@ -580,6 +618,100 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_identity_survives_output_and_pruning_but_resets_for_grid_and_color_changes() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(80, 4, 0, 0).unwrap();
+        let lines = "history row\r\n".repeat(512);
+        engine.write(lines.as_bytes());
+        engine.snapshot().unwrap();
+        let generation = engine.history.generation;
+        let (history, flags) = engine.cache_rows(0..4).unwrap();
+        engine.write(b"\x1b[4;1Hlive edit");
+        engine.snapshot().unwrap();
+        assert_eq!(engine.history.generation, generation);
+        let (after, after_flags) = engine.cache_rows(0..4).unwrap();
+        assert!(history == after);
+        assert_eq!(flags, after_flags);
+        for _ in 0..128 {
+            engine.write(lines.as_bytes());
+            engine.snapshot().unwrap();
+            assert_eq!(engine.history.generation, generation);
+            if engine.history.origin != 0 {
+                break;
+            }
+        }
+        assert!(
+            engine.history.origin > 0,
+            "Expected bounded scrollback to prune old rows"
+        );
+        for change in [
+            b"\x1b[3J".as_slice(),
+            b"\x1b]4;2;rgb:ab/cd/ef\x07",
+            b"\x1b[?5h",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+        ] {
+            let previous = engine.history.generation;
+            engine.write(change);
+            engine.snapshot().unwrap();
+            assert_ne!(engine.history.generation, previous, "change {change:?}");
+            assert_eq!(engine.history.origin, 0);
+        }
+        let previous = engine.history.generation;
+        engine.resize(40, 4, 0, 0).unwrap();
+        engine.resize(80, 4, 0, 0).unwrap();
+        engine.snapshot().unwrap();
+        assert_ne!(engine.history.generation, previous);
+        engine.write(lines.as_bytes());
+        engine.snapshot().unwrap();
+        let previous = engine.history.generation;
+        engine.write(format!("\x1b[3J{lines}").as_bytes());
+        engine.snapshot().unwrap();
+        assert_ne!(
+            engine.history.generation, previous,
+            "Clear and refill in one write"
+        );
+    }
+
+    #[test]
+    fn prefetched_history_matches_rendered_rendition_without_moving_the_view() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(24, 4, 0, 0).unwrap();
+        for sequence in [
+            "\x1b[1;3;4:3;53;58:2::10:20:30;38;5;2;48;2;7;8;9m界é\x1b[0m\r\n",
+            "\x1b[7;31;44minverse\x1b[0m\r\n",
+            "\x1b[48;5;3m\x1b[K\x1b[0m\r\n",
+            "\x1b[48;2;12;34;56m\x1b[K\x1b[0m\r\n",
+            "a long wrapped line with wide 界 and combining é characters\r\n",
+            "\x1b]4;2;rgb:ab/cd/ef\x07tail\r\n",
+        ] {
+            engine.write(sequence.as_bytes());
+        }
+        engine.write(format!("a{}\r\n", "\u{301}".repeat(40)).as_bytes());
+        engine.snapshot().unwrap();
+        let total = engine.frame.scrollback.total;
+        for offset in 0..=total.saturating_sub(4) {
+            engine.scroll_to(offset);
+            engine.snapshot().unwrap();
+            let frame = engine.frame;
+            let expected = engine.cells.clone();
+            let flags = engine.row_flags.clone();
+            let (cached, cached_flags) = engine.cache_rows(offset..offset + 4).unwrap();
+            assert!(
+                cached == expected,
+                "Cached rendition differed at history offset {offset}"
+            );
+            assert_eq!(cached_flags, flags);
+            engine.snapshot().unwrap();
+            assert!(engine.frame == frame);
+            assert!(engine.cells == expected);
+        }
+        engine.write(b"\x1b[?2026hheld");
+        engine.snapshot().unwrap();
+        assert!(engine.cache_rows(0..1).is_err());
+    }
 
     #[test]
     fn clear_screen_erases_history_selection_and_search_without_resetting_session_state() {

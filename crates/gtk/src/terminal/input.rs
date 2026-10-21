@@ -160,7 +160,10 @@ impl Terminal {
         let weak = Rc::downgrade(self);
         self.area.set_scroll_func(move |row| {
             if let Some(t) = weak.upgrade() {
-                t.session.borrow().scroll_to(row);
+                t.session.borrow_mut().scroll_to(row);
+                t.update_drag_selection();
+                t.sync_accessible_selection();
+                t.area.queue_draw();
             }
         });
         let weak = Rc::downgrade(self);

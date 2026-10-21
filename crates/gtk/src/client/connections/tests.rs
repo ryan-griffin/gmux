@@ -55,6 +55,7 @@ impl Fixture {
             snapshot: None,
             attached: HashSet::new(),
             focused: Cell::new(false),
+            frame_interval: gmux_client::transport::DEFAULT_FRAME_INTERVAL,
             status_changed: false,
         };
         Self { hub, path, ids }

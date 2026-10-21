@@ -271,8 +271,32 @@ impl Ui {
             command_exits: RefCell::new(HashSet::new()),
             keyboard,
             update_source: RefCell::new(None),
-            reconnect_source: RefCell::new(None),
+            deadline_source: RefCell::new(None),
             theme_handler: RefCell::new(None),
+            frame_clock_handler: RefCell::new(None),
+        });
+        let weak = Rc::downgrade(&ui);
+        ui.window.connect_realize(move |window| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if let Some((clock, handler)) = ui.frame_clock_handler.borrow_mut().take() {
+                clock.disconnect(handler);
+            }
+            if let Some(clock) = window.frame_clock() {
+                let weak = Rc::downgrade(&ui);
+                let handler = clock.connect_after_paint(move |clock| {
+                    if let Some(ui) = weak.upgrade() {
+                        let (micros, _) = clock.refresh_info(clock.frame_time());
+                        ui.sessions
+                            .borrow_mut()
+                            .set_frame_interval(Duration::from_micros(
+                                micros.clamp(1_000, 1_000_000) as u64,
+                            ));
+                    }
+                });
+                *ui.frame_clock_handler.borrow_mut() = Some((clock, handler));
+            }
         });
         let weak = Rc::downgrade(&ui);
         ui.window.connect_is_active_notify(move |window| {
@@ -569,16 +593,25 @@ impl Ui {
                         .chain(ui.restore_selection.get().map(|(desired, _, _)| desired));
                     ui.sessions.borrow_mut().prune_handles(retained);
                 }
-                ui.schedule_reconnect(&wake);
+                ui.schedule_deadlines(&wake);
                 glib::ControlFlow::Continue
             });
         *ui.update_source.borrow_mut() = Some(source);
         ui.sessions.borrow_mut().connect_remotes();
         Ok(ui)
     }
-    fn schedule_reconnect(self: &Rc<Self>, wake: &ipc::Wake) {
-        let next = self.sessions.borrow().next_retry();
-        let mut pending = self.reconnect_source.borrow_mut();
+    /// Wake for connection retries and coalesced scroll releases. Waiting
+    /// creates no permanent worker; deadlines are rescheduled on every poll.
+    fn schedule_deadlines(self: &Rc<Self>, wake: &ipc::Wake) {
+        let next = {
+            let sessions = self.sessions.borrow();
+            sessions
+                .next_retry()
+                .into_iter()
+                .chain(sessions.next_scroll())
+                .min()
+        };
+        let mut pending = self.deadline_source.borrow_mut();
         if pending.as_ref().map(|(at, _)| *at) == next {
             return;
         }
@@ -593,7 +626,7 @@ impl Ui {
                     .max(Duration::from_millis(1)),
                 move || {
                     if let Some(ui) = weak.upgrade() {
-                        ui.reconnect_source.borrow_mut().take();
+                        ui.deadline_source.borrow_mut().take();
                         wake.notify();
                     }
                 },
