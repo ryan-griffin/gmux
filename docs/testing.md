@@ -95,7 +95,7 @@ and Ghostty library:
 ```sh
 ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
 mkdir -p artifacts
-cc -O2 -std=c11 -I"$ghostty_prefix/include" \
+cc -O2 -std=c11 -DGMUX_VERSION='"benchmark"' -I"$ghostty_prefix/include" \
   scripts/sync-output-benchmark.c src/ghostty_bridge.c \
   -L"$ghostty_prefix/lib" -Wl,-rpath,"$ghostty_prefix/lib" \
   -Wl,--wrap=ghostty_render_state_new -lghostty-vt -o artifacts/sync-output-benchmark

@@ -129,6 +129,7 @@ struct GmuxEngine {
     GhosttyMouseEvent mouse;
     GmuxEventFn callback;
     void *userdata;
+    uint32_t cell_width, cell_height;
     bool dark;
     bool held;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
@@ -349,6 +350,19 @@ static void write_pty(GhosttyTerminal t, void *ud, const uint8_t *data, size_t l
     GmuxEngine *e = ud;
     e->callback(e->userdata, 0, data, len);
 }
+static bool terminal_size(GhosttyTerminal t, void *ud, GhosttySizeReportSize *out) {
+    GmuxEngine *e = ud;
+    if (ghostty_terminal_get(t, GHOSTTY_TERMINAL_DATA_COLS, &out->columns) ||
+        ghostty_terminal_get(t, GHOSTTY_TERMINAL_DATA_ROWS, &out->rows)) return false;
+    out->cell_width = e->cell_width;
+    out->cell_height = e->cell_height;
+    return true;
+}
+static GhosttyString xtversion(GhosttyTerminal t, void *ud) {
+    (void)t; (void)ud;
+    static const uint8_t version[] = "gmux " GMUX_VERSION;
+    return (GhosttyString){.ptr = version, .len = sizeof(version) - 1};
+}
 static void bell(GhosttyTerminal t, void *ud) {
     (void)t;
     GmuxEngine *e = ud;
@@ -441,6 +455,13 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, progress_report);
+    static const uint8_t terminfo[] = "xterm-256color";
+    GhosttyString terminfo_name = {.ptr = terminfo, .len = sizeof(terminfo) - 1};
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SIZE, terminal_size) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_XTVERSION, xtversion) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &terminfo_name)) {
+        gmux_engine_free(e); return NULL;
+    }
     // Track only a bounded unfinished sequence for shutdown snapshots.
     size_t continuation_max = 64 * 1024;
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
@@ -703,11 +724,16 @@ int gmux_engine_resize(GmuxEngine *e, uint16_t cols, uint16_t rows, uint32_t cw,
     uint16_t previous_cols = 0, previous_rows = 0;
     ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &previous_cols);
     ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ROWS, &previous_rows);
+    int result = ghostty_terminal_resize(e->terminal, cols, rows, cw, ch);
+    if (result) return result;
     if (cols != previous_cols || rows != previous_rows) {
         e->text_generation++;
         e->history_reset++;
     }
-    return ghostty_terminal_resize(e->terminal, cols, rows, cw, ch);
+    // Libghostty sends the resize report itself, using these same metrics.
+    e->cell_width = cw;
+    e->cell_height = ch;
+    return 0;
 }
 void gmux_engine_scroll(GmuxEngine *e, intptr_t delta, bool bottom) {
     GhosttyTerminalScrollViewport scroll = {

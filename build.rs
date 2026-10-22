@@ -137,6 +137,10 @@ fn main() {
     bridge
         .file("src/ghostty_bridge.c")
         .include(prefix.join("include"))
+        .define(
+            "GMUX_VERSION",
+            concat!("\"", env!("CARGO_PKG_VERSION"), "\""),
+        )
         .flag("-std=c11")
         // Every exported definition must have a prototype in the shared header.
         .flag("-Werror=missing-prototypes")
