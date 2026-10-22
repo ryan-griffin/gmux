@@ -40,6 +40,71 @@ compositing, and display latency. The suite also checks viewport coalescing,
 search pacing, request fairness, and large pastes. `--measure` reports timings
 without applying input-latency thresholds.
 
+## Idle scrollback compression
+
+The daemon starts compressing a pane after its libghostty compression activity
+token stays unchanged for five seconds. It runs at most one incremental call
+across all panes per ten milliseconds, serving the oldest deadline first.
+Input, PTY output, search, and frame work run before compression on the same
+thread.
+Completion removes the deadline. Reading compressed history restores it and
+starts another idle delay. Attached, hidden, and detached panes use this policy.
+
+`gmux status` includes `terminal_memory` entries for each pane. `memory` reports
+page counts, reserved virtual bytes, resident page bytes, compressed pages and
+bytes, image bytes, and platform support. These totals combine both screens.
+Page figures exclude images, native bookkeeping, render caches, Rust buffers,
+and frontend history caches. Statistics walk the page list on request without
+decompressing it. They are not sampled in the background. `compression` reports
+the number of incremental calls, cumulative wall time in `work_ns`, and the
+longest call in `max_step_ns`. `scheduled` includes the idle delay and pending
+continuations.
+
+```sh
+python3 scripts/cargo_build.py --release gmux
+python3 scripts/compression-smoke-test.py --binary target/release/gmux \
+  --baseline artifacts/gmux-before-compression \
+  --report artifacts/compression.json
+```
+
+Save the baseline executable before building the comparison revision, and use
+the same pinned library for both. Omit `--baseline` for a single-build check.
+The Linux probe generates colored Unicode logs with hyperlinks in four panes,
+first detached, then with one visible pane and the remaining panes hidden. It
+records library page storage, process RSS and CPU, incremental work duration,
+and socket-input-to-changed-cell latency during and after compression. The
+latency includes the worker's PTY response and daemon frame pacing. It excludes
+GTK and presentation. Baseline binaries without memory statistics still report
+process samples. The comparison build uses the same observation duration and
+input sampling window as the candidate.
+
+The default run keeps production retention, so old generated lines may already
+have been pruned. To measure larger retained histories and the combined work
+limit with many panes:
+
+```sh
+python3 scripts/compression-smoke-test.py --binary target/release/gmux \
+  --baseline artifacts/gmux-before-compression --history-mib 64 \
+  --lines 20000 --panes 24 --samples 100 \
+  --report artifacts/compression-large.json
+```
+
+`--history-mib` builds a Linux `LD_PRELOAD` interposer that sets the public
+libghostty scrollback byte limit at terminal creation in both builds. The
+temporary interposer applies to the test daemons and their children. Reports
+identify this override and hash the binaries. Keep these results separate from
+production-retention measurements.
+Process CPU includes control sampling and input work; `work_ns` measures only
+the elapsed time inside compression calls and may include preemption.
+
+The probe observes the detached main thread through `/proc` without sending
+requests for 5.5 seconds after completion and after removing all panes. Both
+intervals must have zero voluntary context switches, catching continued timer
+wakeups beyond the idle delay. Resident-byte reductions and RSS reductions are
+separate observations. Compression support depends on the platform; macOS may
+reclaim the discarded physical memory lazily, so RSS can exceed library
+resident-byte statistics. This probe does not measure macOS reclamation.
+
 ## Rendering
 
 `crates/gtk/examples/renderer-benchmark.rs` measures scene preparation, completed rendering,

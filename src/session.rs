@@ -37,9 +37,18 @@ impl Drop for Pty {
     }
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct TerminalMemory {
+    pane: u64,
+    memory: crate::engine::MemoryUsage,
+    compression: crate::compression::CompressionStats,
+    scheduled: bool,
+}
+
 pub(crate) struct TerminalSession {
     id: u64,
     engine: Engine,
+    compression: crate::compression::IdleCompression,
     pty: Option<Pty>,
     pid: Option<u32>,
     directory: PathBuf,
@@ -51,6 +60,40 @@ pub(crate) struct TerminalSession {
 }
 
 impl TerminalSession {
+    pub(crate) fn compression_deadline(&self) -> Option<Instant> {
+        self.compression.deadline
+    }
+
+    pub(crate) fn refresh_compression(&mut self, now: Instant) -> Option<Instant> {
+        match self.engine.compression_activity() {
+            Ok(activity) => self.compression.observe(activity, now),
+            Err(_) => self.compression.deadline = None,
+        }
+        self.compression_deadline()
+    }
+
+    pub(crate) fn compress(&mut self) {
+        let started = Instant::now();
+        let result = self.engine.compress();
+        self.compression
+            .finish(result.as_ref().ok().copied(), started, Instant::now());
+        if let Err(error) = result {
+            eprintln!(
+                "Could not compress scrollback for pane {}: {error}",
+                self.id
+            );
+        }
+    }
+
+    pub(crate) fn memory_usage(&self) -> anyhow::Result<TerminalMemory> {
+        Ok(TerminalMemory {
+            pane: self.id,
+            memory: self.engine.memory_usage()?,
+            compression: self.compression.stats,
+            scheduled: self.compression.deadline.is_some(),
+        })
+    }
+
     pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
         self.engine.progress()
     }
@@ -113,6 +156,8 @@ impl TerminalSession {
         }
         engine.set_cursor_style(cursor_style)?;
         engine.set_theme(theme)?;
+        let mut compression = crate::compression::IdleCompression::default();
+        compression.observe(engine.compression_activity()?, Instant::now());
         let (cols, rows) = engine.dimensions();
         let pair = native_pty_system().openpty(PtySize {
             rows,
@@ -153,6 +198,7 @@ impl TerminalSession {
         Ok(Self {
             id,
             engine,
+            compression,
             pty: Some(Pty {
                 master: pair.master,
                 child: Some(child),
