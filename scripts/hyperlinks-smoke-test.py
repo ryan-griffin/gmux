@@ -14,7 +14,7 @@ artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 prefix = Path(os.environ.get("GHOSTTY_PREFIX", root / ".deps/ghostty"))
 check = artifacts / "hyperlink-check"
-subprocess.run(["cc", "-O2", "-std=c11", f"-I{prefix}/include", str(root / "scripts/hyperlink-check.c"),
+subprocess.run(["cc", "-O2", "-std=c11", '-DGMUX_VERSION="test"', f"-I{prefix}/include", str(root / "scripts/hyperlink-check.c"),
                 f"-L{prefix}/lib", f"-Wl,-rpath,{prefix}/lib", "-lghostty-vt", "-o", str(check)], check=True)
 subprocess.run([str(check)], check=True)
 

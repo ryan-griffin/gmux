@@ -1966,6 +1966,73 @@ mod tests {
         assert!(e.text().unwrap().starts_with("hello\nred"));
     }
     #[test]
+    fn terminal_size_queries_follow_grid_and_cell_metrics() {
+        let mut engine = Engine::new().unwrap();
+        let queries = b"\x1b[18t\x1b[14t\x1b[16t";
+        engine.write(queries);
+        assert_eq!(
+            engine.take_events().0,
+            b"\x1b[8;24;80t\x1b[4;0;0t\x1b[6;0;0t"
+        );
+        for ((cols, rows, cw, ch), expected) in [
+            (
+                (100, 40, 9, 18),
+                "\x1b[8;40;100t\x1b[4;720;900t\x1b[6;18;9t",
+            ),
+            (
+                (100, 40, 10, 20),
+                "\x1b[8;40;100t\x1b[4;800;1000t\x1b[6;20;10t",
+            ),
+            ((57, 19, 0, 0), "\x1b[8;19;57t\x1b[4;0;0t\x1b[6;0;0t"),
+        ] {
+            engine.resize(cols, rows, cw, ch).unwrap();
+            assert!(engine.take_events().0.is_empty());
+            engine.write(queries);
+            assert_eq!(engine.take_events().0, expected.as_bytes());
+        }
+    }
+    #[test]
+    fn in_band_size_reports_use_current_geometry_once_per_enable_or_resize() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(100, 40, 9, 18).unwrap();
+        assert!(engine.take_events().0.is_empty());
+        for _ in 0..2 {
+            engine.write(b"\x1b[?2048h");
+            assert_eq!(engine.take_events().0, b"\x1b[48;40;100;720;900t");
+        }
+        engine.resize(120, 50, 10, 20).unwrap();
+        assert_eq!(engine.take_events().0, b"\x1b[48;50;120;1000;1200t");
+        // Failed resizes must preserve geometry and cached history.
+        engine.snapshot().unwrap();
+        let generation = engine.history.generation;
+        assert!(engine.resize(0, 50, 11, 22).is_err());
+        assert!(engine.take_events().0.is_empty());
+        engine.snapshot().unwrap();
+        assert_eq!(engine.history.generation, generation);
+        engine.write(b"\x1b[?2048h");
+        assert_eq!(engine.take_events().0, b"\x1b[48;50;120;1000;1200t");
+        engine.write(b"\x1b[?2048l");
+        engine.resize(90, 30, 8, 16).unwrap();
+        assert!(engine.take_events().0.is_empty());
+        engine.write(b"\x1b[?2048h");
+        assert_eq!(engine.take_events().0, b"\x1b[48;30;90;480;720t");
+    }
+    #[test]
+    fn terminal_identity_queries_match_shell_environment() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"\x1bP+q544e\x1b\\\x1b[>q");
+        assert_eq!(
+            engine.take_events().0,
+            concat!(
+                "\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\",
+                "\x1bP>|gmux ",
+                env!("CARGO_PKG_VERSION"),
+                "\x1b\\"
+            )
+            .as_bytes()
+        );
+    }
+    #[test]
     fn notifications_title_and_chunked_utf8() {
         let mut e = Engine::new().unwrap();
         e.write(b"\x1b]2;project\x07\x1b]777;notify;Agent;Ready\x07");

@@ -98,7 +98,7 @@ The counters exclude allocations inside the shared Ghostty library.
 
 ```sh
 mkdir -p artifacts
-cc -O2 -std=c11 -DGMUX_BENCH_INCREMENTAL -I.deps/ghostty/include -Isrc \
+cc -O2 -std=c11 -DGMUX_VERSION='"benchmark"' -DGMUX_BENCH_INCREMENTAL -I.deps/ghostty/include -Isrc \
   scripts/hyperlink-benchmark.c -L.deps/ghostty/lib \
   -Wl,-rpath,"$PWD/.deps/ghostty/lib" -Wl,--wrap=malloc \
   -Wl,--wrap=calloc -Wl,--wrap=realloc \
