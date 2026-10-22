@@ -303,6 +303,8 @@ impl Daemon {
                 "uptime_seconds": self.started.elapsed().as_secs(),
                 "snapshots": self.snapshots,
                 "sent_rows": self.sent_rows,
+                "terminal_memory": self.sessions.values()
+                    .map(TerminalSession::memory_usage).collect::<anyhow::Result<Vec<_>>>()?,
                 "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),
                 "git": self.git.as_ref().map_or_else(crate::branch::Stats::default, crate::branch::Service::stats),
             })),

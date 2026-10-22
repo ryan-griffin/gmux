@@ -71,6 +71,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut frontend_indices = Vec::new();
     let mut ready = HashSet::new();
     let mut exited = Vec::new();
+    let mut compression_budget = crate::compression::CompressionBudget::new(Instant::now());
     loop {
         let now = Instant::now();
         if quit_at.is_some_and(|deadline| now >= deadline) {
@@ -138,6 +139,11 @@ pub fn run() -> anyhow::Result<()> {
         }
         let attached = daemon.frontends.values().any(|f| f.attached);
         let held = daemon.sessions.values().any(TerminalSession::render_held);
+        let compression_deadline = daemon
+            .sessions
+            .values()
+            .filter_map(TerminalSession::compression_deadline)
+            .min();
         let mut deadline = quit_at;
         for next in [
             (saving.is_none() && !controls.is_empty()).then_some(now),
@@ -149,6 +155,9 @@ pub fn run() -> anyhow::Result<()> {
                 .then_some(now),
             attached.then_some(next_metadata),
             daemon.next_update(),
+            compression_budget
+                .deadline(compression_deadline)
+                .filter(|_| !daemon.quitting),
             daemon
                 .sessions
                 .values()
@@ -389,6 +398,24 @@ pub fn run() -> anyhow::Result<()> {
             daemon.changed.clear();
             daemon.metadata_changed.clear();
             daemon.errors.clear();
+        }
+        // Input, PTY reads, searches, frames, and teardown all take priority.
+        // Observe activity once after all terminal access, including reads
+        // that restore compressed history. Compression itself leaves the token
+        // unchanged, so the next poll can use these cached deadlines.
+        let now = Instant::now();
+        if !daemon.quitting {
+            let next = daemon
+                .sessions
+                .iter_mut()
+                .filter_map(|(&id, session)| session.refresh_compression(now).map(|at| (id, at)))
+                .min_by_key(|&(id, at)| (at, id));
+            if let Some((id, at)) = next
+                && compression_budget.ready(Some(at), now)
+            {
+                daemon.sessions.get_mut(&id).unwrap().compress();
+                compression_budget.used(Instant::now());
+            }
         }
     }
     if !daemon.checkpointed {

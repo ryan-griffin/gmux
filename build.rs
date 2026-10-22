@@ -18,6 +18,7 @@ impl bindgen::callbacks::ParseCallbacks for BridgeCallbacks {
 
     fn add_derives(&self, info: &bindgen::callbacks::DeriveInfo<'_>) -> Vec<String> {
         match info.name {
+            "GmuxMemoryUsage" => vec!["Default", "Debug", "serde::Serialize"],
             "Frame" => vec!["Default", "serde::Serialize", "serde::Deserialize"],
             "Scrollback" => vec!["Default", "Debug", "serde::Serialize", "serde::Deserialize"],
             _ => vec![],
@@ -44,7 +45,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         )
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
-        .allowlist_var("GMUX_(UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK)_.*")
+        .allowlist_var("GMUX_(UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION)_.*")
         .allowlist_function("gmux_engine_.*")
         .allowlist_function("gmux_checkpoint_history")
         .use_core()

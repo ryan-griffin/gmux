@@ -8,8 +8,16 @@ use std::{
 mod ffi {
     include!(concat!(env!("OUT_DIR"), "/ghostty_bridge.rs"));
 }
+pub(crate) use ffi::GmuxMemoryUsage as MemoryUsage;
 use ffi::*;
 use ffi::{Cell, Frame};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompressionResult {
+    Unsupported,
+    Pending,
+    Complete,
+}
 
 // Accept only the pinned cell formatter's rendition operations. Validate the
 // whole UTF-8 stream before touching the fresh terminal, including controls in
@@ -172,6 +180,37 @@ impl Drop for EngineView {
     }
 }
 impl Engine {
+    pub(crate) fn memory_usage(&self) -> anyhow::Result<MemoryUsage> {
+        let mut usage = MemoryUsage::default();
+        let result = unsafe { gmux_engine_memory_usage(self.raw.as_ptr(), &mut usage) };
+        anyhow::ensure!(result == 0, "Ghostty memory query failed ({result})");
+        Ok(usage)
+    }
+
+    pub(crate) fn compression_activity(&self) -> anyhow::Result<u64> {
+        let mut activity = 0;
+        let result = unsafe { gmux_engine_compression_activity(self.raw.as_ptr(), &mut activity) };
+        anyhow::ensure!(
+            result == 0,
+            "Ghostty compression activity query failed ({result})"
+        );
+        Ok(activity)
+    }
+
+    pub(crate) fn compress(&mut self) -> anyhow::Result<CompressionResult> {
+        // Engine is !Send/!Sync and the daemon owns it. This call runs between
+        // terminal operations, outside any entered frontend view.
+        let mut result = 0;
+        let error = unsafe { gmux_engine_compress(self.raw.as_ptr(), &mut result) };
+        anyhow::ensure!(error == 0, "Ghostty compression failed ({error})");
+        match result as u32 {
+            GMUX_COMPRESSION_UNSUPPORTED => Ok(CompressionResult::Unsupported),
+            GMUX_COMPRESSION_PENDING => Ok(CompressionResult::Pending),
+            GMUX_COMPRESSION_COMPLETE => Ok(CompressionResult::Complete),
+            _ => anyhow::bail!("Invalid Ghostty compression result ({result})"),
+        }
+    }
+
     pub(crate) fn use_view_appearance(&mut self, view: &EngineView) -> anyhow::Result<()> {
         let result =
             unsafe { gmux_engine_use_view_appearance(self.raw.as_ptr(), view.raw.as_ptr()) };
@@ -721,6 +760,138 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finish_compression(engine: &mut Engine) -> CompressionResult {
+        for _ in 0..4096 {
+            let result = engine.compress().unwrap();
+            if result != CompressionResult::Pending {
+                return result;
+            }
+        }
+        panic!("Incremental compression did not complete");
+    }
+
+    #[test]
+    fn compression_preserves_views_history_identity_rendition_search_and_checkpoint() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(80, 4, 0, 0).unwrap();
+        for row in 0..1024 {
+            engine.write(format!("\x1b[31;4:3mrow {row:04} 界é\x1b[0m \x1b]8;;https://example.com/{row}\x07link\x1b]8;;\x07\r\n").as_bytes());
+        }
+        engine.snapshot().unwrap();
+        let revision = engine.revision;
+        let history = engine.history;
+        let live = engine.cells.clone();
+        let (cached, flags) = engine.cache_rows(20..24).unwrap();
+        let query: String = cached.iter().take(8).map(Cell::text).collect();
+        assert!(query.starts_with("row "));
+        // Recovery replays into a fresh terminal with its own page limits.
+        // Compare the same recovery path before and after compression.
+        let mut reference = Engine::new().unwrap();
+        reference
+            .restore_history(&engine.checkpoint().unwrap())
+            .unwrap();
+        reference.snapshot().unwrap();
+        let recovered_cache = reference.cache_rows(20..24).unwrap();
+        let recovered_query: String = recovered_cache.0.iter().take(8).map(Cell::text).collect();
+        reference.find(&recovered_query);
+        while reference.find_pending() {
+            reference.poll_find();
+        }
+        let recovered_matches = reference.find_state().total;
+        assert_eq!(recovered_matches, 1);
+        let mut view = engine.new_view().unwrap();
+        let viewed = engine.with_view(&mut view, |engine| {
+            engine.scroll_to(100);
+            engine.snapshot().unwrap();
+            engine
+                .select((0, 100), (7, 100), SelectionMode::Cell)
+                .unwrap();
+            (
+                engine.frame,
+                engine.cells.clone(),
+                engine.hyperlinks.clone(),
+                engine.copy().unwrap(),
+            )
+        });
+        view.set_active(false);
+        let before = engine.memory_usage().unwrap();
+        let mut live_view = engine.new_view().unwrap();
+        let token = engine.compression_activity().unwrap();
+        let result = finish_compression(&mut engine);
+        assert_eq!(engine.compression_activity().unwrap(), token);
+        let after = engine.memory_usage().unwrap();
+        if before.compression_supported {
+            assert_eq!(result, CompressionResult::Complete);
+            assert!(after.compressed_pages > 0);
+            assert!(after.resident_bytes < before.resident_bytes);
+            assert_eq!(before.virtual_bytes, after.virtual_bytes);
+        } else {
+            assert_eq!(result, CompressionResult::Unsupported);
+        }
+        for _ in 0..8 {
+            engine.with_view(&mut live_view, |engine| engine.snapshot().unwrap());
+        }
+        assert_eq!(
+            engine.compression_activity().unwrap(),
+            token,
+            "Live frames must not keep restarting the idle delay"
+        );
+        engine.snapshot().unwrap();
+        assert_eq!(engine.revision, revision);
+        assert!(engine.history == history);
+        assert!(engine.cells == live);
+        let (restored_cache, restored_flags) = engine.cache_rows(20..24).unwrap();
+        assert!(restored_cache == cached);
+        assert_eq!(restored_flags, flags);
+        view.set_active(true);
+        engine.with_view(&mut view, |engine| {
+            engine.snapshot().unwrap();
+            assert!(engine.frame == viewed.0);
+            assert!(engine.cells == viewed.1);
+            assert_eq!(engine.hyperlinks, viewed.2);
+            assert_eq!(engine.copy().unwrap(), viewed.3);
+        });
+        engine.find(&query);
+        while engine.find_pending() {
+            engine.poll_find();
+        }
+        assert_eq!(engine.find_state().total, 1);
+        if before.compression_supported {
+            assert_ne!(
+                engine.compression_activity().unwrap(),
+                token,
+                "Reading compressed history must restart the idle delay"
+            );
+        }
+        finish_compression(&mut engine);
+        let mut fresh = Engine::new().unwrap();
+        fresh
+            .restore_history(&engine.checkpoint().unwrap())
+            .unwrap();
+        fresh.snapshot().unwrap();
+        let (restored_cache, restored_flags) = fresh.cache_rows(20..24).unwrap();
+        assert!(restored_cache == recovered_cache.0);
+        assert_eq!(restored_flags, recovered_cache.1);
+        fresh.find(&recovered_query);
+        while fresh.find_pending() {
+            fresh.poll_find();
+        }
+        assert_eq!(fresh.find_state().total, recovered_matches);
+        let complete = engine.text().unwrap();
+        engine.write(b"\x1b[?2026h\r\x1b[2Kpartial");
+        finish_compression(&mut engine);
+        assert_eq!(engine.text().unwrap(), complete);
+        engine.write(b" frame\x1b[?2026l");
+        assert!(engine.text().unwrap().contains("partial frame"));
+        engine.write(b"\x1b[?1049halternate\x1b[?1049l\r\nresponsive");
+        assert!(engine.text().unwrap().contains("responsive"));
+        engine.resize(60, 5, 0, 0).unwrap();
+        finish_compression(&mut engine);
+        engine.clear_screen().unwrap();
+        finish_compression(&mut engine);
+        assert_eq!(engine.text().unwrap(), "");
+    }
 
     #[test]
     fn history_identity_survives_output_and_pruning_but_resets_for_grid_and_color_changes() {

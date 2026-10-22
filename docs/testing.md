@@ -52,6 +52,13 @@ hover, contextual copy and modifier-click against delayed and held frames. It
 never launches a browser. The renderer suite checks shared hover/OSC 22 pointer
 ownership alongside fractional alignment, retained rows and cursor scheduling.
 
+The `compression` headless suite checks attached and detached multi-pane
+compression, input during incremental work, transparent history access, and
+deadline removal after completion and pane teardown. It observes idle periods
+longer than the five-second compression delay without sending daemon requests.
+See [performance measurements](performance.md#idle-scrollback-compression) for
+release-build comparisons and larger retained-history workloads.
+
 ## Native prerequisites
 
 The native suites need PyGObject and these installed components:

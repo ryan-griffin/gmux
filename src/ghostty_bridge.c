@@ -469,6 +469,40 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     return e;
 }
 
+int gmux_engine_memory_usage(GmuxEngine *e, GmuxMemoryUsage *out) {
+    GhosttyTerminalMemoryUsage usage = GHOSTTY_INIT_SIZED(GhosttyTerminalMemoryUsage);
+    int result = ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_MEMORY_USAGE, &usage);
+    if (result) return result;
+    *out = (GmuxMemoryUsage){
+        .compression_supported = usage.compression_supported,
+        .pages = usage.primary_pages + usage.alternate_pages,
+        .virtual_bytes = usage.primary_virtual_bytes + usage.alternate_virtual_bytes,
+        .resident_bytes = usage.primary_resident_bytes + usage.alternate_resident_bytes,
+        .compressed_pages = usage.primary_compressed_pages + usage.alternate_compressed_pages,
+        .compressed_bytes = usage.primary_compressed_bytes + usage.alternate_compressed_bytes,
+        .image_bytes = usage.primary_image_bytes + usage.alternate_image_bytes,
+    };
+    return 0;
+}
+
+int gmux_engine_compression_activity(GmuxEngine *e, uint64_t *activity) {
+    return ghostty_terminal_compression_activity(e->terminal, activity);
+}
+
+int gmux_engine_compress(GmuxEngine *e, int *out) {
+    GhosttyTerminalCompressionResult result;
+    int error = ghostty_terminal_compress(e->terminal,
+        GHOSTTY_TERMINAL_COMPRESSION_MODE_INCREMENTAL, &result);
+    if (error) return error;
+    switch (result) {
+    case GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED: *out = GMUX_COMPRESSION_UNSUPPORTED; break;
+    case GHOSTTY_TERMINAL_COMPRESSION_RESULT_PENDING: *out = GMUX_COMPRESSION_PENDING; break;
+    case GHOSTTY_TERMINAL_COMPRESSION_RESULT_COMPLETE: *out = GMUX_COMPRESSION_COMPLETE; break;
+    default: return -1;
+    }
+    return 0;
+}
+
 // Serialized terminal state, distinct from gmux_engine_snapshot's viewport.
 int gmux_engine_checkpoint(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
     GhosttyResult result = ghostty_snapshot_encode_buf(e->terminal, out, cap, written);
@@ -736,6 +770,11 @@ int gmux_engine_resize(GmuxEngine *e, uint16_t cols, uint16_t rows, uint32_t cw,
     return 0;
 }
 void gmux_engine_scroll(GmuxEngine *e, intptr_t delta, bool bottom) {
+    // View enter/leave restores the live viewport around every client frame.
+    // A redundant scroll still changes Ghostty's compression activity token.
+    bool active = false;
+    if (bottom && !ghostty_terminal_get(e->terminal,
+        GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &active) && active) return;
     GhosttyTerminalScrollViewport scroll = {
         .tag = bottom ? GHOSTTY_SCROLL_VIEWPORT_BOTTOM : GHOSTTY_SCROLL_VIEWPORT_DELTA,
         .value = {.delta = delta}

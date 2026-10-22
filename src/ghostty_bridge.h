@@ -11,6 +11,10 @@
 #define GMUX_PROGRESS_INDETERMINATE 3
 #define GMUX_PROGRESS_PAUSED 4
 
+#define GMUX_COMPRESSION_UNSUPPORTED 0
+#define GMUX_COMPRESSION_PENDING 1
+#define GMUX_COMPRESSION_COMPLETE 2
+
 #define GMUX_LINK_MAX_URI_BYTES (16u * 1024)
 #define GMUX_LINK_MAX_TARGET_BYTES (256u * 1024)
 #define GMUX_LINK_MAX_SPANS 16384u
@@ -95,6 +99,21 @@ typedef struct {
 
 typedef struct GmuxEngine GmuxEngine;
 typedef struct GmuxView GmuxView;
+// Page and image totals for both screens. Excludes bridge/render/client caches
+// and terminal bookkeeping. Reading these walks pages without decompressing.
+typedef struct {
+    bool compression_supported;
+    uint64_t pages;
+    uint64_t virtual_bytes;
+    uint64_t resident_bytes;
+    uint64_t compressed_pages;
+    uint64_t compressed_bytes;
+    uint64_t image_bytes;
+} GmuxMemoryUsage;
+int gmux_engine_memory_usage(GmuxEngine *engine, GmuxMemoryUsage *out);
+int gmux_engine_compression_activity(GmuxEngine *engine, uint64_t *activity);
+// One bounded incremental step, serialized with all other terminal access.
+int gmux_engine_compress(GmuxEngine *engine, int *result);
 typedef struct {
     uint64_t generation;
     uint64_t origin;
