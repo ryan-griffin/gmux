@@ -540,9 +540,6 @@ impl Terminal {
         if let Some(error) = &update.error {
             self.show_status(error);
         }
-        if let Some(text) = &update.copy {
-            self.area.clipboard().set_text(text);
-        }
         if update.changed {
             if self.selection_anchor.get().is_some() {
                 if let Some(origin) = self.session.borrow().selection_origin() {

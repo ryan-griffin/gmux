@@ -307,7 +307,6 @@ impl Daemon {
             frontend.git_sent.remove(&id);
             frontend.visible.remove(&id);
             frontend.views.remove(&id);
-            frontend.clipboard.remove(&id);
             frontend.errors.remove(&id);
             if frontend
                 .paste

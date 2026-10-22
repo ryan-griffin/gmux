@@ -59,6 +59,13 @@ longer than the five-second compression delay without sending daemon requests.
 See [performance measurements](performance.md#idle-scrollback-compression) for
 release-build comparisons and larger retained-history workloads.
 
+The `clipboard` headless suite checks OSC 52 through local and remote streams,
+recipient focus and visibility, explicit copy ordering, decoded size limits,
+detach/reconnect without replay, and bounded output when a frontend stops
+reading. It also compiles the native normalized-request policy and reply check.
+The native `terminal-input` suite checks Unicode OSC 52 writes through the GDK
+clipboard and primary-selection paste in the private Wayland session.
+
 ## Native prerequisites
 
 The native suites need PyGObject and these installed components:

@@ -49,7 +49,7 @@ pub(super) struct Frontend {
     pub(super) discarding: bool,
     pub(super) paste: Option<Paste>,
     pub(super) views: HashMap<u64, crate::engine::EngineView>,
-    pub(super) clipboard: HashMap<u64, String>,
+    clipboard_writes: bool,
     pub(super) errors: HashMap<u64, String>,
     pub(super) state_revision: Option<u64>,
     pub(super) sizes: HashMap<u64, TerminalSize>,
@@ -67,6 +67,23 @@ pub(super) struct Paste {
     pub(super) options: PasteOptions,
 }
 impl Frontend {
+    fn queue_clipboard(
+        &mut self,
+        pane: u64,
+        write: gmux_client::clipboard::Write,
+    ) -> anyhow::Result<()> {
+        self.queue(Packet {
+            header: Header {
+                meta: Metadata {
+                    id: pane,
+                    ..Metadata::default()
+                },
+                copy: Some(write),
+                ..Header::default()
+            },
+            cells: Vec::new(),
+        })
+    }
     pub(super) fn new(socket: UnixStream) -> Self {
         Self {
             socket,
@@ -91,7 +108,7 @@ impl Frontend {
             discarding: false,
             paste: None,
             views: HashMap::new(),
-            clipboard: HashMap::new(),
+            clipboard_writes: false,
             errors: HashMap::new(),
             state_revision: None,
             sizes: HashMap::new(),
@@ -229,6 +246,34 @@ fn requested_size<'a>(
 }
 
 impl Daemon {
+    pub(super) fn clipboard_recipient(&self, pane: u64) -> Option<u64> {
+        self.frontends
+            .iter()
+            .filter(|(_, frontend)| {
+                frontend.attached && frontend.clipboard_writes && frontend.visible.contains(&pane)
+            })
+            .min_by_key(|(id, frontend)| (!frontend.focused, **id))
+            .map(|(&id, _)| id)
+    }
+    pub(super) fn deliver_clipboard(
+        &mut self,
+        recipient: u64,
+        pane: u64,
+        writes: Vec<gmux_client::clipboard::Write>,
+    ) {
+        let Some(frontend) = self.frontends.get_mut(&recipient) else {
+            return;
+        };
+        for write in writes {
+            if let Err(error) = frontend.queue_clipboard(pane, write) {
+                eprintln!("Detaching frontend: {error}");
+                self.frontends.remove(&recipient);
+                self.git_dirty = true;
+                self.resize_sessions(None);
+                break;
+            }
+        }
+    }
     pub(super) fn resize_sessions(&mut self, current: Option<(u64, &Frontend)>) {
         let panes: Vec<_> = self.sessions.keys().copied().collect();
         for pane in panes {
@@ -319,6 +364,10 @@ impl Daemon {
             );
             frontend.frame_interval = Duration::from_micros(micros as u64);
             frontend.next_frame = Instant::now();
+            return Ok(());
+        }
+        if let StreamCommand::ClipboardWrites { enabled } = command {
+            frontend.clipboard_writes = enabled;
             return Ok(());
         }
         if let StreamCommand::Focused { active } = command {
@@ -473,6 +522,7 @@ impl Daemon {
             command,
             StreamCommand::Theme { .. } | StreamCommand::Style { .. }
         );
+        let mut copy = None;
         match command {
             StreamCommand::Input { bytes } => session.send(&bytes)?,
             StreamCommand::Paste { text, options } => {
@@ -548,7 +598,7 @@ impl Daemon {
                             engine.selection().is_some(),
                             "Select terminal text to copy it"
                         );
-                        frontend.clipboard.insert(id, engine.copy()?);
+                        copy = Some(engine.copy()?);
                     }
                     StreamCommand::Find { query } => engine.find(&query),
                     StreamCommand::FindAdvance { previous } => engine.find_advance(previous),
@@ -569,6 +619,15 @@ impl Daemon {
                 }
                 Ok(())
             })?,
+        }
+        if let Some(text) = copy {
+            frontend.queue_clipboard(
+                id,
+                gmux_client::clipboard::Write {
+                    destination: gmux_client::clipboard::Destination::Clipboard,
+                    text: Some(text),
+                },
+            )?;
         }
         frontend.changed.insert(id);
         if appearance_changed {
@@ -735,7 +794,6 @@ impl Daemon {
                 .errors
                 .remove(&id)
                 .or_else(|| self.errors.get(&id).cloned());
-            let mut copy = frontend.clipboard.remove(&id);
             let terminal_changed = frontend.terminal_changed.contains(&id);
             let changed = terminal_changed
                 || frontend.changed.contains(&id)
@@ -754,7 +812,6 @@ impl Daemon {
                 && !screen
                 && notify.is_empty()
                 && error.is_none()
-                && copy.is_none()
                 && frontend.metadata.contains_key(&id)
             {
                 continue;
@@ -764,7 +821,6 @@ impl Daemon {
                 && !changed
                 && notify.is_empty()
                 && error.is_none()
-                && copy.is_none()
                 && frontend.metadata.get(&id) == Some(&meta)
             {
                 continue;
@@ -966,7 +1022,6 @@ impl Daemon {
                 && !selection_ack_changed
                 && notify.is_empty()
                 && error.is_none()
-                && copy.is_none()
                 && frontend.metadata.get(&id) == Some(&meta)
             {
                 continue;
@@ -988,30 +1043,6 @@ impl Daemon {
                 .sent_scroll_serials
                 .insert(id, frontend.scroll_serials.get(&id).copied().unwrap_or(0));
             let viewport_changed = screen && (frame.is_some() || find_changed || selection_changed);
-            // Large selections should not share the size limit of a full viewport.
-            if let Some(text) = copy.take() {
-                frontend.queue(Packet {
-                    header: Header {
-                        git: None,
-                        state: None,
-                        meta: meta.clone(),
-                        frame: None,
-                        scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
-                        rows: Vec::new(),
-                        notifications: Vec::new(),
-                        error: None,
-                        find: None,
-                        selection,
-                        selection_serial,
-                        selection_origin,
-                        row_flags: Vec::new(),
-                        hyperlinks: None,
-                        copy: Some(text),
-                        ..Header::default()
-                    },
-                    cells: Vec::new(),
-                })?;
-            }
             frontend.queue(Packet {
                 header: Header {
                     git: None,
@@ -1037,7 +1068,7 @@ impl Daemon {
                     selection,
                     selection_serial,
                     selection_origin,
-                    copy,
+                    copy: None,
                 },
                 cells,
             })?;

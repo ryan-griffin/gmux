@@ -128,6 +128,7 @@ struct GmuxEngine {
     GhosttyMouseEncoder mouse_encoder;
     GhosttyMouseEvent mouse;
     GmuxEventFn callback;
+    GmuxClipboardFn clipboard;
     void *userdata;
     uint32_t cell_width, cell_height;
     bool dark;
@@ -363,6 +364,61 @@ static GhosttyString xtversion(GhosttyTerminal t, void *ud) {
     static const uint8_t version[] = "gmux " GMUX_VERSION;
     return (GhosttyString){.ptr = version, .len = sizeof(version) - 1};
 }
+static bool string_equal(GhosttyString value, const char *text) {
+    size_t len = strlen(text);
+    return value.len == len && value.ptr && !memcmp(value.ptr, text, len);
+}
+static void clipboard_write(GhosttyTerminal t, void *ud, const GhosttyClipboardWrite *write) {
+    (void)t;
+    // No request or reply pointer may escape this callback. Unknown layouts
+    // are denied by returning without a reply, per the library contract.
+    if (write->size < offsetof(GhosttyClipboardWrite, reply) + sizeof(write->reply) || !write->reply) return;
+    GmuxEngine *e = ud;
+    GhosttyClipboardWriteReply reply = {
+        .size = sizeof(reply), .result = GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED,
+    };
+    uint8_t destination;
+    switch (write->location) {
+        case GHOSTTY_CLIPBOARD_LOCATION_STANDARD: destination = GMUX_CLIPBOARD_STANDARD; break;
+        case GHOSTTY_CLIPBOARD_LOCATION_PRIMARY: destination = GMUX_CLIPBOARD_PRIMARY; break;
+        default: goto done;
+    }
+    // Accept the whole atomic request, never just one representation of rich
+    // clipboard contents. Zero representations means clear, not empty text.
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (write->contents_len == 1 && write->contents) {
+        const GhosttyClipboardContent *content = write->contents;
+        if (!string_equal(content->mime, "text/plain") &&
+            !string_equal(content->mime, "text/plain;charset=utf-8")) goto done;
+        data = content->data.ptr;
+        len = content->data.len;
+        if (len > GMUX_CLIPBOARD_MAX_BYTES || (len && !data)) {
+            reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+            goto done;
+        }
+        // Keep empty text distinct even if the library uses a NULL slice.
+        if (!data) data = (const uint8_t *)"";
+    } else if (write->contents_len != 0) goto done;
+    reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
+    if (e->clipboard) {
+        switch (e->clipboard(e->userdata, destination, data, len)) {
+            case GMUX_CLIPBOARD_SUCCESS: reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS; break;
+            case GMUX_CLIPBOARD_INVALID: reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA; break;
+            default: break;
+        }
+    }
+done:
+    write->reply(write, &reply);
+}
+void gmux_engine_clipboard_callback(GmuxEngine *e, GmuxClipboardFn callback) {
+    if (e->clipboard == callback) return;
+    e->clipboard = callback;
+    // With no recipient, the library can skip OSC 52 decoding and refuse rich
+    // transactions before buffering their contents. No request is retained.
+    ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+        callback ? clipboard_write : NULL);
+}
 static void bell(GhosttyTerminal t, void *ud) {
     (void)t;
     GmuxEngine *e = ud;
@@ -464,6 +520,9 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     }
     // Track only a bounded unfinished sequence for shutdown snapshots.
     size_t continuation_max = 64 * 1024;
+    size_t clipboard_max = GMUX_CLIPBOARD_MAX_BYTES;
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES,
+        &clipboard_max)) { gmux_engine_free(e); return NULL; }
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
         &continuation_max)) { gmux_engine_free(e); return NULL; }
     return e;

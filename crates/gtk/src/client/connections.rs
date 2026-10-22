@@ -648,6 +648,7 @@ impl Connections {
             .get_mut(&reference.daemon)
             .and_then(|o| o.link.manager_mut())
             .ok_or_else(|| anyhow::anyhow!("Connection is disconnected"))?;
+        manager.set_clipboard_writes(true)?;
         let handle = manager.attach(reference.id, theme)?;
         self.attached.insert(id);
         Ok(handle)
@@ -782,7 +783,14 @@ impl Connections {
     pub fn take_status_changed(&mut self) -> bool {
         std::mem::take(&mut self.status_changed)
     }
+    #[cfg(test)]
     pub fn poll(&mut self) -> HashMap<u64, SessionUpdate> {
+        self.poll_with_clipboard(|_| {})
+    }
+    pub fn poll_with_clipboard(
+        &mut self,
+        mut clipboard: impl FnMut(gmux_client::clipboard::Write),
+    ) -> HashMap<u64, SessionUpdate> {
         if self.watcher.changed()
             && let Err(error) = self.refresh_definitions()
         {
@@ -794,7 +802,7 @@ impl Connections {
         let now = Instant::now();
         for (&daemon, origin) in &mut self.origins {
             let was_connected = origin.link.status() == ConnectionStatus::Connected;
-            let update = origin.link.poll_at(now);
+            let update = origin.link.poll_at_with_clipboard(now, &mut clipboard);
             if update.status_changed {
                 self.status_changed = true;
                 if let Some(manager) = origin.link.manager() {

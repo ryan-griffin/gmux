@@ -218,6 +218,7 @@ pub struct SessionManager {
     subscription_pending: bool,
     frame_interval: Duration,
     frame_interval_sent: bool,
+    clipboard_writes: bool,
     pending_reads: HashMap<u64, u64>,
     wake: ipc::Wake,
     disconnected: bool,
@@ -379,6 +380,7 @@ impl SessionManager {
             subscription_pending: false,
             frame_interval: transport::DEFAULT_FRAME_INTERVAL,
             frame_interval_sent: true,
+            clipboard_writes: false,
             pending_reads: HashMap::new(),
             wake,
             disconnected: false,
@@ -412,6 +414,18 @@ impl SessionManager {
     pub fn set_focused(&self, active: bool) -> anyhow::Result<()> {
         self.connection
             .send(StreamRequest::connection(StreamCommand::Focused { active }))
+    }
+    /// Advertise that this frontend can consume unsolicited clipboard writes.
+    pub fn set_clipboard_writes(&mut self, enabled: bool) -> anyhow::Result<()> {
+        if self.clipboard_writes == enabled {
+            return Ok(());
+        }
+        self.connection
+            .send(StreamRequest::connection(StreamCommand::ClipboardWrites {
+                enabled,
+            }))?;
+        self.clipboard_writes = enabled;
+        Ok(())
     }
     pub fn set_frame_interval(&mut self, interval: Duration) {
         let interval = interval.clamp(Duration::from_millis(1), Duration::from_secs(1));
@@ -577,6 +591,14 @@ impl SessionManager {
         Ok(handle)
     }
     pub fn poll(&mut self) -> HashMap<u64, SessionUpdate> {
+        self.poll_with_clipboard(|_| {})
+    }
+    /// Deliver clipboard side effects in wire order, across panes and explicit
+    /// copy requests. They are never coalesced into viewport state or replayed.
+    pub fn poll_with_clipboard(
+        &mut self,
+        mut clipboard: impl FnMut(crate::clipboard::Write),
+    ) -> HashMap<u64, SessionUpdate> {
         // A full command queue must not lose a tab's viewport subscription.
         let _ = self.subscribe();
         self.flush_reads();
@@ -591,6 +613,10 @@ impl SessionManager {
         for _ in 0..256 {
             match self.receiver.try_recv() {
                 Ok(Ok(mut packet)) => {
+                    if let Some(write) = packet.header.copy.take() {
+                        clipboard(write);
+                        continue;
+                    }
                     if let Some(git) = packet.header.git.take() {
                         if self.git_panes.contains(&git.id) {
                             if let Some(session) = self.sessions.get(&git.id) {
@@ -805,9 +831,6 @@ impl SessionManager {
                             update.changed = true;
                         }
                         session.flush_scroll();
-                        if packet.header.copy.is_some() {
-                            update.copy = packet.header.copy;
-                        }
                         if packet.header.error.is_some() {
                             update.error = packet.header.error;
                         }
@@ -1594,6 +1617,7 @@ mod tests {
                 subscription_pending: false,
                 frame_interval: transport::DEFAULT_FRAME_INTERVAL,
                 frame_interval_sent: true,
+                clipboard_writes: false,
                 pending_reads: HashMap::new(),
                 wake,
                 disconnected: false,
@@ -1603,6 +1627,89 @@ mod tests {
             sender,
             session,
         )
+    }
+
+    #[test]
+    fn clipboard_capability_changes_coalesce_and_failed_advertisements_can_retry() {
+        let (mut manager, _, _) = manager();
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        manager.connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        manager.set_clipboard_writes(false).unwrap();
+        assert!(receiver.try_recv().is_err());
+        for _ in 0..10 {
+            manager.set_clipboard_writes(true).unwrap();
+        }
+        assert!(manager.set_clipboard_writes(false).is_err());
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"clipboard-writes","enabled":true})
+        );
+        manager.set_clipboard_writes(false).unwrap();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"clipboard-writes","enabled":false})
+        );
+        manager.set_clipboard_writes(false).unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn clipboard_packets_keep_cross_pane_wire_order_without_mutating_selection_or_replay() {
+        use crate::clipboard::{Destination, Write};
+        let (mut manager, sender, handle) = manager();
+        handle.borrow_mut().selection = Some((0, 1));
+        for (pane, destination, text) in [
+            (1, Destination::Clipboard, Some("first 界🙂")),
+            (2, Destination::Primary, Some("")),
+            (1, Destination::Clipboard, None),
+            (2, Destination::Clipboard, Some("last")),
+        ] {
+            let packet = Packet {
+                header: Header {
+                    meta: Metadata {
+                        id: pane,
+                        ..Metadata::default()
+                    },
+                    copy: Some(Write {
+                        destination,
+                        text: text.map(str::to_owned),
+                    }),
+                    ..Header::default()
+                },
+                cells: vec![],
+            };
+            // Include actual encoding, decoding, and retained-byte admission.
+            let mut bytes = vec![];
+            packet.encode_into(&mut bytes).unwrap();
+            sender
+                .send(Ok(Packet::read(&mut &bytes[..]).unwrap()))
+                .unwrap();
+        }
+        let mut writes = vec![];
+        assert!(
+            manager
+                .poll_with_clipboard(|write| writes.push(write))
+                .is_empty()
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .map(|w| (w.destination, w.text.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Destination::Clipboard, Some("first 界🙂")),
+                (Destination::Primary, Some("")),
+                (Destination::Clipboard, None),
+                (Destination::Clipboard, Some("last")),
+            ]
+        );
+        assert_eq!(handle.borrow().selection, Some((0, 1)));
+        manager.poll_with_clipboard(|_| panic!("replayed clipboard write"));
     }
 
     #[test]

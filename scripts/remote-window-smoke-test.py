@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check GTK tabs across connections, workspace ownership, routing, and detach."""
 import fcntl
+import base64
 import json
 import os
 import signal
@@ -13,7 +14,7 @@ import time
 
 from cargo_test_support import cargo_binary
 from test_support import AppFixture, scenario, wait_for
-from wayland_test_support import ensure_wayland_session
+from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
 daemon, cli = cargo_binary("gmux"), cargo_binary("gmux-gtk")
@@ -88,6 +89,13 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
     wait_for(lambda: receiver.rpc("renderer-info")["gtk"])
     wait_for(lambda: len(receiver.rpc("list")["tabs"]) == 2)
     assert {t["connection"] for t in receiver.rpc("list")["tabs"]} == {"server", "other"}
+    with scenario("a remote terminal writes Unicode to its GTK frontend's clipboard"), WaylandInput() as native:
+        receiver.rpc("focus", pane=original["pane"])
+        text = "REMOTE_OSC52_界🙂e\u0301\n"
+        sequence = b'\x1b]52;c;' + base64.b64encode(text.encode()) + b'\x1b\\'
+        code = "import os; os.write(1," + repr(sequence) + ")"
+        server.rpc("send", pane=original["pane"], text="python3 -c " + shlex.quote(code), enter=True)
+        wait_for(lambda: native.clipboard_text() == text)
     assert isinstance(command(receiver, "rpc", json.dumps(dict(method="read", pane=original["pane"])))["text"], str)
     assert "absolute" in command(receiver, "new", "--directory", "relative", check=False)
     created = command(receiver, "new", "--directory", "~/project")

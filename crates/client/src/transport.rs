@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 29;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -83,7 +83,7 @@ pub struct Header {
     pub selection_serial: u64,
     #[serde(default)]
     pub selection_origin: Option<u64>,
-    pub copy: Option<String>,
+    pub copy: Option<crate::clipboard::Write>,
 }
 
 fn is_zero(value: &i16) -> bool {
@@ -95,6 +95,25 @@ pub struct Packet {
     pub cells: Vec<Cell>,
 }
 
+/// JSON escaping can expand control text sixfold. Stop encoding at the packet
+/// limit, before an oversized header can grow the frontend's transport buffer.
+struct HeaderWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    end: usize,
+}
+impl Write for HeaderWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.end.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other("Viewport header is too large"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Packet {
     pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
         let start = bytes.len();
@@ -102,7 +121,12 @@ impl Packet {
         // A failed packet must leave previously queued packets untouched.
         bytes.extend_from_slice(&[0; 8]);
         let result = (|| {
-            serde_json::to_writer(&mut *bytes, &self.header)?;
+            if self.header.copy.is_some() {
+                self.encode_clipboard_header(bytes, start + 4 + MAX_PACKET)?;
+            } else {
+                // Keep ordinary viewport traffic on serde's direct Vec writer.
+                serde_json::to_writer(&mut *bytes, &self.header)?;
+            }
             let header_size = bytes.len() - start - 8;
             let size = 4 + header_size + self.cells.len() * CELL_BYTES;
             anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
@@ -123,6 +147,13 @@ impl Packet {
             bytes.truncate(start);
         }
         result
+    }
+
+    #[cold]
+    fn encode_clipboard_header(&self, bytes: &mut Vec<u8>, end: usize) -> anyhow::Result<()> {
+        self.header.copy.as_ref().unwrap().validate()?;
+        serde_json::to_writer(HeaderWriter { bytes, end }, &self.header)?;
+        Ok(())
     }
 
     /// Decode one packet, skipping heartbeat replies and leaving following data buffered.
@@ -155,6 +186,9 @@ impl Packet {
             reader.read_exact(&mut bytes)?;
             serde_json::from_slice::<Header>(&bytes)?
         };
+        if let Some(write) = &header.copy {
+            write.validate()?;
+        }
         if let Some(end) = header.cache_valid_before {
             anyhow::ensure!(
                 header.generation != 0
@@ -710,10 +744,41 @@ mod tests {
         assert_eq!(encoded, original);
 
         packet.header.meta.directory = "/tmp".into();
-        packet.header.copy = Some("x".repeat(MAX_PACKET));
+        packet.header.copy = Some(crate::clipboard::Write {
+            destination: crate::clipboard::Destination::Clipboard,
+            text: Some("x".repeat(MAX_PACKET)),
+        });
         assert!(packet.encode_into(&mut encoded).is_err());
         assert_eq!(encoded, original);
         let decoded = Packet::read(&mut &encoded[..]).unwrap();
         assert!(decoded.cells == packet.cells);
+    }
+
+    #[test]
+    fn clipboard_text_limits_apply_to_decode_and_bound_json_escape_growth() {
+        use crate::clipboard::{Destination, Write};
+        let mut packet = Packet {
+            header: Header {
+                copy: Some(Write {
+                    destination: Destination::Clipboard,
+                    text: Some("\u{1}".repeat(MAX_PASTE)),
+                }),
+                ..Header::default()
+            },
+            cells: vec![],
+        };
+        let mut encoded = vec![0; 16];
+        assert!(packet.encode_into(&mut encoded).is_err());
+        assert_eq!(encoded, [0; 16]);
+        assert!(encoded.capacity() <= 2 * (MAX_PACKET + 20));
+        for text in ["x".repeat(MAX_PASTE + 1), "has\0nul".into()] {
+            packet.header.copy.as_mut().unwrap().text = Some(text);
+            // Bypass the encoder's checks to test untrusted remote packets.
+            let header = serde_json::to_vec(&packet.header).unwrap();
+            let mut wire = ((header.len() + 4) as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&header);
+            assert!(Packet::read(&mut &wire[..]).is_err());
+        }
     }
 }

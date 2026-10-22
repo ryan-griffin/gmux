@@ -1,5 +1,6 @@
 //! Direct daemon connections, execution commands, and terminal viewport streams.
 pub mod cells;
+pub mod clipboard;
 pub use cells::{Cell, Frame, Scrollback};
 pub mod connection;
 pub mod connections;

@@ -268,6 +268,15 @@ impl TerminalSession {
         self.send_with_enter(&bytes, enter)
     }
 
+    pub(crate) fn poll_with_clipboard(
+        &mut self,
+        enabled: bool,
+    ) -> (SessionUpdate, Vec<gmux_client::clipboard::Write>) {
+        self.engine.set_clipboard_enabled(enabled);
+        let update = self.poll();
+        self.engine.set_clipboard_enabled(false);
+        (update, self.engine.take_clipboard_writes())
+    }
     pub(crate) fn poll(&mut self) -> SessionUpdate {
         let mut update = SessionUpdate {
             changed: self.engine.expire_render_hold(),
