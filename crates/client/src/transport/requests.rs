@@ -75,6 +75,16 @@ pub enum SelectionMode {
     Line,
 }
 
+/// Keyboard action supplied by the originating frontend, before terminal encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyAction {
+    #[default]
+    Press,
+    Repeat,
+    Release,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum StreamCommand {
@@ -149,8 +159,7 @@ pub enum StreamCommand {
         cp: u32,
         #[serde(default)]
         mods: u16,
-        #[serde(default)]
-        release: bool,
+        action: KeyAction,
         #[serde(default)]
         text: String,
     },
@@ -210,8 +219,10 @@ mod tests {
     #[test]
     fn malformed_commands_keep_routing_and_reject_numeric_truncation() {
         for wire in [
-            json!({"method":"key","pane":7,"mods":65536}),
-            json!({"method":"key","pane":7,"cp":4294967296u64}),
+            json!({"method":"key","pane":7,"action":"unknown"}),
+            json!({"method":"key","pane":7,"release":false}),
+            json!({"method":"key","pane":7,"action":"press","mods":65536}),
+            json!({"method":"key","pane":7,"action":"press","cp":4294967296u64}),
             json!({"method":"resize","pane":7,"cols":65537,"rows":24}),
             json!({"method":"paste-data","pane":7,"text":false}),
             json!({"method":"scroll-to","pane":7,"row":-1,"serial":1}),

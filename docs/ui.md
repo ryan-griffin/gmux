@@ -88,7 +88,11 @@ With no running GTK client it falls back to the daemon's default viewport, like
 
 Arrow navigation keeps focus in the sidebar. Clicking a tab or pressing Enter
 activates it and focuses its terminal. Application shortcuts consume key presses
-and releases before terminal encoding.
+and releases before terminal encoding. Held hardware keys produce repeat events
+for applications that enable Kitty keyboard event reporting; ordinary terminal
+auto-repeat keeps its normal bytes. Each window tracks keys independently and
+resets tracking when focus changes. Composed and asynchronous input-method text
+commits carry no physical key action from an earlier event.
 
 Clear Screen erases the primary screen and scrollback for all views of a pane,
 clears selections, and restarts each view's Find query. It waits for a complete

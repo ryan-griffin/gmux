@@ -8,9 +8,9 @@ use std::{
 
 mod memory;
 mod requests;
-pub use requests::{PasteOptions, SelectionMode, StreamCommand, StreamRequest};
+pub use requests::{KeyAction, PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 29;
+pub const VERSION: u32 = 30;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;

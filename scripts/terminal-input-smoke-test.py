@@ -6,6 +6,7 @@ headless Mutter compositor with XWayland disabled and a private PipeWire server.
 """
 import json
 import base64
+from contextlib import contextmanager
 from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport, create_tab_when_connected, assert_stays
 import os
@@ -61,7 +62,12 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
         f"Exec={handler} %u\nMimeType=x-scheme-handler/gmux-test-osc8;\n")
     (temp / "config/mimeapps.list").write_text(
         "[Default Applications]\nx-scheme-handler/gmux-test-osc8=gmux-osc8-test.desktop\n")
+    compose = temp / "config/gtk-4.0/Compose"
+    compose.parent.mkdir(parents=True)
+    compose.write_text('<F12> <e> : "é" U00E9\n')
+    (compose.parent / "settings.ini").write_text("[Settings]\ngtk-enable-animations=false\n")
     env = dict(os.environ, GTK_A11Y="atspi", SHELL=str(shell),
+               GTK_IM_MODULE="simple",
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"), XDG_DATA_HOME=str(data_home))
     app = daemon = None
     pane = None
@@ -214,14 +220,24 @@ done.touch()
             native.key(Gdk.KEY_Control_R, False)
             wait_for(lambda: underline(False))
             # The window tracker also updates a hovered, unfocused terminal.
+            # The search bar moves the grid, so reacquire its painted target
+            # before testing modifier changes with the pointer stationary.
             rpc("action", name="find")
             wait_for(lambda: not appearance()["focused"])
+            wait_for(lambda: appearance()["origin"][1] > geometry["origin"][1])
+            lx, ly, _, _ = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((39, 91, 173)))
+            native.move(lx + 7.5 * geometry["cell_width"], ly + .5 * geometry["cell_height"])
+            wait_for(lambda: appearance()["pointer_name"] == "pointer")
             native.key(Gdk.KEY_Control_L, True)
             wait_for(lambda: underline(True))
             native.key(Gdk.KEY_Control_L, False)
             wait_for(lambda: underline(False))
             rpc("action", name="find")
             rpc("focus", pane=pane)
+            wait_for(lambda: appearance()["origin"] == geometry["origin"])
+            lx, ly, _, _ = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((39, 91, 173)))
+            native.move(lx + 7.5 * geometry["cell_width"], ly + .5 * geometry["cell_height"])
+            wait_for(lambda: appearance()["pointer_name"] == "pointer")
             # Ctrl may already be held when this window receives focus. Its
             # release, or a second modifier, must still clear stationary hover.
             Gtk.init()
@@ -358,48 +374,202 @@ done.touch()
                         paste=paste, enter=True, client=client)
                     wait_for(marker.is_file)
 
-            # Capture actual GTK events in Kitty mode, including a release
-            # while the other side of the same modifier is still held.
+            # Record bytes from real GDK events, including compositor-driven
+            # auto-repeat. Control files keep the probe alive through focus moves.
             keyboard_probe = temp / "keyboard.py"
-            keyboard_result = temp / "keyboard.json"
-            keyboard_probe.write_text("""import json, os, select, sys, termios, time, tty
+            keyboard_probe.write_text("""import os, select, sys, termios, tty
 from pathlib import Path
+flags, output, stop, done, title = sys.argv[1:]
 old = termios.tcgetattr(0)
-data = bytearray()
 try:
     tty.setraw(0)
-    os.write(1, b'\\x1b[>31u\\x1b]2;KITTY_MODIFIERS_READY\\x07')
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        if select.select([0], [], [], max(0, deadline - time.monotonic()))[0]:
-            data.extend(os.read(0, 4096))
+    os.write(1, f'\\x1b[>{flags}u\\x1b]2;{title}\\x07'.encode())
+    with open(output, 'ab', buffering=0) as result:
+        while not Path(stop).exists():
+            if select.select([0], [], [], .01)[0]:
+                result.write(os.read(0, 4096))
 finally:
     os.write(1, b'\\x1b[<u')
     termios.tcsetattr(0, termios.TCSANOW, old)
-Path(sys.argv[1]).write_text(json.dumps(list(data)))
+Path(done).touch()
 """)
-            rpc("send", pane=pane,
-                text=f"python3 {shlex.quote(str(keyboard_probe))} {shlex.quote(str(keyboard_result))}",
-                paste=True, enter=True)
-            wait_for(lambda: any(p["id"] == pane and p["title"] == "KITTY_MODIFIERS_READY"
-                                 for t in rpc("list")["tabs"] for p in t["panes"]))
-            events = [(Gdk.KEY_Shift_L, True), (Gdk.KEY_Shift_R, True),
-                      (Gdk.KEY_Shift_L, False), (Gdk.KEY_Shift_R, False),
-                      (Gdk.KEY_Control_R, True), (Gdk.KEY_Control_L, True),
-                      (Gdk.KEY_Control_R, False), (Gdk.KEY_Control_L, False),
-                      (Gdk.KEY_Alt_L, True), (Gdk.KEY_Alt_L, False),
-                      (Gdk.KEY_Caps_Lock, True), (Gdk.KEY_Caps_Lock, False),
-                      (Gdk.KEY_Caps_Lock, True), (Gdk.KEY_Caps_Lock, False)]
-            for symbol, pressed in events:
-                native.key(symbol, pressed)
-                time.sleep(.01)
-            actual = bytes(wait_for(lambda: json.loads(keyboard_result.read_text()),
-                                    exceptions=(OSError, json.JSONDecodeError)))
-            expected = (b"\x1b[57441;2u\x1b[57447;2u\x1b[57441;2:3u\x1b[57447;1:3u"
-                        b"\x1b[57448;5u\x1b[57442;5u\x1b[57448;5:3u\x1b[57442;1:3u"
-                        b"\x1b[57443;3u\x1b[57443;1:3u"
-                        b"\x1b[57358;65u\x1b[57358;65:3u\x1b[57358u\x1b[57358;1:3u")
-            assert actual == expected, ("GTK modifier events did not include their own state change", actual, expected)
+
+            @contextmanager
+            def keyboard_capture(flags):
+                # Unique titles and files prevent a previous probe's replies
+                # from satisfying readiness or completion checks.
+                output = temp / f"keyboard-{time.monotonic_ns()}"
+                stop, done = Path(str(output) + ".stop"), Path(str(output) + ".done")
+                title = output.name
+                output.touch()
+                rpc("send", pane=pane, text="python3 " + " ".join(map(shlex.quote,
+                    map(str, [keyboard_probe, flags, output, stop, done, title]))), paste=True, enter=True)
+                wait_for(lambda: any(p["id"] == pane and p["title"] == title
+                                     for t in rpc("list")["tabs"] for p in t["panes"]))
+                try:
+                    yield output.read_bytes
+                except BaseException:
+                    print("Keyboard capture:", flags, repr(output.read_bytes()[-2048:]), flush=True)
+                    raise
+                finally:
+                    stop.touch()
+                    wait_for(done.exists)
+
+            def tap(symbol):
+                native.key(symbol, True)
+                native.key(symbol, False)
+
+            def held(read, code, press, repeat, release):
+                start = len(read())
+                native.keycode(code, True)
+                try:
+                    wait_for(lambda: read()[start:].count(repeat) >= 2)
+                finally:
+                    native.keycode(code, False)
+                wait_for(lambda: read()[start:].endswith(release))
+                actual = read()[start:]
+                repeats = actual.count(repeat)
+                assert actual == press + repeat * repeats + release, (actual, press, repeat, release)
+
+            # Modifier releases must retain the other side's held state.
+            with keyboard_capture(31) as read_keys:
+                events = [(Gdk.KEY_Shift_L, True), (Gdk.KEY_Shift_R, True),
+                          (Gdk.KEY_Shift_L, False), (Gdk.KEY_Shift_R, False),
+                          (Gdk.KEY_Control_R, True), (Gdk.KEY_Control_L, True),
+                          (Gdk.KEY_Control_R, False), (Gdk.KEY_Control_L, False),
+                          (Gdk.KEY_Alt_L, True), (Gdk.KEY_Alt_L, False),
+                          (Gdk.KEY_Caps_Lock, True), (Gdk.KEY_Caps_Lock, False),
+                          (Gdk.KEY_Caps_Lock, True), (Gdk.KEY_Caps_Lock, False)]
+                for symbol, pressed in events:
+                    native.key(symbol, pressed)
+                    time.sleep(.01)
+                expected = (b"\x1b[57441;2u\x1b[57447;2u\x1b[57441;2:3u\x1b[57447;1:3u"
+                            b"\x1b[57448;5u\x1b[57442;5u\x1b[57448;5:3u\x1b[57442;1:3u"
+                            b"\x1b[57443;3u\x1b[57443;1:3u"
+                            b"\x1b[57358;65u\x1b[57358;65:3u\x1b[57358u\x1b[57358;1:3u")
+                wait_for(lambda: read_keys().endswith(b"\x1b[57358;1:3u"))
+                assert read_keys() == expected, (read_keys(), expected)
+                held(read_keys, 30, b"\x1b[97;;97u", b"\x1b[97;1:2;97u", b"\x1b[97;1:3u")
+                held(read_keys, 103, b"\x1b[1;1:1A", b"\x1b[1;1:2A", b"\x1b[1;1:3A")
+                # Repeat classification follows hardware identity when Shift
+                # changes the keyval and text while the same key stays down.
+                native.keycode(30, True)
+                wait_for(lambda: read_keys().endswith(b"\x1b[97;;97u"))
+                native.key(Gdk.KEY_Shift_R, True)
+                try:
+                    wait_for(lambda: b"\x1b[97:65;2:2;65u" in read_keys())
+                finally:
+                    native.keycode(30, False)
+                    native.key(Gdk.KEY_Shift_R, False)
+                wait_for(lambda: read_keys().endswith(b"\x1b[57447;1:3u"))
+
+                # A shortcut owns its physical key until release, even if its
+                # modifiers are released first and native repeat is still active.
+                native.key(Gdk.KEY_Control_L, True)
+                native.key(Gdk.KEY_Shift_L, True)
+                native.keycode(46, True)  # Ctrl+Shift+C
+                time.sleep(.04)
+                native.key(Gdk.KEY_Shift_L, False)
+                native.key(Gdk.KEY_Control_L, False)
+                wait_for(lambda: read_keys().endswith(b"\x1b[57442;1:3u"))
+                start = len(read_keys())
+                time.sleep(.7)
+                native.keycode(46, False)
+                # The next tap's release is an ordered marker for all preceding
+                # input, including the suppressed hold's release.
+                tap(Gdk.KEY_c)
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[99;1:3u"))
+                assert read_keys()[start:] == b"\x1b[99;;99u\x1b[99;1:3u"
+
+                # Compose commits once as text, without reusing a held action.
+                start = len(read_keys())
+                tap(Gdk.KEY_F12)
+                tap(Gdk.KEY_e)
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[101;1:3u"))
+                assert read_keys()[start:].count("é".encode()) == 1, read_keys()[start:]
+                assert b":2" not in read_keys()[start:], read_keys()[start:]
+
+                # Releases delivered to a search entry, another pane, or an
+                # external window cannot leave a held bit in this terminal.
+                for destination in ("search", "pane", "menu", "window"):
+                    print("Keyboard focus reset:", destination, flush=True)
+                    native.keycode(30, True)
+                    wait_for(lambda: read_keys().endswith(b"\x1b[97;;97u"))
+                    if destination == "search":
+                        rpc("action", name="find")
+                        wait_for(lambda: not rpc("renderer-info", pane=pane)["viewport"]["focused"])
+                    elif destination == "pane":
+                        other_pane = rpc("split", pane=pane)["pane"]
+                        wait_for(lambda: rpc("renderer-info", pane=other_pane)["viewport"]["focused"])
+                    elif destination == "menu":
+                        tap(Gdk.KEY_Menu)
+                        wait_for(lambda: not rpc("renderer-info", pane=pane)["viewport"]["focused"])
+                    else:
+                        probe_window = Gtk.Window(title="Keyboard focus reset")
+                        probe_window.set_default_size(180, 100)
+                        probe_window.present()
+                        wait_for(lambda: not rpc("renderer-info", pane=pane)["window_active"],
+                                 context=GLib.MainContext.default())
+                    native.keycode(30, False)
+                    if destination == "search":
+                        rpc("action", name="find")
+                    elif destination == "pane":
+                        rpc("close", pane=other_pane)
+                    elif destination == "menu":
+                        tap(Gdk.KEY_Escape)
+                    else:
+                        probe_window.destroy()
+                        wait_for(lambda: rpc("renderer-info", pane=pane)["window_active"],
+                                 context=GLib.MainContext.default())
+                    rpc("focus", pane=pane)
+                    wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["focused"])
+                    # Popup keyboard grabs return after GTK restores widget
+                    # focus. Wait for a fresh compositor frame before typing.
+                    native.drain_frames()
+                    native.frame()
+                    start = len(read_keys())
+                    tap(Gdk.KEY_a)
+                    wait_for(lambda: read_keys()[start:].endswith(b"\x1b[97;1:3u"))
+                    assert read_keys()[start:] == b"\x1b[97;;97u\x1b[97;1:3u", (destination, read_keys()[start:])
+
+                # Two frontend windows over the same session own separate key
+                # histories. Closing one while a key is held also resets focus.
+                first_window = rpc("windows")["windows"][0]["id"]
+                native.keycode(30, True)
+                wait_for(lambda: read_keys().endswith(b"\x1b[97;;97u"))
+                rpc("action", window=first_window, name="new-window")
+                second_window = wait_for(lambda: next((w["id"] for w in rpc("windows")["windows"]
+                    if w["id"] != first_window), None))
+                wait_for(lambda: any(p["id"] == pane for t in rpc("list", window=second_window)["tabs"]
+                                     for p in t["panes"]))
+                rpc("focus", window=second_window, pane=pane)
+                wait_for(lambda: rpc("renderer-info", window=second_window, pane=pane)["window_active"])
+                native.keycode(30, False)
+                wait_for(lambda: read_keys().endswith(b"\x1b[97;1:3u"))
+                start = len(read_keys())
+                tap(Gdk.KEY_a)
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[97;1:3u"))
+                assert read_keys()[start:] == b"\x1b[97;;97u\x1b[97;1:3u", read_keys()[start:]
+                native.keycode(30, True)
+                wait_for(lambda: read_keys().endswith(b"\x1b[97;;97u"))
+                rpc("detach", window=second_window)
+                wait_for(lambda: rpc("status")["local_clients"] == 1)
+                wait_for(lambda: rpc("renderer-info", window=first_window, pane=pane)["window_active"])
+                native.keycode(30, False)
+                wait_for(lambda: read_keys().endswith(b"\x1b[97;1:3u"))
+                held(read_keys, 30, b"\x1b[97;;97u", b"\x1b[97;1:2;97u", b"\x1b[97;1:3u")
+
+            # With no event reporting, real native holds retain legacy bytes.
+            with keyboard_capture(0) as read_keys:
+                native.keycode(30, True)
+                try:
+                    wait_for(lambda: len(read_keys()) >= 3)
+                finally:
+                    native.keycode(30, False)
+                tap(Gdk.KEY_b)
+                wait_for(lambda: read_keys().endswith(b"b"))
+                actual = read_keys()
+                assert actual == b"a" * (len(actual) - 1) + b"b", actual
 
             command = r"printf '\033[2J\033[H\033[48;2;230;30;45mKEYBOARD_INPUT_OK\033[0m\n'"
             for char in command + "\n":
@@ -408,6 +578,11 @@ Path(sys.argv[1]).write_text(json.dumps(list(data)))
                 native.key(symbol, False)
                 time.sleep(0.005)
             wait_for(lambda: "KEYBOARD_INPUT_OK" in rpc("read", pane=pane)["text"].splitlines())
+            # Topology changes can replace the terminal widget and its
+            # accessible object. Use the current object after the focus tests.
+            terminal = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
+                if obj.get_process_id() == app.pid and obj.get_role_name() == "terminal"
+                and obj.get_text_iface() is not None), None), context=GLib.MainContext.default())
             text_iface = terminal.get_text_iface()
             assert text_iface is not None, "Terminal must expose accessible text"
             wait_for(lambda: "KEYBOARD_INPUT_OK" in Atspi.Text.get_text(text_iface, 0, -1))
@@ -945,7 +1120,7 @@ finally:
             expected_hash = hashlib.sha256(b"\x1b[200~" + encoded + b"\x1b[201~").hexdigest()
             wait_for(lambda: expected_hash in rpc("read", pane=pane)["text"], context=GLib.MainContext.default())
             assert rpc("status")["local_clients"] and app.poll() is None
-            print("PASS: native Wayland keyboard input, Kitty modifier presses/releases with both sides and Caps Lock, "
+            print("PASS: native Wayland keyboard input, Kitty press/repeat/release and focus resets, composition and shortcut holds, Kitty modifier presses/releases with both sides and Caps Lock, "
                   "OSC 8 hover/copy/Ctrl-click through an isolated URI handler with held and delayed frames, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "

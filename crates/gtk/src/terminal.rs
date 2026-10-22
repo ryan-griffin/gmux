@@ -5,7 +5,10 @@ use crate::{
     terminal_canvas::TerminalCanvas,
     theme::Theme,
 };
-use gmux_client::{Frame, transport::SelectionMode};
+use gmux_client::{
+    Frame,
+    transport::{KeyAction, SelectionMode},
+};
 use gmux_client::{remote::SessionHandle, session::SessionUpdate};
 use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
 use std::{
@@ -115,7 +118,7 @@ pub struct Terminal {
 mod cursor;
 mod input;
 mod links;
-pub(crate) use input::KeyboardModifiers;
+pub(crate) use input::KeyboardState;
 use input::mods;
 
 impl Terminal {
@@ -126,7 +129,7 @@ impl Terminal {
         on_focus: Rc<dyn Fn(u64)>,
         on_close: Rc<dyn Fn(u64)>,
         application: &gtk::Application,
-        keyboard: Rc<RefCell<KeyboardModifiers>>,
+        keyboard: Rc<RefCell<KeyboardState>>,
     ) -> Rc<Self> {
         let directory = session.borrow().directory().to_path_buf();
         let grid = session.borrow().size();
@@ -314,7 +317,7 @@ impl Terminal {
         terminal.install_focus(&canvas, on_focus);
         terminal.install_canvas_callbacks();
         close.connect_clicked(move |_| on_close(id));
-        terminal.install_keyboard(application, keyboard);
+        terminal.install_keyboard(keyboard);
         terminal.install_pointer();
         terminal.install_selection();
         terminal.install_scrolling(&canvas);
@@ -500,11 +503,11 @@ impl Terminal {
         self.cursor.restart();
         self.session.borrow().send_with_enter(bytes, enter)
     }
-    fn key_input(&self, name: &str, cp: u32, mods: u16, release: bool, text: &str) {
-        if !release {
+    fn key_input(&self, name: &str, cp: u32, mods: u16, action: KeyAction, text: &str) {
+        if action != KeyAction::Release {
             self.cursor.restart();
         }
-        if let Err(error) = self.session.borrow().key(name, cp, mods, release, text) {
+        if let Err(error) = self.session.borrow().key(name, cp, mods, action, text) {
             self.show_status(&error.to_string());
         }
     }

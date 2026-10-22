@@ -126,7 +126,7 @@ pub struct Ui {
     command_count: Cell<usize>,
     creation_serial: Cell<u64>,
     command_exits: RefCell<HashSet<u64>>,
-    keyboard: Rc<RefCell<crate::terminal::KeyboardModifiers>>,
+    keyboard: Rc<RefCell<crate::terminal::KeyboardState>>,
     update_source: RefCell<Option<glib::SourceId>>,
     deadline_source: RefCell<Option<(std::time::Instant, glib::SourceId)>>,
     theme_handler: RefCell<Option<glib::SignalHandlerId>>,

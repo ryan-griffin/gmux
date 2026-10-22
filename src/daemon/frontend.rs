@@ -1,6 +1,6 @@
 //! Frontend socket buffering, terminal input, and viewport updates.
 use super::*;
-use gmux_client::transport::{PasteOptions, StreamCommand, StreamRequest};
+use gmux_client::transport::{KeyAction, PasteOptions, StreamCommand, StreamRequest};
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
 const READ_CHUNK: usize = 16 * 1024;
@@ -543,12 +543,12 @@ impl Daemon {
                 name,
                 cp,
                 mods,
-                release,
+                action,
                 text,
             } => {
-                let bytes = session.key(&name, cp, mods, release, &text);
+                let bytes = session.key(&name, cp, mods, action, &text);
                 if !bytes.is_empty() {
-                    if !release {
+                    if action != KeyAction::Release {
                         session.with_view(view, |engine| engine.scroll(0, true));
                     }
                     session.send(&bytes)?;
