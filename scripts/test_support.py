@@ -181,7 +181,7 @@ class AccessibilityFixture:
 
 
 class DelayedViewport:
-    """Relay a private daemon stream, with controllable reply latency."""
+    """Delay and count the first frontend stream; relay other windows normally."""
     def __init__(self, socket_path, proxy_path):
         self.socket_path = str(socket_path)
         self.proxy_path = str(proxy_path)
@@ -226,7 +226,7 @@ class DelayedViewport:
         Path(self.socket_path + ".ui").symlink_to(self.proxy_path + ".ui")
         listener = socket.socket(socket.AF_UNIX)
         listener.bind(self.proxy_path + ".stream")
-        listener.listen(1)
+        listener.listen()
         self.sockets.append(listener)
 
         def relay(source, destination, delayed=False):
@@ -241,17 +241,25 @@ class DelayedViewport:
                     destination.sendall(data)
             except OSError:
                 pass  # Closing the fixture interrupts blocked stream operations.
+            finally:
+                try:
+                    destination.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
 
         def accept():
+            delayed = True
             try:
-                client, _ = listener.accept()
-                backend = socket.socket(socket.AF_UNIX)
-                self.sockets.extend((client, backend))
-                backend.connect(self.socket_path + ".stream")
-                writer = threading.Thread(target=relay, args=(client, backend), daemon=True)
-                self.threads.append(writer)
-                writer.start()
-                relay(backend, client, delayed=True)
+                while not self.closed.is_set():
+                    client, _ = listener.accept()
+                    backend = socket.socket(socket.AF_UNIX)
+                    self.sockets.extend((client, backend))
+                    backend.connect(self.socket_path + ".stream")
+                    for source, destination, delay in ((client, backend, False), (backend, client, delayed)):
+                        worker = threading.Thread(target=relay, args=(source, destination, delay), daemon=True)
+                        self.threads.append(worker)
+                        worker.start()
+                    delayed = False
             except OSError:
                 pass
 

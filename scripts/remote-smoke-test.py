@@ -185,6 +185,42 @@ with (artifacts / "remote-smoke.log").open("w") as log, \
             # With no attached view, copy returns an empty string, still inside JSON.
             assert command(fixture, *selector, "rpc", json.dumps(dict(method="copy", pane=pane))) == {"text": ""}
 
+    with scenario("local and remote streams preserve explicit keyboard actions"):
+        probe = server.path / "keyboard.py"
+        probe.write_text("""import os, sys, termios, tty
+from pathlib import Path
+flags, output, ready, size = sys.argv[1:]
+old = termios.tcgetattr(0)
+data = bytearray()
+try:
+    tty.setraw(0)
+    os.write(1, f'\\x1b[>{flags}u\\x1b]2;{ready}\\x07'.encode())
+    while len(data) < int(size):
+        data.extend(os.read(0, int(size) - len(data)))
+finally:
+    os.write(1, b'\\x1b[<u')
+    termios.tcsetattr(0, termios.TCSANOW, old)
+Path(output).write_bytes(data)
+""")
+        for remote in (False, True):
+            for flags, expected in [(31, b"\x1b[97;;97u\x1b[97;1:2;97u\x1b[97;1:2;97u\x1b[97;1:3u!"),
+                                    (0, b"aaa!")]:
+                output = server.path / f"keyboard-{remote}-{flags}"
+                stream = Client(client, pane, connection="server") if remote else Client(server, pane)
+                try:
+                    stream.send("paste", text="python3 " + " ".join(map(shlex.quote,
+                        map(str, [probe, flags, output, output.name, len(expected)]))), enter=True)
+                    stream.until(lambda h: h["meta"]["title"] == output.name)
+                    for action in ("press", "repeat", "repeat", "release"):
+                        stream.send("key", name="a", cp=97, mods=0, action=action,
+                                    text="" if action == "release" else "a")
+                    # A trailing byte proves that legacy release emitted nothing.
+                    stream.send("input", bytes=[ord("!")])
+                    wait_for(output.exists)
+                    assert output.read_bytes() == expected, (remote, flags, output.read_bytes(), expected)
+                finally:
+                    stream.close()
+
     with scenario("any client can consume viewport packets and send input over direct TCP"):
         stream = Client(client, pane, connection="server")
         stream.until(lambda header: header["frame"] is not None)

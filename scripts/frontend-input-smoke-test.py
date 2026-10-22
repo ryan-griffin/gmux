@@ -187,7 +187,7 @@ while True:
                 if index % 2:
                     client.send("input", bytes=[ord("q")])
                 else:
-                    client.send("key", name="q", cp=ord("q"), text="q")
+                    client.send("key", action="press", name="q", cp=ord("q"), text="q")
                 client.until(lambda h, text: h["meta"]["id"] == pane and f"PROBE{response:06d}" in text)
                 if index >= 3:
                     samples.append((time.perf_counter_ns() - start) / 1e6)

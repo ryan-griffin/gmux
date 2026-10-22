@@ -1,4 +1,8 @@
-use gmux_client::{model::CursorStyle, theme::Theme, transport::SelectionMode};
+use gmux_client::{
+    model::CursorStyle,
+    theme::Theme,
+    transport::{KeyAction, SelectionMode},
+};
 use std::{
     ffi::{CString, c_void},
     ptr::NonNull,
@@ -751,7 +755,14 @@ impl Engine {
     pub fn take_directory_update(&mut self) -> bool {
         std::mem::take(&mut self.events.directory_changed)
     }
-    pub fn key(&mut self, name: &str, cp: u32, mods: u16, release: bool, text: &str) -> Vec<u8> {
+    pub fn key(
+        &mut self,
+        name: &str,
+        cp: u32,
+        mods: u16,
+        action: KeyAction,
+        text: &str,
+    ) -> Vec<u8> {
         let Ok(name) = CString::new(name) else {
             return vec![];
         };
@@ -762,7 +773,11 @@ impl Engine {
                 name.as_ptr(),
                 cp,
                 mods,
-                release,
+                match action {
+                    KeyAction::Press => GMUX_KEY_ACTION_PRESS,
+                    KeyAction::Repeat => GMUX_KEY_ACTION_REPEAT,
+                    KeyAction::Release => GMUX_KEY_ACTION_RELEASE,
+                } as u8,
                 text.as_ptr().cast(),
                 text.len(),
                 out.as_mut_ptr(),
@@ -1633,7 +1648,7 @@ mod tests {
             fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
             assert!(!fresh.mode(0));
             assert!(!fresh.mode(1004));
-            assert_eq!(fresh.key("Up", 0, 0, false, ""), b"\x1b[A");
+            assert_eq!(fresh.key("Up", 0, 0, KeyAction::Press, ""), b"\x1b[A");
             assert_eq!(fresh.paste("input", false).unwrap(), b"input");
             assert_eq!(fresh.metadata(false), "");
             fresh.write(b"fresh shell\r\n");
@@ -2297,42 +2312,120 @@ mod tests {
     #[test]
     fn keys_respect_terminal_modes() {
         let mut e = Engine::new().unwrap();
-        assert_eq!(e.key("space", ' ' as u32, 0, false, " "), b" ");
-        assert_eq!(e.key("c", 'c' as u32, 2, false, "c"), vec![3]);
-        assert_eq!(e.key("Up", 0, 0, false, ""), b"\x1b[A");
+        assert_eq!(e.key("space", ' ' as u32, 0, KeyAction::Press, " "), b" ");
+        assert_eq!(e.key("c", 'c' as u32, 2, KeyAction::Press, "c"), vec![3]);
+        assert_eq!(e.key("Up", 0, 0, KeyAction::Press, ""), b"\x1b[A");
         e.write(b"\x1b[?1h");
-        assert_eq!(e.key("Up", 0, 0, false, ""), b"\x1bOA");
+        assert_eq!(e.key("Up", 0, 0, KeyAction::Press, ""), b"\x1bOA");
         e.write(b"\x1b[?2004h");
         assert!(e.mode(2004));
     }
 
     #[test]
+    fn key_actions_follow_negotiated_event_reporting() {
+        use KeyAction::{Press, Release, Repeat};
+        let mut engine = Engine::new().unwrap();
+        for (mode, press, repeat, release) in [
+            (
+                b"\x1b[=0u".as_slice(),
+                b"a".as_slice(),
+                b"a".as_slice(),
+                b"".as_slice(),
+            ),
+            (b"\x1b[=9u", b"\x1b[97u", b"\x1b[97u", b""),
+            (b"\x1b[=11u", b"\x1b[97u", b"\x1b[97;1:2u", b"\x1b[97;1:3u"),
+            (
+                b"\x1b[=31u",
+                b"\x1b[97;;97u",
+                b"\x1b[97;1:2;97u",
+                b"\x1b[97;1:3u",
+            ),
+        ] {
+            engine.write(mode);
+            for (action, expected) in [
+                (Press, press),
+                (Repeat, repeat),
+                (Repeat, repeat),
+                (Release, release),
+            ] {
+                assert_eq!(
+                    engine.key("a", 97, 0, action, if action == Release { "" } else { "a" }),
+                    expected
+                );
+            }
+        }
+        engine.write(b"\x1b[=2u");
+        assert_eq!(engine.key("Up", 0, 0, Repeat, ""), b"\x1b[1;1:2A");
+        engine.write(b"\x1b[=0u\x1b[?1h");
+        assert_eq!(engine.key("Up", 0, 0, Repeat, ""), b"\x1bOA");
+        assert_eq!(engine.key("c", 99, 2, Repeat, "c"), b"\x03");
+        assert!(engine.key("Up", 0, 0, Release, "").is_empty());
+    }
+
+    #[test]
     fn keypad_keys_respect_application_mode() {
         let mut e = Engine::new().unwrap();
-        assert_eq!(e.key("KP_1", '1' as u32, 0, false, "1"), b"1");
+        assert_eq!(e.key("KP_1", '1' as u32, 0, KeyAction::Press, "1"), b"1");
         e.write(b"\x1b[?1035l\x1b=");
-        assert_eq!(e.key("KP_1", '1' as u32, 0, false, "1"), b"\x1bOq");
-        assert_eq!(e.key("KP_Add", '+' as u32, 0, false, "+"), b"\x1bOk");
-        assert_eq!(e.key("KP_Enter", '\r' as u32, 0, false, ""), b"\x1bOM");
+        assert_eq!(
+            e.key("KP_1", '1' as u32, 0, KeyAction::Press, "1"),
+            b"\x1bOq"
+        );
+        assert_eq!(
+            e.key("KP_Add", '+' as u32, 0, KeyAction::Press, "+"),
+            b"\x1bOk"
+        );
+        assert_eq!(
+            e.key("KP_Enter", '\r' as u32, 0, KeyAction::Press, ""),
+            b"\x1bOM"
+        );
         e.write(b"\x1b>");
-        assert_eq!(e.key("KP_1", '1' as u32, 0, false, "1"), b"1");
+        assert_eq!(e.key("KP_1", '1' as u32, 0, KeyAction::Press, "1"), b"1");
         e.write(b"\x1b[>31u");
-        assert_eq!(e.key("KP_1", '1' as u32, 0, false, "1"), b"\x1b[57400;;49u");
+        assert_eq!(
+            e.key("KP_1", '1' as u32, 0, KeyAction::Press, "1"),
+            b"\x1b[57400;;49u"
+        );
     }
 
     #[test]
     fn extended_keyboard_reports_modifier_and_lock_keys() {
         let mut engine = Engine::new().unwrap();
-        assert!(engine.key("Shift_L", 0, 0, false, "").is_empty());
-        assert!(engine.key("Control_R", 0, 0, true, "").is_empty());
-        assert_eq!(engine.key("Menu", 0, 2, false, ""), b"\x1b[29;5~");
-        assert_eq!(engine.key("Menu", 0, 1, false, ""), b"\x1b[29;2~");
+        assert!(engine.key("Shift_L", 0, 0, KeyAction::Press, "").is_empty());
+        assert!(
+            engine
+                .key("Control_R", 0, 0, KeyAction::Release, "")
+                .is_empty()
+        );
+        assert_eq!(
+            engine.key("Menu", 0, 2, KeyAction::Press, ""),
+            b"\x1b[29;5~"
+        );
+        assert_eq!(
+            engine.key("Menu", 0, 1, KeyAction::Press, ""),
+            b"\x1b[29;2~"
+        );
         engine.write(b"\x1b[>31u");
-        assert_eq!(engine.key("Shift_L", 0, 1, false, ""), b"\x1b[57441;2u");
-        assert_eq!(engine.key("Shift_L", 0, 0, true, ""), b"\x1b[57441;1:3u");
-        assert_eq!(engine.key("Control_R", 0, 2, false, ""), b"\x1b[57448;5u");
-        assert_eq!(engine.key("Alt_L", 0, 4, false, ""), b"\x1b[57443;3u");
-        assert_eq!(engine.key("Super_R", 0, 8, false, ""), b"\x1b[57450;9u");
+        assert_eq!(
+            engine.key("Shift_L", 0, 1, KeyAction::Press, ""),
+            b"\x1b[57441;2u"
+        );
+        assert_eq!(
+            engine.key("Shift_L", 0, 0, KeyAction::Release, ""),
+            b"\x1b[57441;1:3u"
+        );
+        assert_eq!(
+            engine.key("Control_R", 0, 2, KeyAction::Press, ""),
+            b"\x1b[57448;5u"
+        );
+        assert_eq!(
+            engine.key("Alt_L", 0, 4, KeyAction::Press, ""),
+            b"\x1b[57443;3u"
+        );
+        assert_eq!(
+            engine.key("Super_R", 0, 8, KeyAction::Press, ""),
+            b"\x1b[57450;9u"
+        );
         for (name, code) in [
             ("Caps_Lock", 57358),
             ("Scroll_Lock", 57359),
@@ -2341,7 +2434,7 @@ mod tests {
             ("Pause", 57362),
         ] {
             assert_eq!(
-                engine.key(name, 0, 0, false, ""),
+                engine.key(name, 0, 0, KeyAction::Press, ""),
                 format!("\x1b[{code}u").as_bytes()
             );
         }

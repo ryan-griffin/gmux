@@ -6,7 +6,7 @@ use crate::{
     model::{CursorStyle, ExecutionState},
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
-    transport::{self, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest},
+    transport::{self, KeyAction, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest},
 };
 #[cfg(test)]
 use serde_json::{Value, json};
@@ -940,8 +940,10 @@ impl RemoteSession {
         // coalescing through them; other commands follow the latest scroll.
         if !matches!(
             command,
-            StreamCommand::Key { release: true, .. }
-                | StreamCommand::Theme { .. }
+            StreamCommand::Key {
+                action: KeyAction::Release,
+                ..
+            } | StreamCommand::Theme { .. }
                 | StreamCommand::Style { .. }
         ) {
             self.send_scroll()?;
@@ -1015,14 +1017,14 @@ impl RemoteSession {
         name: &str,
         cp: u32,
         mods: u16,
-        release: bool,
+        action: KeyAction,
         text: &str,
     ) -> anyhow::Result<()> {
         self.command(StreamCommand::Key {
             name: name.to_owned(),
             cp,
             mods,
-            release,
+            action,
             text: text.to_owned(),
         })
     }
@@ -2970,6 +2972,34 @@ mod tests {
     }
 
     #[test]
+    fn key_actions_survive_the_frontend_command_queue() {
+        let (_, _, session) = manager();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(8);
+        session.borrow_mut().connection = Rc::new(Connection {
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        for (action, expected) in [
+            (KeyAction::Press, "press"),
+            (KeyAction::Repeat, "repeat"),
+            (KeyAction::Release, "release"),
+        ] {
+            session.borrow().key("a", 97, 0, action, "").unwrap();
+            let request = wire(receiver.try_recv().unwrap());
+            assert_eq!(
+                request,
+                json!({"method":"key","pane":1,"name":"a","cp":97,"mods":0,"action":expected,"text":""})
+            );
+            assert!(
+                matches!(StreamRequest::decode(&serde_json::to_vec(&request).unwrap()).command,
+                StreamCommand::Key { action: actual, .. } if actual == action)
+            );
+        }
+    }
+
+    #[test]
     fn rapid_scroll_events_pipeline_before_viewport_replies_arrive() {
         let (mut manager, sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
@@ -3019,7 +3049,10 @@ mod tests {
                 .borrow()
                 .set_cursor_style(CursorStyle::Block, false)
                 .unwrap();
-            session.borrow().key("a", b'a' as u32, 0, true, "").unwrap();
+            session
+                .borrow()
+                .key("a", b'a' as u32, 0, KeyAction::Release, "")
+                .unwrap();
             manager.poll();
             let commands: Vec<_> = receiver.try_iter().map(wire).collect();
             assert_eq!(commands.len(), 4);
@@ -3172,7 +3205,7 @@ mod tests {
         other.borrow_mut().scroll_to(30);
         session
             .borrow()
-            .key("a", b'a' as u32, 0, false, "a")
+            .key("a", b'a' as u32, 0, KeyAction::Press, "a")
             .unwrap();
         session.borrow_mut().scroll_to(10);
         session.borrow_mut().scroll_to(20);
@@ -3186,7 +3219,7 @@ mod tests {
         // viewport-dependent input never overtakes older scrolls.
         session
             .borrow()
-            .key("b", b'b' as u32, 0, false, "b")
+            .key("b", b'b' as u32, 0, KeyAction::Press, "b")
             .unwrap();
         let commands: Vec<_> = receiver.try_iter().take(2).map(wire).collect();
         assert_eq!(commands.len(), 2);

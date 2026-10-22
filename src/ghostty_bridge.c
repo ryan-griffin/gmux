@@ -1077,9 +1077,16 @@ static GhosttyKey key_for(uint32_t cp, const char *name) {
     return GHOSTTY_KEY_UNIDENTIFIED;
 }
 size_t gmux_engine_key(GmuxEngine *e, const char *name, uint32_t cp, uint16_t mods,
-    bool release, const char *text, size_t len, uint8_t *out, size_t cap) {
+    uint8_t action, const char *text, size_t len, uint8_t *out, size_t cap) {
     ghostty_key_encoder_setopt_from_terminal(e->encoder, e->terminal);
-    ghostty_key_event_set_action(e->key, release ? GHOSTTY_KEY_ACTION_RELEASE : GHOSTTY_KEY_ACTION_PRESS);
+    GhosttyKeyAction ghostty_action;
+    switch (action) {
+        case GMUX_KEY_ACTION_PRESS: ghostty_action = GHOSTTY_KEY_ACTION_PRESS; break;
+        case GMUX_KEY_ACTION_REPEAT: ghostty_action = GHOSTTY_KEY_ACTION_REPEAT; break;
+        case GMUX_KEY_ACTION_RELEASE: ghostty_action = GHOSTTY_KEY_ACTION_RELEASE; break;
+        default: return 0;
+    }
+    ghostty_key_event_set_action(e->key, ghostty_action);
     ghostty_key_event_set_key(e->key, key_for(cp, name));
     ghostty_key_event_set_mods(e->key, mods);
     ghostty_key_event_set_consumed_mods(e->key, len ? mods & GHOSTTY_MODS_SHIFT : 0);

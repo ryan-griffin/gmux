@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define GMUX_KEY_ACTION_PRESS 0
+#define GMUX_KEY_ACTION_REPEAT 1
+#define GMUX_KEY_ACTION_RELEASE 2
+
 #define GMUX_PROGRESS_INACTIVE 0
 #define GMUX_PROGRESS_DETERMINATE 1
 #define GMUX_PROGRESS_ERROR 2
@@ -188,7 +192,7 @@ size_t gmux_engine_string(GmuxEngine *engine, int pwd, uint8_t *out, size_t cap)
 int gmux_engine_mode(GmuxEngine *engine, int mode);
 int gmux_engine_paste(GmuxEngine *engine, const uint8_t *data, size_t len, bool clipboard);
 size_t gmux_engine_key(GmuxEngine *engine, const char *name, uint32_t cp, uint16_t mods,
-    bool release, const char *text, size_t len, uint8_t *out, size_t cap);
+    uint8_t action, const char *text, size_t len, uint8_t *out, size_t cap);
 size_t gmux_engine_mouse(GmuxEngine *engine, float x, float y, uint32_t cw, uint32_t ch,
     int action, int button, uint16_t mods, bool pressed, uint8_t *out, size_t cap);
 

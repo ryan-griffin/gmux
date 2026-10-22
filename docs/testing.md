@@ -47,10 +47,13 @@ given explicit binary paths.
 The `hyperlinks` headless suite checks OSC 8 maps through the daemon, including
 target-only packets, independent viewports, holds, reconnect and clear. It also
 compiles a native ownership check for hold release, timeout and host clear.
-The native `terminal-input` suite installs a private test URI handler and checks
-hover, contextual copy and modifier-click against delayed and held frames. It
-never launches a browser. The renderer suite checks shared hover/OSC 22 pointer
-ownership alongside fractional alignment, retained rows and cursor scheduling.
+The native `terminal-input` suite checks compositor-generated keyboard repeats,
+Kitty event negotiation, legacy typing, modifiers, composition, shortcuts, and
+key tracking across pane and window focus changes. It also installs a private
+test URI handler and checks hover, contextual copy and modifier-click against
+delayed and held frames. It never launches a browser. The renderer suite checks
+shared hover/OSC 22 pointer ownership alongside fractional alignment, retained
+rows and cursor scheduling.
 
 The `compression` headless suite checks attached and detached multi-pane
 compression, input during incremental work, transparent history access, and

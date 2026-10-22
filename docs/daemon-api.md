@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 29:
+handshake. The current protocol version is 30:
 
 ```json
-{"version":29,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":30,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -167,7 +167,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":29,"daemon":"returned-identity"}
+{"method":"attach","version":30,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -180,6 +180,19 @@ focused view controls a pane's PTY size.
 
 Use `input` with a byte array to write terminal input, or `key`, `mouse`, and
 `paste` for terminal-aware input. `focused` declares the connection's focus.
+Each `key` requires `action`: `"press"`, `"repeat"`, or `"release"`, alongside
+optional `name`, `cp`, `mods`, and `text`. For example:
+
+```json
+{"method":"key","pane":2,"name":"a","cp":97,"mods":0,"action":"repeat","text":"a"}
+```
+
+The originating frontend classifies hardware key events independently of other
+windows and connections. The daemon encodes each action using the terminal's
+negotiated keyboard mode. Kitty repeat and release event types require the
+[event reporting flag](https://sw.kovidgoyal.net/kitty/keyboard-protocol/#event-types).
+Legacy modes encode repeats as ordinary key presses and omit releases.
+
 `frame-interval` sets this connection's viewport, search, and progress pacing with a
 `micros` integer from 1,000 to 1,000,000. It defaults to 16,000. GTK updates it
 from the display frame clock; one client's interval does not pace another client.

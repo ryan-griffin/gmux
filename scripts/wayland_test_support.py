@@ -222,6 +222,11 @@ class WaylandInput:
         self.call(REMOTE, self.remote, REMOTE + ".Session", "NotifyKeyboardKeysym", "(ub)",
                   (keysym, pressed))
 
+    def keycode(self, code, pressed):
+        """Send a Linux evdev code, independent of the current keymap/modifiers."""
+        self.call(REMOTE, self.remote, REMOTE + ".Session", "NotifyKeyboardKeycode", "(ub)",
+                  (code, pressed))
+
     def button(self, pressed):
         self.call(REMOTE, self.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)",
                   (272, pressed))

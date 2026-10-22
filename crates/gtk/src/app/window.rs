@@ -213,7 +213,7 @@ impl Ui {
             adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 700sp").unwrap());
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
-        let keyboard = Rc::new(RefCell::new(crate::terminal::KeyboardModifiers::default()));
+        let keyboard = Rc::new(RefCell::new(crate::terminal::KeyboardState::default()));
         let ui = Rc::new(Self {
             app: app.clone(),
             window,
@@ -276,20 +276,6 @@ impl Ui {
             frame_clock_handler: RefCell::new(None),
         });
         let weak = Rc::downgrade(&ui);
-        crate::terminal::KeyboardModifiers::install(
-            &ui.window,
-            ui.keyboard.clone(),
-            move |active| {
-                if let Some(ui) = weak.upgrade() {
-                    for tab in ui.tabs.borrow().iter() {
-                        for pane in tab.panes.values() {
-                            pane.link_modifiers_changed(active);
-                        }
-                    }
-                }
-            },
-        );
-        let weak = Rc::downgrade(&ui);
         ui.window.connect_realize(move |window| {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -326,6 +312,16 @@ impl Ui {
             }
         });
         ui.install_actions();
+        let weak = Rc::downgrade(&ui);
+        crate::terminal::KeyboardState::install(&ui.window, ui.keyboard.clone(), move |active| {
+            if let Some(ui) = weak.upgrade() {
+                for tab in ui.tabs.borrow().iter() {
+                    for pane in tab.panes.values() {
+                        pane.link_modifiers_changed(active);
+                    }
+                }
+            }
+        });
         ui.refresh_client_ui();
         let weak = Rc::downgrade(&ui);
         ui.split.connect_show_sidebar_notify(move |split| {

@@ -10,8 +10,48 @@ const CAPS_LOCK: u16 = 1 << 4;
 const META: u16 = 1 << 5;
 const HYPER: u16 = 1 << 6;
 
+// GDK has no public repeat flag. Linux keycodes (including the XKB offset)
+// fit here. Unknown/zero codes are always presses rather than guessed repeats.
+// Fixed storage bounds both memory and work, without allocating on key events.
 #[derive(Default)]
-pub(crate) struct KeyboardModifiers {
+struct HeldKeys([u64; 16]);
+
+impl HeldKeys {
+    fn contains(&self, code: u32) -> bool {
+        code != 0
+            && self
+                .0
+                .get(code as usize / 64)
+                .is_some_and(|word| word & (1 << (code % 64)) != 0)
+    }
+
+    fn press(&mut self, code: u32) -> KeyAction {
+        let Some(word) = self.0.get_mut(code as usize / 64).filter(|_| code != 0) else {
+            return KeyAction::Press;
+        };
+        let bit = 1 << (code % 64);
+        let action = if *word & bit == 0 {
+            KeyAction::Press
+        } else {
+            KeyAction::Repeat
+        };
+        *word |= bit;
+        action
+    }
+
+    fn release(&mut self, code: u32) -> bool {
+        let Some(word) = self.0.get_mut(code as usize / 64) else {
+            return false;
+        };
+        let bit = 1 << (code % 64);
+        let held = *word & bit != 0;
+        *word &= !bit;
+        held
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct KeyboardState {
     // Two bits per modifier, in protocol order: Shift L/R, Control L/R,
     // Alt L/R, Super L/R, Meta L/R, Hyper L/R. Each pair preserves the other
     // side on release; Meta/Hyper do not change VT input encoding.
@@ -19,9 +59,14 @@ pub(crate) struct KeyboardModifiers {
     encoded: u16,
     caps_lock: Option<bool>,
     extra_modifiers: bool,
+    keys: HeldKeys,
+    action: KeyAction,
+    ignored_keys: HeldKeys,
+    ignored_event: bool,
+    shortcut_event: bool,
 }
 
-impl KeyboardModifiers {
+impl KeyboardState {
     pub(crate) fn install(
         window: &impl IsA<gtk::Window>,
         keyboard: Rc<RefCell<Self>>,
@@ -29,16 +74,37 @@ impl KeyboardModifiers {
     ) {
         let window = window.as_ref();
         let changed = Rc::new(changed);
+        // GTK can activate application accelerators before the terminal's key
+        // controller runs. Remember those physical keys here as well.
+        let shortcuts = Rc::new(window.application().map_or_else(Vec::new, |application| {
+            application
+                .list_action_descriptions()
+                .iter()
+                .flat_map(|action| application.accels_for_action(action))
+                .filter_map(gtk::accelerator_parse)
+                .collect::<Vec<_>>()
+        }));
         // Track the whole window so shortcuts and focus changes between panes
         // cannot hide a modifier press or release from the next terminal.
         let controller = gtk::EventControllerKey::new();
         controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let pressed = keyboard.clone();
         let press_changed = changed.clone();
-        controller.connect_key_pressed(move |controller, key, _, modifiers| {
-            let before = pressed.borrow().links_active();
-            pressed.borrow_mut().update(key, modifiers, false);
-            let active = pressed.borrow().links_active();
+        let press_shortcuts = shortcuts.clone();
+        controller.connect_key_pressed(move |controller, key, code, modifiers| {
+            let shortcut = application_shortcut(controller, &press_shortcuts);
+            let (before, active) = {
+                let mut keyboard = pressed.borrow_mut();
+                let before = keyboard.links_active();
+                let action = keyboard.keys.press(code);
+                if shortcut {
+                    keyboard.ignored_keys.press(code);
+                }
+                keyboard.ignored_event = keyboard.ignored_keys.contains(code);
+                keyboard.shortcut_event = shortcut;
+                keyboard.update(key, modifiers, action);
+                (before, keyboard.links_active())
+            };
             // A pointer can enter with Ctrl already held, without this window
             // observing its press. Always publish modifier events, including
             // releases whose before/after encoded states are both empty.
@@ -49,15 +115,34 @@ impl KeyboardModifiers {
         });
         let released = keyboard.clone();
         let release_changed = changed.clone();
-        controller.connect_key_released(move |controller, key, _, modifiers| {
-            let before = released.borrow().links_active();
-            released.borrow_mut().update(key, modifiers, true);
-            let active = released.borrow().links_active();
+        controller.connect_key_released(move |controller, key, code, modifiers| {
+            let shortcut = application_shortcut(controller, &shortcuts);
+            let (before, active) = {
+                let mut keyboard = released.borrow_mut();
+                let before = keyboard.links_active();
+                keyboard.keys.release(code);
+                keyboard.ignored_event = keyboard.ignored_keys.release(code);
+                keyboard.shortcut_event = shortcut;
+                keyboard.update(key, modifiers, KeyAction::Release);
+                (before, keyboard.links_active())
+            };
             if before != active || modifier_event(controller) {
                 release_changed(active);
             }
         });
         window.add_controller(controller);
+        // A pane, menu, or other widget can consume a release. Start a fresh
+        // input sequence whenever its destination changes, even within a window.
+        let focus_widget = keyboard.clone();
+        window.connect_focus_widget_notify(move |_| {
+            let mut keyboard = focus_widget.borrow_mut();
+            keyboard.keys = HeldKeys::default();
+            keyboard.ignored_event = false;
+            keyboard.shortcut_event = false;
+            keyboard.action = KeyAction::Press;
+        });
+        let teardown = keyboard.clone();
+        window.connect_unrealize(move |_| *teardown.borrow_mut() = Self::default());
         let focus = keyboard.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
@@ -71,7 +156,9 @@ impl KeyboardModifiers {
         !self.extra_modifiers && self.encoded & (SHIFT | CONTROL | ALT | SUPER) == CONTROL
     }
 
-    fn update(&mut self, key: gdk::Key, modifiers: gdk::ModifierType, release: bool) -> u16 {
+    fn update(&mut self, key: gdk::Key, modifiers: gdk::ModifierType, action: KeyAction) -> u16 {
+        self.action = action;
+        let release = action == KeyAction::Release;
         let mut encoded = mods(modifiers);
         for (mask, flag) in [
             (gdk::ModifierType::META_MASK, META),
@@ -128,7 +215,7 @@ impl KeyboardModifiers {
                 if let Some(locked) = self.caps_lock.take() {
                     encoded = (encoded & !CAPS_LOCK) | if locked { CAPS_LOCK } else { 0 };
                 }
-            } else {
+            } else if action == KeyAction::Press {
                 encoded ^= CAPS_LOCK;
                 self.caps_lock = Some(encoded & CAPS_LOCK != 0);
             }
@@ -256,24 +343,9 @@ impl Terminal {
             }
         });
     }
-    pub(super) fn install_keyboard(
-        self: &Rc<Self>,
-        application: &gtk::Application,
-        keyboard: Rc<RefCell<KeyboardModifiers>>,
-    ) {
+    pub(super) fn install_keyboard(self: &Rc<Self>, keyboard: Rc<RefCell<KeyboardState>>) {
         let key = gtk::EventControllerKey::new();
-        // Use the registered accelerators and GDK's keyboard-layout matching
-        // for both press and release, instead of a separate modifier whitelist.
-        let shortcuts = Rc::new(
-            application
-                .list_action_descriptions()
-                .iter()
-                .flat_map(|action| application.accels_for_action(action))
-                .filter_map(gtk::accelerator_parse)
-                .collect::<Vec<_>>(),
-        );
-        let press_shortcuts = shortcuts.clone();
-        let pending_key = Rc::new(RefCell::new((String::new(), 0u32, 0u16)));
+        let pending_key = Rc::new(ValueCell::new(None::<(gdk::Key, u16, KeyAction)>));
         let pending = pending_key.clone();
         let weak = Rc::downgrade(self);
         self.im.connect_commit(move |_, text| {
@@ -281,20 +353,46 @@ impl Terminal {
                 if t.selection.borrow_mut().take().is_some() {
                     let _ = t.session.borrow().clear_selection();
                 }
-                let pending = pending.borrow();
-                t.key_input(&pending.0, pending.1, pending.2, false, text);
+                // Only a synchronous, unchanged text commit belongs to this
+                // physical key. Composition and asynchronous commits are text
+                // input, with no stale key identity, modifiers, or repeat action.
+                if let Some((key, mods, action)) = pending.take()
+                    && let Some(cp) = key.to_unicode()
+                    && text.len() == cp.len_utf8()
+                    && text.starts_with(cp)
+                {
+                    t.key_input(
+                        key.name().as_deref().unwrap_or(""),
+                        cp as u32,
+                        mods,
+                        action,
+                        text,
+                    );
+                } else {
+                    t.key_input("", 0, 0, KeyAction::Press, text);
+                }
             }
         });
         let weak = Rc::downgrade(self);
         let press_keyboard = keyboard.clone();
-        key.connect_key_pressed(move |controller, key, _, modifiers| {
+        key.connect_key_pressed(move |controller, key, code, modifiers| {
             let Some(t) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
             if t.context_menu.is_visible() {
                 return glib::Propagation::Proceed;
             }
+            let (encoded_modifiers, action, shortcut, ignored) = {
+                let keyboard = press_keyboard.borrow();
+                (
+                    keyboard.encoded,
+                    keyboard.action,
+                    keyboard.shortcut_event,
+                    keyboard.ignored_event,
+                )
+            };
             if crate::menu::context_menu_shortcut(key, modifiers) {
+                press_keyboard.borrow_mut().ignored_keys.press(code);
                 let displayed = t.displayed_links.borrow();
                 let (cw, ch) = displayed.metrics;
                 let frame = displayed.frame;
@@ -303,10 +401,11 @@ impl Terminal {
                 t.show_context_menu(position.0, position.1);
                 return glib::Propagation::Stop;
             }
-            if application_shortcut(controller, &press_shortcuts) {
+            if shortcut {
                 return glib::Propagation::Proceed;
             }
             if let Some(previous) = scroll_shortcut(key, modifiers) {
+                press_keyboard.borrow_mut().ignored_keys.press(code);
                 let delta = if previous {
                     -(t.grid.get().1 as isize)
                 } else {
@@ -315,26 +414,24 @@ impl Terminal {
                 t.scroll(delta);
                 return glib::Propagation::Stop;
             }
-            let text = key
-                .to_unicode()
-                .filter(|c| !c.is_control())
-                .map(|c| c.to_string())
-                .unwrap_or_default();
+            // Keep a consumed shortcut's repeats out of terminal input if its
+            // modifiers change before the physical key is released.
+            if ignored {
+                return glib::Propagation::Stop;
+            }
             let cp = key.to_unicode().map(|c| c as u32).unwrap_or(0);
-            let encoded_modifiers = press_keyboard.borrow().encoded;
-            *pending_key.borrow_mut() = (
-                key.name().map(|n| n.to_string()).unwrap_or_default(),
-                cp,
-                encoded_modifiers,
-            );
             if !modifiers.intersects(
                 gdk::ModifierType::CONTROL_MASK
                     | gdk::ModifierType::ALT_MASK
                     | gdk::ModifierType::SUPER_MASK,
             ) && let Some(event) = controller.current_event()
-                && t.im.filter_keypress(&event)
             {
-                return glib::Propagation::Stop;
+                pending_key.set(Some((key, encoded_modifiers, action)));
+                let filtered = t.im.filter_keypress(&event);
+                let committed = pending_key.take().is_none();
+                if filtered || committed {
+                    return glib::Propagation::Stop;
+                }
             }
             // Modifier presses precede copy accelerators and must retain selection.
             let modifier = modifier_event(controller);
@@ -344,18 +441,30 @@ impl Terminal {
                     let _ = t.session.borrow().clear_selection();
                 }
             }
+            let text = key
+                .to_unicode()
+                .filter(|c| !c.is_control())
+                .map(|c| c.to_string())
+                .unwrap_or_default();
             t.key_input(
                 key.name().as_deref().unwrap_or(""),
                 cp,
                 encoded_modifiers,
-                false,
+                action,
                 &text,
             );
             glib::Propagation::Stop
         });
         let weak = Rc::downgrade(self);
-        key.connect_key_released(move |controller, key, _, modifiers| {
-            if application_shortcut(controller, &shortcuts)
+        key.connect_key_released(move |_, key, _, modifiers| {
+            let (encoded_modifiers, ignored) = {
+                let keyboard = keyboard.borrow();
+                (
+                    keyboard.encoded,
+                    keyboard.ignored_event || keyboard.shortcut_event,
+                )
+            };
+            if ignored
                 || scroll_shortcut(key, modifiers).is_some()
                 || crate::menu::context_menu_shortcut(key, modifiers)
             {
@@ -367,8 +476,8 @@ impl Terminal {
                 t.key_input(
                     key.name().as_deref().unwrap_or(""),
                     key.to_unicode().map(|c| c as u32).unwrap_or(0),
-                    keyboard.borrow().encoded,
-                    true,
+                    encoded_modifiers,
+                    KeyAction::Release,
                     "",
                 );
             }
@@ -657,6 +766,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hardware_keys_are_independent_and_tracking_is_bounded() {
+        let mut keys = HeldKeys::default();
+        let mut other_window = HeldKeys::default();
+        assert_eq!(keys.press(38), KeyAction::Press);
+        assert_eq!(keys.press(38), KeyAction::Repeat);
+        assert_eq!(keys.press(38), KeyAction::Repeat);
+        assert_eq!(keys.press(50), KeyAction::Press);
+        assert_eq!(other_window.press(38), KeyAction::Press);
+        assert!(keys.release(38));
+        assert!(!keys.release(38));
+        assert_eq!(keys.press(38), KeyAction::Press);
+        assert_eq!(keys.press(50), KeyAction::Repeat);
+        assert_eq!(keys.press(1023), KeyAction::Press);
+        assert_eq!(keys.press(1023), KeyAction::Repeat);
+        assert!(keys.release(1023));
+        assert!(!keys.contains(1023));
+        for unknown in [0, 1024, u32::MAX] {
+            assert_eq!(keys.press(unknown), KeyAction::Press);
+            assert_eq!(keys.press(unknown), KeyAction::Press);
+            assert!(!keys.release(unknown));
+        }
+    }
+
+    #[test]
     fn history_scroll_shortcuts_require_only_shift() {
         let shift = gdk::ModifierType::SHIFT_MASK;
         assert_eq!(scroll_shortcut(gdk::Key::Page_Up, shift), Some(true));
@@ -718,51 +851,70 @@ mod tests {
                 8,
             ),
         ] {
-            let mut keyboard = KeyboardModifiers::default();
+            let mut keyboard = KeyboardState::default();
             assert_eq!(
-                keyboard.update(left, gdk::ModifierType::empty(), false),
+                keyboard.update(left, gdk::ModifierType::empty(), KeyAction::Press),
                 encoded
             );
-            assert_eq!(keyboard.update(left, mask, true), 0);
+            assert_eq!(keyboard.update(left, mask, KeyAction::Release), 0);
             assert_eq!(
-                keyboard.update(left, gdk::ModifierType::empty(), false),
+                keyboard.update(left, gdk::ModifierType::empty(), KeyAction::Press),
                 encoded
             );
-            assert_eq!(keyboard.update(left, mask, false), encoded);
-            assert_eq!(keyboard.update(right, mask, false), encoded);
-            assert_eq!(keyboard.update(left, mask, true), encoded);
-            assert_eq!(keyboard.update(right, mask, true), 0);
+            assert_eq!(keyboard.update(left, mask, KeyAction::Press), encoded);
+            assert_eq!(keyboard.update(right, mask, KeyAction::Press), encoded);
+            assert_eq!(keyboard.update(left, mask, KeyAction::Release), encoded);
+            assert_eq!(keyboard.update(right, mask, KeyAction::Release), 0);
 
             // A modifier can already be held when the window gains focus.
-            assert_eq!(keyboard.update(right, mask, false), encoded);
-            assert_eq!(keyboard.update(right, mask, true), encoded);
-            assert_eq!(keyboard.update(left, mask, true), 0);
+            assert_eq!(keyboard.update(right, mask, KeyAction::Press), encoded);
+            assert_eq!(keyboard.update(right, mask, KeyAction::Release), encoded);
+            assert_eq!(keyboard.update(left, mask, KeyAction::Release), 0);
         }
     }
 
     #[test]
     fn caps_lock_events_report_the_lock_state_after_each_toggle() {
-        let mut keyboard = KeyboardModifiers::default();
+        let mut keyboard = KeyboardState::default();
         let control = gdk::ModifierType::CONTROL_MASK;
         let locked = control | gdk::ModifierType::LOCK_MASK;
-        assert_eq!(keyboard.update(gdk::Key::Caps_Lock, control, false), 18);
-        assert_eq!(keyboard.update(gdk::Key::Caps_Lock, locked, true), 18);
-        assert_eq!(keyboard.update(gdk::Key::Caps_Lock, locked, false), 2);
-        assert_eq!(keyboard.update(gdk::Key::Caps_Lock, locked, true), 2);
+        assert_eq!(
+            keyboard.update(gdk::Key::Caps_Lock, control, KeyAction::Press),
+            18
+        );
+        assert_eq!(
+            keyboard.update(gdk::Key::Caps_Lock, locked, KeyAction::Release),
+            18
+        );
+        assert_eq!(
+            keyboard.update(gdk::Key::Caps_Lock, locked, KeyAction::Press),
+            2
+        );
+        assert_eq!(
+            keyboard.update(gdk::Key::Caps_Lock, locked, KeyAction::Release),
+            2
+        );
         // State from later non-modifier events also clears missed releases.
-        assert_eq!(keyboard.update(gdk::Key::Shift_L, control, false), 3);
-        assert_eq!(keyboard.update(gdk::Key::a, control, false), 2);
+        assert_eq!(
+            keyboard.update(gdk::Key::Shift_L, control, KeyAction::Press),
+            3
+        );
+        assert_eq!(keyboard.update(gdk::Key::a, control, KeyAction::Press), 2);
         assert_eq!(keyboard.held, 0);
     }
 
     #[test]
     fn link_modifiers_follow_after_event_state_and_ignore_lock_bits() {
-        let mut keyboard = KeyboardModifiers::default();
+        let mut keyboard = KeyboardState::default();
         let control = gdk::ModifierType::CONTROL_MASK;
-        keyboard.update(gdk::Key::Control_L, gdk::ModifierType::empty(), false);
+        keyboard.update(
+            gdk::Key::Control_L,
+            gdk::ModifierType::empty(),
+            KeyAction::Press,
+        );
         assert!(keyboard.links_active());
-        keyboard.update(gdk::Key::Control_R, control, false);
-        keyboard.update(gdk::Key::Control_L, control, true);
+        keyboard.update(gdk::Key::Control_R, control, KeyAction::Press);
+        keyboard.update(gdk::Key::Control_L, control, KeyAction::Release);
         assert!(keyboard.links_active());
         for extra in [
             gdk::ModifierType::SHIFT_MASK,
@@ -771,12 +923,16 @@ mod tests {
             gdk::ModifierType::META_MASK,
             gdk::ModifierType::HYPER_MASK,
         ] {
-            keyboard.update(gdk::Key::a, control | extra, false);
+            keyboard.update(gdk::Key::a, control | extra, KeyAction::Press);
             assert!(!keyboard.links_active());
         }
-        keyboard.update(gdk::Key::a, control | gdk::ModifierType::LOCK_MASK, false);
+        keyboard.update(
+            gdk::Key::a,
+            control | gdk::ModifierType::LOCK_MASK,
+            KeyAction::Press,
+        );
         assert!(keyboard.links_active());
-        keyboard.update(gdk::Key::Control_R, control, true);
+        keyboard.update(gdk::Key::Control_R, control, KeyAction::Release);
         assert!(!keyboard.links_active());
     }
 
@@ -795,23 +951,33 @@ mod tests {
                 gdk::ModifierType::HYPER_MASK,
             ),
         ] {
-            let mut keyboard = KeyboardModifiers::default();
-            keyboard.update(gdk::Key::Control_L, gdk::ModifierType::empty(), false);
-            assert_eq!(keyboard.update(left, control, false), CONTROL);
+            let mut keyboard = KeyboardState::default();
+            keyboard.update(
+                gdk::Key::Control_L,
+                gdk::ModifierType::empty(),
+                KeyAction::Press,
+            );
+            assert_eq!(keyboard.update(left, control, KeyAction::Press), CONTROL);
             assert!(!keyboard.links_active());
-            assert_eq!(keyboard.update(left, control | mask, true), CONTROL);
+            assert_eq!(
+                keyboard.update(left, control | mask, KeyAction::Release),
+                CONTROL
+            );
             assert!(keyboard.links_active());
-            keyboard.update(left, control, false);
-            keyboard.update(right, control | mask, false);
-            keyboard.update(left, control | mask, true);
+            keyboard.update(left, control, KeyAction::Press);
+            keyboard.update(right, control | mask, KeyAction::Press);
+            keyboard.update(left, control | mask, KeyAction::Release);
             assert!(!keyboard.links_active());
-            assert_eq!(keyboard.update(right, control | mask, true), CONTROL);
+            assert_eq!(
+                keyboard.update(right, control | mask, KeyAction::Release),
+                CONTROL
+            );
             assert!(keyboard.links_active());
             // Infer the opposite side when focus arrived after its press.
-            keyboard.update(right, control | mask, false);
-            keyboard.update(right, control | mask, true);
+            keyboard.update(right, control | mask, KeyAction::Press);
+            keyboard.update(right, control | mask, KeyAction::Release);
             assert!(!keyboard.links_active());
-            keyboard.update(left, control | mask, true);
+            keyboard.update(left, control | mask, KeyAction::Release);
             assert!(keyboard.links_active());
         }
     }
