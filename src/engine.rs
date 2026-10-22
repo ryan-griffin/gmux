@@ -69,6 +69,48 @@ struct Events {
     title_changed: bool,
     directory_changed: bool,
     progress: crate::progress::RetainedProgress,
+    clipboard: Vec<gmux_client::clipboard::Write>,
+    clipboard_bytes: usize,
+}
+const MAX_CLIPBOARD_EVENTS: usize = 64;
+const _: () = assert!(GMUX_CLIPBOARD_MAX_BYTES as usize == gmux_client::transport::MAX_PASTE);
+
+unsafe extern "C" fn clipboard_write(
+    ud: *mut c_void,
+    destination: u8,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    use gmux_client::clipboard::{Destination, Write};
+    let events = unsafe { &mut *ud.cast::<Events>() };
+    if len > gmux_client::transport::MAX_PASTE {
+        return GMUX_CLIPBOARD_INVALID as i32;
+    }
+    if events.clipboard.len() >= MAX_CLIPBOARD_EVENTS
+        || len > gmux_client::transport::MAX_PASTE - events.clipboard_bytes
+    {
+        return GMUX_CLIPBOARD_BUSY as i32;
+    }
+    let destination = match u32::from(destination) {
+        GMUX_CLIPBOARD_STANDARD => Destination::Clipboard,
+        GMUX_CLIPBOARD_PRIMARY => Destination::Primary,
+        _ => return GMUX_CLIPBOARD_INVALID as i32,
+    };
+    let text = if data.is_null() {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return GMUX_CLIPBOARD_INVALID as i32;
+        };
+        if text.contains('\0') {
+            return GMUX_CLIPBOARD_INVALID as i32;
+        }
+        Some(text.to_owned())
+    };
+    events.clipboard_bytes += len;
+    events.clipboard.push(Write { destination, text });
+    GMUX_CLIPBOARD_SUCCESS as i32
 }
 unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usize) {
     // The C engine calls synchronously on the thread owning the session.
@@ -211,6 +253,16 @@ impl Engine {
         }
     }
 
+    /// Enable admission only while a connected recipient owns the next PTY poll.
+    pub(crate) fn set_clipboard_enabled(&mut self, enabled: bool) {
+        unsafe {
+            gmux_engine_clipboard_callback(self.raw.as_ptr(), enabled.then_some(clipboard_write))
+        }
+    }
+    pub(crate) fn take_clipboard_writes(&mut self) -> Vec<gmux_client::clipboard::Write> {
+        self.events.clipboard_bytes = 0;
+        std::mem::take(&mut self.events.clipboard)
+    }
     pub(crate) fn use_view_appearance(&mut self, view: &EngineView) -> anyhow::Result<()> {
         let result =
             unsafe { gmux_engine_use_view_appearance(self.raw.as_ptr(), view.raw.as_ptr()) };
@@ -2719,5 +2771,7 @@ mod progress_tests {
     }
 }
 
+#[cfg(test)]
+mod clipboard_tests;
 #[cfg(test)]
 mod hyperlink_tests;

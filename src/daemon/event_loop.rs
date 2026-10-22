@@ -333,10 +333,11 @@ pub fn run() -> anyhow::Result<()> {
         }));
         exited.clear();
         for id in ready.drain() {
+            let recipient = daemon.clipboard_recipient(id);
             let Some(session) = daemon.sessions.get_mut(&id) else {
                 continue;
             };
-            let update = session.poll();
+            let (update, clipboard) = session.poll_with_clipboard(recipient.is_some());
             if update.progress_changed {
                 daemon.metadata_changed.insert(id);
             }
@@ -356,6 +357,11 @@ pub fn run() -> anyhow::Result<()> {
             }
             if !update.notifications.is_empty() {
                 daemon.queue_notifications(id, update.notifications);
+            }
+            if !clipboard.is_empty()
+                && let Some(recipient) = recipient
+            {
+                daemon.deliver_clipboard(recipient, id, clipboard);
             }
         }
         if metadata_due {

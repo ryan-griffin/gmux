@@ -521,7 +521,18 @@ impl Ui {
                         ui.message(&error.to_string());
                     }
                 }
-                let updates = ui.sessions.borrow_mut().poll();
+                let updates = ui.sessions.borrow_mut().poll_with_clipboard(|write| {
+                    use gmux_client::clipboard::Destination;
+                    let clipboard = match write.destination {
+                        Destination::Clipboard => ui.window.clipboard(),
+                        Destination::Primary => ui.window.primary_clipboard(),
+                    };
+                    if let Some(text) = write.text {
+                        clipboard.set_text(&text);
+                    } else {
+                        let _ = clipboard.set_content(None::<&gdk::ContentProvider>);
+                    }
+                });
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 let updates_git_changed = updates.values().any(|update| update.git_changed);
                 for (id, mut update) in updates {

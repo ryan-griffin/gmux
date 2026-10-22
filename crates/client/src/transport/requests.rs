@@ -91,6 +91,9 @@ pub enum StreamCommand {
     Focused {
         active: bool,
     },
+    ClipboardWrites {
+        enabled: bool,
+    },
     Subscribe {
         panes: HashSet<u64>,
     },

@@ -135,6 +135,16 @@ int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
 int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
+#define GMUX_CLIPBOARD_STANDARD 0
+#define GMUX_CLIPBOARD_PRIMARY 1
+#define GMUX_CLIPBOARD_SUCCESS 0
+#define GMUX_CLIPBOARD_BUSY 1
+#define GMUX_CLIPBOARD_INVALID 2
+#define GMUX_CLIPBOARD_MAX_BYTES (4 * 1024 * 1024)
+// Synchronous admission only. Validate and copy borrowed text before success.
+// A NULL pointer clears the destination; non-NULL with len == 0 is empty text.
+typedef int (*GmuxClipboardFn)(void *userdata, uint8_t destination, const uint8_t *data, size_t len);
+void gmux_engine_clipboard_callback(GmuxEngine *engine, GmuxClipboardFn callback);
 // Called synchronously; true accepts all borrowed bytes, false aborts formatting.
 typedef bool (*GmuxWriterFn)(void *userdata, const uint8_t *data, size_t len);
 

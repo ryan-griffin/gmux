@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-HEADLESS = ["serve", "daemon", "ownership", "remote", "git", "multi-client", "frontend-input", "scrollback", "compression", "progress", "hyperlinks"]
+HEADLESS = ["serve", "daemon", "ownership", "remote", "git", "multi-client", "frontend-input", "scrollback", "compression", "progress", "hyperlinks", "clipboard"]
 DESKTOP = ["local-execution", "smoke", "multi-window", "remote-window", "remotes-ui", "terminal-input", "notifications", "renderer", "progress-ui"]
 
 parser = argparse.ArgumentParser(description=__doc__)

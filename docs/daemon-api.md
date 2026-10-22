@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 28:
+handshake. The current protocol version is 29:
 
 ```json
-{"version":28,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":29,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -167,7 +167,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":28,"daemon":"returned-identity"}
+{"method":"attach","version":29,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -189,6 +189,12 @@ panes whose Git metadata the client needs. The Rust `transport::StreamCommand`
 and `StreamRequest` types define the complete command schema;
 `transport::command` bounds its size and writes a newline-terminated command.
 
+A frontend that handles terminal clipboard writes advertises
+`{"method":"clipboard-writes","enabled":true}`. The default is disabled, so
+headless observers do not become clipboard recipients. An eligible connection
+must also subscribe to the pane. The last focused eligible connection wins,
+with connection order as the fallback. Detached writes are dropped immediately.
+
 Replies are binary viewport packets. Each packet begins with a little-endian
 32-bit payload length. The payload begins with a little-endian 32-bit JSON
 header length, then that many UTF-8 JSON bytes, then cell bytes. The header
@@ -199,6 +205,17 @@ rows. Before applying changed rows, shift the previous viewport by `row_shift`
 rows, positive toward smaller viewport indices. Newly exposed rows are always
 included in `rows`. Apply the same shift to soft-wrap flags. Metadata-only
 packets have no cell data.
+
+Clipboard packets are dedicated transient events. Their `copy` field is an
+object with `destination` (`"clipboard"` or `"primary"`) and `text`. A null
+`text` clears that destination; an empty string offers empty text. Apply each
+event in wire order across all panes, without applying its default viewport or
+selection metadata. Both explicit `copy` replies and unsolicited writes use
+these packets. `SessionManager::poll_with_clipboard` delivers them in order.
+They are neither coalesced into pane updates nor saved or replayed on reconnect.
+Decoded UTF-8 text is limited to 4 MiB; NUL and unsupported contents are rejected.
+The 16 MiB packet limit also applies after JSON escaping. A stalled frontend's
+output is bounded by the existing 32 MiB transport queue.
 
 `generation` identifies cached history for this pane and view. Clears, reflow,
 screen switches, and resolved palette or appearance changes advance it. Discard

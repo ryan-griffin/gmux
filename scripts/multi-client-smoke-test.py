@@ -59,7 +59,7 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             first.until(lambda h: h["meta"]["id"] == pane and h["selection"] is not None)
             first.send("copy")
             copied = first.until(lambda h: h["meta"]["id"] == pane and h["copy"] is not None)
-            assert "FIRST_INPUT" in copied["copy"], copied
+            assert "FIRST_INPUT" in copied["copy"]["text"], copied
             second.send("copy")
             rejected = second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
             assert rejected["error"] == "Select terminal text to copy it" and rejected["selection"] is None
@@ -181,7 +181,7 @@ while control.read_text() != "quit": time.sleep(0.005)
                         and h["frame"]["scrollback"]["offset"] == 0 and "one" in first.text())
             first.send("copy")
             copied = first.until(lambda h: h["copy"] is not None)
-            assert copied["copy"] == "one", copied
+            assert copied["copy"] == dict(destination="clipboard", text="one"), copied
     finally:
         control.write_text("quit")
         first.close()

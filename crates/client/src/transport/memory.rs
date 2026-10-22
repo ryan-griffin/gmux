@@ -37,7 +37,11 @@ impl Packet {
                 .map(String::capacity)
                 .sum::<usize>()
             + header.error.as_ref().map_or(0, String::capacity)
-            + header.copy.as_ref().map_or(0, String::capacity)
+            + header
+                .copy
+                .as_ref()
+                .and_then(|write| write.text.as_ref())
+                .map_or(0, String::capacity)
             + header.find.as_ref().map_or(0, |find| {
                 find.highlights.capacity() * size_of::<(usize, usize, u8)>()
             })

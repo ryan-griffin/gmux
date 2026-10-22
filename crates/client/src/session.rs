@@ -24,5 +24,4 @@ pub struct SessionUpdate {
     pub unread: Option<bool>,
     pub error: Option<String>,
     pub notifications: Vec<String>,
-    pub copy: Option<String>,
 }

@@ -5,6 +5,7 @@ Run python3 scripts/terminal-input-smoke-test.py. The script starts its own
 headless Mutter compositor with XWayland disabled and a private PipeWire server.
 """
 import json
+import base64
 from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport, create_tab_when_connected, assert_stays
 import os
@@ -144,6 +145,26 @@ done.touch()
             native.key(Gdk.KEY_a, False)
             wait_for(lambda: appearance_events.exists() and b'a' in appearance_events.read_bytes())
             assert appearance()["cursor_phase_visible"], "IME commit must restore cursor without movement"
+            # Terminal clipboard writes use the daemon stream and real GDK
+            # offers. Primary selection must not overwrite the regular clipboard.
+            def program_clipboard(text, destination):
+                sequence = b'\x1b]52;' + destination.encode() + b';' + base64.b64encode(text.encode()) + b'\x1b\\'
+                appearance_control.write_bytes(sequence)
+                wait_for(lambda: appearance_applied.read_bytes() == sequence)
+            clipboard_text = "OSC52 clipboard 界🙂e\u0301\n"
+            program_clipboard(clipboard_text, "c")
+            wait_for(lambda: native.clipboard_text() == clipboard_text)
+            primary_text = "OSC52_PRIMARY_界🙂"
+            program_clipboard(primary_text, "p")
+            clipboard_text += "PRIMARY_APPLIED"
+            program_clipboard(clipboard_text, "c")
+            wait_for(lambda: native.clipboard_text() == clipboard_text)
+            # Paste primary through the terminal's middle-button action while
+            # the raw input probe records exactly what GTK delivers.
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)", (274, True))
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)", (274, False))
+            wait_for(lambda: primary_text.encode() in appearance_events.read_bytes(), context=GLib.MainContext.default())
+            assert native.clipboard_text() == clipboard_text
             wait_for(lambda: appearance(lambda s: not s["cursor_phase_visible"]))
             native.set_clipboard_text("PASTE_ACTIVITY")
             rpc("action", name="paste")
@@ -933,7 +954,7 @@ finally:
                   "stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
                   "fast edge drags during overscroll without viewport bouncing, "
                   "edge and release cancellation, "
-                  "selection across scrollback, Ctrl+Shift+C, and large Unicode clipboard paste with XWayland disabled")
+                  "selection across scrollback, Ctrl+Shift+C, OSC 52 clipboard/primary writes, and large Unicode clipboard paste with XWayland disabled")
         except Exception:
             if app is not None and app.poll() is None and pane is not None:
                 print("Last terminal output:", rpc("read", pane=pane)["text"], flush=True)

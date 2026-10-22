@@ -266,6 +266,13 @@ impl Connection {
     }
     /// Poll connections in one event-loop iteration against a shared timestamp.
     pub fn poll_at(&mut self, now: Instant) -> Update {
+        self.poll_at_with_clipboard(now, |_| {})
+    }
+    pub fn poll_at_with_clipboard(
+        &mut self,
+        now: Instant,
+        clipboard: impl FnMut(crate::clipboard::Write),
+    ) -> Update {
         let mut update = Update::default();
         if self.next_retry().is_some_and(|at| at <= now) {
             self.connect();
@@ -297,7 +304,7 @@ impl Connection {
             }
         }
         if let State::Connected(manager) = &mut self.state {
-            update.panes = manager.poll();
+            update.panes = manager.poll_with_clipboard(clipboard);
             if let Some(state) = manager.take_state() {
                 manager.install_metadata(&state.metadata, state.revision);
                 update.state = Some(state);
