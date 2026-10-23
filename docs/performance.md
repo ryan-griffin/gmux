@@ -94,6 +94,48 @@ compositing, and display latency. The suite also checks viewport coalescing,
 search pacing, request fairness, and large pastes. `--measure` reports timings
 without applying input-latency thresholds.
 
+## Semantic shell markers
+
+`scripts/shell-benchmark.c` measures native marker processing and prompt jumps
+with 24 inactive views. It also counts tracked references, allocator usage, and
+render updates. Compile with the same pinned Ghostty library for comparisons:
+
+```sh
+ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
+cc -O2 -std=c11 -DGMUX_VERSION='"benchmark"' -I"$ghostty_prefix/include" \
+  scripts/shell-benchmark.c src/ghostty_bridge.c \
+  -L"$ghostty_prefix/lib" -Wl,-rpath,"$ghostty_prefix/lib" \
+  -Wl,--wrap=ghostty_terminal_new \
+  -Wl,--wrap=ghostty_terminal_grid_ref_track \
+  -Wl,--wrap=ghostty_tracked_grid_ref_free \
+  -Wl,--wrap=ghostty_render_state_update -lghostty-vt \
+  -o artifacts/shell-benchmark
+artifacts/shell-benchmark 1 50000 100000 0
+artifacts/shell-benchmark 1 50000 100000 1
+```
+
+Arguments select OSC 133 markers, command count, retained-line limit, and
+allocation counting. A zero line limit uses the terminal's default history
+budget. Timing uses process CPU and excludes GTK, Rust metadata serialization,
+socket delivery, and shell execution. Count allocations separately from CPU
+measurements. The allocator figures cover libghostty bookkeeping, excluding
+its memory-mapped grid pages. `prompt_anchor_bytes` separately measures the
+bridge's prompt index. It starts at 512 bytes on 64-bit systems, doubles
+as needed up to 32 KiB, and is released when no prompt anchors remain.
+The benchmark asserts that all tracked references and counted allocations
+are released and no render updates occur for inactive views.
+
+Each pane has at most 2,048 prompt references and two reusable output targets.
+Each output target uses two tracked cells to detect discarded locations, including
+partial-page erasures that clamp references. Monotonic prompt IDs reject targets
+whose command was replaced in the active area. Each frontend allocates another pair
+only when a context-menu output target is captured.
+Navigation searches the prompt index and reads only the target's row metadata.
+Output selection also validates the owning prompt's row metadata. New primary
+prompts check the prior prompt's active row for erasure, without visiting history.
+Compression activity changes when a requested target needs decompression;
+ordinary marker bookkeeping and command metadata reads do not keep history awake.
+
 ## Idle scrollback compression
 
 The daemon starts compressing a pane after its libghostty compression activity
@@ -108,7 +150,9 @@ starts another idle delay. Attached, hidden, and detached panes use this policy.
 page counts, reserved virtual bytes, resident page bytes, compressed pages and
 bytes, image bytes, and platform support. These totals combine both screens.
 Page figures exclude images, native bookkeeping, render caches, Rust buffers,
-and frontend history caches. Statistics walk the page list on request without
+and frontend history caches. `prompt_anchors` separately counts retained primary
+prompt references, and `prompt_anchor_bytes` reports their index's allocated bytes.
+Statistics walk the page list on request without
 decompressing it. They are not sampled in the background. `compression` reports
 the number of incremental calls, cumulative wall time in `work_ns`, and the
 longest call in `max_step_ns`. `scheduled` includes the idle delay and pending

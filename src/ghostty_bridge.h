@@ -104,7 +104,8 @@ typedef struct {
 typedef struct GmuxEngine GmuxEngine;
 typedef struct GmuxView GmuxView;
 // Page and image totals for both screens. Excludes bridge/render/client caches
-// and terminal bookkeeping. Reading these walks pages without decompressing.
+// and terminal bookkeeping. Prompt counters separately report the bridge index.
+// Reading these walks pages without decompressing.
 typedef struct {
     bool compression_supported;
     uint64_t pages;
@@ -113,6 +114,8 @@ typedef struct {
     uint64_t compressed_pages;
     uint64_t compressed_bytes;
     uint64_t image_bytes;
+    uint64_t prompt_anchors;
+    uint64_t prompt_anchor_bytes;
 } GmuxMemoryUsage;
 int gmux_engine_memory_usage(GmuxEngine *engine, GmuxMemoryUsage *out);
 int gmux_engine_compression_activity(GmuxEngine *engine, uint64_t *activity);
@@ -139,6 +142,14 @@ int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
 int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
+// Event kind 5. Strings are borrowed for the synchronous event callback.
+typedef struct {
+    uint8_t kind; // 1 prompt, 2 input, 3 output, 4 command end
+    bool has_exit_code;
+    int32_t exit_code;
+    const uint8_t *command;
+    size_t command_len;
+} GmuxCommandEvent;
 #define GMUX_CLIPBOARD_STANDARD 0
 #define GMUX_CLIPBOARD_PRIMARY 1
 #define GMUX_CLIPBOARD_SUCCESS 0
@@ -190,6 +201,13 @@ uint64_t gmux_engine_links_revision(GmuxEngine *engine);
 int gmux_engine_selection_origin(GmuxEngine *engine, uint64_t *origin);
 void gmux_engine_scroll(GmuxEngine *engine, intptr_t delta, bool bottom);
 void gmux_engine_scroll_to(GmuxEngine *engine, uint64_t row);
+// Primary-screen semantic operations; return 1 when no target is available.
+int gmux_engine_prompt(GmuxEngine *engine, bool previous);
+// target: 0 last completed output (current if unavailable), 1 screen point,
+// 2 this view's captured output point.
+int gmux_engine_select_output(GmuxEngine *engine, uint8_t target, uint16_t x, uint32_t y);
+int gmux_engine_output_anchor(GmuxEngine *engine, uint16_t x, uint32_t y);
+bool gmux_engine_cursor_at_prompt(GmuxEngine *engine);
 bool gmux_engine_expire_render_hold(GmuxEngine *engine);
 size_t gmux_engine_string(GmuxEngine *engine, int pwd, uint8_t *out, size_t cap);
 int gmux_engine_mode(GmuxEngine *engine, int mode);

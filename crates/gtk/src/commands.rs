@@ -61,6 +61,26 @@ pub const COMMANDS: &[Command] = &[
         keywords: "erase scrollback history output terminal",
     },
     Command {
+        title: "Go to Previous Prompt",
+        action: "previous-prompt",
+        keywords: "shell command history scroll navigation",
+    },
+    Command {
+        title: "Go to Next Prompt",
+        action: "next-prompt",
+        keywords: "shell command history scroll navigation",
+    },
+    Command {
+        title: "Select Last Command Output",
+        action: "select-output",
+        keywords: "shell result text selection",
+    },
+    Command {
+        title: "Copy Last Command Output",
+        action: "copy-output",
+        keywords: "shell result text clipboard",
+    },
+    Command {
         title: "Rename Tab…",
         action: "rename",
         keywords: "edit name title",

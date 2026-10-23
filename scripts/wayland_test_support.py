@@ -245,9 +245,16 @@ class WaylandInput:
         return bounds
 
     def clipboard_text(self):
-        result, descriptors = self.bus.call_with_unix_fd_list_sync(REMOTE, self.remote,
-            REMOTE + ".Session", "SelectionRead", GLib.Variant("(s)", ("text/plain;charset=utf-8",)),
-            GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, 5000, None, None)
+        try:
+            result, descriptors = self.bus.call_with_unix_fd_list_sync(REMOTE, self.remote,
+                REMOTE + ".Session", "SelectionRead", GLib.Variant("(s)", ("text/plain;charset=utf-8",)),
+                GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, 5000, None, None)
+        except GLib.Error as error:
+            # A fresh session has no owner until GTK publishes its first offer.
+            # Let callers wait for that offer while preserving other failures.
+            if "No selection owner available" in error.message:
+                return None
+            raise
         fd = descriptors.get(result.unpack()[0])
         try:
             deadline = time.monotonic() + 5

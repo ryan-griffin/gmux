@@ -1077,6 +1077,44 @@ impl RemoteSession {
     pub fn copy(&self) -> anyhow::Result<()> {
         self.command(StreamCommand::Copy)
     }
+    pub fn command_state(&self) -> &crate::shell::CommandState {
+        &self.meta.command
+    }
+    pub fn select_output(&self, point: Option<(u16, u32)>, copy: bool) -> anyhow::Result<()> {
+        self.select_output_target(point, false, copy)
+    }
+    pub fn anchor_output(&self, point: (u16, u32)) -> anyhow::Result<()> {
+        self.command(StreamCommand::AnchorOutput { point })
+    }
+    pub fn select_anchored_output(&self, copy: bool) -> anyhow::Result<()> {
+        self.select_output_target(None, true, copy)
+    }
+    fn select_output_target(
+        &self,
+        point: Option<(u16, u32)>,
+        anchored: bool,
+        copy: bool,
+    ) -> anyhow::Result<()> {
+        let serial = self.selection_serial.get() + 1;
+        self.command(StreamCommand::SelectOutput {
+            point,
+            anchored,
+            copy,
+            serial,
+        })?;
+        self.selection_serial.set(serial);
+        Ok(())
+    }
+    pub fn prompt(&mut self, previous: bool) -> anyhow::Result<()> {
+        self.send_scroll()?;
+        let serial = self.scroll_serial.get() + 1;
+        self.command(StreamCommand::Prompt { previous, serial })?;
+        self.scroll_serial.set(serial);
+        self.scroll_sent.set(serial);
+        self.scroll_target = None;
+        self.prediction = None;
+        Ok(())
+    }
     pub fn clear_selection(&self) -> anyhow::Result<()> {
         let serial = self.selection_serial.get() + 1;
         self.command(StreamCommand::ClearSelection { serial })?;
@@ -1571,6 +1609,7 @@ mod tests {
                 exited: false,
                 unread_sequence: 0,
                 busy: false,
+                command: Default::default(),
                 progress: Default::default(),
                 modes: [false; 2],
             },

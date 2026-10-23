@@ -5,7 +5,7 @@ mkdir -p artifacts
 exec > >(tee artifacts/packages.log) 2>&1
 dnf --assumeyes --setopt=install_weak_deps=False install \
     gcc gcc-c++ clang clang-libs pkgconf-pkg-config gtk4-devel libadwaita-devel \
-    glib2-devel curl git tar gzip zstd rustup python3
+    glib2-devel curl git tar gzip zstd rustup python3 bash zsh
 cat /etc/os-release
 dnf repolist --enabled
 rpm -qa | sort > artifacts/packages.txt

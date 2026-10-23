@@ -7,6 +7,7 @@ mod engine;
 mod persistence;
 mod scrollback;
 mod session;
+mod shell;
 mod title;
 
 mod progress;

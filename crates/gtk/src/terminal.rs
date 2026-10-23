@@ -29,6 +29,10 @@ const CONTEXT_MENU_SECTIONS: &[&[(&str, &str)]] = &[
         ("Split _Right", "win.split-right"),
         ("Split _Down", "win.split-down"),
     ],
+    &[
+        ("Select Command _Output", "terminal.select-output"),
+        ("Cop_y Command Output", "terminal.copy-output"),
+    ],
     &[("C_lose Pane", "win.close")],
 ];
 
@@ -203,11 +207,6 @@ impl Terminal {
         let paste_action = gio::SimpleAction::new("paste", None);
         let copy_link_action =
             gio::SimpleAction::new("copy-link", Some(&String::static_variant_type()));
-        let actions = gio::SimpleActionGroup::new();
-        actions.add_action(&copy_link_action);
-        actions.add_action(&copy_action);
-        actions.add_action(&paste_action);
-        area.insert_action_group("terminal", Some(&actions));
         let scroller = gtk::ScrolledWindow::builder()
             .child(&area)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -475,6 +474,19 @@ impl Terminal {
     }
     fn show_context_menu(&self, x: f64, y: f64) {
         self.area.grab_focus();
+        let displayed = self.displayed_links.borrow();
+        let frame = displayed.frame;
+        if frame.cols > 0 && frame.rows > 0 {
+            let column = (x / displayed.metrics.0).max(0.0) as u16;
+            let row = (y / displayed.metrics.1).max(0.0) as u32;
+            let point = (
+                column.min(frame.cols - 1),
+                (frame.scrollback.offset + u64::from(row.min(u32::from(frame.rows - 1))))
+                    .min(u64::from(u32::MAX)) as u32,
+            );
+            let _ = self.session.borrow().anchor_output(point);
+        }
+        drop(displayed);
         let link = self
             .displayed_links
             .borrow()
@@ -748,6 +760,24 @@ impl Terminal {
             return;
         }
         self.stop_selection_drag();
+    }
+    pub fn prompt(&self, previous: bool) {
+        self.stop_selection_drag();
+        if let Err(error) = self.session.borrow_mut().prompt(previous) {
+            self.show_status(&error.to_string());
+        }
+    }
+    pub fn select_output(&self, point: Option<(u16, u32)>, copy: bool) {
+        self.stop_selection_drag();
+        if let Err(error) = self.session.borrow().select_output(point, copy) {
+            self.show_status(&error.to_string());
+        }
+    }
+    fn select_context_output(&self, copy: bool) {
+        self.stop_selection_drag();
+        if let Err(error) = self.session.borrow().select_anchored_output(copy) {
+            self.show_status(&error.to_string());
+        }
     }
     fn paste_from(self: &Rc<Self>, clipboard: &gdk::Clipboard) {
         let weak = Rc::downgrade(self);

@@ -72,6 +72,15 @@ reading. It also compiles the native normalized-request policy and reply check.
 The native `terminal-input` suite checks Unicode OSC 52 writes through the GDK
 clipboard and primary-selection paste in the private Wayland session.
 
+The `shell` headless suite requires Bash and Zsh. It checks real login startup,
+existing prompt/preexec hooks, scalar and array `PROMPT_COMMAND`, disabled Bash
+history, relative resource paths, repeated sourcing, multiline input, builtin busy
+state, exit codes, frontend reconnect, fresh-shell restoration, independent prompt
+navigation and output copy, partial
+markers, alternate screens, reset, and foreground-process fallback. Engine tests
+cover reflow, pruning, anchor limits, command identity across active-area reuse,
+and metadata reads during idle compression.
+
 ## Native prerequisites
 
 The native suites need PyGObject and these installed components:

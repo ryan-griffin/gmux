@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub fn pane_method(method: &str) -> bool {
     matches!(
         method,
-        "split" | "close" | "send" | "read" | "links" | "notify"
+        "split" | "close" | "send" | "read" | "links" | "notify" | "metadata" | "command-output"
     )
 }
 
@@ -63,6 +63,10 @@ pub enum ExecutionRequest {
     },
     Metadata {
         pane: u64,
+    },
+    CommandOutput {
+        pane: u64,
+        point: Option<(u16, u32)>,
     },
     Copy {
         pane: u64,
@@ -152,6 +156,13 @@ pub enum PublicRequest {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum PaneRequest {
+    Metadata {
+        pane: Option<u64>,
+    },
+    CommandOutput {
+        pane: Option<u64>,
+        point: Option<(u16, u32)>,
+    },
     Read {
         pane: Option<u64>,
     },
@@ -224,6 +235,7 @@ impl Request {
                     | ExecutionRequest::Send { pane: id, .. }
                     | ExecutionRequest::Notify { pane: id, .. }
                     | ExecutionRequest::Metadata { pane: id }
+                    | ExecutionRequest::CommandOutput { pane: id, .. }
                     | ExecutionRequest::Copy { pane: id } => *id = resolve_pane(Some(*id))?,
                     _ => (),
                 }
@@ -268,7 +280,7 @@ impl Request {
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
         Ok(if Command::supports(method) {
             Self::Layout(serde_json::from_value(value)?)
-        } else if matches!(method, "state" | "busy" | "metadata" | "copy") {
+        } else if matches!(method, "state" | "busy" | "copy") {
             Self::Execution(serde_json::from_value(value)?)
         } else if method.starts_with('_') {
             Self::Internal(serde_json::from_value(value)?)
@@ -379,6 +391,13 @@ impl PaneRequest {
         mut resolve_pane: impl FnMut(Option<u64>) -> anyhow::Result<u64>,
     ) -> anyhow::Result<ExecutionRequest> {
         Ok(match self {
+            Self::Metadata { pane } => ExecutionRequest::Metadata {
+                pane: resolve_pane(pane)?,
+            },
+            Self::CommandOutput { pane, point } => ExecutionRequest::CommandOutput {
+                pane: resolve_pane(pane)?,
+                point,
+            },
             Self::Links { pane } => ExecutionRequest::Links {
                 pane: resolve_pane(pane)?,
             },

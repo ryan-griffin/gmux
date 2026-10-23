@@ -606,7 +606,8 @@ mod tests {
         let daemon = DaemonId::generate().unwrap();
         for failure in [
             Some("authentication"),
-            Some("version"),
+            Some("older-version"),
+            Some("newer-version"),
             Some("identity"),
             None,
         ] {
@@ -631,7 +632,8 @@ mod tests {
                     Some("authentication") => {
                         reply = serde_json::json!({"error":"Authentication failed"})
                     }
-                    Some("version") => reply["version"] = (transport::VERSION + 1).into(),
+                    Some("older-version") => reply["version"] = (transport::VERSION - 1).into(),
+                    Some("newer-version") => reply["version"] = (transport::VERSION + 1).into(),
                     Some("identity") => {
                         reply["daemon"] =
                             serde_json::to_value(DaemonId::generate().unwrap()).unwrap()

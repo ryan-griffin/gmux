@@ -115,6 +115,21 @@ pub enum StreamCommand {
         through: u64,
     },
     Copy,
+    Prompt {
+        previous: bool,
+        serial: u64,
+    },
+    SelectOutput {
+        point: Option<(u16, u32)>,
+        #[serde(default)]
+        anchored: bool,
+        #[serde(default)]
+        copy: bool,
+        serial: u64,
+    },
+    AnchorOutput {
+        point: (u16, u32),
+    },
     Find {
         #[serde(default)]
         query: String,

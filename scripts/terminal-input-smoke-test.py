@@ -151,6 +151,41 @@ done.touch()
             native.key(Gdk.KEY_a, False)
             wait_for(lambda: appearance_events.exists() and b'a' in appearance_events.read_bytes())
             assert appearance()["cursor_phase_visible"], "IME commit must restore cursor without movement"
+            # Shell actions use the native key dispatch and GDK clipboard.
+            shell_sequence = ("\x1b[3J\x1b[2J\x1b[H" + "".join(
+                f"\x1b]133;A\x07$ \x1b]133;B\x07cmd{i}\r\n\x1b]133;C\x07"
+                + ("\x1b[48;2;33;122;77m" if i == 98 else "")
+                + f"native-output-{i}\x1b[0m\r\n\x1b]133;D;0\x07"
+                for i in range(100)) + "\x1b]133;A\x07$ \x1b]133;B\x07").encode()
+            appearance_control.write_bytes(shell_sequence)
+            wait_for(lambda: appearance_applied.read_bytes() == shell_sequence)
+            wait_for(lambda: "native-output-99" in Atspi.Text.get_text(terminal.get_text_iface(), 0, -1))
+            rpc("action", name="select-output")
+            wait_for(lambda: rpc("_copy", pane=pane)["text"] == "native-output-99")
+            rpc("action", name="copy-output")
+            wait_for(lambda: native.clipboard_text() == "native-output-99")
+            geometry = appearance()
+            sx, sy, _, sb = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((33, 122, 77)))
+            native.move(sx + geometry["cell_width"] * .5, (sy + sb) / 2)
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)", (273, True))
+            native.call(REMOTE, native.remote, REMOTE + ".Session", "NotifyPointerButton", "(ib)", (273, False))
+            item = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
+                if obj.get_process_id() == app.pid and obj.get_name() == "Copy Command Output"), None))
+            Atspi.Action.do_action(item.get_action_iface(), 0)
+            wait_for(lambda: native.clipboard_text() == "native-output-98")
+            before_prompt = appearance()["scrollback"]["offset"]
+            native.key(Gdk.KEY_Control_L, True)
+            native.key(Gdk.KEY_Shift_L, True)
+            native.key(Gdk.KEY_Up, True)
+            native.key(Gdk.KEY_Up, False)
+            native.key(Gdk.KEY_Shift_L, False)
+            native.key(Gdk.KEY_Control_L, False)
+            wait_for(lambda: appearance(lambda s: not s["scroll_pending"] and s["scrollback"]["offset"] < before_prompt))
+            rpc("action", name="next-prompt")
+            wait_for(lambda: appearance(lambda s: not s["scroll_pending"] and s["scrollback"]["offset"] == before_prompt))
+            # Return to a neutral screen for the remaining input probes.
+            appearance_control.write_bytes(b'\x1b[3J\x1b[2J\x1b[H')
+            wait_for(lambda: appearance_applied.read_bytes() == b'\x1b[3J\x1b[2J\x1b[H')
             # Terminal clipboard writes use the daemon stream and real GDK
             # offers. Primary selection must not overwrite the regular clipboard.
             def program_clipboard(text, destination):

@@ -268,6 +268,7 @@ impl Daemon {
             exited: session.exited(),
             unread_sequence,
             busy: session.busy(),
+            command: session.command_state(),
             progress: session.progress(),
             modes: [session.mode(0), session.mode(1004)],
         }
@@ -481,6 +482,7 @@ mod tests {
                     exited: false,
                     unread_sequence: 1,
                     busy: false,
+                    command: Default::default(),
                     progress: Default::default(),
                     modes: [false; 2],
                 },
@@ -555,6 +557,7 @@ mod tests {
                         exited: false,
                         unread_sequence: 0,
                         busy: false,
+                        command: Default::default(),
                         progress: Default::default(),
                         modes: [false; 2],
                     },

@@ -49,7 +49,9 @@ impl Packet {
 }
 
 fn metadata_size(meta: &Metadata) -> usize {
-    meta.directory.capacity() + meta.title.capacity()
+    meta.directory.capacity()
+        + meta.title.capacity()
+        + meta.command.command.as_ref().map_or(0, String::capacity)
 }
 
 fn state_size(state: &CommandReply) -> usize {
@@ -146,6 +148,14 @@ mod tests {
                 s.metadata[0].directory.reserve(LIMIT * 2)
             }),
             ("metadata title", |s| s.metadata[0].title.reserve(LIMIT * 2)),
+            ("metadata command", |s| {
+                s.metadata[0]
+                    .command
+                    .command
+                    .as_mut()
+                    .unwrap()
+                    .reserve(LIMIT * 2)
+            }),
             ("tab vector", |s| s.execution.tabs.reserve(LIMIT)),
             ("tab name", |s| s.execution.tabs[0].name.reserve(LIMIT * 2)),
             ("directory table", |s| {
@@ -173,6 +183,7 @@ mod tests {
             let mut state = state();
             // An empty optional warning also serializes independently of capacity.
             state.result.warning = Some(String::new());
+            state.metadata[0].command.command = Some(String::new());
             let encoded = serde_json::to_vec(&state).unwrap();
             reserve(&mut state);
             assert_eq!(serde_json::to_vec(&state).unwrap(), encoded, "{name}");

@@ -16,6 +16,10 @@ impl Ui {
             ("paste", &["<Control><Shift>v"]),
             ("find", &["<Control><Shift>f"]),
             ("clear-screen", &[]),
+            ("previous-prompt", &["<Control><Shift>Up"]),
+            ("next-prompt", &["<Control><Shift>Down"]),
+            ("select-output", &[]),
+            ("copy-output", &[]),
             ("sidebar", &["<Control><Shift>b"]),
             ("search-tabs", &[]),
             ("palette", &["<Control><Shift>p"]),
@@ -227,6 +231,16 @@ impl Ui {
                     p.clear_screen();
                 }
             }
+            "previous-prompt" | "next-prompt" => {
+                if let Some(p) = self.active_pane() {
+                    p.prompt(name == "previous-prompt");
+                }
+            }
+            "select-output" | "copy-output" => {
+                if let Some(p) = self.active_pane() {
+                    p.select_output(None, name == "copy-output");
+                }
+            }
             "sidebar" => self.split.set_show_sidebar(!self.split.shows_sidebar()),
             "search-tabs" => {
                 self.split.set_show_sidebar(true);
@@ -330,6 +344,10 @@ pub(super) const TAB_ACTIONS: &[&str] = &[
     "paste",
     "find",
     "clear-screen",
+    "previous-prompt",
+    "next-prompt",
+    "select-output",
+    "copy-output",
     "rename",
     "reset-active-tab-name",
     "next-tab",

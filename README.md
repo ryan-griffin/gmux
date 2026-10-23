@@ -48,6 +48,7 @@ Shortcuts dialog to find other actions.
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
 | Find | Ctrl+Shift+F |
+| Previous / next prompt | Ctrl+Shift+Up / Ctrl+Shift+Down |
 | Command palette | Ctrl+Shift+P |
 
 Closing a window leaves its terminals running. Reopen Gmux to reconnect.
@@ -76,11 +77,18 @@ gmux list
 gmux new --name server --directory ~/Projects/my-app
 gmux split --down
 gmux send 'cargo test' --enter
+gmux metadata
+gmux command-output
 gmux notify 'Tests finished'
 ```
 
 Run `gmux --help` for commands. Pane commands use the calling shell's pane;
 otherwise pass `--pane` to choose one. Use `gmux-gtk` for workspace and window actions.
+
+Bash and Zsh shells report command lifecycle and exit status automatically.
+Use Terminal Actions or the command palette to select or copy command output
+without its prompt. See [shell integration](docs/shell-integration.md) for setup,
+nested shells, and socket commands.
 
 ## Development
 
