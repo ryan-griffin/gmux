@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{KeyAction, PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 30;
+pub const VERSION: u32 = 31;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -78,7 +78,7 @@ pub struct Header {
     pub notifications: Vec<String>,
     pub error: Option<String>,
     pub find: Option<crate::search::FindState>,
-    pub selection: Option<(u64, u64)>,
+    pub selection: Option<crate::selection::Selection>,
     #[serde(default)]
     pub selection_serial: u64,
     #[serde(default)]

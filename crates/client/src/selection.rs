@@ -1,5 +1,102 @@
 //! Immediate viewport selection while the daemon resolves full history bounds.
 use crate::{session::ScreenSnapshot, transport::SelectionMode};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Shape {
+    #[default]
+    Linear,
+    Rectangle,
+}
+
+/// Inclusive cell indices in the terminal's physical rows. Rectangle endpoints
+/// are normalized to top-left and bottom-right with the current column count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Selection {
+    pub start: u64,
+    pub end: u64,
+    pub shape: Shape,
+}
+
+impl Selection {
+    pub fn linear(start: u64, end: u64) -> Self {
+        Self {
+            start: start.min(end),
+            end: start.max(end),
+            shape: Shape::Linear,
+        }
+    }
+
+    pub fn rectangle(a: u64, b: u64, cols: u16) -> Self {
+        let cols = u64::from(cols.max(1));
+        Self {
+            start: (a / cols).min(b / cols) * cols + (a % cols).min(b % cols),
+            end: (a / cols).max(b / cols) * cols + (a % cols).max(b % cols),
+            shape: Shape::Rectangle,
+        }
+    }
+
+    /// Clip to a viewport and return indices relative to its first cell.
+    pub fn viewport(self, offset: u64, cols: u16, len: usize) -> Option<Self> {
+        if cols == 0 || len == 0 {
+            return None;
+        }
+        let cols = u64::from(cols);
+        let base = offset * cols;
+        let limit = base + len as u64 - 1;
+        if self.start > limit || self.end < base {
+            return None;
+        }
+        let (start, end) = match self.shape {
+            Shape::Linear => (self.start.max(base), self.end.min(limit)),
+            Shape::Rectangle => (
+                (self.start / cols).max(offset) * cols + self.start % cols,
+                (self.end / cols).min(limit / cols) * cols + self.end % cols,
+            ),
+        };
+        Some(Self {
+            start: start - base,
+            end: end - base,
+            ..self
+        })
+    }
+
+    /// Inclusive columns in a physical row before expanding wide glyph edges.
+    pub fn columns(self, base: usize, len: usize, cols: u16) -> Option<(usize, usize)> {
+        if len == 0 || cols == 0 {
+            return None;
+        }
+        let base = base as u64;
+        let cols = u64::from(cols);
+        if self.start > base + len as u64 - 1 || self.end < base {
+            return None;
+        }
+        let (start, end) = match self.shape {
+            Shape::Linear => (
+                self.start.saturating_sub(base) as usize,
+                (self.end - base).min(len as u64 - 1) as usize,
+            ),
+            Shape::Rectangle => ((self.start % cols) as usize, (self.end % cols) as usize),
+        };
+        (start <= end && end < len).then_some((start, end))
+    }
+
+    /// Include the complete wide glyph at either edge, as Ghostty's formatter
+    /// does. Geometry uses constant storage, independent of selection area.
+    pub fn row(self, base: usize, cells: &[crate::Cell], cols: u16) -> Option<(usize, usize)> {
+        let (mut start, mut end) = self.columns(base, cells.len(), cols)?;
+        if self.shape == Shape::Rectangle {
+            if start > 0 && cells[start].flags & 64 != 0 {
+                start -= 1;
+            }
+            if end + 1 < cells.len() && cells[end + 1].flags & 64 != 0 {
+                end += 1;
+            }
+        }
+        (start <= end && end < cells.len()).then_some((start, end))
+    }
+}
 
 type Span = (usize, usize);
 
@@ -22,9 +119,16 @@ impl Preview {
         origin: usize,
         endpoint: usize,
         mode: SelectionMode,
-    ) -> Option<Span> {
-        if mode == SelectionMode::Cell {
-            return Some((origin.min(endpoint), origin.max(endpoint)));
+    ) -> Option<Selection> {
+        if screen.frame.cols == 0 {
+            return None;
+        }
+        if mode == SelectionMode::Cell || mode == SelectionMode::Rectangle {
+            return Some(if mode == SelectionMode::Rectangle {
+                Selection::rectangle(origin as u64, endpoint as u64, screen.frame.cols)
+            } else {
+                Selection::linear(origin as u64, endpoint as u64)
+            });
         }
         let key = (
             screen.text_revision,
@@ -124,7 +228,10 @@ impl Preview {
         }
         let anchor = anchor.range;
         let current = current.range;
-        Some((anchor.0.min(current.0), anchor.1.max(current.1)))
+        Some(Selection::linear(
+            anchor.0.min(current.0) as u64,
+            anchor.1.max(current.1) as u64,
+        ))
     }
 }
 

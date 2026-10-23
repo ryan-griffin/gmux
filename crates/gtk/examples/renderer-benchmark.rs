@@ -19,10 +19,42 @@ use renderer::{Renderer, Scene};
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Instant};
 
+// Counts Rust allocations during scene preparation. GTK/Pango/GSK allocations
+// are outside this allocator; requested bytes are not retained heap usage.
+struct CountingAllocator;
+static COUNT_ALLOCATIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALLOCATED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        count_allocation(size);
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+}
+fn count_allocation(size: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if COUNT_ALLOCATIONS.load(Relaxed) {
+        ALLOCATIONS.fetch_add(1, Relaxed);
+        ALLOCATED_BYTES.fetch_add(size, Relaxed);
+    }
+}
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
 #[derive(Parser)]
 struct Options {
     #[arg(long, default_value_t = 60)]
     frames: usize,
+    /// Measure changing linear and rectangular selections over unchanged text.
+    #[arg(long)]
+    selection: bool,
     #[arg(long, default_value_t = 120)]
     cols: u16,
     #[arg(long, default_value_t = 40)]
@@ -142,13 +174,18 @@ fn main() -> anyhow::Result<()> {
         "unique",
         "decorations",
     ] {
-        for workload in [
-            "static",
-            "single-row",
-            "full-screen",
-            "all-rows",
-            "cursor-blink",
-        ] {
+        let workloads: &[&str] = if options.selection {
+            &["linear-selection", "rectangle-selection"]
+        } else {
+            &[
+                "static",
+                "single-row",
+                "full-screen",
+                "all-rows",
+                "cursor-blink",
+            ]
+        };
+        for &workload in workloads {
             let mut renderer = Renderer::new();
             let mut cells = fixture(options.cols, options.rows, theme, fixture_name != "ascii");
             if fixture_name == "ligatures" {
@@ -204,12 +241,15 @@ fn main() -> anyhow::Result<()> {
             let mut complete = Vec::new();
             let mut total = Vec::new();
             let mut rebuilt_rows = 0;
+            let mut expected_rebuilt_rows = 0;
             let mut new_text_nodes = 0;
             let mut cached_shapes = 0;
             let mut cached_shape_bytes = 0;
+            let mut allocations = 0;
+            let mut allocated_bytes = 0;
             let mut pixels = vec![0; width as usize * height as usize * 4];
             for iteration in 0..options.frames + 5 {
-                if !matches!(workload, "static" | "cursor-blink") {
+                if !options.selection && !matches!(workload, "static" | "cursor-blink") {
                     if workload == "full-screen" {
                         cells.rotate_left(options.cols as usize);
                     }
@@ -268,6 +308,7 @@ fn main() -> anyhow::Result<()> {
                     frame.cursor_x = options.cols / 2;
                     frame.cursor_y = options.rows / 2;
                 }
+                let selection_column = 2 + iteration % (options.cols as usize - 3);
                 let scene = Scene {
                     frame,
                     cells: &cells,
@@ -277,7 +318,17 @@ fn main() -> anyhow::Result<()> {
                     width,
                     height,
                     theme,
-                    selection: None,
+                    selection: if options.selection {
+                        let end = u64::from(options.rows - 1) * u64::from(options.cols)
+                            + selection_column as u64;
+                        Some(if workload == "rectangle-selection" {
+                            gmux_client::selection::Selection::rectangle(1, end, options.cols)
+                        } else {
+                            gmux_client::selection::Selection::linear(1, end)
+                        })
+                    } else {
+                        None
+                    },
                     hovered_link: None,
                     matches: &highlights,
                     focused: workload == "cursor-blink",
@@ -285,8 +336,14 @@ fn main() -> anyhow::Result<()> {
                 };
                 let started = Instant::now();
                 let snapshot = gtk::Snapshot::new();
+                ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+                ALLOCATED_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+                COUNT_ALLOCATIONS.store(true, std::sync::atomic::Ordering::Relaxed);
                 let stats = renderer.snapshot(&snapshot, &scene, &font, &context);
                 let node = snapshot.to_node().unwrap();
+                COUNT_ALLOCATIONS.store(false, std::sync::atomic::Ordering::Relaxed);
+                let frame_allocations = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+                let frame_bytes = ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
                 let prepared = started.elapsed().as_secs_f64() * 1000.0;
                 let gpu_started = Instant::now();
                 let texture = gpu.render_texture(&node, Some(&viewport));
@@ -299,12 +356,22 @@ fn main() -> anyhow::Result<()> {
                         "static" => 0,
                         "single-row" => 1,
                         "all-rows" => options.rows as usize,
+                        // Moving from a wide glyph's head to its spacer tail
+                        // keeps exactly the same cells selected in that row.
+                        "rectangle-selection" if selection_column != 2 => cells
+                            .chunks(options.cols as usize)
+                            .filter(|row| row[selection_column].flags & 64 == 0)
+                            .count(),
+                        "rectangle-selection" => options.rows as usize,
                         _ => 1,
                     };
                     assert_eq!(
                         stats.rebuilt_rows, expected,
                         "Row cache invalidation in {workload}"
                     );
+                    expected_rebuilt_rows += expected;
+                    allocations += frame_allocations;
+                    allocated_bytes += frame_bytes;
                     prepare.push(prepared);
                     complete.push(rendered);
                     total.push(prepared + rendered);
@@ -321,7 +388,9 @@ fn main() -> anyhow::Result<()> {
             }
             let result = json!({"fixture": fixture_name, "workload": workload, "terminal_renderer": "gsk",
                     "prepare": summary(prepare), "render_and_download": summary(complete), "total": summary(total),
-                    "rebuilt_rows": rebuilt_rows, "new_text_nodes": new_text_nodes,
+                    "rebuilt_rows": rebuilt_rows, "expected_rebuilt_rows": expected_rebuilt_rows, "new_text_nodes": new_text_nodes,
+                    "rust_allocations_per_frame": allocations as f64 / options.frames as f64,
+                    "rust_allocated_bytes_per_frame": allocated_bytes as f64 / options.frames as f64,
                     "cached_shapes": cached_shapes, "cached_shape_bytes": cached_shape_bytes});
             println!("{result}");
             results.push(result);

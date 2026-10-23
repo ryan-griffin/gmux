@@ -545,7 +545,7 @@ fn validate_ligatures(
             scene.height = (ch + 2) * 2;
             scene.matches = &matches;
             if case == "selection" {
-                scene.selection = Some((0, 0));
+                scene.selection = Some(gmux_client::selection::Selection::linear(0, 0));
             }
             if case == "cursor" {
                 scene.frame.cursor_x = 1;
@@ -1037,7 +1037,7 @@ fn validate_batched_patterns(
         s.height = 86;
         s.scale = scale;
         s.origin = origin;
-        s.selection = Some((1, 19));
+        s.selection = Some(gmux_client::selection::Selection::linear(1, 19));
         let expected = gtk::Snapshot::new();
         expected.append_color(
             &rgba(s.frame.background, 1.0),
@@ -1161,7 +1161,7 @@ fn validate_link_hover(
         scene.scale = scale;
         scene.origin = (0.25, 0.5);
         scene.metrics.1 = 21.3;
-        scene.selection = Some((36, 44));
+        scene.selection = Some(gmux_client::selection::Selection::linear(36, 44));
         scene.frame.cursor_visible = 1;
         scene.frame.cursor_style = 1;
         scene.frame.cursor_x = 4;
@@ -1365,7 +1365,9 @@ fn validate_cache(
             "search" => {
                 scene.matches = &highlights;
             }
-            "selection" => scene.selection = Some((42, 45)),
+            "selection" => {
+                scene.selection = Some(gmux_client::selection::Selection::linear(42, 45))
+            }
             "block" => {
                 scene.frame.cursor_visible = 1;
                 scene.frame.cursor_style = 1;
@@ -1531,7 +1533,7 @@ fn validate_scroll_cache(
                 scene.scale = scale;
                 scene.origin = origin;
                 if step >= 2 {
-                    scene.selection = Some((42, 85));
+                    scene.selection = Some(gmux_client::selection::Selection::linear(42, 85));
                     highlights.fill(0);
                     highlights[step * 40 + 3] = 1;
                     highlights[step * 40 + 4] = 2;
@@ -1625,7 +1627,7 @@ fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context
     let cells = vec![cell(" ", theme, 0); 320];
     let mut scene = scene(&cells, theme);
     scene.metrics = (10.0, 24.0);
-    scene.selection = Some((2, 5));
+    scene.selection = Some(gmux_client::selection::Selection::linear(2, 5));
     let mut highlights = vec![0; 320];
     highlights[42] = 1;
     highlights[43] = 2;
@@ -1643,6 +1645,34 @@ fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context
     assert_eq!(sample(25, 12), bgra(theme.selection_background));
     assert_eq!(sample(35, 36), bgra(theme.selection_background));
     assert_ne!(sample(25, 36), bgra(theme.background));
+
+    // Rectangle geometry and glyph colors must equal independently recolored
+    // cells, including wide glyphs intersected at either edge.
+    let mut rectangle_cells = cells.clone();
+    rectangle_cells[1] = cell("界", theme, 0);
+    rectangle_cells[2] = cell("", theme, 64);
+    rectangle_cells[3] = cell("e\u{301}", theme, 0);
+    rectangle_cells[45] = cell("界", theme, 0);
+    rectangle_cells[46] = cell("", theme, 64);
+    scene.cells = &rectangle_cells;
+    scene.matches = &[];
+    scene.selection = Some(gmux_client::selection::Selection::rectangle(2, 85, 40));
+    let actual = node(&mut Renderer::new(), &scene, font, context).0;
+    let mut expected_cells = rectangle_cells.clone();
+    for (row, left, right) in [(0, 1, 5), (1, 2, 6), (2, 2, 5)] {
+        for cell in &mut expected_cells[row * 40 + left..=row * 40 + right] {
+            cell.fg = theme.selection_foreground;
+            cell.bg = theme.selection_background;
+        }
+    }
+    scene.cells = &expected_cells;
+    scene.selection = None;
+    let expected = node(&mut Renderer::new(), &scene, font, context).0;
+    assert_eq!(
+        pixels(&render(gpu, &actual, &scene)),
+        pixels(&render(gpu, &expected, &scene)),
+        "Rectangle selection must paint only the selected row columns and complete glyphs"
+    );
 
     // Decorations on blank cells and spacer tails must be visible; concealed
     // cells suppress text and decorations while retaining their background.
@@ -1820,7 +1850,7 @@ fn main() -> anyhow::Result<()> {
             "cursor_lifecycle": options.cursor_lifecycle,
             "glyph_cases": cases,
             "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
-                       "font and context changes", "fractional blocks", "selection and search", "link hover SGR pixels and glyph cache retention",
+                       "font and context changes", "fractional blocks", "linear and rectangular selection and search", "link hover SGR pixels and glyph cache retention",
                        "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
                        "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts"]
         }))?,

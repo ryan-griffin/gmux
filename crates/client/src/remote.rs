@@ -4,6 +4,7 @@ use crate::{
     control::InternalRequest,
     incoming, ipc,
     model::{CursorStyle, ExecutionState},
+    selection::Selection,
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
     transport::{self, KeyAction, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest},
@@ -905,7 +906,7 @@ pub struct RemoteSession {
     scroll_cadence: Duration,
     pending_scroll: ValueCell<Option<u64>>,
     find: crate::search::FindState,
-    selection: Option<(u64, u64)>,
+    selection: Option<Selection>,
     selection_serial: ValueCell<u64>,
     selection_acknowledged: u64,
     selection_origin: Option<u64>,
@@ -1095,7 +1096,7 @@ impl RemoteSession {
         self.clear_cache();
         Ok(())
     }
-    pub fn selection(&self) -> Option<(u64, u64)> {
+    pub fn selection(&self) -> Option<Selection> {
         self.selection
     }
     pub fn scroll_to(&mut self, row: u64) {
@@ -1664,7 +1665,7 @@ mod tests {
     fn clipboard_packets_keep_cross_pane_wire_order_without_mutating_selection_or_replay() {
         use crate::clipboard::{Destination, Write};
         let (mut manager, sender, handle) = manager();
-        handle.borrow_mut().selection = Some((0, 1));
+        handle.borrow_mut().selection = Some(Selection::linear(0, 1));
         for (pane, destination, text) in [
             (1, Destination::Clipboard, Some("first 界🙂")),
             (2, Destination::Primary, Some("")),
@@ -1710,7 +1711,7 @@ mod tests {
                 (Destination::Clipboard, Some("last")),
             ]
         );
-        assert_eq!(handle.borrow().selection, Some((0, 1)));
+        assert_eq!(handle.borrow().selection, Some(Selection::linear(0, 1)));
         manager.poll_with_clipboard(|_| panic!("replayed clipboard write"));
     }
 
@@ -2142,13 +2143,16 @@ mod tests {
         for manager in [&mut local, &mut remote] {
             manager.git_panes.insert(1);
         }
-        local_session.borrow_mut().selection = Some((1, 3));
+        local_session.borrow_mut().selection = Some(Selection::linear(1, 3));
         send(&local_sender, "/tmp", "local-main");
         send(&remote_sender, "/tmp", "remote-main");
         let updates = local.poll();
         assert!(updates[&1].git_changed);
         assert!(!updates[&1].changed && !updates[&1].directory_changed);
-        assert_eq!(local_session.borrow().selection, Some((1, 3)));
+        assert_eq!(
+            local_session.borrow().selection,
+            Some(Selection::linear(1, 3))
+        );
         remote.poll();
         assert_eq!(local_session.borrow().branch(), "local-main");
         assert_eq!(remote_session.borrow().branch(), "remote-main");
@@ -2456,7 +2460,7 @@ mod tests {
         frame: Frame,
         rows: Vec<u16>,
         cells: Vec<Cell>,
-        selection: Option<(u64, u64)>,
+        selection: Option<Selection>,
     ) {
         sender
             .send(Ok(Packet {
@@ -2553,19 +2557,19 @@ mod tests {
             .borrow()
             .select((0, 0), (1, 0), SelectionMode::Word)
             .unwrap();
-        send(0, Some((2, 3)));
+        send(0, Some(Selection::linear(2, 3)));
         manager.poll();
         assert!(session.borrow().selection_pending());
         assert_eq!(session.borrow().selection(), None);
-        send(1, Some((0, 1)));
+        send(1, Some(Selection::linear(0, 1)));
         assert!(manager.poll()[&1].changed);
         assert!(!session.borrow().selection_pending());
-        assert_eq!(session.borrow().selection(), Some((0, 1)));
+        assert_eq!(session.borrow().selection(), Some(Selection::linear(0, 1)));
         session.borrow().clear_selection().unwrap();
-        send(1, Some((2, 3)));
+        send(1, Some(Selection::linear(2, 3)));
         manager.poll();
         assert!(session.borrow().selection_pending());
-        assert_eq!(session.borrow().selection(), Some((0, 1)));
+        assert_eq!(session.borrow().selection(), Some(Selection::linear(0, 1)));
         send(2, None);
         assert!(manager.poll()[&1].changed);
         assert!(!session.borrow().selection_pending());
@@ -2580,11 +2584,18 @@ mod tests {
             cursor_y: 1,
             ..session.borrow().frame
         };
-        send_frame(&sender, &session, frame, vec![], vec![], Some((1, 3)));
+        send_frame(
+            &sender,
+            &session,
+            frame,
+            vec![],
+            vec![],
+            Some(Selection::linear(1, 3)),
+        );
         assert!(manager.poll()[&1].changed);
         assert_eq!(session.borrow().snapshot().text_revision, 0);
         assert_eq!(session.borrow().snapshot().frame.cursor_y, 1);
-        assert_eq!(session.borrow().selection(), Some((1, 3)));
+        assert_eq!(session.borrow().selection(), Some(Selection::linear(1, 3)));
         let frame = Frame {
             cols: 4,
             rows: 1,

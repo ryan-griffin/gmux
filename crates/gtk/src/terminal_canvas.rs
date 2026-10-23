@@ -228,13 +228,11 @@ mod imp {
             self.text
                 .borrow()
                 .selection
-                .map(|(start, end)| {
-                    vec![gtk::AccessibleTextRange::new(
-                        start as usize,
-                        (end - start) as usize,
-                    )]
+                .iter()
+                .map(|&(start, end)| {
+                    gtk::AccessibleTextRange::new(start as usize, (end - start) as usize)
                 })
-                .unwrap_or_default()
+                .collect()
         }
         fn extents(&self, start: u32, end: u32) -> Option<gtk::graphene::Rect> {
             let text = self.text.borrow();
@@ -286,7 +284,7 @@ impl TerminalCanvas {
     pub fn update_text(
         &self,
         screen: &gmux_client::session::ScreenSnapshot<'_>,
-        selection: Option<(usize, usize)>,
+        selection: Option<gmux_client::selection::Selection>,
     ) {
         let imp = self.imp();
         let key = (
@@ -306,10 +304,9 @@ impl TerminalCanvas {
             }
         } else {
             let mut old = imp.text.borrow_mut();
-            let (caret, selected) = (old.caret, old.selection);
-            old.update_positions(screen.frame, selection);
+            let caret = old.caret;
+            let selection_changed = old.update_positions(screen.frame, selection);
             let caret_changed = old.caret != caret;
-            let selection_changed = old.selection != selected;
             drop(old);
             if caret_changed {
                 self.update_caret_position();

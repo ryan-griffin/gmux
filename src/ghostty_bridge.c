@@ -135,6 +135,8 @@ struct GmuxEngine {
     bool held;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
     SelectionCache selection_cache;
+    bool selection_rectangle;
+    GhosttyTerminalScreen selection_screen;
     uint64_t text_generation;
     uint64_t hold_started_ms;
     GmuxView *views;
@@ -157,6 +159,8 @@ struct GmuxView {
     GhosttyTerminalScrollbar scrollbar;
     GhosttyTrackedGridRef viewport, selection_start, selection_end, selection_anchor;
     SelectionCache selection_cache;
+    bool selection_rectangle;
+    GhosttyTerminalScreen selection_screen;
     Links links;
     bool held_used;
     bool captured;
@@ -207,6 +211,8 @@ static void swap_view(GmuxEngine *e, GmuxView *v) {
     SWAP(selection_end, GhosttyTrackedGridRef);
     SWAP(selection_anchor, GhosttyTrackedGridRef);
     SWAP(selection_cache, SelectionCache);
+    SWAP(selection_rectangle, bool);
+    SWAP(selection_screen, GhosttyTerminalScreen);
 #undef SWAP
 }
 
@@ -1274,7 +1280,13 @@ static int selection_unit(GmuxEngine *e, uint64_t from, uint64_t toward, uint16_
 int gmux_engine_select(GmuxEngine *e, uint16_t sx, uint32_t sy, uint16_t ex, uint32_t ey, uint8_t mode) {
     GhosttyPoint start = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={sx,sy}};
     GhosttyPoint end = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={ex,ey}};
-    if (mode == 0) {
+    GhosttyTerminalScreen screen;
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen) || mode > 3) return -1;
+    if ((e->selection_start || e->selection_anchor) &&
+        (e->selection_screen != screen || e->selection_rectangle != (mode == 3))) gmux_engine_clear_selection(e);
+    e->selection_screen = screen;
+    e->selection_rectangle = mode == 3;
+    if (mode == 0 || mode == 3) {
         if (!e->selection_start && track_selection_point(e, &e->selection_start, start)) return -1;
         return track_selection_point(e, &e->selection_end, end);
     }
@@ -1319,17 +1331,27 @@ void gmux_engine_clear_selection(GmuxEngine *e) {
     clear_selection_bounds(e);
     ghostty_tracked_grid_ref_free(e->selection_anchor); e->selection_anchor=NULL;
 }
-int gmux_engine_selection(GmuxEngine *e, uint64_t *start, uint64_t *end) {
+int gmux_engine_selection(GmuxEngine *e, uint64_t *start, uint64_t *end, bool *rectangle) {
+    GhosttyTerminalScreen screen;
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen) || screen != e->selection_screen) return -1;
     if (!e->selection_start || !e->selection_end) return -1;
     GhosttyPointCoordinate a,b; uint16_t cols=0;
     if (ghostty_tracked_grid_ref_point(e->selection_start, GHOSTTY_POINT_TAG_SCREEN, &a) ||
         ghostty_tracked_grid_ref_point(e->selection_end, GHOSTTY_POINT_TAG_SCREEN, &b) ||
         ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols)) return -1;
+    *rectangle = e->selection_rectangle;
+    if (*rectangle) {
+        uint16_t left = a.x < b.x ? a.x : b.x, right = a.x > b.x ? a.x : b.x;
+        uint32_t top = a.y < b.y ? a.y : b.y, bottom = a.y > b.y ? a.y : b.y;
+        a = (GhosttyPointCoordinate){left, top}; b = (GhosttyPointCoordinate){right, bottom};
+    }
     *start = (uint64_t)a.y*cols+a.x; *end=(uint64_t)b.y*cols+b.x;
     if (*start > *end) { uint64_t swap=*start; *start=*end; *end=swap; }
     return 0;
 }
 int gmux_engine_selection_origin(GmuxEngine *e, uint64_t *origin) {
+    GhosttyTerminalScreen screen;
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen) || screen != e->selection_screen) return -1;
     GhosttyTrackedGridRef ref = e->selection_anchor ? e->selection_anchor : e->selection_start;
     GhosttyPointCoordinate point;
     uint16_t cols = 0;
@@ -1338,14 +1360,65 @@ int gmux_engine_selection_origin(GmuxEngine *e, uint64_t *origin) {
     *origin = (uint64_t)point.y * cols + point.x;
     return 0;
 }
+// The pinned formatter defers unwritten trailing cells even with trim=false.
+// Restore just that physical padding; Ghostty still formats all text/graphemes.
+static int rectangle_padding(GhosttyGridRef ref, uint16_t left, uint16_t right, size_t *padding) {
+    *padding = 0;
+    for (uint32_t x = (uint32_t)right + 1; x > left;) {
+        ref.x = --x;
+        GhosttyCell cell;
+        GhosttyCellWide wide;
+        bool text;
+        if (ghostty_grid_ref_cell(&ref, &cell) ||
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide) ||
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_HAS_TEXT, &text)) return -1;
+        if (text || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) break;
+        (*padding)++;
+    }
+    return 0;
+}
 int gmux_engine_copy(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
+    *written = 0;
+    uint64_t start, end;
+    bool rectangle;
+    if (gmux_engine_selection(e, &start, &end, &rectangle)) return 0;
     GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
-    if (!e->selection_start || !e->selection_end || ghostty_tracked_grid_ref_snapshot(e->selection_start, &selection.start) ||
-        ghostty_tracked_grid_ref_snapshot(e->selection_end, &selection.end)) { *written=0; return 0; }
+    selection.rectangle = rectangle;
     GhosttyTerminalSelectionFormatOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
-    options.emit=GHOSTTY_FORMATTER_FORMAT_PLAIN; options.unwrap=true; options.trim=true; options.selection=&selection;
-    GhosttyResult result=ghostty_terminal_selection_format_buf(e->terminal, options, out, cap, written);
-    return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
+    options.emit=GHOSTTY_FORMATTER_FORMAT_PLAIN; options.unwrap=!rectangle; options.trim=!rectangle; options.selection=&selection;
+    if (!rectangle) {
+        if (ghostty_tracked_grid_ref_snapshot(e->selection_start, &selection.start) ||
+            ghostty_tracked_grid_ref_snapshot(e->selection_end, &selection.end)) return -1;
+        GhosttyResult result=ghostty_terminal_selection_format_buf(e->terminal, options, out, cap, written);
+        return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
+    }
+    uint16_t cols;
+    if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols) || !cols) return -1;
+    const uint16_t left = start % cols, right = end % cols;
+    const uint32_t bottom = end / cols;
+    for (uint32_t y = start / cols;; y++) {
+        GhosttyPoint point = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={left,y}};
+        if (ghostty_terminal_grid_ref(e->terminal, point, &selection.start)) return -1;
+        selection.end = selection.start;
+        selection.end.x = right;
+        size_t padding, bytes = 0;
+        if (rectangle_padding(selection.end, left, right, &padding)) return -1;
+        size_t available = *written < cap ? cap - *written : 0;
+        GhosttyResult result = ghostty_terminal_selection_format_buf(e->terminal, options,
+            available ? out + *written : NULL, available, &bytes);
+        if (result != GHOSTTY_SUCCESS && result != GHOSTTY_OUT_OF_SPACE) return -1;
+        if (bytes > SIZE_MAX - *written) return -1;
+        *written += bytes;
+        if (padding > SIZE_MAX - *written) return -1;
+        available = *written < cap ? cap - *written : 0;
+        if (available) memset(out + *written, ' ', padding < available ? padding : available);
+        *written += padding;
+        if (y == bottom) break;
+        if (*written == SIZE_MAX) return -1;
+        if (*written < cap) out[*written] = '\n';
+        (*written)++;
+    }
+    return *written > cap ? 1 : 0;
 }
 
 void gmux_engine_links(GmuxEngine *e, GmuxLinkFn visit, void *userdata) {

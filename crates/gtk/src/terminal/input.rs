@@ -594,18 +594,30 @@ impl Terminal {
                 adjustment.emit_by_name::<()>("value-changed", &[]);
                 t.area.grab_focus();
                 t.drag_origin.set((x, y));
-                t.selection_mode.set(match (presses - 1) % 3 {
-                    1 => SelectionMode::Word,
-                    2 => SelectionMode::Line,
-                    _ => SelectionMode::Cell,
-                });
+                t.selection_mode.set(
+                    if gesture
+                        .current_event_state()
+                        .contains(gdk::ModifierType::CONTROL_MASK)
+                    {
+                        SelectionMode::Rectangle
+                    } else {
+                        match (presses - 1) % 3 {
+                            1 => SelectionMode::Word,
+                            2 => SelectionMode::Line,
+                            _ => SelectionMode::Cell,
+                        }
+                    },
+                );
                 let offset = t.session.borrow().snapshot().frame.scrollback.offset as usize;
                 let cols = t.session.borrow().snapshot().frame.cols as usize;
                 t.selection_anchor
                     .set(Some(offset * cols + t.cell_at(x, y)));
                 t.selection.borrow_mut().take();
                 let _ = t.session.borrow().clear_selection();
-                if t.selection_mode.get() != SelectionMode::Cell {
+                if matches!(
+                    t.selection_mode.get(),
+                    SelectionMode::Word | SelectionMode::Line
+                ) {
                     t.update_drag_selection();
                     t.send_drag_selection();
                 }

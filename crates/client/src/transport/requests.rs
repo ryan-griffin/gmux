@@ -73,6 +73,7 @@ pub enum SelectionMode {
     Cell,
     Word,
     Line,
+    Rectangle,
 }
 
 /// Keyboard action supplied by the originating frontend, before terminal encoding.

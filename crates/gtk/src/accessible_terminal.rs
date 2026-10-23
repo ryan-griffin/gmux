@@ -1,5 +1,8 @@
 //! Character offsets for GTK's accessible text interface, including wide cells.
-use gmux_client::{Cell, Frame};
+use gmux_client::{
+    Cell, Frame,
+    selection::{Selection, Shape},
+};
 use std::ops::Range;
 
 #[derive(Default)]
@@ -7,18 +10,18 @@ pub struct Text {
     pub value: String,
     pub offsets: Vec<u32>,
     pub caret: u32,
-    pub selection: Option<(u32, u32)>,
+    pub selection: Vec<(u32, u32)>,
     pub cols: usize,
     cell_ends: Vec<u32>,
     spans: Vec<Range<usize>>,
 }
 impl Text {
-    pub fn from_frame(frame: Frame, cells: &[Cell], selection: Option<(usize, usize)>) -> Self {
+    pub fn from_frame(frame: Frame, cells: &[Cell], selection: Option<Selection>) -> Self {
         let mut text = Self::default();
         text.rebuild(frame, cells, selection);
         text
     }
-    pub fn rebuild(&mut self, frame: Frame, cells: &[Cell], selection: Option<(usize, usize)>) {
+    pub fn rebuild(&mut self, frame: Frame, cells: &[Cell], selection: Option<Selection>) {
         let cols = frame.cols as usize;
         self.cols = cols;
         self.value.clear();
@@ -61,6 +64,7 @@ impl Text {
             self.offsets.shrink_to_fit();
             self.cell_ends.shrink_to_fit();
             self.spans.shrink_to_fit();
+            self.selection.shrink_to_fit();
         }
     }
     /// Heap capacity, excluding allocator overhead and the Text struct itself.
@@ -68,11 +72,13 @@ impl Text {
         self.value.capacity()
             + (self.offsets.capacity() + self.cell_ends.capacity()) * size_of::<u32>()
             + self.spans.capacity() * size_of::<Range<usize>>()
+            + self.selection.capacity() * size_of::<(u32, u32)>()
     }
     pub fn used_bytes(&self) -> usize {
         self.value.len()
             + (self.offsets.len() + self.cell_ends.len()) * size_of::<u32>()
             + self.spans.len() * size_of::<Range<usize>>()
+            + self.selection.len() * size_of::<(u32, u32)>()
     }
     pub fn has_excess_capacity(&self, used_bytes: usize) -> bool {
         // Allow slack for ordinary resizes. Reclaim capacity above four times
@@ -82,14 +88,42 @@ impl Text {
     pub fn char_count(&self) -> u32 {
         self.offsets.last().copied().unwrap_or(0)
     }
-    pub fn update_positions(&mut self, frame: Frame, selection: Option<(usize, usize)>) {
+    /// Returns whether the ranges changed, reusing their row-sized allocation.
+    pub fn update_positions(&mut self, frame: Frame, selection: Option<Selection>) -> bool {
         self.caret = self
             .offsets
             .get(frame.cursor_y as usize * self.cols + frame.cursor_x as usize)
             .copied()
             .unwrap_or(self.char_count());
-        self.selection = selection
-            .and_then(|(start, end)| Some((*self.offsets.get(start)?, *self.cell_ends.get(end)?)));
+        let mut count = 0;
+        let mut changed = false;
+        let mut add = |start: usize, end: usize| {
+            if let (Some(&start), Some(&end)) = (self.offsets.get(start), self.cell_ends.get(end)) {
+                if self.selection.get(count) != Some(&(start, end)) {
+                    changed = true;
+                    if let Some(range) = self.selection.get_mut(count) {
+                        *range = (start, end);
+                    } else {
+                        self.selection.push((start, end));
+                    }
+                }
+                count += 1;
+            }
+        };
+        if let Some(selection) = selection {
+            if selection.shape == Shape::Linear {
+                add(selection.start as usize, selection.end as usize);
+            } else if self.cols > 0 {
+                for base in (0..self.cell_ends.len()).step_by(self.cols) {
+                    if let Some((start, end)) = selection.columns(base, self.cols, frame.cols) {
+                        add(base + start, base + end);
+                    }
+                }
+            }
+        }
+        changed |= self.selection.len() != count;
+        self.selection.truncate(count);
+        changed
     }
     pub fn bytes(&self, start: u32, end: u32) -> Vec<u8> {
         let mut bytes: Vec<_> = self
@@ -170,6 +204,28 @@ impl Text {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rectangle_ranges_exclude_unselected_columns_and_newlines_and_reuse_storage() {
+        let frame = Frame {
+            cols: 6,
+            rows: 3,
+            ..Frame::default()
+        };
+        let mut cells = vec![Cell::default(); 18];
+        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[1].flags = 64;
+        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        let mut text = Text::from_frame(frame, &cells, Some(Selection::rectangle(1, 14, 6)));
+        assert_eq!(text.selection, [(0, 3), (8, 10), (15, 17)]);
+        let pointer = text.selection.as_ptr();
+        assert!(!text.update_positions(frame, Some(Selection::rectangle(14, 1, 6))));
+        assert!(text.update_positions(frame, Some(Selection::rectangle(2, 8, 6))));
+        assert_eq!(text.selection, [(1, 3), (9, 10)]);
+        assert_eq!(text.selection.as_ptr(), pointer);
+        assert!(text.update_positions(frame, None));
+        assert!(text.selection.is_empty());
+    }
+
     fn allocations(text: &Text) -> (*const u8, *const u32, *const u32, *const Range<usize>) {
         (
             text.value.as_ptr(),
@@ -190,18 +246,18 @@ mod tests {
         let mut cells = vec![Cell::default(); 2];
         cells[0].text[..3].copy_from_slice("e\u{301}".as_bytes());
         cells[1].text[0] = b'X';
-        let mut text = Text::from_frame(frame, &cells, Some((0, 0)));
+        let mut text = Text::from_frame(frame, &cells, Some(Selection::linear(0, 0)));
         assert_eq!(text.value, "e\u{301}X");
         assert_eq!(text.caret, 2);
-        assert_eq!(text.selection, Some((0, 2)));
+        assert_eq!(text.selection, vec![(0, 2)]);
         assert_eq!(text.extents(1, 2, 8.0, 16.0), Some((0.0, 0.0, 8.0, 16.0)));
         cells[0].text = [0; 64];
         cells[0].text[0] = b'e';
         cells[1].text[..3].copy_from_slice("\u{301}X".as_bytes());
-        text.rebuild(frame, &cells, Some((0, 0)));
+        text.rebuild(frame, &cells, Some(Selection::linear(0, 0)));
         assert_eq!(text.value, "e\u{301}X");
         assert_eq!(text.caret, 1);
-        assert_eq!(text.selection, Some((0, 1)));
+        assert_eq!(text.selection, vec![(0, 1)]);
         assert_eq!(text.extents(1, 2, 8.0, 16.0), Some((8.0, 0.0, 8.0, 16.0)));
         assert_eq!(text.offset_at(12.0, 8.0, 8.0, 16.0), Some(1));
     }
@@ -222,7 +278,7 @@ mod tests {
         }
         cells[1].flags = 64;
         cells[5].flags = 64;
-        let mut text = Text::from_frame(frame, &cells, Some((0, 5)));
+        let mut text = Text::from_frame(frame, &cells, Some(Selection::linear(0, 5)));
         assert_eq!(text.value, "界e\u{301}X\n👩‍💻b ");
         let storage = allocations(&text);
         // A one-row update leaves the first row's offsets and geometry intact.
@@ -234,13 +290,13 @@ mod tests {
                 ..frame
             },
             &cells,
-            Some((5, 6)),
+            Some(Selection::linear(5, 6)),
         );
         assert_eq!(allocations(&text), storage);
         assert_eq!(text.value, "界e\u{301}X\n👩‍💻c ");
         assert_eq!(text.offsets, [0, 0, 1, 3, 5, 5, 8, 9, 10]);
         assert_eq!(text.caret, 8);
-        assert_eq!(text.selection, Some((5, 9)));
+        assert_eq!(text.selection, vec![(5, 9)]);
         assert_eq!(text.bytes(5, 8), "👩‍💻\0".as_bytes());
         assert_eq!(text.extents(5, 8, 8.0, 16.0), Some((0.0, 16.0, 16.0, 16.0)));
         assert_eq!(text.offset_at(12.0, 24.0, 8.0, 16.0), Some(5));
@@ -256,14 +312,14 @@ mod tests {
         );
         assert_eq!(text.value, "界");
         assert_eq!(text.offsets, [0, 0, 1]);
-        assert_eq!(text.selection, None);
+        assert!(text.selection.is_empty());
         assert_eq!(text.extents(0, 1, 8.0, 16.0), Some((0.0, 0.0, 16.0, 16.0)));
-        text.rebuild(Frame::default(), &[], Some((0, 0)));
+        text.rebuild(Frame::default(), &[], Some(Selection::linear(0, 0)));
         assert!(text.value.is_empty());
         assert_eq!(text.offsets, [0]);
         assert_eq!(text.char_count(), 0);
         assert_eq!(text.caret, 0);
-        assert_eq!(text.selection, None);
+        assert!(text.selection.is_empty());
         assert!(text.spans.is_empty());
         assert!(text.cell_ends.is_empty());
     }
@@ -290,11 +346,11 @@ mod tests {
         cells[0].text[..3].copy_from_slice("界".as_bytes());
         cells[1].flags = 64;
         cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
-        let expected = Text::from_frame(frame, &cells, Some((0, 2)));
+        let expected = Text::from_frame(frame, &cells, Some(Selection::linear(0, 2)));
         // The canvas must drop its old, large text instead of keeping it as a
         // spare, even if there are no further text changes after this resize.
         assert!(text.has_excess_capacity(expected.used_bytes()));
-        text.rebuild(frame, &cells, Some((0, 2)));
+        text.rebuild(frame, &cells, Some(Selection::linear(0, 2)));
         assert!(text.capacity_bytes() <= expected.capacity_bytes());
         assert!(text.capacity_bytes() < 100 * 1024);
         assert!(!text.has_excess_capacity(expected.used_bytes()));
@@ -303,7 +359,7 @@ mod tests {
         assert_eq!(text.cell_ends, expected.cell_ends);
         assert_eq!(text.spans, expected.spans);
         assert_eq!(text.caret, 1);
-        assert_eq!(text.selection, Some((0, 3)));
+        assert_eq!(text.selection, vec![(0, 3)]);
         assert_eq!(text.extents(0, 1, 8.0, 16.0), Some((0.0, 0.0, 16.0, 16.0)));
         assert_eq!(text.extents(1, 3, 8.0, 16.0), Some((16.0, 0.0, 8.0, 16.0)));
         assert_eq!(text.offset_at(12.0, 8.0, 8.0, 16.0), Some(0));
@@ -323,11 +379,11 @@ mod tests {
                 ..Frame::default()
             },
             &cells,
-            Some((0, 2)),
+            Some(Selection::linear(0, 2)),
         );
         assert_eq!(text.value, "界e\u{301} ");
         assert_eq!(text.caret, 1);
-        assert_eq!(text.selection, Some((0, 3)));
+        assert_eq!(text.selection, vec![(0, 3)]);
         assert_eq!(text.bytes(0, 1), "界\0".as_bytes());
         assert_eq!(text.extents(0, 1, 8.0, 16.0), Some((0.0, 0.0, 16.0, 16.0)));
         assert_eq!(text.extents(1, 2, 8.0, 16.0), Some((16.0, 0.0, 8.0, 16.0)));
@@ -358,10 +414,10 @@ mod tests {
                 cursor_x: 3,
                 ..frame
             },
-            Some((1, 3)),
+            Some(Selection::linear(1, 3)),
         );
         assert_eq!(text.caret, 2);
-        assert_eq!(text.selection, Some((1, 3)));
+        assert_eq!(text.selection, vec![(1, 3)]);
         assert_eq!(text.bytes(1, 3), "b界\0".as_bytes());
         text.update_positions(
             Frame {
@@ -369,10 +425,10 @@ mod tests {
                 cursor_y: 1,
                 ..frame
             },
-            Some((3, 4)),
+            Some(Selection::linear(3, 4)),
         );
         assert_eq!(text.caret, 6);
-        assert_eq!(text.selection, Some((2, 6)));
+        assert_eq!(text.selection, vec![(2, 6)]);
         assert_eq!(text.bytes(2, 6), "界\ne\u{301}\0".as_bytes());
         text.update_positions(
             Frame {
@@ -382,7 +438,7 @@ mod tests {
             None,
         );
         assert_eq!(text.caret, text.char_count());
-        assert_eq!(text.selection, None);
+        assert!(text.selection.is_empty());
     }
     #[test]
     fn hit_testing_rejects_off_grid_points_and_extents_validate_ranges() {

@@ -488,6 +488,9 @@ impl Ui {
             let section = adw::ShortcutsSection::new(Some(title));
             for (title, action) in *actions {
                 let item = adw::ShortcutsItem::from_action(title, &format!("win.{action}"));
+                if *action == "copy" {
+                    item.set_subtitle("Ctrl+drag selects a rectangle. Add Shift when an application captures pointer input.");
+                }
                 if *action == "close" {
                     item.set_subtitle("Closes the window when the empty state is shown");
                 }

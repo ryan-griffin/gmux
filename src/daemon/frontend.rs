@@ -23,7 +23,7 @@ pub(super) struct SentScreen {
     pub(super) hyperlinks: gmux_client::hyperlinks::Hyperlinks,
 }
 pub(super) struct SentSelection {
-    range: Option<(u64, u64)>,
+    range: Option<gmux_client::selection::Selection>,
     serial: u64,
 }
 pub(super) struct Frontend {

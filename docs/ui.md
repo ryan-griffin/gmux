@@ -61,6 +61,21 @@ targets the clicked pane. Use Shift+right-click to open it while an application
 captures mouse input; the Menu key and Shift+F10 also open it. Tab context menus
 target the clicked tab.
 
+Drag to select text, double-click to select a word, or triple-click to select a
+logical line. Hold Ctrl while starting a drag to select a rectangle of terminal
+columns. Add Shift when an application captures pointer input. The shape stays
+fixed until release, so releasing Ctrl during a drag does not change the selection.
+Ctrl+click on a link still opens it; Ctrl+Shift+drag can start a rectangle there.
+Keyboard Shortcuts describes the rectangle gesture under Copy Selection.
+
+Copy a rectangle with Ctrl+Shift+C or Copy. Each selected physical row becomes
+one copied line, including soft-wrapped rows. Blank cells and trailing spaces
+preserve column alignment. Wide glyphs touching an edge are included whole, and
+combining characters stay with their glyph. Reflow moves the tracked corners and
+recomputes the rectangle using the new grid. Pruned corners invalidate it.
+Each window keeps its own selection; switching to another terminal screen hides
+it until its original screen is active again.
+
 OSC 8 links use their explicit target, which can differ from the printed text.
 The pointer changes over a link and its tooltip shows the target. Holding Ctrl
 underlines the captured span, including wrapped lines. Text with a single SGR
