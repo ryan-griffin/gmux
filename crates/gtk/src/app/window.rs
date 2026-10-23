@@ -905,6 +905,15 @@ fn terminal_menu_button() -> gtk::MenuButton {
     terminal.append(Some("_Find in Terminal…"), Some("win.find"));
     terminal.append(Some("_Clear Screen"), Some("win.clear-screen"));
     menu.append_section(None, &terminal);
+    let shell = gio::Menu::new();
+    shell.append(Some("Go to _Previous Prompt"), Some("win.previous-prompt"));
+    shell.append(Some("Go to _Next Prompt"), Some("win.next-prompt"));
+    shell.append(
+        Some("Select Last Command _Output"),
+        Some("win.select-output"),
+    );
+    shell.append(Some("Cop_y Last Command Output"), Some("win.copy-output"));
+    menu.append_submenu(Some("_Shell"), &shell);
     let zoom = gio::Menu::new();
     let zoom_in = gio::MenuItem::new(Some("_Zoom In"), Some("win.zoom-in"));
     // GTK does not infer a displayed accelerator for alternative shortcuts.

@@ -36,6 +36,8 @@ if ! "$gmux_headless"; then install -Dm755 "${gmux_binaries[1]}" "$gmux_install_
 mkdir -p "$gmux_install_prefix/lib/gmux"
 cp -L "$gmux_ghostty_prefix/lib/libghostty-vt.so" "$gmux_install_prefix/lib/gmux/libghostty-vt.so.0"
 install -Dm644 LICENSE "$gmux_install_prefix/share/doc/gmux/LICENSE"
+mkdir -p "$gmux_install_prefix/share/gmux"
+cp -R data/shell-integration "$gmux_install_prefix/share/gmux/"
 if ! "$gmux_headless"; then
     install -Dm644 data/dev.gmux.Gmux.desktop "$gmux_install_prefix/share/applications/dev.gmux.Gmux.desktop"
     install -Dm644 data/dev.gmux.Gmux.svg "$gmux_install_prefix/share/icons/hicolor/scalable/apps/dev.gmux.Gmux.svg"

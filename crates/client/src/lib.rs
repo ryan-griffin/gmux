@@ -17,6 +17,7 @@ pub mod scroll_cache;
 pub mod search;
 pub mod selection;
 pub mod session;
+pub mod shell;
 pub mod storage;
 pub mod theme;
 pub mod transport;

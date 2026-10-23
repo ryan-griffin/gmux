@@ -117,6 +117,14 @@ typedef struct {
     uint64_t text_generation;
 } HistoryCache;
 
+// Two distinct cells let us detect a discarded location even when Ghostty
+// clamps an erased partial page's tracked references to its first cell.
+typedef struct {
+    GhosttyTrackedGridRef point, guard;
+    uint64_t prompt_id, rewrite;
+} OutputAnchor;
+typedef struct { GhosttyTrackedGridRef point; uint64_t id; } PromptAnchor;
+
 struct GmuxEngine {
     GhosttyTerminal terminal;
     GhosttyRenderState render;
@@ -134,6 +142,7 @@ struct GmuxEngine {
     bool dark;
     bool held;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
+    OutputAnchor output_anchor;
     SelectionCache selection_cache;
     bool selection_rectangle;
     GhosttyTerminalScreen selection_screen;
@@ -150,6 +159,11 @@ struct GmuxEngine {
     HistoryCache history;
     HistoryCache *view_history;
     uint64_t history_reset;
+    PromptAnchor *prompts;
+    OutputAnchor output, completed_output;
+    size_t prompt_head, prompt_count, prompt_capacity;
+    uint64_t prompt_sequence, prompt_rewrites;
+    bool auxiliary_prompt, output_open, prompt_executed;
 };
 
 struct GmuxView {
@@ -158,6 +172,7 @@ struct GmuxView {
     GhosttyRenderState render;
     GhosttyTerminalScrollbar scrollbar;
     GhosttyTrackedGridRef viewport, selection_start, selection_end, selection_anchor;
+    OutputAnchor output_anchor;
     SelectionCache selection_cache;
     bool selection_rectangle;
     GhosttyTerminalScreen selection_screen;
@@ -168,6 +183,8 @@ struct GmuxView {
     Appearance appearance;
     HistoryCache history;
 };
+
+#include "ghostty_shell.h"
 
 static int apply_appearance(GmuxEngine *e, const Appearance *appearance) {
     // Identical defaults leave Ghostty's incremental row tracking untouched.
@@ -210,6 +227,7 @@ static void swap_view(GmuxEngine *e, GmuxView *v) {
     SWAP(selection_start, GhosttyTrackedGridRef);
     SWAP(selection_end, GhosttyTrackedGridRef);
     SWAP(selection_anchor, GhosttyTrackedGridRef);
+    SWAP(output_anchor, OutputAnchor);
     SWAP(selection_cache, SelectionCache);
     SWAP(selection_rectangle, bool);
     SWAP(selection_screen, GhosttyTerminalScreen);
@@ -246,6 +264,7 @@ void gmux_engine_view_free(GmuxView *v) {
     ghostty_tracked_grid_ref_free(v->selection_start);
     ghostty_tracked_grid_ref_free(v->selection_end);
     ghostty_tracked_grid_ref_free(v->selection_anchor);
+    shell_output_clear(&v->output_anchor);
     ghostty_tracked_grid_ref_free(v->history.anchor);
     ghostty_tracked_grid_ref_free(v->history.previous);
     ghostty_render_state_free(v->render);
@@ -476,8 +495,10 @@ void gmux_engine_free(GmuxEngine *e) {
     ghostty_tracked_grid_ref_free(e->selection_start);
     ghostty_tracked_grid_ref_free(e->selection_end);
     ghostty_tracked_grid_ref_free(e->selection_anchor);
+    shell_output_clear(&e->output_anchor);
     ghostty_tracked_grid_ref_free(e->history.anchor);
     ghostty_tracked_grid_ref_free(e->history.previous);
+    shell_clear(e);
     ghostty_key_event_free(e->key);
     ghostty_mouse_event_free(e->mouse);
     ghostty_mouse_encoder_free(e->mouse_encoder);
@@ -517,6 +538,10 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, progress_report);
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, semantic_prompt) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RESET, shell_reset)) {
+        gmux_engine_free(e); return NULL;
+    }
     static const uint8_t terminfo[] = "xterm-256color";
     GhosttyString terminfo_name = {.ptr = terminfo, .len = sizeof(terminfo) - 1};
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SIZE, terminal_size) ||
@@ -546,6 +571,8 @@ int gmux_engine_memory_usage(GmuxEngine *e, GmuxMemoryUsage *out) {
         .compressed_pages = usage.primary_compressed_pages + usage.alternate_compressed_pages,
         .compressed_bytes = usage.primary_compressed_bytes + usage.alternate_compressed_bytes,
         .image_bytes = usage.primary_image_bytes + usage.alternate_image_bytes,
+        .prompt_anchors = e->prompt_count,
+        .prompt_anchor_bytes = e->prompt_capacity * sizeof(*e->prompts),
     };
     return 0;
 }
@@ -779,6 +806,7 @@ void gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
         len -= consumed;
     }
     ghostty_terminal_vt_write(e->terminal, data, len);
+    if (e->prompt_count || e->output.point || e->completed_output.point) shell_prune(e);
 }
 int gmux_engine_clear_screen(GmuxEngine *e) {
     e->clear_pending = false;
@@ -799,13 +827,16 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
     const char clear[] = "\x1b[2J\x1b[3J\x1b[H";
     e->text_generation++;
     e->history_reset++;
+    shell_clear(e);
     ghostty_terminal_vt_write(e->terminal, (const uint8_t *)clear, sizeof(clear) - 1);
     gmux_engine_clear_selection(e);
+    shell_output_clear(&e->output_anchor);
     for (GmuxView *v = e->views; v; v = v->next) {
         ghostty_tracked_grid_ref_free(v->viewport); v->viewport = NULL;
         ghostty_tracked_grid_ref_free(v->selection_start); v->selection_start = NULL;
         ghostty_tracked_grid_ref_free(v->selection_end); v->selection_end = NULL;
         ghostty_tracked_grid_ref_free(v->selection_anchor); v->selection_anchor = NULL;
+        shell_output_clear(&v->output_anchor);
         v->selection_cache.valid = 0;
     }
     gmux_engine_scroll(e, 0, true);
@@ -828,6 +859,7 @@ int gmux_engine_resize(GmuxEngine *e, uint16_t cols, uint16_t rows, uint32_t cw,
     if (cols != previous_cols || rows != previous_rows) {
         e->text_generation++;
         e->history_reset++;
+        shell_prune(e);
     }
     // Libghostty sends the resize report itself, using these same metrics.
     e->cell_width = cw;

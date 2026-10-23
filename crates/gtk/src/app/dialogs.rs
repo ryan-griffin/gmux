@@ -466,6 +466,8 @@ impl Ui {
                     ("Copy Selection", "copy"),
                     ("Paste", "paste"),
                     ("Find in Terminal…", "find"),
+                    ("Go to Previous Prompt", "previous-prompt"),
+                    ("Go to Next Prompt", "next-prompt"),
                     ("Zoom In", "zoom-in"),
                     ("Zoom Out", "zoom-out"),
                     ("Reset Zoom", "zoom-reset"),

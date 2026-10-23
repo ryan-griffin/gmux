@@ -140,6 +140,8 @@ impl Daemon {
                             "title": session.title(),
                             "directory": session.directory(),
                             "exited": session.exited(),
+                            "busy": session.busy(),
+                            "command": session.command_state(),
                             "progress": session.progress(),
                             "unread": self.unread.contains_key(&session.id()),
                         })
@@ -324,6 +326,10 @@ impl Daemon {
                 Ok(
                     json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))}),
                 )
+            }
+            ExecutionRequest::CommandOutput { pane: id, point } => {
+                let text = self.sessions.get_mut(&id).unwrap().command_output(point)?;
+                Ok(json!({"text":text}))
             }
             ExecutionRequest::Copy { pane: id } => {
                 let frontend = self

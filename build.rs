@@ -106,6 +106,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ghostty_bridge.c");
     println!("cargo:rerun-if-changed=src/ghostty_bridge.h");
     println!("cargo:rerun-if-changed=src/ghostty_links.h");
+    println!("cargo:rerun-if-changed=src/ghostty_shell.h");
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREFIX");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=scripts/bootstrap-ghostty.py");

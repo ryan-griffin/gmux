@@ -66,6 +66,23 @@ enum Command {
         #[arg(long, env = "GMUX_PANE")]
         pane: Option<u64>,
     },
+    /// Inspect command lifecycle, last reported exit code, and process metadata.
+    Metadata {
+        #[arg(long, env = "GMUX_PANE")]
+        pane: Option<u64>,
+    },
+    /// Print the latest command's output, or output containing a screen cell.
+    #[command(name = "command-output")]
+    Output {
+        #[arg(long, env = "GMUX_PANE")]
+        pane: Option<u64>,
+        /// Zero-based column. Both coordinates are required together.
+        #[arg(long, requires = "row")]
+        column: Option<u16>,
+        /// Zero-based row in retained history, including the active screen.
+        #[arg(long, requires = "column")]
+        row: Option<u32>,
+    },
     /// Deliver a notification to clients viewing a pane.
     Notify {
         message: String,
@@ -280,7 +297,7 @@ fn run() -> anyhow::Result<()> {
         );
     }
     let stop = matches!(&cli.command, Command::Stop);
-    let plain_text = matches!(&cli.command, Command::Read { .. });
+    let plain_text = matches!(&cli.command, Command::Read { .. } | Command::Output { .. });
     let request = match cli.command {
         Command::Serve(_) => unreachable!(),
         Command::Status => serde_json::to_value(PublicRequest::Status)?,
@@ -307,6 +324,13 @@ fn run() -> anyhow::Result<()> {
             enter,
         })?,
         Command::Links { pane } => serde_json::to_value(PaneRequest::Links { pane })?,
+        Command::Metadata { pane } => serde_json::to_value(PaneRequest::Metadata { pane })?,
+        Command::Output { pane, column, row } => {
+            serde_json::to_value(PaneRequest::CommandOutput {
+                pane,
+                point: column.zip(row),
+            })?
+        }
         Command::Read { pane } => serde_json::to_value(PaneRequest::Read { pane })?,
         Command::Notify { message, pane } => {
             serde_json::to_value(PaneRequest::Notify { pane, message })?

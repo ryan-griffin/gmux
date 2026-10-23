@@ -587,6 +587,15 @@ impl Daemon {
                     *previous = serial;
                 }
             }
+            StreamCommand::Prompt { previous, serial } => {
+                let old = frontend.scroll_serials.entry(id).or_default();
+                if serial >= *old {
+                    *old = serial;
+                    // A missing target is harmless, but still acknowledge the
+                    // viewport serial so the client can drop its prediction.
+                    let _ = session.with_view(view, |engine| engine.prompt(previous));
+                }
+            }
             command => session.with_view(view, |engine| -> anyhow::Result<()> {
                 // Search navigation uses this client's current viewport metadata.
                 if matches!(command, StreamCommand::FindAdvance { .. }) {
@@ -600,6 +609,23 @@ impl Daemon {
                         );
                         copy = Some(engine.copy()?);
                     }
+                    StreamCommand::SelectOutput {
+                        point,
+                        anchored,
+                        copy: should_copy,
+                        serial,
+                    } => {
+                        frontend.selection_serials.insert(id, serial);
+                        if anchored {
+                            engine.select_anchored_output()?;
+                        } else {
+                            engine.select_output(point)?;
+                        }
+                        if should_copy {
+                            copy = Some(engine.copy()?);
+                        }
+                    }
+                    StreamCommand::AnchorOutput { point } => engine.anchor_output(point)?,
                     StreamCommand::Find { query } => engine.find(&query),
                     StreamCommand::FindAdvance { previous } => engine.find_advance(previous),
                     StreamCommand::Select {
@@ -745,6 +771,7 @@ impl Daemon {
                     exited: false,
                     unread_sequence: 0,
                     busy: false,
+                    command: Default::default(),
                     progress: Default::default(),
                     modes: [false; 2],
                 },

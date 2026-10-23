@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{KeyAction, PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 31;
+pub const VERSION: u32 = 32;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -29,6 +29,7 @@ pub struct Metadata {
     /// Sequence of the most recent unread alert; zero after acknowledgement.
     pub unread_sequence: u64,
     pub busy: bool,
+    pub command: crate::shell::CommandState,
     pub progress: crate::progress::Progress,
     pub modes: [bool; 2],
 }
@@ -346,6 +347,7 @@ mod tests {
                     exited: false,
                     unread_sequence: 0,
                     busy: false,
+                    command: Default::default(),
                     progress: Default::default(),
                     modes: [false, true],
                 },

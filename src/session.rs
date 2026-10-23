@@ -130,7 +130,8 @@ impl TerminalSession {
         history: Option<&[u8]>,
     ) -> anyhow::Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut command = CommandBuilder::new(shell);
+        let mut command = CommandBuilder::new(&shell);
+        crate::shell::configure(&mut command, Path::new(&shell));
         command.arg("-l");
         command.env("GMUX_TAB", tab.to_string());
         command.env("GMUX_PANE", id.to_string());
@@ -403,10 +404,20 @@ impl TerminalSession {
 
     pub(crate) fn busy(&self) -> bool {
         !self.exited
-            && self
-                .foreground_pid()
-                .zip(self.pid)
-                .is_some_and(|(fg, pid)| fg != pid)
+            && (self.engine.semantic_busy()
+                || self
+                    .foreground_pid()
+                    .zip(self.pid)
+                    .is_some_and(|(fg, pid)| fg != pid))
+    }
+
+    pub(crate) fn command_state(&self) -> gmux_client::shell::CommandState {
+        self.engine.command_state()
+    }
+
+    pub(crate) fn command_output(&mut self, point: Option<(u16, u32)>) -> anyhow::Result<String> {
+        self.engine.select_output(point)?;
+        self.engine.copy()
     }
 
     /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.

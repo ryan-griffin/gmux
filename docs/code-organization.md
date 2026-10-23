@@ -48,6 +48,12 @@ terminal engine. `src/ghostty_bridge.h` defines the C/Rust boundary, and
 generates Rust bindings with bindgen and checks struct layouts at compile time.
 Edit the shared header when changing the boundary.
 
+`src/ghostty_shell.h` keeps tracked primary prompts and command-output selection
+inside the C boundary. The semantic callback reports bounded command metadata
+to `engine.rs`. `src/shell.rs` configures startup using the packaged Bash and
+Zsh resources in `data/shell-integration`. Session command state is shared;
+prompt navigation, captured context targets, and selection belong to each view.
+
 `crates/gtk/src/renderer.rs` builds GSK scenes and caches rows and glyphs. `crates/gtk/src/render.rs`
 handles Pango shaping and cell graphics. `crates/gtk/src/terminal_canvas.rs` implements the
 scrollable widget and accessible text interface; `crates/gtk/src/accessible_terminal.rs`

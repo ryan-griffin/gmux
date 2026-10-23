@@ -229,6 +229,22 @@ impl KeyboardState {
 
 impl Terminal {
     pub(super) fn install_clipboard_actions(self: &Rc<Self>) {
+        let group = gio::SimpleActionGroup::new();
+        for (name, copy) in [("select-output", false), ("copy-output", true)] {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = Rc::downgrade(self);
+            action.connect_activate(move |_, _| {
+                if let Some(t) = weak.upgrade() {
+                    t.select_context_output(copy);
+                }
+            });
+            group.add_action(&action);
+        }
+        // Keep clipboard and output actions in the same terminal action group.
+        group.add_action(&self.copy_action);
+        group.add_action(&self.paste_action);
+        group.add_action(&self.copy_link_action);
+        self.area.insert_action_group("terminal", Some(&group));
         let weak = Rc::downgrade(self);
         self.copy_action.connect_activate(move |_, _| {
             if let Some(t) = weak.upgrade() {

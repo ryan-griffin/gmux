@@ -80,6 +80,7 @@ struct Events {
     progress: crate::progress::RetainedProgress,
     clipboard: Vec<gmux_client::clipboard::Write>,
     clipboard_bytes: usize,
+    command: gmux_client::shell::CommandState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
 const _: () = assert!(GMUX_CLIPBOARD_MAX_BYTES as usize == gmux_client::transport::MAX_PASTE);
@@ -125,19 +126,23 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
     // The C engine calls synchronously on the thread owning the session.
     // Its userdata is a stable Box owned by Engine, valid until gmux_engine_free.
     let events = unsafe { &mut *ud.cast::<Events>() };
-    let bytes = if len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(data, len) }
+    // Read byte payloads lazily; semantic reports contain C struct padding.
+    let bytes = || {
+        if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }
+        }
     };
     match kind {
-        0 => events.replies.extend_from_slice(bytes),
+        0 => events.replies.extend_from_slice(bytes()),
         1 => events
             .notifications
-            .push(String::from_utf8_lossy(bytes).into_owned()),
+            .push(String::from_utf8_lossy(bytes()).into_owned()),
         2 => events.title_changed = true,
         3 => events.directory_changed = true,
-        4 if bytes.len() == 2 => {
+        4 if len == 2 => {
+            let bytes = bytes();
             use gmux_client::progress::ProgressState;
             let state = match u32::from(bytes[0]) {
                 GMUX_PROGRESS_INACTIVE => ProgressState::Inactive,
@@ -151,6 +156,60 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
             events
                 .progress
                 .report(state, percentage, std::time::Instant::now());
+        }
+        5 if len == std::mem::size_of::<GmuxCommandEvent>() => {
+            // The report and command text are borrowed only for this call.
+            let report = unsafe { &*data.cast::<GmuxCommandEvent>() };
+            use gmux_client::shell::CommandPhase;
+            let state = &mut events.command;
+            match report.kind {
+                1 | 2 => {
+                    if state.phase == CommandPhase::Running {
+                        state.last_exit_code = None;
+                    }
+                    state.phase = if report.kind == 1 {
+                        CommandPhase::Prompt
+                    } else {
+                        CommandPhase::Input
+                    };
+                    state.command = None;
+                    state.command_truncated = false;
+                }
+                3 => {
+                    if state.phase != CommandPhase::Running {
+                        state.command = None;
+                        state.command_truncated = false;
+                    }
+                    state.phase = CommandPhase::Running;
+                    if report.command_len > 0 && !report.command.is_null() {
+                        let len = report.command_len.min(4096);
+                        let text = unsafe { std::slice::from_raw_parts(report.command, len) };
+                        // Do not split the last UTF-8 character at the byte cap.
+                        let text = match std::str::from_utf8(text) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                std::str::from_utf8(&text[..error.valid_up_to()]).unwrap()
+                            }
+                        };
+                        state.command_truncated = text.len() < report.command_len;
+                        state.command = Some(text.to_owned());
+                    }
+                }
+                4 => {
+                    if !matches!(state.phase, CommandPhase::Running | CommandPhase::Complete) {
+                        state.command = None;
+                        state.command_truncated = false;
+                    }
+                    state.phase = CommandPhase::Complete;
+                    state.last_exit_code = report.has_exit_code.then_some(report.exit_code);
+                }
+                _ => {}
+            }
+        }
+        6 => {
+            events.command = Default::default();
+            events.title_changed = true;
+            events.directory_changed = true;
         }
         _ => {}
     }
@@ -231,6 +290,39 @@ impl Drop for EngineView {
     }
 }
 impl Engine {
+    pub(crate) fn command_state(&self) -> gmux_client::shell::CommandState {
+        let mut state = self.events.command.clone();
+        state.at_prompt = unsafe { gmux_engine_cursor_at_prompt(self.raw.as_ptr()) };
+        state
+    }
+    pub(crate) fn semantic_busy(&self) -> bool {
+        self.events.command.phase == gmux_client::shell::CommandPhase::Running
+    }
+    pub(crate) fn prompt(&mut self, previous: bool) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_prompt(self.raw.as_ptr(), previous) };
+        anyhow::ensure!(
+            result == 0,
+            "No {} prompt available",
+            if previous { "previous" } else { "next" }
+        );
+        Ok(())
+    }
+    pub(crate) fn select_output(&mut self, point: Option<(u16, u32)>) -> anyhow::Result<()> {
+        self.select_output_target(u8::from(point.is_some()), point.unwrap_or_default())
+    }
+    pub(crate) fn select_anchored_output(&mut self) -> anyhow::Result<()> {
+        self.select_output_target(2, (0, 0))
+    }
+    fn select_output_target(&mut self, target: u8, (x, y): (u16, u32)) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_select_output(self.raw.as_ptr(), target, x, y) };
+        anyhow::ensure!(result == 0, "No command output available");
+        Ok(())
+    }
+    pub(crate) fn anchor_output(&mut self, (x, y): (u16, u32)) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_output_anchor(self.raw.as_ptr(), x, y) };
+        anyhow::ensure!(result == 0, "No command output available");
+        Ok(())
+    }
     pub(crate) fn memory_usage(&self) -> anyhow::Result<MemoryUsage> {
         let mut usage = MemoryUsage::default();
         let result = unsafe { gmux_engine_memory_usage(self.raw.as_ptr(), &mut usage) };
@@ -2885,3 +2977,6 @@ mod progress_tests {
 mod clipboard_tests;
 #[cfg(test)]
 mod hyperlink_tests;
+
+#[cfg(test)]
+mod shell_tests;
