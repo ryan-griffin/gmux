@@ -64,6 +64,9 @@ text, character offsets, caret, selection, text boundaries, and cell extents.
 Color-only updates reuse text mappings. Text or layout changes rebuild the
 viewport text, with retained buffers capped after shrinking. Wide glyphs expose
 two-cell bounds, and combining characters share their glyph's bounds.
+Rectangular selections expose a separate accessible range per selected physical
+row, excluding other columns and row separators. GTK character ranges cannot
+represent half of a wide glyph, so those ranges include the complete glyph.
 
 ## Validation
 

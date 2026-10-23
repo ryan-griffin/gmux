@@ -1,5 +1,6 @@
 use gmux_client::{
     model::CursorStyle,
+    selection::{Selection, Shape},
     theme::Theme,
     transport::{KeyAction, SelectionMode},
 };
@@ -15,6 +16,10 @@ mod ffi {
 pub(crate) use ffi::GmuxMemoryUsage as MemoryUsage;
 use ffi::*;
 use ffi::{Cell, Frame};
+
+#[cfg(test)]
+#[path = "engine/selection_tests.rs"]
+mod selection_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompressionResult {
@@ -686,10 +691,19 @@ impl Engine {
         self.find.restart();
         Ok(())
     }
-    pub fn selection(&self) -> Option<(u64, u64)> {
-        let (mut start, mut end) = (0, 0);
-        (unsafe { gmux_engine_selection(self.raw.as_ptr(), &mut start, &mut end) } == 0)
-            .then_some((start, end))
+    pub fn selection(&self) -> Option<Selection> {
+        let (mut start, mut end, mut rectangle) = (0, 0, false);
+        (unsafe { gmux_engine_selection(self.raw.as_ptr(), &mut start, &mut end, &mut rectangle) }
+            == 0)
+            .then_some(Selection {
+                start,
+                end,
+                shape: if rectangle {
+                    Shape::Rectangle
+                } else {
+                    Shape::Linear
+                },
+            })
     }
     pub fn copy(&self) -> anyhow::Result<String> {
         let mut written = 0;
@@ -713,7 +727,7 @@ impl Engine {
             "Could not copy terminal selection"
         );
         bytes.truncate(written);
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        String::from_utf8(bytes).map_err(Into::into)
     }
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }
@@ -1723,14 +1737,17 @@ mod tests {
                     engine.snapshot().unwrap();
                     let base = engine.frame.scrollback.offset as usize * 12;
                     let limit = base + engine.cells.len() - 1;
-                    let clip = |range: Option<(u64, u64)>| {
-                        range.and_then(|(a, b)| {
-                            let start = a.max(base as u64);
-                            let end = b.min(limit as u64);
-                            (start <= end).then_some((start, end))
+                    let clip = |range: Option<Selection>| {
+                        range.and_then(|selection| {
+                            selection.viewport((base / 12) as u64, 12, limit - base + 1)
                         })
                     };
-                    for mode in [SelectionMode::Word, SelectionMode::Line] {
+                    for mode in [
+                        SelectionMode::Cell,
+                        SelectionMode::Word,
+                        SelectionMode::Line,
+                        SelectionMode::Rectangle,
+                    ] {
                         for origin in [0, 11, 13, 17, 36, 47, limit] {
                             for endpoint in base..base + engine.cells.len() {
                                 let predicted = preview.range(
@@ -1756,7 +1773,7 @@ mod tests {
                                     )
                                     .unwrap();
                                 assert_eq!(
-                                    clip(predicted.map(|(a, b)| (a as u64, b as u64))),
+                                    clip(predicted),
                                     clip(engine.selection()),
                                     "mode {}, origin {origin}, endpoint {endpoint}, revision {revision}",
                                     mode as u8
@@ -1813,10 +1830,10 @@ mod tests {
         engine.resize(16, 4, 8, 16).unwrap();
         engine.write(b"one\r\n  next  \r\n\r\n");
         engine.select((5, 1), (3, 2), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((16, 47)));
+        assert_eq!(engine.selection(), Some(Selection::linear(16, 47)));
         assert_eq!(engine.copy().unwrap(), "  next");
         engine.select((5, 1), (15, 1), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((16, 31)));
+        assert_eq!(engine.selection(), Some(Selection::linear(16, 31)));
         engine.clear_selection();
         engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
         assert_eq!(engine.selection(), None);
@@ -1825,16 +1842,16 @@ mod tests {
         engine.select((3, 2), (15, 2), SelectionMode::Line).unwrap();
         assert_eq!(engine.selection(), None);
         engine.select((3, 2), (5, 1), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((16, 47)));
+        assert_eq!(engine.selection(), Some(Selection::linear(16, 47)));
         engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
         assert_eq!(engine.selection(), None);
         engine.select((3, 2), (3, 3), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((32, 63)));
+        assert_eq!(engine.selection(), Some(Selection::linear(32, 63)));
         engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
         assert_eq!(engine.selection(), None);
         engine.write(b"\x1b[3;1Hnew");
         engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((32, 47)));
+        assert_eq!(engine.selection(), Some(Selection::linear(32, 47)));
         assert_eq!(engine.copy().unwrap(), "new");
         engine.write(b"\r\x1b[2K");
         engine.select((3, 2), (3, 2), SelectionMode::Line).unwrap();
@@ -1855,12 +1872,12 @@ mod tests {
         engine.clear_selection();
         engine.resize(8, 5, 8, 16).unwrap();
         engine.select((2, 1), (2, 1), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((0, 23)));
+        assert_eq!(engine.selection(), Some(Selection::linear(0, 23)));
         assert_eq!(engine.copy().unwrap(), "  wrapped_word end");
         engine.clear_screen().unwrap();
         engine.write(b"                      ");
         engine.select((2, 1), (2, 1), SelectionMode::Line).unwrap();
-        assert_eq!(engine.selection(), Some((0, 23)));
+        assert_eq!(engine.selection(), Some(Selection::linear(0, 23)));
     }
 
     #[test]

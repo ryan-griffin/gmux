@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 30:
+handshake. The current protocol version is 31:
 
 ```json
-{"version":30,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":31,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -167,7 +167,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":30,"daemon":"returned-identity"}
+{"method":"attach","version":31,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -201,6 +201,35 @@ from the display frame clock; one client's interval does not pace another client
 panes whose Git metadata the client needs. The Rust `transport::StreamCommand`
 and `StreamRequest` types define the complete command schema;
 `transport::command` bounds its size and writes a newline-terminated command.
+
+`select` takes inclusive `[column, physical_row]` endpoints in retained terminal
+history. `mode` is `"cell"` (the default), `"word"`, `"line"`, or `"rectangle"`.
+For example, this stream command selects columns 4 through 8 on physical rows
+10 through 12:
+
+```json
+{"method":"select","pane":1,"start":[4,10],"end":[8,12],"mode":"rectangle","serial":7}
+```
+
+A viewport header's `selection` is null or an object such as
+`{"start":804,"end":968,"shape":"rectangle"}` for an 80-column grid.
+Indices are inclusive cell offsets in physical history rows, with rectangle
+corners normalized to top-left and bottom-right. `shape` is `"linear"` or
+`"rectangle"`. `selection_origin` retains the tracked drag anchor, and
+`selection_serial` acknowledges the latest selection or clear command.
+Clients should preview drags locally and ignore older acknowledgements.
+The toolkit-independent `selection::Selection` supplies viewport clipping and
+row geometry without allocating a cell mask.
+
+Each stream owns its selection, including its shape. `copy` on that stream
+copies that view's current selection. Rectangles keep physical row breaks,
+selected blank cells and trailing spaces; a wide glyph intersecting an edge
+is copied whole. The current tracked corners define the rectangle after reflow.
+Pruned references invalidate both highlight and copy. A selection is available
+only on the screen where it was made. These rules also apply to the control
+API's `copy` request, which chooses the focused frontend view, then the newest
+frontend as a fallback. `gmux rpc '{"method":"copy","pane":1}'` returns its
+text; it does not write the desktop clipboard.
 
 A frontend that handles terminal clipboard writes advertises
 `{"method":"clipboard-writes","enabled":true}`. The default is disabled, so

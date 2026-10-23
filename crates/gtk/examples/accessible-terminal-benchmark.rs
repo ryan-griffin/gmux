@@ -130,13 +130,35 @@ fn main() {
                     .zip(black_box(&recolored))
                     .any(|(a, b)| !a.text_eq(b));
                 assert!(!text_changed);
-                text.update_positions(black_box(frame), black_box(Some((0, cells.len() - 1))));
+                text.update_positions(
+                    black_box(frame),
+                    black_box(Some(gmux_client::selection::Selection::linear(
+                        0,
+                        cells.len() as u64 - 1,
+                    ))),
+                );
                 black_box(&text);
             });
+            let mut column = 1u64;
+            let rectangle_positions = measure(|| {
+                column = 1 + column % (u64::from(cols) - 2);
+                text.update_positions(
+                    black_box(frame),
+                    black_box(Some(gmux_client::selection::Selection::rectangle(
+                        1,
+                        u64::from(rows - 1) * u64::from(cols) + column,
+                        cols,
+                    ))),
+                );
+                black_box(&text);
+            });
+            let range_capacity_bytes = text.selection.capacity() * size_of::<(u32, u32)>();
             results.push(json!({
                 "cols": cols,
                 "rows": rows,
                 "fixture": if unicode { "unicode" } else { "ascii" },
+                "rectangle_positions": rectangle_positions,
+                "range_capacity_bytes": range_capacity_bytes,
                 "fresh": fresh,
                 "reused": reused,
                 "color_row": color_row,

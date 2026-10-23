@@ -653,6 +653,9 @@ Path(done).touch()
                 wait_for(lambda: native.clipboard_text() == expected,
                          message=f"Selection must copy {expected!r}")
 
+            def selection(start, end, shape="linear"):
+                return dict(start=start, end=end, shape=shape)
+
             def resume_selection(expected):
                 native.button(False)
                 proxy.delay = .035
@@ -665,24 +668,24 @@ Path(done).touch()
 
             proxy.pause()
             repeat_click(10, 0, 2, hold=True)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 11],
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(4, 11),
                      message="Double-click must select the complete word")
             selected = wait_for(lambda: Atspi.Text.get_selection(text_iface, 0)
                                 if Atspi.Text.get_n_selections(text_iface) else None)
             assert Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset) == "café_界é"
             move_cell(14, 0)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 15])
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(4, 15))
             move_cell(1, 0)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 11])
-            resume_selection([0, 11])
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(0, 11))
+            resume_selection(selection(0, 11))
             copied("one café_界é")
 
             # Output can change word bounds without moving the held pointer.
             repeat_click(10, 0, 2, hold=True)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 11])
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(4, 11))
             rpc("send", pane=pane, text="printf '\\033[Hone alphabetlong two'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one alphabetlong two"))
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [4, 15])
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(4, 15))
             native.button(False)
             copied("alphabetlong")
 
@@ -691,11 +694,11 @@ Path(done).touch()
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("wrapped_"))
             proxy.pause()
             repeat_click(5, 1, 3, hold=True)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 2 * cols - 1],
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(0, 2 * cols - 1),
                      message="Triple-click must select the complete wrapped line")
             move_cell(3, 2)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [0, 3 * cols - 1])
-            resume_selection([0, 3 * cols - 1])
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(0, 3 * cols - 1))
+            resume_selection(selection(0, 3 * cols - 1))
             copied(wrapped_line + "\n  line two")
             repeat_click(5, 1, 1)
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
@@ -707,11 +710,49 @@ Path(done).touch()
             assert rpc("renderer-info", pane=pane)["viewport"]["selection"] is None
             assert Atspi.Text.get_n_selections(text_iface) == 0
             move_cell(3, 2)
-            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == [2 * cols, 6 * cols - 1])
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(2 * cols, 6 * cols - 1))
             move_cell(5, 5)
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
             resume_selection(None)
             assert Atspi.Text.get_n_selections(text_iface) == 0
+
+            # Rectangles preview immediately while the stream is paused. Each
+            # accessible range is one row, with complete wide/combining glyphs.
+            rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[Ha界éZ\\r\\n12界Q\\r\\n'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("a界éZ"))
+            for start, end in [((2, 0), (3, 1)), ((3, 1), (2, 0)),
+                               ((3, 0), (2, 1)), ((2, 1), (3, 0))]:
+                native.key(Gdk.KEY_Control_L, True)
+                proxy.pause()
+                repeat_click(*start, 1, hold=True)
+                move_cell(*end)
+                expected = selection(2, cols + 3, "rectangle")
+                wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == expected)
+                wait_for(lambda: Atspi.Text.get_n_selections(text_iface) == 2)
+                ranges = [Atspi.Text.get_selection(text_iface, i) for i in range(2)]
+                assert [Atspi.Text.get_text(text_iface, r.start_offset, r.end_offset) for r in ranges] == ["界é", "界"]
+                native.key(Gdk.KEY_Control_L, False)
+                resume_selection(expected)
+                copied("界é\n界")
+            # Blank rows and unwritten trailing cells retain the selected width.
+            native.key(Gdk.KEY_Control_L, True)
+            repeat_click(6, 3, 1, hold=True)
+            move_cell(8, 5)
+            native.button(False)
+            native.key(Gdk.KEY_Control_L, False)
+            copied("   \n   \n   ")
+            # Soft wraps remain separate physical rows in a block copy.
+            wrapped = "A" * cols + "B" * cols
+            rpc("send", pane=pane, text=f"printf '\\033[3J\\033[2J\\033[H{wrapped}'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("A" * cols))
+            native.key(Gdk.KEY_Control_L, True)
+            repeat_click(2, 0, 1, hold=True)
+            move_cell(4, 1)
+            native.button(False)
+            native.key(Gdk.KEY_Control_L, False)
+            copied("AAA\nBBB")
+            repeat_click(2, 0, 1)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] is None)
 
             # Mouse-reporting applications keep repeat clicks unless Shift is held.
             mouse_probe = temp / "mouse.py"
@@ -744,6 +785,23 @@ finally:
             repeat_click(1, 0, 2)
             copied("one")
             native.key(Gdk.KEY_Shift_L, False)
+            assert mouse_result.read_bytes() == reported
+            native.key(Gdk.KEY_Control_L, True)
+            repeat_click(1, 0, 1, hold=True)
+            move_cell(5, 0)
+            native.button(False)
+            native.key(Gdk.KEY_Control_L, False)
+            wait_for(lambda: len(mouse_result.read_bytes()) > len(reported))
+            assert rpc("renderer-info", pane=pane)["viewport"]["selection"] is not None  # preceding word remains
+            reported = mouse_result.read_bytes()
+            native.key(Gdk.KEY_Control_L, True)
+            native.key(Gdk.KEY_Shift_L, True)
+            repeat_click(1, 0, 1, hold=True)
+            move_cell(5, 1)
+            native.button(False)
+            native.key(Gdk.KEY_Shift_L, False)
+            native.key(Gdk.KEY_Control_L, False)
+            copied("ne tw\n     ")
             assert mouse_result.read_bytes() == reported
             rpc("send", pane=pane, text="q")
             wait_for(lambda: "GMUX_INPUT>" in Atspi.Text.get_text(text_iface, 0, -1))
@@ -1016,31 +1074,41 @@ finally:
                 page(Gdk.KEY_Page_Down)
             wait_for(lambda: viewport(lambda state: 0 < state["scrollback"]["offset"] <
                                      state["scrollback"]["total"] - state["scrollback"]["len"]))
-            native.move(left + cw * 6.5, (viewport_top + viewport_bottom) / 2)
-            native.button(True)
-            proxy.delay = .035
-            checked = 0
-            for index in range(120):
-                y = viewport_top - 2 * row_height if index % 2 else viewport_bottom + 2 * row_height
-                native.move(left + cw * 6.5, y)
-                for _ in range(2):
-                    state = rpc("renderer-info", pane=pane)["viewport"]
-                    drag = state["selection_drag"]
-                    if drag is not None:
-                        x, y = drag["position"]
-                        col = min(state["cols"] - 1, max(0, int(x // state["cell_width"])))
-                        row = min(state["rows"] - 1, max(0, int(y // state["cell_height"])))
-                        end = (state["scrollback"]["offset"] + row) * state["cols"] + col
-                        expected_selection = sorted((drag["anchor"], end))
-                        assert state["selection"] == expected_selection, ("A stale selection reply caused flicker", state)
-                        checked += 1
-                    time.sleep(.002)
-            assert checked >= 100, checked
-            proxy.delay = 0
-            native.move(left + cw * 6.5, (viewport_top + viewport_bottom) / 2)
-            time.sleep(.05)
-            native.button(False)
-            assert_stopped()
+            for shape in ("linear", "rectangle"):
+                native.move(left + cw * 6.5, (viewport_top + viewport_bottom) / 2)
+                if shape == "rectangle":
+                    native.key(Gdk.KEY_Control_L, True)
+                native.button(True)
+                proxy.delay = .035
+                checked = 0
+                for index in range(120):
+                    y = viewport_top - 2 * row_height if index % 2 else viewport_bottom + 2 * row_height
+                    native.move(left + cw * 6.5, y)
+                    for _ in range(2):
+                        state = rpc("renderer-info", pane=pane)["viewport"]
+                        drag = state["selection_drag"]
+                        if drag is not None:
+                            x, y = drag["position"]
+                            col = min(state["cols"] - 1, max(0, int(x // state["cell_width"])))
+                            row = min(state["rows"] - 1, max(0, int(y // state["cell_height"])))
+                            end = (state["scrollback"]["offset"] + row) * state["cols"] + col
+                            anchor = drag["anchor"]
+                            columns = state["cols"]
+                            expected_selection = (selection(
+                                min(anchor // columns, end // columns) * columns + min(anchor % columns, end % columns),
+                                max(anchor // columns, end // columns) * columns + max(anchor % columns, end % columns), "rectangle")
+                                if shape == "rectangle" else selection(*sorted((anchor, end))))
+                            assert state["selection"] == expected_selection, ("A stale selection reply caused flicker", state)
+                            checked += 1
+                        time.sleep(.002)
+                assert checked >= 100, checked
+                proxy.delay = 0
+                native.move(left + cw * 6.5, (viewport_top + viewport_bottom) / 2)
+                time.sleep(.05)
+                native.button(False)
+                if shape == "rectangle":
+                    native.key(Gdk.KEY_Control_L, False)
+                assert_stopped()
             # After rapid motion around an edge, a stationary drag must move
             # the viewport only in that edge's direction, without bouncing back.
             for direction in (-1, 1):
@@ -1124,7 +1192,8 @@ finally:
                   "OSC 8 hover/copy/Ctrl-click through an isolated URI handler with held and delayed frames, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
-                  "wide-glyph geometry, double/triple-click selection, line dragging, and Shift selection in mouse-reporting applications, "
+                  "wide-glyph geometry, double/triple-click selection, rectangular Unicode/blank/soft-wrap copy with accessible row ranges, "
+                  "line dragging, Ctrl+Shift rectangle override in mouse-reporting applications, "
                   "rapid touchpad and keyboard scroll reversals with delayed replies and a stable scrollbar target, "
                   "stationary selection autoscroll in both directions, rapid drag reversals without stale highlights, "
                   "fast edge drags during overscroll without viewport bouncing, "

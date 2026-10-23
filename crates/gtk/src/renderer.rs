@@ -19,7 +19,7 @@ pub struct Scene<'a> {
     pub width: i32,
     pub height: i32,
     pub theme: Theme,
-    pub selection: Option<(usize, usize)>,
+    pub selection: Option<gmux_client::selection::Selection>,
     /// Half-open range from the hyperlink map captured with this frame.
     pub hovered_link: Option<(usize, usize)>,
     pub matches: &'a [u8],
@@ -68,23 +68,33 @@ impl Scene<'_> {
         )
     }
 
-    fn selected(&self, index: usize) -> bool {
-        self.selection
-            .is_some_and(|(start, end)| index >= start && index <= end)
-    }
-
     fn highlight(&self, index: usize) -> u8 {
         self.matches.get(index).copied().unwrap_or(0)
     }
+}
+
+/// Shape and wide edges are resolved once per row. Color lookups share this
+/// interval without copying the scene or calculating geometry for each cell.
+struct RowColors<'a, 'b> {
+    scene: &'a Scene<'b>,
+    selection: Option<(usize, usize)>,
+}
+
+impl RowColors<'_, '_> {
+    fn selected(&self, index: usize) -> bool {
+        self.selection
+            .is_some_and(|(start, end)| (start..=end).contains(&index))
+    }
 
     fn foreground(&self, index: usize, cell: &Cell) -> ([u8; 3], f32) {
-        let under_cursor = self.block_cursor()
-            && (self.cursor_index()..self.cursor_index() + self.cursor_width()).contains(&index);
+        let scene = self.scene;
+        let under_cursor = scene.block_cursor()
+            && (scene.cursor_index()..scene.cursor_index() + scene.cursor_width()).contains(&index);
         (
             if under_cursor {
                 cell.bg
-            } else if self.selected(index) || self.highlight(index) == 2 {
-                self.theme.selection_foreground
+            } else if self.selected(index) || scene.highlight(index) == 2 {
+                scene.theme.selection_foreground
             } else {
                 cell.fg
             },
@@ -94,6 +104,19 @@ impl Scene<'_> {
                 1.0
             },
         )
+    }
+
+    fn backgrounds(&self, index: usize, cell: &Cell) -> [Option<([u8; 3], f32)>; 2] {
+        let scene = self.scene;
+        if self.selected(index) || scene.highlight(index) == 2 {
+            [Some((scene.theme.selection_background, 1.0)), None]
+        } else if scene.highlight(index) == 1 {
+            [Some((cell.bg, 1.0)), Some((scene.theme.palette[11], 0.3))]
+        } else if cell.bg != scene.frame.background {
+            [Some((cell.bg, 1.0)), None]
+        } else {
+            [None, None]
+        }
     }
 }
 
@@ -382,7 +405,13 @@ impl Renderer {
         for (y, cells) in scene.cells.chunks(cols).enumerate() {
             let base = y * cols;
             let highlights = scene.matches.get(base..base + cells.len()).unwrap_or(&[]);
-            let selection = row_selection(scene.selection, base, cells.len());
+            let selection = scene
+                .selection
+                .and_then(|selection| selection.row(base, cells, scene.frame.cols));
+            let colors = RowColors {
+                scene,
+                selection: selection.map(|(start, end)| (base + start, base + end)),
+            };
             let cursor = (scene.block_cursor() && scene.frame.cursor_y as usize == y).then(|| {
                 (
                     scene.frame.cursor_x as usize,
@@ -418,15 +447,16 @@ impl Renderer {
                 while x < cells.len() {
                     decorations |= cells[x].decoration;
                     flags |= cells[x].flags;
-                    let colors = backgrounds(scene, base + x, &cells[x]);
+                    let backgrounds = colors.backgrounds(base + x, &cells[x]);
                     let mut end = x + 1;
-                    while end < cells.len() && backgrounds(scene, base + end, &cells[end]) == colors
+                    while end < cells.len()
+                        && colors.backgrounds(base + end, &cells[end]) == backgrounds
                     {
                         decorations |= cells[end].decoration;
                         flags |= cells[end].flags;
                         end += 1;
                     }
-                    for (rgb, alpha) in colors.into_iter().flatten() {
+                    for (rgb, alpha) in backgrounds.into_iter().flatten() {
                         append_row_rect(
                             &background,
                             scene,
@@ -463,7 +493,7 @@ impl Renderer {
                 if decorations & decoration::UNDERLINE_MASK != 0 || hovered_link.is_some() {
                     append_decorations(
                         &background,
-                        scene,
+                        &colors,
                         cells,
                         base,
                         y,
@@ -473,7 +503,7 @@ impl Renderer {
                 if decorations & decoration::OVERLINE != 0 {
                     append_decorations(
                         &background,
-                        scene,
+                        &colors,
                         cells,
                         base,
                         y,
@@ -501,7 +531,7 @@ impl Renderer {
                         scene.metrics.0,
                         scene.metrics.1,
                     );
-                    let (rgb, alpha) = scene.foreground(base + x, cell);
+                    let (rgb, alpha) = colors.foreground(base + x, cell);
                     let mut first_rect = true;
                     let graphic = has_glyph
                         && render::graphic_rects(text, rect, |rect| {
@@ -547,7 +577,7 @@ impl Renderer {
                             while end < limit
                                 && ascii_cell(&cells[end])
                                 && cells[end].flags & (1 | 2 | 4) == cell.flags & (1 | 2 | 4)
-                                && scene.foreground(base + end, &cells[end]) == (rgb, alpha)
+                                && colors.foreground(base + end, &cells[end]) == (rgb, alpha)
                             {
                                 self.text.push(cells[end].text[0] as char);
                                 end += 1;
@@ -578,7 +608,7 @@ impl Renderer {
                 if flags & 16 != 0 {
                     append_decorations(
                         &row_snapshot,
-                        scene,
+                        &colors,
                         cells,
                         base,
                         y,
@@ -747,33 +777,6 @@ impl TextBatch {
     }
 }
 
-fn row_selection(
-    selection: Option<(usize, usize)>,
-    base: usize,
-    len: usize,
-) -> Option<(usize, usize)> {
-    selection.and_then(|(start, end)| {
-        (start < base + len && end >= base).then(|| {
-            (
-                start.saturating_sub(base),
-                end.saturating_sub(base).min(len - 1),
-            )
-        })
-    })
-}
-
-fn backgrounds(scene: &Scene<'_>, index: usize, cell: &Cell) -> [Option<([u8; 3], f32)>; 2] {
-    if scene.selected(index) || scene.highlight(index) == 2 {
-        [Some((scene.theme.selection_background, 1.0)), None]
-    } else if scene.highlight(index) == 1 {
-        [Some((cell.bg, 1.0)), Some((scene.theme.palette[11], 0.3))]
-    } else if cell.bg != scene.frame.background {
-        [Some((cell.bg, 1.0)), None]
-    } else {
-        [None, None]
-    }
-}
-
 fn rgba(rgb: [u8; 3], alpha: f32) -> gdk::RGBA {
     gdk::RGBA::new(
         rgb[0] as f32 / 255.0,
@@ -831,7 +834,7 @@ enum DecorationKind {
 // Explicit underline colors remain
 // independent of selection and cursor text colors, including black.
 fn decoration(
-    scene: &Scene<'_>,
+    colors: &RowColors<'_, '_>,
     index: usize,
     cell: &Cell,
     kind: DecorationKind,
@@ -839,6 +842,7 @@ fn decoration(
     if cell.flags & 32 != 0 {
         return None;
     }
+    let scene = colors.scene;
     let style = match kind {
         DecorationKind::Underline => {
             if scene
@@ -862,7 +866,7 @@ fn decoration(
     if style == underline::NONE || style > underline::DASHED {
         return None;
     }
-    let (mut rgb, alpha) = scene.foreground(index, cell);
+    let (mut rgb, alpha) = colors.foreground(index, cell);
     if kind == DecorationKind::Underline && cell.has_underline_color() {
         rgb = cell.underline_color;
     }
@@ -988,7 +992,7 @@ fn append_decoration(
 
 fn append_decorations(
     snapshot: &gtk::Snapshot,
-    scene: &Scene<'_>,
+    colors: &RowColors<'_, '_>,
     cells: &[Cell],
     base: usize,
     y: usize,
@@ -996,15 +1000,16 @@ fn append_decorations(
 ) {
     let mut start = 0;
     while start < cells.len() {
-        let Some(style) = decoration(scene, base + start, &cells[start], kind) else {
+        let Some(style) = decoration(colors, base + start, &cells[start], kind) else {
             start += 1;
             continue;
         };
         let mut end = start + 1;
-        while end < cells.len() && decoration(scene, base + end, &cells[end], kind) == Some(style) {
+        while end < cells.len() && decoration(colors, base + end, &cells[end], kind) == Some(style)
+        {
             end += 1;
         }
-        append_decoration(snapshot, scene, y, start, end, kind, style);
+        append_decoration(snapshot, colors.scene, y, start, end, kind, style);
         start = end;
     }
 }

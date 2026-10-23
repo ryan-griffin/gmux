@@ -63,6 +63,15 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             second.send("copy")
             rejected = second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
             assert rejected["error"] == "Select terminal text to copy it" and rejected["selection"] is None
+            second.send("select", start=[col, row], end=[col + 4, row + 1], mode="rectangle", serial=1)
+            block = second.until(lambda h: h["meta"]["id"] == pane and h["selection_serial"] == 1)
+            assert block["selection"] == dict(start=row * second.frame["cols"] + col,
+                                               end=(row + 1) * second.frame["cols"] + col + 4, shape="rectangle"), block
+            second.send("copy")
+            copied_block = second.until(lambda h: h["copy"] is not None)["copy"]["text"]
+            assert copied_block.split("\n")[0] == "FIRST" and len(copied_block.split("\n")) == 2, copied_block
+            first.send("copy")
+            assert "FIRST_INPUT" in first.until(lambda h: h["copy"] is not None)["copy"]["text"]
             first.send("find", query="line")
             first.until(lambda h: h["meta"]["id"] == pane and h["find"] and h["find"]["total"] == 80 and not h["find"]["pending"])
             second.send("find", query="FIRST_INPUT")

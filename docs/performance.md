@@ -4,6 +4,60 @@ Benchmarks write local reports under `artifacts/`, which Git ignores. Keep sourc
 revisions and matching frontend/daemon binaries with reports when comparing
 builds. Results depend on the compositor, driver, font, and machine.
 
+## Rectangular selection
+
+The renderer resolves rectangle columns and wide-glyph edges once per visible
+row. It retains the existing row caches and creates no selection object per
+cell. A frontend's optional selection occupies 24 bytes on x86-64, the same as
+the previous optional endpoint tuple. The native engine and each native view
+use eight more bytes for shape and screen ownership.
+
+Measure changing selection boundaries on unchanged text with the release
+renderer. The fixture runs in the private Wayland session and checks rectangle
+pixels against independently recolored cells:
+
+```sh
+cargo build --locked --release -p gmux-gtk --example renderer-benchmark --example renderer-check
+python3 scripts/renderer-smoke-test.py --selection \
+  --binary target/release/examples/renderer-benchmark \
+  --check-binary target/release/examples/renderer-check \
+  --output artifacts/selection-rendering
+```
+
+Reports separate scene preparation from rendering and texture download. Rust
+allocation counts cover preparation only, excluding GTK, Pango, GSK, and native
+terminal allocations. Changing a rectangle can invalidate every visible row;
+changing a linear endpoint usually invalidates one row. Wide glyphs can make
+adjacent rectangle endpoints cover the same cells. The benchmark checks the
+exact number of rebuilt rows in each frame, including those unchanged wide
+glyph boundaries.
+
+`accessible-terminal-benchmark` reports rectangle range updates and retained
+range capacity independently of GTK. It reuses one character range per selected
+physical row, including blank cells and complete wide/combining glyphs.
+
+The native benchmark measures selection updates and copies without GTK or
+sockets. It counts newly created tracked references after drag setup:
+
+```sh
+ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
+mkdir -p artifacts
+cc -O2 -std=c11 -DGMUX_VERSION='"benchmark"' -Isrc -I"$ghostty_prefix/include" \
+  scripts/selection-benchmark.c src/ghostty_bridge.c \
+  -L"$ghostty_prefix/lib" -Wl,-rpath,"$ghostty_prefix/lib" \
+  -Wl,--wrap=ghostty_terminal_grid_ref_track -lghostty-vt \
+  -o artifacts/selection-benchmark
+artifacts/selection-benchmark 512 200000
+artifacts/selection-benchmark 10000 200000
+```
+
+Mode 0 is linear and mode 3 is rectangular. Timings use process CPU time;
+copying formats the final selection, whose output differs by shape. Rectangle
+copy uses Ghostty's formatter per physical row, then restores trailing unwritten
+cell padding. Selection updates reuse the two tracked corners and do not scan
+history. Compile with `GMUX_LINEAR_BASELINE` and the older bridge's headers and
+source to compare its linear path.
+
 ## Application
 
 ```sh

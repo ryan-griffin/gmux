@@ -86,7 +86,7 @@ pub struct Terminal {
     link_hover: ValueCell<Option<(usize, usize)>>,
     paste_action: gio::SimpleAction,
     session: SessionHandle,
-    selection: RefCell<Option<(usize, usize)>>,
+    selection: RefCell<Option<gmux_client::selection::Selection>>,
     selection_mode: ValueCell<SelectionMode>,
     selection_preview: RefCell<gmux_client::selection::Preview>,
     drag_origin: ValueCell<(f64, f64)>,
@@ -325,7 +325,11 @@ impl Terminal {
     }
     fn drag_selection_end(&self) -> Option<usize> {
         let (x, y) = self.drag_position.get().or_else(|| {
-            (self.selection_mode.get() != SelectionMode::Cell).then(|| self.drag_origin.get())
+            matches!(
+                self.selection_mode.get(),
+                SelectionMode::Word | SelectionMode::Line
+            )
+            .then(|| self.drag_origin.get())
         })?;
         let frame = self.session.borrow().snapshot().frame;
         Some(frame.scrollback.offset as usize * frame.cols as usize + self.cell_at(x, y))
@@ -375,7 +379,10 @@ impl Terminal {
         let request = DragSelectionRequest {
             endpoint,
             // Cell selection keeps fixed bounds when only the text changes.
-            text_revision: if self.selection_mode.get() == SelectionMode::Cell {
+            text_revision: if matches!(
+                self.selection_mode.get(),
+                SelectionMode::Cell | SelectionMode::Rectangle
+            ) {
                 0
             } else {
                 screen.text_revision
@@ -398,11 +405,12 @@ impl Terminal {
     fn sync_accessible_selection(&self) {
         let session = self.session.borrow();
         let screen = session.snapshot();
-        let base = screen.frame.scrollback.offset as usize * screen.frame.cols as usize;
-        let selection = self.selection.borrow().and_then(|(a, b)| {
-            let start = a.max(base);
-            let end = b.min(base + screen.cells.len().saturating_sub(1));
-            (start <= end).then_some((start.saturating_sub(base), end.saturating_sub(base)))
+        let selection = self.selection.borrow().and_then(|selection| {
+            selection.viewport(
+                screen.frame.scrollback.offset,
+                screen.frame.cols,
+                screen.cells.len(),
+            )
         });
         self.area.update_text(&screen, selection);
     }
@@ -547,16 +555,19 @@ impl Terminal {
             if self.selection_anchor.get().is_some() {
                 if let Some(origin) = self.session.borrow().selection_origin() {
                     self.selection_anchor.set(Some(origin as usize));
+                } else if self.drag_request.get().is_some()
+                    && !self.session.borrow().selection_pending()
+                {
+                    // Pruning or a screen switch invalidated the tracked click.
+                    // Retire the local preview along with the daemon's bounds.
+                    self.stop_selection_drag();
+                    self.selection.borrow_mut().take();
                 }
                 // The drag owns the displayed selection. Replies may describe
                 // a previous pointer position, including the preceding clear.
                 self.update_drag_selection();
             } else if !self.session.borrow().selection_pending() {
-                *self.selection.borrow_mut() = self
-                    .session
-                    .borrow()
-                    .selection()
-                    .map(|(a, b)| (a as usize, b as usize));
+                *self.selection.borrow_mut() = self.session.borrow().selection();
             }
             self.area.queue_draw();
             self.sync_accessible_selection();
@@ -867,11 +878,8 @@ impl Terminal {
         let mut search = self.search.borrow_mut();
         let find = session.find_state();
         let matches = search.update(e.cells.len(), &find.highlights);
-        let base = e.frame.scrollback.offset as usize * e.frame.cols as usize;
-        let selection = self.selection.borrow().and_then(|(start, end)| {
-            let start = start.max(base);
-            let end = end.min(base + e.cells.len().saturating_sub(1));
-            (start <= end).then_some((start.saturating_sub(base), end.saturating_sub(base)))
+        let selection = self.selection.borrow().and_then(|selection| {
+            selection.viewport(e.frame.scrollback.offset, e.frame.cols, e.cells.len())
         });
         let (scale, origin) = self.surface_position();
         let scene = Scene {
