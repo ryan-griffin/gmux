@@ -2,6 +2,10 @@
 #[path = "../src/progress.rs"]
 mod progress;
 use gmux_client::progress::{Progress, ProgressState};
+use gmux_client::{
+    activity::Activity,
+    program_status::{Record, State, Summary},
+};
 use gtk::{gio, prelude::*};
 use std::time::{Duration, Instant};
 
@@ -25,7 +29,7 @@ fn widget_count(widget: &gtk::Widget) -> usize {
 }
 
 fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
-    let progress = progress::PaneProgress::new(7);
+    let progress = progress::PaneProgress::new();
     progress.bar.set_direction(direction);
     let area = gtk::DrawingArea::builder()
         .hexpand(true)
@@ -67,7 +71,7 @@ fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
         ] {
             for percentage in [0, 9, 42, 99, 100] {
                 value.apply(state, Some(percentage));
-                progress.update(value);
+                progress.update(gmux_client::activity::Activity::select(None, value));
                 settle();
                 assert_eq!((area.width(), area.height()), size, "{titles}, {state:?}");
                 assert_eq!(progress.bar.is_mapped(), value.active());
@@ -98,7 +102,7 @@ fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
             }
         }
         value.apply(ProgressState::Indeterminate, None);
-        progress.update(value);
+        progress.update(gmux_client::activity::Activity::select(None, value));
         window.set_visible(false);
         settle();
         assert!(
@@ -117,10 +121,64 @@ fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
             "Mapping must resume unknown progress"
         );
         value.apply(ProgressState::Inactive, None);
-        progress.update(value);
+        progress.update(gmux_client::activity::Activity::select(None, value));
         settle();
         assert!(!fill.has_css_class("pulse"));
         assert!(!progress.bar.is_mapped());
+
+        // Rich reports select the same production bar, replacing a conflicting
+        // legacy value. Missing estimates never become numeric zero or 100%.
+        value.apply(ProgressState::Determinate, Some(91));
+        for (state, percentage) in [
+            (State::Working, Some(38)),
+            (State::Working, None),
+            (State::Blocked, Some(25)),
+            (State::Blocked, None),
+            (State::Error, None),
+            (State::Done, None),
+            (State::Idle, None),
+        ] {
+            let status = Summary {
+                count: 1,
+                record: Record {
+                    id: String::new(),
+                    state,
+                    kind: None,
+                    progress: percentage,
+                    app: None,
+                    title: String::new(),
+                    message: String::new(),
+                },
+            };
+            progress.update(Activity::select(Some(&status), value));
+            settle();
+            assert_eq!((area.width(), area.height()), size);
+            assert_eq!(
+                progress.bar.is_mapped(),
+                matches!(state, State::Working | State::Blocked | State::Error)
+            );
+            assert_eq!(
+                fill.has_css_class("pulse"),
+                state == State::Working && percentage.is_none()
+            );
+            assert_eq!(
+                gtk::test_accessible_has_property(&progress.bar, gtk::AccessibleProperty::ValueNow),
+                percentage.is_some()
+            );
+            assert_eq!(
+                progress.bar.has_css_class("warning"),
+                state == State::Blocked
+            );
+            assert_eq!(progress.bar.has_css_class("error"), state == State::Error);
+            if let Some(p) = percentage {
+                assert_eq!(progress.bar.fraction(), f64::from(p) / 100.0);
+            }
+        }
+        progress.update(Activity::select(None, value));
+        settle();
+        assert_eq!(progress.bar.fraction(), 0.91);
+        value.apply(ProgressState::Inactive, None);
+        progress.update(Activity::select(None, value));
     }
     let result = serde_json::json!({"widget_count":widget_count(progress.bar.upcast_ref()),
         "style":"Adwaita osd", "height":bar_height});

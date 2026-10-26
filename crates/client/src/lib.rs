@@ -1,4 +1,5 @@
 //! Direct daemon connections, execution commands, and terminal viewport streams.
+pub mod activity;
 pub mod cells;
 pub mod clipboard;
 pub use cells::{Cell, Frame, Scrollback};
@@ -11,6 +12,7 @@ pub mod ipc;
 pub mod local;
 pub mod model;
 pub mod network;
+pub mod program_status;
 pub mod progress;
 pub mod remote;
 pub mod scroll_cache;

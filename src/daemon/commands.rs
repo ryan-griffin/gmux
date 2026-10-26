@@ -143,6 +143,7 @@ impl Daemon {
                             "busy": session.busy(),
                             "command": session.command_state(),
                             "progress": session.progress(),
+                            "program_status": session.program_status(),
                             "unread": self.unread.contains_key(&session.id()),
                         })
                     })
@@ -155,6 +156,8 @@ impl Daemon {
                     "unread": ids.iter().any(|id| self.unread.contains_key(id)),
                     "progress": gmux_client::progress::representative(ids.iter().filter_map(|id|
                         self.sessions.get(id).map(|s| (*id, s.progress())))),
+                    "program_status": gmux_client::program_status::representative(ids.iter().filter_map(|id|
+                        self.sessions.get(id).map(|s| (*id, s.program_status())))),
                     "layout": tab.layout,
                     "panes": panes,
                 })
@@ -324,7 +327,8 @@ impl Daemon {
                 let session = self.sessions.get_mut(&id).unwrap();
                 session.refresh_directory();
                 Ok(
-                    json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0))}),
+                    json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0)),
+                        "program_status_records": session.program_status_records()}),
                 )
             }
             ExecutionRequest::CommandOutput { pane: id, point } => {

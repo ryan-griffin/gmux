@@ -29,6 +29,7 @@ parser.add_argument("--output", type=Path, default=Path("artifacts/performance.j
 parser.add_argument("--seconds", type=float, default=5)
 parser.add_argument("--samples", type=int, default=40)
 parser.add_argument("--renderer", choices=["vulkan", "gl", "cairo"], default="vulkan")
+parser.add_argument("--workload", choices=["cells", "program-status", "program-status-mixed"], default="cells")
 args = parser.parse_args()
 assert args.seconds >= 1 and args.samples >= 5
 ensure_wayland_session()
@@ -59,8 +60,8 @@ def process_sample(pid):
 
 
 worker_source = r'''
-import os, pathlib, select, sys, time, tty
-role, control, ready = sys.argv[1:]
+import base64, os, pathlib, select, sys, time, tty
+role, control, ready, workload = sys.argv[1:]
 control, ready = pathlib.Path(control), pathlib.Path(ready)
 if role == "probe":
     tty.setraw(0)
@@ -72,11 +73,27 @@ if role == "probe":
         rgb = b"20;220;110" if green else b"230;30;45"
         os.write(1, b"\x1b[H\x1b[48;2;" + rgb + b"m \x1b[0m")
 else:
+    message = base64.b64encode(b"Status benchmark " + b"x" * 2031).decode()
+    if workload != "cells":
+        os.write(1, "".join(f"\x1b]7501;state=idle:id=task{i:02}:app=benchmark:msg={message}\x07" for i in range(64)).encode())
     ready.write_text(str(os.getpid()))
     lines = 0
+    previous = "idle"
     while True:
-        if control.read_text() == "busy":
-            text = "".join(f"\x1b[38;5;{(lines+i)%216+16}mrow {lines+i:08d} " + "abc界🙂 " * 12 + "\x1b[0m\r\n" for i in range(20))
+        mode = control.read_text()
+        if workload != "cells" and mode != previous:
+            if mode in ("idle", "indeterminate") or workload == "program-status-mixed":
+                state = "idle" if mode == "idle" else "working"
+                estimate = ":progress=38" if mode == "busy" else ""
+                os.write(1, f"\x1b]7501;state={state}:id=task00:app=benchmark{estimate}:msg={message}\x07".encode())
+        previous = mode
+        if mode == "busy":
+            if workload == "program-status":
+                text = "".join(f"\x1b]7501;state=working:id=task00:app=benchmark:progress={(lines+i)%101}:msg={message}\x07" for i in range(20))
+            elif workload == "program-status-mixed":
+                text = "".join(f"\x1b]9;4;1;{(lines+i)%101}\x07" for i in range(20))
+            else:
+                text = "".join(f"\x1b[38;5;{(lines+i)%216+16}mrow {lines+i:08d} " + "abc界🙂 " * 12 + "\x1b[0m\r\n" for i in range(20))
             os.write(1, text.encode())
             lines += 20
         time.sleep(1/60)
@@ -121,7 +138,7 @@ try:
             def run_worker(pane, role):
                 wait_for(lambda: "GMUX_BENCH>" in rpc("read", pane=pane)["text"])
                 ready = temp / f"ready-{pane}"
-                command = shlex.join(["python3", str(worker), role, str(control), str(ready)])
+                command = shlex.join(["python3", str(worker), role, str(control), str(ready), args.workload])
                 rpc("send", pane=pane, text=command, paste=True, enter=True)
                 wait_for(ready.exists)
 
@@ -146,7 +163,11 @@ try:
                 compositor=subprocess.check_output(["mutter", "--version"], text=True, stderr=subprocess.STDOUT).strip(),
                 monitor=native.parameters, capture="PipeWire / GStreamer RGBA appsink", xwayland=False,
                 samples=args.samples, seconds_per_cpu_sample=args.seconds,
-                workload="Three output processes, each sending 20 colored Unicode lines at up to 60 batches/s, plus an interactive probe.",
+                workload=("Three programs with 64 OSC 7501 records each, sending 20 OSC 9;4 reports per batch beneath a retained status, at up to 60 batches/s, plus an interactive probe."
+                          if args.workload == "program-status-mixed" else
+                          "Three programs with 64 records each, sending 20 OSC 7501 reports with 2048-byte messages at up to 60 batches/s, plus an interactive probe."
+                          if args.workload == "program-status" else
+                          "Three output processes, each sending 20 colored Unicode lines at up to 60 batches/s, plus an interactive probe."),
                 latency_method="Mutter native keysym q press/release to changed first-cell pixel in a composited PipeWire frame on a 1280x960@60 headless Wayland monitor. Normal GTK frame pacing. Includes input delivery, PTY, daemon transport, GTK rendering, compositor presentation, capture and observer readback; excludes physical display scanout.",
                 resource_method="Frontend and daemon process CPU as percent of one core; sampled resident memory and main-thread context switches. Workload child processes, compositor, PipeWire, WirePlumber and benchmark observer excluded.", scenarios=[])
 
@@ -225,6 +246,10 @@ try:
             idle = measure_resources("attached_idle_four_panes", True)
             idle["latency"] = measure_latency(first["pane"])
             report["scenarios"].append(idle)
+            if args.workload != "cells":
+                control.write_text("indeterminate")
+                time.sleep(1)
+                report["scenarios"].append(measure_resources("attached_indeterminate_visible_panes", True))
             control.write_text("busy")
             time.sleep(1)
             busy = measure_resources("attached_three_busy_visible_panes", True)
@@ -236,6 +261,12 @@ try:
             hidden = measure_resources("attached_three_busy_hidden_panes", True)
             hidden["latency"] = measure_latency(hidden_probe)
             report["scenarios"].append(hidden)
+            if args.workload != "cells":
+                control.write_text("indeterminate")
+                time.sleep(1)
+                report["scenarios"].append(measure_resources("attached_indeterminate_hidden_panes", True))
+                control.write_text("busy")
+                time.sleep(1)
             rpc("detach")
             assert app.wait(timeout=8) == 0
             app = None

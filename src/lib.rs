@@ -10,4 +10,5 @@ mod session;
 mod shell;
 mod title;
 
+mod program_status;
 mod progress;

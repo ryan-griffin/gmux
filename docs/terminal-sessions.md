@@ -195,6 +195,10 @@ The daemon tracks unread alerts with sequence numbers so a delayed acknowledgeme
 cannot clear a newer alert. The frontend sends desktop notifications and
 suppresses them for the focused pane while its window is active.
 
+The sidebar uses a corner dot on its activity icon for unread alerts, or a dot
+alone when there is no activity. Reading an alert removes the dot and leaves
+reported program state intact.
+
 While detached, the daemon queues up to 64 alerts per pane within a 512 KiB text
 budget. Queued alerts arrive on reconnect. Unread state and queued messages stay
 in memory and do not survive daemon restarts.
@@ -206,3 +210,9 @@ and reconnect. Identical reports refresh a 15-second deadline without another
 progress broadcast. Reset, exit, removal, and expiry clear it. Progress is
 independent of busy checks and unread alerts. See [terminal progress](progress.md)
 for script usage, status fields, and the tab selection rule.
+
+Program status reports are also execution-owned. The daemon retains a bounded
+record set across screen switches and client reconnects, sends a representative
+through live metadata, and exposes complete details on request. Done/error
+records keep an exited pane available until acknowledged. Fresh shells do not
+inherit reports. See [program status](program-status.md) for UI and lifecycle rules.

@@ -28,7 +28,7 @@ enum Command {
     Serve(ServeOptions),
     /// Inspect the daemon's identity, connections, and execution statistics.
     Status,
-    /// List tabs, panes, working directories, progress, and unread indicators.
+    /// List tabs, panes, working directories, program status, progress, and unread indicators.
     List,
     /// Create a terminal tab.
     New {
@@ -66,7 +66,7 @@ enum Command {
         #[arg(long, env = "GMUX_PANE")]
         pane: Option<u64>,
     },
-    /// Inspect command lifecycle, last reported exit code, and process metadata.
+    /// Inspect program status records, command lifecycle, and process metadata.
     Metadata {
         #[arg(long, env = "GMUX_PANE")]
         pane: Option<u64>,

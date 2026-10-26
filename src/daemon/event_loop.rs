@@ -338,7 +338,7 @@ pub fn run() -> anyhow::Result<()> {
                 continue;
             };
             let (update, clipboard) = session.poll_with_clipboard(recipient.is_some());
-            if update.progress_changed {
+            if update.progress_changed || update.program_status_changed {
                 daemon.metadata_changed.insert(id);
             }
             daemon.git_dirty |= update.directory_changed && daemon.git.is_some();
@@ -351,7 +351,7 @@ pub fn run() -> anyhow::Result<()> {
             if metadata_due {
                 session.refresh_directory();
             }
-            if session.exited() {
+            if session.exited() && !session.retain_exited() {
                 exited.push(id);
                 daemon.changed.insert(id);
             }

@@ -7,9 +7,17 @@ grid size. Errors use red and paused progress uses the warning color.
 Indeterminate progress uses native activity mode only while the pane is mapped;
 hidden panes retain no progress animation callbacks or timers.
 
-Progress appears only in panes. Accessible progress values name the state and
-source pane. CLI and socket status retain reports for hidden
-panes and include a representative pane for each tab.
+The bar appears in panes. The sidebar also shows a static working, paused or
+error icon, including for hidden tabs. An unread alert adds a small corner dot to
+that icon, using one slot beside the tab title. Accessible progress values name
+the state and percentage. CLI and socket status retain reports for hidden panes
+and include a representative pane for each tab.
+
+OSC 7501 uses the same bar and sidebar indicator. Retained OSC 7501 status takes
+precedence within its pane; OSC 9;4 becomes visible again when those records clear.
+The underlying reports and their lifetimes remain independent. See
+[program status](program-status.md#shared-progress-and-sidebar-presentation) for
+the combined sidebar selection rule.
 
 For example, a shell script can report 42%, then remove its indication:
 
@@ -48,7 +56,8 @@ A soft terminal reset does not clear it. Progress is not saved with scrollback
 or desktop state; a new shell starts inactive. It is independent of busy-process
 checks and unread terminal alerts.
 
-Tab status selects one reporting pane, without averaging percentages. Error takes
+The tab's protocol-specific `progress` metadata selects one reporting pane,
+without averaging percentages. Error takes
 priority over paused, then determinate, then indeterminate. Equal-priority
 reports use the lowest daemon-local pane ID. Changing the active pane does not
 change that rule. Each visible pane still shows its own progress, independent

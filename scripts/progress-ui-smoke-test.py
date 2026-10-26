@@ -35,14 +35,15 @@ with (artifacts / "progress-ui-smoke.log").open("w") as log, AccessibilityFixtur
     pane = created["pane"]
     probe = ProgressProbe(fixture, pane)
 
-    def indicators(identifier=pane):
+    def indicators(value_text=None):
         return [obj for obj in descendants(Atspi.get_desktop(0)) if obj.get_process_id() == app.pid
-            and obj.get_role_name() == "progress bar" and obj.get_name() == f"Pane {identifier} progress"
-            and obj.get_state_set().contains(Atspi.StateType.SHOWING)]
+            and obj.get_role_name() == "progress bar" and obj.get_name() == "Progress"
+            and obj.get_state_set().contains(Atspi.StateType.SHOWING)
+            and (value_text is None or Atspi.Value.get_text(obj.get_value_iface()) == value_text)]
 
-    def check_value(state, percentage, identifier=pane):
+    def check_value(state, percentage):
         def values_ready():
-            nodes = indicators(identifier)
+            nodes = indicators(state)
             if len(nodes) != 1:
                 return None
             node = nodes[0]
@@ -65,7 +66,7 @@ with (artifacts / "progress-ui-smoke.log").open("w") as log, AccessibilityFixtur
             assert before == percentage
         return node
 
-    with scenario("pane-only progress exposes named state and percentage without text events"):
+    with scenario("pane bars and sidebar icons expose progress without terminal text events"):
         terminal = wait_accessible(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
             if obj.get_process_id() == app.pid and obj.get_role_name() == "terminal"), None))
         original = Atspi.Text.get_text(terminal.get_text_iface(), 0, -1)
@@ -94,7 +95,7 @@ with (artifacts / "progress-ui-smoke.log").open("w") as log, AccessibilityFixtur
         probe.expect("inactive", 0)
         wait_accessible(lambda: not indicators())
 
-    with scenario("hidden panes retain progress in status without sidebar indicators"):
+    with scenario("hidden panes keep an attributed sidebar icon without an animated bar"):
         second = fixture.rpc("split", pane=pane)["pane"]
         other = ProgressProbe(fixture, second)
         probe.report(1, 91)
@@ -103,11 +104,15 @@ with (artifacts / "progress-ui-smoke.log").open("w") as log, AccessibilityFixtur
         tab = wait_for(lambda: next((tab for tab in fixture.rpc("list")["tabs"]
             if tab["id"] == created["tab"] and tab["progress"] and tab["progress"]["pane"] == second), None))
         assert tab["progress"]["progress"] == dict(state="error", percentage=12), tab
-        check_value("Error, 12%", 12, identifier=second)
+        check_value("Error, 12%", 12)
         fixture.rpc("new", name="Foreground", directory=str(fixture.path))
         other.report(4, 63)
         other.expect("paused", 63)
-        wait_accessible(lambda: not indicators(second) and not indicators(pane))
+        wait_accessible(lambda: not indicators())
+        wait_accessible(lambda: any(obj.get_process_id() == app.pid
+            and obj.get_role_name() == "image" and obj.get_name() == "Paused, 63%"
+            and obj.get_state_set().contains(Atspi.StateType.SHOWING)
+            for obj in descendants(Atspi.get_desktop(0))))
         hidden = next(tab for tab in fixture.rpc("list")["tabs"] if tab["id"] == created["tab"])
         assert hidden["progress"] == dict(pane=second, progress=dict(state="paused", percentage=63)), hidden
 
@@ -122,13 +127,13 @@ with (artifacts / "progress-ui-smoke.log").open("w") as log, AccessibilityFixtur
         wait_for(lambda: next(tab for tab in fixture.rpc("list")["tabs"]
             if tab["id"] == created["tab"])["progress"] ==
             dict(pane=second, progress=dict(state="error", percentage=23)))
-        wait_accessible(lambda: not indicators(second))
+        wait_accessible(lambda: not indicators())
         fixture.rpc("focus", pane=second)
-        check_value("Error, 23%", 23, identifier=second)
+        check_value("Error, 23%", 23)
         fixture.rpc("screenshot", path=str(artifacts / "progress-error.png"))
         other.report(0)
         other.expect("inactive", 0)
-        wait_accessible(lambda: not indicators(second))
+        wait_accessible(lambda: not indicators("Error, 23%"))
 
     with scenario("pane progress stays visible below the top edge with pane titles disabled"):
         probe.report(0)
@@ -138,7 +143,7 @@ with (artifacts / "progress-ui-smoke.log").open("w") as log, AccessibilityFixtur
         fixture.set_settings(dict(show_pane_titles=False))
         other.report(1, 58)
         app = fixture.start_app(cargo_binary("gmux-gtk"), stdout=log, stderr=log)
-        check_value("In progress, 58%", 58, identifier=second)
+        check_value("In progress, 58%", 58)
         fixture.rpc("screenshot", path=str(artifacts / "progress-no-titles.png"))
         other.report(0)
-        wait_accessible(lambda: not indicators(second))
+        wait_accessible(lambda: not indicators())

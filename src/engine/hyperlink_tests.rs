@@ -132,7 +132,9 @@ fn variable_rust_hold_scratch_releases_after_release_expiry_and_host_clear() {
         });
         assert!(e.held_hyperlinks.memory_size() > 0);
         match ending {
-            0 => e.write(b"\x1b[?2026l"),
+            0 => {
+                e.write(b"\x1b[?2026l");
+            }
             1 => {
                 std::thread::sleep(std::time::Duration::from_millis(1050));
             }

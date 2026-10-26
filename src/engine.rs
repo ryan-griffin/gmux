@@ -78,6 +78,7 @@ struct Events {
     title_changed: bool,
     directory_changed: bool,
     progress: crate::progress::RetainedProgress,
+    program_status: crate::program_status::Records,
     clipboard: Vec<gmux_client::clipboard::Write>,
     clipboard_bytes: usize,
     command: gmux_client::shell::CommandState,
@@ -211,6 +212,47 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
             events.title_changed = true;
             events.directory_changed = true;
         }
+        7 if len == std::mem::size_of::<GmuxProgramStatusEvent>() => {
+            use gmux_client::program_status::{Kind, State};
+            let report = unsafe { &*data.cast::<GmuxProgramStatusEvent>() };
+            // All strings have been validated and decoded by the pinned parser.
+            // Copy during this synchronous callback, never queue borrowed data.
+            let text = |value: &GmuxText| -> &str {
+                if value.len == 0 {
+                    return "";
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+                std::str::from_utf8(bytes).unwrap_or("")
+            };
+            let id = text(&report.id);
+            if report.state == 5 {
+                events.program_status.clear(id);
+                return;
+            }
+            let state = match report.state {
+                0 => State::Idle,
+                1 => State::Working,
+                2 => State::Done,
+                3 => State::Blocked,
+                4 => State::Error,
+                _ => return,
+            };
+            events.program_status.report(crate::program_status::Report {
+                id,
+                state,
+                kind: match report.kind {
+                    1 => Some(Kind::Permission),
+                    2 => Some(Kind::Question),
+                    3 => Some(Kind::Auth),
+                    _ => None,
+                },
+                progress: u8::try_from(report.progress).ok(),
+                app: (!text(&report.app).is_empty()).then(|| text(&report.app)),
+                title: text(&report.title),
+                message: text(&report.message),
+            });
+        }
+        8 => events.program_status.end_execution(),
         _ => {}
     }
 }
@@ -560,6 +602,12 @@ impl Engine {
     pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
         self.events.progress.value
     }
+    pub(crate) fn program_status(&self) -> &crate::program_status::Records {
+        &self.events.program_status
+    }
+    pub(crate) fn program_status_mut(&mut self) -> &mut crate::program_status::Records {
+        &mut self.events.program_status
+    }
     pub(crate) fn progress_deadline(&self) -> Option<std::time::Instant> {
         self.events.progress.deadline
     }
@@ -569,10 +617,13 @@ impl Engine {
     pub(crate) fn take_progress_changed(&mut self) -> bool {
         self.events.progress.take_changed(std::time::Instant::now())
     }
-    pub fn write(&mut self, bytes: &[u8]) {
-        self.revision = self.revision.wrapping_add(1);
-        unsafe { gmux_engine_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) }
-        self.find.invalidate();
+    pub fn write(&mut self, bytes: &[u8]) -> bool {
+        let changed = unsafe { gmux_engine_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+            self.find.invalidate();
+        }
+        changed
     }
     pub fn resize(&mut self, cols: u16, rows: u16, cw: u32, ch: u32) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_resize(self.raw.as_ptr(), cols, rows, cw, ch) };
@@ -2980,3 +3031,7 @@ mod hyperlink_tests;
 
 #[cfg(test)]
 mod shell_tests;
+
+#[cfg(test)]
+#[path = "engine/program_status_tests.rs"]
+mod program_status_tests;

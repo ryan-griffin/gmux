@@ -270,6 +270,7 @@ impl Daemon {
             busy: session.busy(),
             command: session.command_state(),
             progress: session.progress(),
+            program_status: session.program_status().cloned(),
             modes: [session.mode(0), session.mode(1004)],
         }
     }
@@ -484,6 +485,7 @@ mod tests {
                     busy: false,
                     command: Default::default(),
                     progress: Default::default(),
+                    program_status: None,
                     modes: [false; 2],
                 },
                 frame: Some(Frame {
@@ -559,6 +561,7 @@ mod tests {
                         busy: false,
                         command: Default::default(),
                         progress: Default::default(),
+                        program_status: None,
                         modes: [false; 2],
                     },
                     frame: Some(Frame {

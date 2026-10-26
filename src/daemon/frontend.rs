@@ -512,6 +512,20 @@ impl Daemon {
             _ => {}
         }
         let session = self.sessions.get_mut(&id).unwrap();
+        // Only an interaction delivered by a viewing frontend acknowledges a
+        // result. Focus/read synchronization and CLI sends do not consume it.
+        let interaction = match &command {
+            StreamCommand::Key { action, .. } => *action != KeyAction::Release,
+            StreamCommand::Input { bytes } => !bytes.is_empty(),
+            StreamCommand::Paste { text, .. } => !text.is_empty(),
+            _ => false,
+        };
+        if interaction && frontend.visible.contains(&id) && session.acknowledge_program_status() {
+            self.metadata_changed.insert(id);
+        }
+        if interaction && session.exited() {
+            return Ok(());
+        }
         if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
             let mut view = session.new_view()?;
             view.set_active(frontend.visible.contains(&id));
@@ -773,6 +787,7 @@ impl Daemon {
                     busy: false,
                     command: Default::default(),
                     progress: Default::default(),
+                    program_status: None,
                     modes: [false; 2],
                 },
                 ..Header::default()
@@ -1061,10 +1076,9 @@ impl Daemon {
                     serial: selection_serial,
                 },
             );
-            let progress_changed = frontend
-                .metadata
-                .get(&id)
-                .is_some_and(|previous| previous.progress != meta.progress);
+            let status_changed = frontend.metadata.get(&id).is_some_and(|previous| {
+                previous.progress != meta.progress || previous.program_status != meta.program_status
+            });
             frontend.metadata.insert(id, meta.clone());
             frontend
                 .sent_scroll_serials
@@ -1099,7 +1113,7 @@ impl Daemon {
                 },
                 cells,
             })?;
-            frame_activity |= viewport_changed || progress_changed;
+            frame_activity |= viewport_changed || status_changed;
         }
         frontend.changed.clear();
         frontend.terminal_changed.clear();

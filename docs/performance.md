@@ -4,6 +4,85 @@ Benchmarks write local reports under `artifacts/`, which Git ignores. Keep sourc
 revisions and matching frontend/daemon binaries with reports when comparing
 builds. Results depend on the compositor, driver, font, and machine.
 
+## Program status
+
+OSC 7501 callbacks update a session-owned set of at most 64 records directly.
+There is no report queue. Unchanged reports update eviction order without string
+allocation or metadata delivery. Changes to a record that leave the representative
+unchanged also avoid allocating or publishing a summary. Live packets carry one
+record. The complete set is serialized only for an explicit metadata request.
+Status-only writes preserve viewport, search and compression activity tokens.
+
+The full message remains in the sidebar tooltip and accessible description.
+Persistent status rendering uses the sidebar icon and thin pane progress bar.
+Sidebar icons are static. Working progress with no estimate uses the existing
+mapped-only bar animation; blocked and failed markers never animate. Status and
+progress updates refresh only affected tabs. Legacy progress changes masked by
+retained OSC 7501 status skip sidebar updates. Sidebar aggregation borrows its
+selected summary without cloning report strings. Protocol-specific CLI lists
+clone only their selected record.
+
+Measure native parsing and retained storage with the matching pinned library:
+
+```sh
+cargo test --locked --release -p gmux-core program_status_measurements -- --ignored --nocapture
+cargo test --locked --release -p gmux-core maximum_text_and_json_escaping -- --nocapture
+```
+
+An x86-64 release run at the record cap took about 1.8 microseconds per unchanged
+short report and 2.3 microseconds per changing report. The inline record owner is
+152 bytes before allocation. Maximum valid text across 64 records plus the cached
+summary retained 163,168 bytes, excluding allocator bookkeeping and the inline
+owner. Worst-case JSON escaping produced 302,657 bytes for complete records and
+4,750 bytes for the live summary. Transport queue accounting includes retained
+summary strings.
+
+Protocol-specific CLI aggregation borrows candidates and clones only the chosen
+record. The combined sidebar selector allocates no strings or report copies. A
+release microbenchmark with maximum-length messages measured about 0.5 microseconds
+for 64 OSC 7501 panes, or 0.9 microseconds when alternating OSC 7501 and OSC 9;4.
+At 256 panes those figures were 1.9 and 3.5 microseconds. The borrowed selection
+occupies 24 inline bytes on x86-64. The sidebar icon and unread badge share a
+fixed 16-pixel slot and retain three GTK widgets, with no additional report storage.
+The ignored benchmark above measures protocol-specific and combined aggregation
+with 1, 16, 64 and 256 panes.
+
+The existing native shell benchmark with 300,000 commands and 24 hidden views
+measured median write CPU of 270 ms without shell markers and 376 ms with them.
+The main-branch bridge measured 283 ms and 370 ms respectively with the same
+library and compiler flags. Both performed zero render updates. Interleave
+revisions when repeating this comparison to reduce machine-load differences.
+
+Measure visible, hidden and detached reporting alongside real input:
+
+```sh
+python3 scripts/cargo_build.py --release gmux gmux-gtk
+python3 scripts/performance-benchmark.py --binary target/release/gmux-gtk \
+  --workload program-status --seconds 2 --samples 15 \
+  --output artifacts/program-status-performance.json
+```
+
+This workload retains 64 records in each of three reporting panes and sends
+20 maximum-message reports per writer batch at up to 60 batches per second.
+It starts with idle records and samples indeterminate working records separately.
+Use `--workload program-status-mixed` to measure changing OSC 9;4 progress beneath
+a retained OSC 7501 report, including the sidebar update suppression.
+On the measured system, visible reporting used 10% of one frontend core;
+composited input latency was 66 ms median and 86 ms at the 95th percentile,
+including PipeWire capture. Hidden reporting used about 5% of a frontend core
+and had 51 ms median and 67 ms 95th-percentile input latency. Three visible native
+activity bars used about 7.5% of a frontend core with zero daemon CPU ticks.
+Hidden indeterminate work, true attached idle and detached idle samples all
+measured zero CPU ticks. Frontend resident memory stayed around 119 MiB across
+these scenarios. These figures include the whole application and depend on the
+machine and compositor. With the mixed-protocol workload, visible and hidden
+reporting each used about 2% of a frontend core, with 48–49 ms median input
+latency. Idle and hidden indeterminate samples still measured zero CPU ticks.
+
+The headless program-status suite also records daemon CPU, retained bytes and
+input round-trip time under rapid hidden reports. It asserts zero viewport
+snapshots for both visible status-only changes and hidden reporting.
+
 ## Rectangular selection
 
 The renderer resolves rectangle columns and wide-glyph edges once per visible

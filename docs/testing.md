@@ -81,6 +81,20 @@ markers, alternate screens, reset, and foreground-process fallback. Engine tests
 cover reflow, pruning, anchor limits, command identity across active-area reuse,
 and metadata reads during idle compression.
 
+The `program-status` headless suite covers OSC 7501 ownership, local/remote
+metadata, reconnect, shared acknowledgement, process exit with background PTY
+holders while detached, record bounds,
+coalescing, hidden-pane extraction and input responsiveness. Engine tests exercise
+the pinned native callback, detection reply, every report split including its OSC
+introducer, replacement, inheritance, clearing,
+eviction, reset/screen lifetime and fresh-shell restoration. The native
+`program-status-ui` suite checks sidebar status and metadata attribution, both
+protocols feeding one progress bar and icon, combined unread badges, independent
+alert acknowledgement, plain accessible labels, unobstructed terminal text,
+hidden tabs, reconnect and shared windows. Its widget fixtures check unknown progress values, mapped-only animation,
+viewport allocation and stable sidebar title positions at normal/large fonts and
+both text directions.
+
 ## Native prerequisites
 
 The native suites need PyGObject and these installed components:

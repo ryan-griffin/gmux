@@ -67,7 +67,7 @@ struct Tab {
     branch_icon: gtk::Image,
     branch_label: gtk::Label,
     unread: HashSet<u64>,
-    unread_indicator: gtk::Box,
+    activity: crate::activity::Indicator,
     menu: gtk::PopoverMenu,
     menu_state: Option<(bool, Option<u64>)>,
 }
@@ -688,7 +688,7 @@ impl Ui {
                 w.unread.remove(&pane)
             };
             if changed {
-                w.unread_indicator.set_visible(!w.unread.is_empty());
+                self.refresh_tab_activity(w);
             }
             return changed;
         }
