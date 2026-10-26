@@ -52,6 +52,10 @@ fn metadata_size(meta: &Metadata) -> usize {
     meta.directory.capacity()
         + meta.title.capacity()
         + meta.command.command.as_ref().map_or(0, String::capacity)
+        + meta
+            .program_status
+            .as_ref()
+            .map_or(0, |s| s.record.heap_bytes())
 }
 
 fn state_size(state: &CommandReply) -> usize {

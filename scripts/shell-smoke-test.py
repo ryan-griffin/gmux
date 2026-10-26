@@ -105,7 +105,10 @@ def shell_fixture(shell, array=False, no_history=False, relative_resources=False
                 f.rpc("send", pane=pane, text="printf 'BUILTIN_VISIBLE\\n'; read -r answer", enter=True)
                 wait_for(lambda: (m := meta())["command"]["phase"] == "running" and m["busy"])
                 assert not meta()["command"]["at_prompt"]
-                client.output("BUILTIN_VISIBLE")
+                # Zsh can echo this marker inside the command before printf
+                # writes it. Wait for the actual output row, not that echo.
+                client.until(lambda h: h["meta"]["id"] == pane and h["frame"]
+                             and any(line.rstrip() == "BUILTIN_VISIBLE" for line in client.text().splitlines()))
                 assert f.rpc("command-output", pane=pane)["text"] == "BUILTIN_VISIBLE"
                 f.rpc("send", pane=pane, text="answer", enter=True)
                 expect_exit(0)

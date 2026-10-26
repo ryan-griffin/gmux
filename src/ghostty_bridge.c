@@ -141,6 +141,9 @@ struct GmuxEngine {
     uint32_t cell_width, cell_height;
     bool dark;
     bool held;
+    bool status_sequence;
+    bool status_escape;
+    bool status_reported;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
     OutputAnchor output_anchor;
     SelectionCache selection_cache;
@@ -481,6 +484,7 @@ static void progress_report(GhosttyTerminal t, void *ud, const GhosttyTerminalPr
     }
     const uint8_t data[] = {state, (uint8_t)report->progress};
     GmuxEngine *e = ud;
+    e->status_reported = true;
     e->callback(e->userdata, 4, data, sizeof(data));
 }
 static bool color_scheme(GhosttyTerminal t, void *ud, GhosttyColorScheme *out) {
@@ -488,6 +492,34 @@ static bool color_scheme(GhosttyTerminal t, void *ud, GhosttyColorScheme *out) {
     GmuxEngine *e = ud;
     *out = e->dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT;
     return true;
+}
+static void program_status(GhosttyTerminal t, void *ud, const GhosttyTerminalProgramStatus *report) {
+    (void)t;
+    if (report->size < offsetof(GhosttyTerminalProgramStatus, message) + sizeof(report->message)) return;
+    GmuxProgramStatusEvent event = {0};
+    switch (report->state) {
+        case GHOSTTY_PROGRAM_STATUS_STATE_IDLE: event.state = 0; break;
+        case GHOSTTY_PROGRAM_STATUS_STATE_WORKING: event.state = 1; break;
+        case GHOSTTY_PROGRAM_STATUS_STATE_DONE: event.state = 2; break;
+        case GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED: event.state = 3; break;
+        case GHOSTTY_PROGRAM_STATUS_STATE_ERROR: event.state = 4; break;
+        case GHOSTTY_PROGRAM_STATUS_STATE_CLEAR: event.state = 5; break;
+        default: return;
+    }
+    switch (report->kind) {
+        case GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION: event.kind = 1; break;
+        case GHOSTTY_PROGRAM_STATUS_KIND_QUESTION: event.kind = 2; break;
+        case GHOSTTY_PROGRAM_STATUS_KIND_AUTH: event.kind = 3; break;
+        default: break;
+    }
+    event.progress = report->progress;
+    event.id = (GmuxText){report->id.ptr, report->id.len};
+    event.app = (GmuxText){report->app.ptr, report->app.len};
+    event.title = (GmuxText){report->title.ptr, report->title.len};
+    event.message = (GmuxText){report->message.ptr, report->message.len};
+    GmuxEngine *e = ud;
+    e->status_reported = true;
+    e->callback(e->userdata, 7, (const uint8_t *)&event, sizeof(event));
 }
 void gmux_engine_free(GmuxEngine *e) {
     if (!e) return;
@@ -538,7 +570,8 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, progress_report);
-    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, semantic_prompt) ||
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, program_status) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, semantic_prompt) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RESET, shell_reset)) {
         gmux_engine_free(e); return NULL;
     }
@@ -796,17 +829,73 @@ int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
     if ((result = gmux_engine_cursor_style(e, v->appearance.cursor_style))) return result;
     return gmux_engine_cursor_blink(e, v->appearance.cursor_blink);
 }
-void gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
-    e->text_generation++;
+bool gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
+    bool changed = false;
     if (e->clear_pending) {
         size_t consumed = 0;
-        if (ghostty_terminal_vt_write_until_ground(e->terminal, data, len, &consumed)) return;
+        if (ghostty_terminal_vt_write_until_ground(e->terminal, data, len, &consumed)) return true;
         gmux_engine_clear_screen(e);
+        e->status_sequence = false;
+        e->status_escape = false;
+        changed = true;
         data += consumed;
         len -= consumed;
     }
-    ghostty_terminal_vt_write(e->terminal, data, len);
-    if (e->prompt_count || e->output.point || e->completed_output.point) shell_prune(e);
+    // Let the upstream stream find sequence boundaries. A chunk containing only
+    // status callbacks cannot change cells, selection, history or search. No
+    // OSC body is parsed here, and mixed output takes the ordinary path.
+    if (e->status_escape && len) {
+        e->status_escape = false;
+        if (data[0] == ']') {
+            ghostty_terminal_vt_write(e->terminal, data, 1);
+            data++; len--;
+            e->status_sequence = true;
+            e->status_reported = false;
+        } else {
+            ghostty_terminal_vt_write(e->terminal, data, len);
+            changed = true;
+            len = 0;
+        }
+    }
+    while (len) {
+        if (!e->status_sequence) {
+            bool ground = false;
+            if (data[0] != 0x1b || (len >= 2 && data[1] != ']') ||
+                ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) || !ground) {
+                ghostty_terminal_vt_write(e->terminal, data, len);
+                changed = true;
+                break;
+            }
+            if (len == 1) {
+                // A read can split even the OSC introducer. ESC alone has no
+                // grid effect; let the next byte decide which path to take.
+                ghostty_terminal_vt_write(e->terminal, data, 1);
+                e->status_escape = true;
+                break;
+            }
+            ghostty_terminal_vt_write(e->terminal, data, 2);
+            data += 2; len -= 2;
+            e->status_sequence = true;
+            e->status_reported = false;
+        }
+        size_t consumed = 0;
+        GhosttyResult result = ghostty_terminal_vt_write_until_ground(e->terminal, data, len, &consumed);
+        if (result == GHOSTTY_NO_VALUE) break;
+        if (result != GHOSTTY_SUCCESS) {
+            changed = true;
+            e->status_sequence = false;
+            break;
+        }
+        data += consumed; len -= consumed;
+        // SUCCESS already guarantees ground, including the terminating byte.
+        changed |= !e->status_reported;
+        e->status_sequence = false;
+    }
+    if (changed) {
+        e->text_generation++;
+        if (e->prompt_count || e->output.point || e->completed_output.point) shell_prune(e);
+    }
+    return changed;
 }
 int gmux_engine_clear_screen(GmuxEngine *e) {
     e->clear_pending = false;

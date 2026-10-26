@@ -128,15 +128,10 @@ impl Ui {
             .column_spacing(8)
             .row_spacing(3)
             .build();
-        // Hidden alerts occupy no space and only offset the title when shown.
+        // Activity and unread alerts share one leading slot.
         let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let unread_indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        unread_indicator.add_css_class("tab-unread");
-        unread_indicator.set_size_request(10, 10);
-        unread_indicator.set_visible(false);
-        unread_indicator.set_valign(gtk::Align::Center);
-        unread_indicator.set_tooltip_text(Some("Unread Terminal Alerts"));
-        name_line.append(&unread_indicator);
+        let activity = crate::activity::Indicator::new();
+        name_line.append(&activity.widget);
         let name_label = gtk::Label::builder()
             .label(&saved.name)
             .xalign(0.0)
@@ -261,7 +256,6 @@ impl Ui {
             .iter()
             .filter_map(|(&id, pane)| pane.unread().then_some(id))
             .collect();
-        unread_indicator.set_visible(!unread.is_empty());
         self.tabs.borrow_mut().insert(
             position,
             Tab {
@@ -291,11 +285,12 @@ impl Ui {
                 branch_icon,
                 branch_label,
                 unread,
-                unread_indicator,
+                activity,
                 menu,
                 menu_state: None,
             },
         );
+        self.refresh_tab_activity(&self.tabs.borrow()[position]);
         self.changing.set(false);
         self.rebuild(saved.id);
         self.refresh_client_ui();
@@ -525,7 +520,7 @@ impl Ui {
                 detach(&p.root);
             }
             w.unread.remove(&id);
-            w.unread_indicator.set_visible(!w.unread.is_empty());
+            self.refresh_tab_activity(w);
             if let Some(layout) = layout {
                 if w.active == id {
                     let ids = layout.ids();
@@ -612,7 +607,39 @@ impl Ui {
                 .map(|(&id, pane)| (self.sessions.borrow().pane_ref(id).id, pane.progress())),
         )
     }
+    pub(super) fn tab_program_status(
+        &self,
+        tab: &Tab,
+    ) -> Option<gmux_client::program_status::PaneStatus> {
+        gmux_client::program_status::representative(tab.panes.iter().map(|(&id, pane)| {
+            (
+                self.sessions.borrow().pane_ref(id).id,
+                pane.program_status(),
+            )
+        }))
+    }
+    pub(super) fn refresh_tab_activity(&self, tab: &Tab) {
+        let sessions = self.sessions.borrow();
+        let selected =
+            gmux_client::activity::representative(tab.panes.iter().map(|(&id, pane)| {
+                (
+                    sessions.pane_ref(id).id,
+                    pane.program_status(),
+                    pane.progress(),
+                )
+            }));
+        tab.activity.update(
+            selected.as_ref().map(|s| s.activity()),
+            !tab.unread.is_empty(),
+        );
+    }
+    pub(super) fn refresh_activity<'a>(&self, tabs: impl IntoIterator<Item = &'a Tab>) {
+        for tab in tabs {
+            self.refresh_tab_activity(tab);
+        }
+    }
     pub(super) fn refresh_metadata(self: &Rc<Self>) {
+        self.refresh_activity(self.tabs.borrow().iter());
         for w in self.tabs.borrow_mut().iter_mut() {
             machine::update_tab(w, &self.sessions.borrow());
             if let Some(p) = w.panes.get(&w.active) {

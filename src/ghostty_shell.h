@@ -185,6 +185,9 @@ static int shell_output_track(GmuxEngine *e, OutputAnchor *anchor, GhosttyPoint 
 static void semantic_prompt(GhosttyTerminal terminal, void *ud,
     const GhosttyTerminalSemanticPrompt *event) {
     GmuxEngine *e = ud;
+    if (event->kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_START &&
+        event->prompt_kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY)
+        e->callback(e->userdata, 8, NULL, 0);
     if (!shell_primary(e)) return;
     GmuxCommandEvent report = {0};
     uint16_t x = 0, y = 0;
@@ -272,6 +275,7 @@ static void semantic_prompt(GhosttyTerminal terminal, void *ud,
 static void shell_reset(GhosttyTerminal terminal, void *ud) {
     (void)terminal;
     GmuxEngine *e = ud;
+    e->status_reported = false;
     shell_clear(e);
     e->history_reset++;
     e->callback(e->userdata, 6, NULL, 0);

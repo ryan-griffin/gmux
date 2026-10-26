@@ -12,7 +12,7 @@ use gmux_client::{
 use gmux_client::{remote::SessionHandle, session::SessionUpdate};
 use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
 use std::{
-    cell::{Cell as ValueCell, RefCell},
+    cell::{Cell as ValueCell, Ref, RefCell},
     path::PathBuf,
     rc::Rc,
     time::Duration,
@@ -162,8 +162,14 @@ impl Terminal {
         title.add_css_class("caption");
         title.set_tooltip_text(Some(&directory.display().to_string()));
         toolbar.set_center_widget(Some(&title));
-        let progress = crate::progress::PaneProgress::new(session.borrow().id());
-        progress.update(session.borrow().progress());
+        let progress = crate::progress::PaneProgress::new();
+        {
+            let session = session.borrow();
+            progress.update(gmux_client::activity::Activity::select(
+                session.program_status(),
+                session.progress(),
+            ));
+        }
         let close = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .tooltip_text("Close Pane (Ctrl+Shift+W)")
@@ -556,9 +562,17 @@ impl Terminal {
     pub fn progress(&self) -> gmux_client::progress::Progress {
         self.session.borrow().progress()
     }
+    pub fn program_status(&self) -> Option<Ref<'_, gmux_client::program_status::Summary>> {
+        Ref::filter_map(self.session.borrow(), |session| session.program_status()).ok()
+    }
     pub fn tick(self: &Rc<Self>, update: &SessionUpdate) {
-        if update.progress_changed {
-            self.progress.update(self.progress());
+        if update.progress_changed || update.program_status_changed {
+            let session = self.session.borrow();
+            self.progress
+                .update(gmux_client::activity::Activity::select(
+                    session.program_status(),
+                    session.progress(),
+                ));
         }
         if let Some(error) = &update.error {
             self.show_status(error);

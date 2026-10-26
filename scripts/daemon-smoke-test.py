@@ -190,6 +190,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         header, cells = screen(pane, lambda header, cells: b"R" in cells)
         assert header["rows"] == [2], f"Expected one changed row, received {header['rows']}"
 
+        # Unsubscribe before counting hidden work. A late prompt frame from the
+        # visible pane must not be mistaken for extraction of the hidden pane.
+        command("subscribe", panes=[])
+        command("test-hidden-ready", pane=pane)
+        copy_reply(lambda header: header["error"] and "test-hidden-ready" in header["error"])
         hidden = rpc("split", pane=pane)["pane"]
         count = rpc("status")["snapshots"]
         send(hidden, "for i in $(seq 1 300); do printf 'hidden %s\\n' \"$i\"; done")

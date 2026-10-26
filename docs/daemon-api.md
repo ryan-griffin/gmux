@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 31:
+handshake. The current protocol version is 33:
 
 ```json
-{"version":31,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":33,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -167,7 +167,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":31,"daemon":"returned-identity"}
+{"method":"attach","version":33,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -193,7 +193,7 @@ negotiated keyboard mode. Kitty repeat and release event types require the
 [event reporting flag](https://sw.kovidgoyal.net/kitty/keyboard-protocol/#event-types).
 Legacy modes encode repeats as ordinary key presses and omit releases.
 
-`frame-interval` sets this connection's viewport, search, and progress pacing with a
+`frame-interval` sets this connection's viewport, search, progress, and program status pacing with a
 `micros` integer from 1,000 to 1,000,000. It defaults to 16,000. GTK updates it
 from the display frame clock; one client's interval does not pace another client.
 `scroll`, `scroll-to`, `find`, `find-advance`, `select`, `clear-selection`,
@@ -342,6 +342,14 @@ sends progress changes without a frame or rows. State snapshots and `metadata`
 include the retained latest progress, including for hidden panes. `list` also
 includes each pane's progress and each tab's selected source pane and progress.
 See [terminal progress](progress.md) for transitions, expiry, and selection.
+
+Pane metadata also includes nullable `program_status`, containing one representative
+`record` and its pane-wide `count`. Tab lists add the selected source `pane`.
+An explicit `metadata` reply adds `program_status_records`, an ID-sorted array of
+all retained records with their original app values. Ordinary metadata carries
+only the representative, with app inheritance resolved. Status-only changes use
+metadata packets without cell rows and share connection frame pacing.
+See [program status](program-status.md) for selection, limits and acknowledgement.
 
 Pane metadata uses `unread_sequence` for the newest unread alert's sequence
 number, or zero after acknowledgement. Send that sequence as `through` in

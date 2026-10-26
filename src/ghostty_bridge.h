@@ -142,6 +142,14 @@ int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
 int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
+// Event kind 7. Stable codes, independent of upstream enum representation.
+typedef struct { const uint8_t *ptr; size_t len; } GmuxText;
+typedef struct {
+    uint8_t state; // 0 idle, 1 working, 2 done, 3 blocked, 4 error, 5 clear
+    uint8_t kind; // 0 absent, 1 permission, 2 question, 3 auth
+    int8_t progress; // -1 absent, otherwise 0..100
+    GmuxText id, app, title, message;
+} GmuxProgramStatusEvent;
 // Event kind 5. Strings are borrowed for the synchronous event callback.
 typedef struct {
     uint8_t kind; // 1 prompt, 2 input, 3 output, 4 command end
@@ -187,7 +195,8 @@ int gmux_engine_selection(GmuxEngine *engine, uint64_t *start, uint64_t *end, bo
 int gmux_engine_copy(GmuxEngine *engine, uint8_t *bytes, size_t cap, size_t *written);
 int gmux_engine_theme(GmuxEngine *engine, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *palette, bool dark);
-void gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
+// False for status-only input or an unfinished OSC introducer/body.
+bool gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
 int gmux_engine_cursor_style(GmuxEngine *engine, uint8_t style);
 int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch);
 int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCell *cells, size_t cap, uint8_t *row_flags);

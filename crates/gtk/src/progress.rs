@@ -1,40 +1,29 @@
 //! Native pane progress bars with mapped-only activity animation.
-use gmux_client::progress::{Progress, ProgressState};
+use gmux_client::activity::{Activity, Bar};
 use gtk::{glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
 };
 
-fn description(progress: Progress) -> String {
-    let percentage = progress.percentage();
-    match progress.state() {
-        ProgressState::Inactive => String::new(),
-        ProgressState::Determinate => format!("In progress, {percentage}%"),
-        ProgressState::Error => format!("Error, {percentage}%"),
-        ProgressState::Paused => format!("Paused, {percentage}%"),
-        ProgressState::Indeterminate => "In progress, percentage unknown".into(),
-    }
-}
-
 #[derive(Default)]
-struct Activity {
-    current: Cell<Progress>,
+struct Animation {
+    current: Cell<Bar>,
     tick: RefCell<Option<gtk::TickCallbackId>>,
 }
 
-impl Activity {
+impl Animation {
     fn stop(&self, bar: &gtk::ProgressBar) {
         if let Some(tick) = self.tick.borrow_mut().take() {
             tick.remove();
             // Leaving GTK activity mode also removes its internal frame callback.
             bar.set_fraction(0.0);
-            Self::unknown_value(bar);
+            bar.reset_property(gtk::AccessibleProperty::ValueNow);
         }
     }
 
     fn sync(&self, bar: &gtk::ProgressBar) {
-        if self.current.get().state() != ProgressState::Indeterminate || !bar.is_mapped() {
+        if self.current.get() != Bar::Working(None) || !bar.is_mapped() {
             self.stop(bar);
         } else if self.tick.borrow().is_none() {
             bar.pulse();
@@ -48,24 +37,15 @@ impl Activity {
             }));
         }
     }
-
-    fn unknown_value(bar: &gtk::ProgressBar) {
-        bar.reset_property(gtk::AccessibleProperty::ValueNow);
-        bar.update_property(&[
-            gtk::accessible::Property::ValueMin(0.0),
-            gtk::accessible::Property::ValueMax(100.0),
-            gtk::accessible::Property::ValueText("In progress, percentage unknown"),
-        ]);
-    }
 }
 
 pub(crate) struct PaneProgress {
     pub(crate) bar: gtk::ProgressBar,
-    activity: Rc<Activity>,
+    animation: Rc<Animation>,
 }
 
 impl PaneProgress {
-    pub(crate) fn new(pane: u64) -> Self {
+    pub(crate) fn new() -> Self {
         // Adwaita's thin OSD bar overlays the canvas below its optional header.
         // It never participates in terminal measurement or intercepts input.
         let bar = gtk::ProgressBar::builder()
@@ -77,31 +57,29 @@ impl PaneProgress {
         bar.add_css_class("osd");
         bar.add_css_class("pane-progress");
         bar.update_property(&[
-            gtk::accessible::Property::Label(&format!("Pane {pane} progress")),
+            gtk::accessible::Property::Label("Progress"),
             gtk::accessible::Property::ReadOnly(true),
         ]);
-        let activity = Rc::new(Activity::default());
-        let mapped = activity.clone();
+        let animation = Rc::new(Animation::default());
+        let mapped = animation.clone();
         bar.connect_map(move |bar| mapped.sync(bar));
-        let unmapped = activity.clone();
+        let unmapped = animation.clone();
         bar.connect_unmap(move |bar| unmapped.sync(bar));
-        Self { bar, activity }
+        Self { bar, animation }
     }
 
-    pub(crate) fn update(&self, progress: Progress) {
-        if self.activity.current.replace(progress) == progress {
+    pub(crate) fn update(&self, activity: Option<Activity<'_>>) {
+        let progress = activity.map_or(Bar::Hidden, Activity::bar);
+        if self.animation.current.replace(progress) == progress {
             return;
         }
-        self.activity.stop(&self.bar);
-        let indeterminate = progress.state() == ProgressState::Indeterminate;
-        self.bar.set_fraction(if indeterminate {
-            0.0
-        } else {
-            f64::from(progress.percentage()) / 100.0
-        });
+        self.animation.stop(&self.bar);
+        self.bar
+            .set_fraction(f64::from(progress.percentage().unwrap_or(0)) / 100.0);
         for (class, enabled) in [
-            ("error", progress.state() == ProgressState::Error),
-            ("warning", progress.state() == ProgressState::Paused),
+            ("error", matches!(progress, Bar::Error(_))),
+            ("warning", matches!(progress, Bar::Paused(_))),
+            ("unknown", progress.percentage().is_none()),
         ] {
             if enabled {
                 self.bar.add_css_class(class);
@@ -109,21 +87,19 @@ impl PaneProgress {
                 self.bar.remove_css_class(class);
             }
         }
-        let text = description(progress);
+        let text = progress.description();
         self.bar.update_property(&[
             gtk::accessible::Property::ValueMin(0.0),
             gtk::accessible::Property::ValueMax(100.0),
             gtk::accessible::Property::ValueText(&text),
         ]);
-        if indeterminate {
-            Activity::unknown_value(&self.bar);
-        } else {
+        if let Some(p) = progress.percentage() {
             self.bar
-                .update_property(&[gtk::accessible::Property::ValueNow(
-                    progress.percentage().into(),
-                )]);
+                .update_property(&[gtk::accessible::Property::ValueNow(p.into())]);
+        } else {
+            self.bar.reset_property(gtk::AccessibleProperty::ValueNow);
         }
-        self.bar.set_visible(progress.active());
-        self.activity.sync(&self.bar);
+        self.bar.set_visible(progress != Bar::Hidden);
+        self.animation.sync(&self.bar);
     }
 }

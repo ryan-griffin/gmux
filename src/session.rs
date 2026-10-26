@@ -44,6 +44,7 @@ pub(crate) struct TerminalMemory {
     memory: crate::engine::MemoryUsage,
     compression: crate::compression::CompressionStats,
     scheduled: bool,
+    program_status_bytes: usize,
 }
 
 pub(crate) struct TerminalSession {
@@ -92,11 +93,25 @@ impl TerminalSession {
             memory: self.engine.memory_usage()?,
             compression: self.compression.stats,
             scheduled: self.compression.deadline.is_some(),
+            program_status_bytes: self.engine.program_status().memory_bytes(),
         })
     }
 
     pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
         self.engine.progress()
+    }
+    pub(crate) fn program_status(&self) -> Option<&gmux_client::program_status::Summary> {
+        self.engine.program_status().summary()
+    }
+    pub(crate) fn program_status_records(&self) -> Vec<&gmux_client::program_status::Record> {
+        self.engine.program_status().records()
+    }
+    pub(crate) fn retain_exited(&self) -> bool {
+        self.engine.program_status().has_result()
+    }
+    pub(crate) fn acknowledge_program_status(&mut self) -> bool {
+        self.engine.program_status_mut().acknowledge();
+        self.engine.program_status_mut().take_changed()
     }
     pub(crate) fn progress_deadline(&self) -> Option<Instant> {
         self.engine.progress_deadline()
@@ -284,7 +299,14 @@ impl TerminalSession {
             changed: self.engine.expire_render_hold(),
             ..SessionUpdate::default()
         };
+        let mut read_budget_exhausted = false;
         if let Some(pty) = &mut self.pty {
+            if matches!(
+                pty.child.as_mut().map(|child| child.try_wait()),
+                Some(Ok(Some(_)))
+            ) {
+                pty.child = None;
+            }
             let fd = pty.master.as_raw_fd().unwrap();
             let mut pending = pty.pending.borrow_mut();
             let mut budget = 512 * 1024;
@@ -308,16 +330,18 @@ impl TerminalSession {
             }
             // Bound work per session so a noisy process cannot block its owner.
             let mut buffer = [0u8; 16384];
+            read_budget_exhausted = !pty.eof;
             for _ in 0..32 {
                 if pty.eof {
+                    read_budget_exhausted = false;
                     break;
                 }
                 let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
                 if n > 0 {
-                    self.engine.write(&buffer[..n as usize]);
-                    update.changed = true;
+                    update.changed |= self.engine.write(&buffer[..n as usize]);
                 } else if n == 0 {
                     pty.eof = true;
+                    read_budget_exhausted = false;
                     break;
                 } else {
                     let error = std::io::Error::last_os_error();
@@ -327,6 +351,7 @@ impl TerminalSession {
                     if error.kind() != std::io::ErrorKind::WouldBlock {
                         pty.eof = true;
                     }
+                    read_budget_exhausted = false;
                     break;
                 }
             }
@@ -345,16 +370,20 @@ impl TerminalSession {
         }
         let title_update = self.engine.take_title_update();
         self.refresh_title(title_update);
-        if let Some(pty) = &mut self.pty
-            && let Some(Ok(Some(_))) = pty.child.as_mut().map(|child| child.try_wait())
-        {
-            pty.child = None;
-            self.exited = true;
+        if let Some(pty) = &mut self.pty {
+            // Drain final output in bounded batches before publishing exit. A
+            // final done/error report may follow more than one read budget.
+            // Do not wait for EOF, which background descendants can delay.
+            // Reaping before reading ensures this drain follows known exit;
+            // no extra poll is needed after WouldBlock in a detached session.
+            self.exited |= pty.child.is_none() && !read_budget_exhausted;
         }
         if self.exited {
             self.engine.clear_progress();
+            self.engine.program_status_mut().end_execution();
         }
         update.progress_changed = self.engine.take_progress_changed();
+        update.program_status_changed = self.engine.program_status_mut().take_changed();
         update.exited = self.exited;
         update
     }
@@ -385,6 +414,9 @@ impl TerminalSession {
     }
 
     pub(crate) fn refresh_directory(&mut self) {
+        if self.exited {
+            return;
+        }
         let actual_directory = self
             .foreground_pid()
             .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok());
@@ -645,6 +677,29 @@ mod tests {
         wait_for(|| session.poll().exited);
         assert_eq!(session.progress(), Default::default());
         assert!(session.progress_deadline().is_none());
+    }
+
+    #[test]
+    fn process_exit_drops_transients_and_keeps_results_until_interaction() {
+        let directory = TestDirectory::new();
+        let mut session = start(
+            1,
+            &directory.0,
+            "stty -echo; printf '\\033]7501;state=blocked:id=worker\\007'; IFS= read -r line; head -c 700000 /dev/zero | tr '\\000' x; printf '\\033]7501;state=done:id=result:msg=SGVsbG8=\\007'",
+        );
+        wait_for(|| {
+            session.poll();
+            session.program_status().is_some_and(|s| s.count == 1)
+        });
+        session.send_text("exit", true).unwrap();
+        wait_for(|| session.poll().exited);
+        assert!(session.retain_exited());
+        assert!(session.poll_fd().is_none());
+        assert_eq!(session.program_status().unwrap().record.id, "result");
+        assert_eq!(session.program_status().unwrap().count, 1);
+        assert!(session.acknowledge_program_status());
+        assert!(!session.retain_exited());
+        assert!(session.program_status().is_none());
     }
 
     #[test]

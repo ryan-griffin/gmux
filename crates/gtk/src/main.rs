@@ -2,6 +2,7 @@
 mod client;
 
 mod accessible_terminal;
+mod activity;
 mod app;
 mod commands;
 mod find_field;
@@ -43,7 +44,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// List tabs, panes, working directories, progress, and unread indicators.
+    /// List tabs, panes, working directories, program status, progress, and unread indicators.
     ///
     /// With GTK open and no --connection, include all connections in the active window.
     List,

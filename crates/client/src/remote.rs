@@ -455,8 +455,10 @@ impl SessionManager {
                 // A separate control reply can predate queued progress reports.
                 // Once attached, the ordered stream owns live progress delivery.
                 let progress = session.meta.progress;
+                let program_status = session.meta.program_status.take();
                 session.meta = meta.clone();
                 session.meta.progress = progress;
+                session.meta.program_status = program_status;
             } else {
                 self.metadata.insert(meta.id, meta.clone());
             }
@@ -660,6 +662,8 @@ impl SessionManager {
                             session.meta.directory != packet.header.meta.directory;
                         update.progress_changed |=
                             session.meta.progress != packet.header.meta.progress;
+                        update.program_status_changed |=
+                            session.meta.program_status != packet.header.meta.program_status;
                         session.meta = packet.header.meta;
                         update.unread = Some(session.unread());
                         let invalidated = packet.header.generation != 0
@@ -969,6 +973,9 @@ impl RemoteSession {
     }
     pub fn progress(&self) -> crate::progress::Progress {
         self.meta.progress
+    }
+    pub fn program_status(&self) -> Option<&crate::program_status::Summary> {
+        self.meta.program_status.as_ref()
     }
     pub fn busy(&self) -> bool {
         self.meta.busy
@@ -1611,6 +1618,7 @@ mod tests {
                 busy: false,
                 command: Default::default(),
                 progress: Default::default(),
+                program_status: None,
                 modes: [false; 2],
             },
             frame: Frame {
@@ -2250,7 +2258,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_changes_are_metadata_only() {
+    fn progress_and_program_status_changes_preserve_viewport_and_ordered_metadata() {
         let (mut manager, sender, session) = manager();
         // Metadata must also leave a populated history cache and its active
         // prediction alone, rather than only preserving an empty live viewport.
@@ -2291,6 +2299,10 @@ mod tests {
             crate::progress::ProgressState::Inactive,
         ] {
             meta.progress.apply(state, Some(42));
+            meta.program_status = Some(serde_json::from_value(serde_json::json!({
+                "count": 1, "record": {"id":"worker", "state":"blocked", "kind":"question",
+                    "progress":42, "app":"cargo", "title":"Tests", "message": format!("{state:?}")}
+            })).unwrap());
             sender
                 .send(Ok(Packet {
                     header: Header {
@@ -2302,6 +2314,7 @@ mod tests {
                 .unwrap();
             let updates = manager.poll();
             assert!(updates[&1].progress_changed);
+            assert!(updates[&1].program_status_changed);
             assert!(!updates[&1].changed);
             let borrowed = session.borrow();
             assert_eq!(borrowed.progress(), meta.progress);
@@ -2316,8 +2329,13 @@ mod tests {
             drop(borrowed);
             let mut stale = meta.clone();
             stale.progress = Default::default();
+            stale.program_status = None;
             manager.install_metadata(&[stale], 1);
             assert_eq!(session.borrow().progress(), meta.progress);
+            assert_eq!(
+                session.borrow().program_status(),
+                meta.program_status.as_ref()
+            );
         }
     }
 

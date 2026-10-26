@@ -531,6 +531,7 @@ impl Ui {
                 });
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 let updates_git_changed = updates.values().any(|update| update.git_changed);
+                let mut status_tabs = HashSet::new();
                 for (id, mut update) in updates {
                     if update.exited && ui.command_count.get() > 0 {
                         ui.command_exits.borrow_mut().insert(id);
@@ -546,6 +547,11 @@ impl Ui {
                         }
                         continue;
                     };
+                    if update.program_status_changed
+                        || (update.progress_changed && pane.program_status().is_none())
+                    {
+                        status_tabs.insert(tab);
+                    }
                     if update.directory_changed {
                         ui.mark_dirty();
                     }
@@ -575,6 +581,9 @@ impl Ui {
                         ui.notify(tab, pane.id, message);
                     }
                     if (update.exited || pane.exited())
+                        && !pane
+                            .program_status()
+                            .is_some_and(|s| s.record.state.result())
                         && let Err(error) = ui.close_pane(pane.id)
                     {
                         ui.message(&error.to_string());
@@ -583,6 +592,13 @@ impl Ui {
                 let status_changed = ui.sessions.borrow_mut().take_status_changed();
                 if directory_changed || status_changed {
                     ui.refresh_metadata();
+                } else if !status_tabs.is_empty() {
+                    ui.refresh_activity(
+                        ui.tabs
+                            .borrow()
+                            .iter()
+                            .filter(|tab| status_tabs.contains(&tab.id)),
+                    );
                 }
                 if status_changed {
                     ui.refresh_empty();
