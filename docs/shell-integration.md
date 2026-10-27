@@ -57,9 +57,11 @@ discarded output produces an error.
 The control socket accepts `metadata` with `pane`, and `command-output` with
 `pane` and an optional `point: [column, row]`. The frontend stream accepts
 `prompt` with `previous` and a scroll `serial`, and `select-output` with an
-optional `point`, a selection `serial`, and an optional `copy` boolean.
-These operate on that stream's view. `copy: true` delivers through the normal
-frontend clipboard channel. Context menus send `anchor-output` with `point`
+optional `point`, a selection `serial`, and `copy: null`, `"text"`, or
+`"text-html"`. A missing or null `copy` only selects. A format value copies
+through the frontend clipboard channel using that stream's view. GTK requests
+`"text-html"`. `command-output` also accepts `formats: "text-html"` to return
+plain text and optional HTML; `gmux command-output --html` prints this JSON. Context menus send `anchor-output` with `point`
 when opened, then `select-output` with `anchored: true` when chosen. This keeps
 the target attached to its command across output and reflow. Discarded or replaced
 commands fail instead of selecting text that reuses their cells. Targets older

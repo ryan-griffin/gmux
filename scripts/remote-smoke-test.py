@@ -250,7 +250,8 @@ Path(output).write_bytes(data)
         selected = stream.until(lambda h: h["selection_serial"] == 19)
         assert selected["selection"] == dict(start=3, end=stream.frame["cols"] + 4, shape="rectangle"), selected
         stream.send("copy")
-        assert stream.until(lambda h: h["copy"] is not None)["copy"]["text"] == "界é\nde"
+        assert stream.until(lambda h: h["copy"] is not None)["copy"] == dict(
+            destination="clipboard", content=dict(text="界é\nde"))
         stream.close()
         wait_for(lambda: server.rpc("status")["remote_clients"] == 0)
         no_local_daemon(client)

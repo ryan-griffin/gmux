@@ -229,7 +229,12 @@ Pruned references invalidate both highlight and copy. A selection is available
 only on the screen where it was made. These rules also apply to the control
 API's `copy` request, which chooses the focused frontend view, then the newest
 frontend as a fallback. `gmux rpc '{"method":"copy","pane":1}'` returns its
-text; it does not write the desktop clipboard.
+text; it does not write the desktop clipboard. Control and stream `copy`
+requests accept `formats: "text"` (the default) or `"text-html"`. The latter
+returns plain `text` and optional `html` from the same selection. Only requested
+representations are generated. `command-output` accepts the same `formats`.
+For stream `select-output`, `copy` is null to select only, `"text"` to copy
+plain text, or `"text-html"` to copy both representations.
 
 A frontend that handles terminal clipboard writes advertises
 `{"method":"clipboard-writes","enabled":true}`. The default is disabled, so
@@ -241,7 +246,7 @@ Replies are binary viewport packets. Each packet begins with a little-endian
 32-bit payload length. The payload begins with a little-endian 32-bit JSON
 header length, then that many UTF-8 JSON bytes, then cell bytes. The header
 contains pane `meta`, an optional `frame`, changed `rows`, and optional execution
-`state`, Git metadata, notifications, search results, selection, copy text, or
+`state`, Git metadata, notifications, search results, selection, clipboard offers, or
 errors. A full viewport arrives on subscription; later packets contain changed
 rows. Before applying changed rows, shift the previous viewport by `row_shift`
 rows, positive toward smaller viewport indices. Newly exposed rows are always
@@ -249,14 +254,20 @@ included in `rows`. Apply the same shift to soft-wrap flags. Metadata-only
 packets have no cell data.
 
 Clipboard packets are dedicated transient events. Their `copy` field is an
-object with `destination` (`"clipboard"` or `"primary"`) and `text`. A null
-`text` clears that destination; an empty string offers empty text. Apply each
+object with `destination` (`"clipboard"` or `"primary"`) and `content`.
+A null `content` clears that destination. Otherwise `content` contains `text`
+and optional `html`, published together as a single offer. `{"text":""}` offers
+an empty text value. Apply each
 event in wire order across all panes, without applying its default viewport or
 selection metadata. Both explicit `copy` replies and unsolicited writes use
 these packets. `SessionManager::poll_with_clipboard` delivers them in order.
 They are neither coalesced into pane updates nor saved or replayed on reconnect.
-Decoded UTF-8 text is limited to 4 MiB; NUL and unsupported contents are rejected.
-The 16 MiB packet limit also applies after JSON escaping. A stalled frontend's
+Decoded UTF-8 text is limited to 4 MiB and HTML to 8 MiB; NUL is rejected.
+HTML is omitted if generation or normalization fails or if JSON escaping would
+exceed the 16 MiB packet budget with 4 KiB reserved for metadata. Plain-text
+copying remains available. Unsolicited terminal writes offer text only.
+See [clipboard behavior](clipboard.md) for formatter limitations.
+A stalled frontend's
 output is bounded by the existing 32 MiB transport queue.
 
 `generation` identifies cached history for this pane and view. Clears, reflow,

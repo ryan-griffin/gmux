@@ -244,10 +244,10 @@ class WaylandInput:
         self.button(False)
         return bounds
 
-    def clipboard_text(self):
+    def clipboard_text(self, mime="text/plain;charset=utf-8"):
         try:
             result, descriptors = self.bus.call_with_unix_fd_list_sync(REMOTE, self.remote,
-                REMOTE + ".Session", "SelectionRead", GLib.Variant("(s)", ("text/plain;charset=utf-8",)),
+                REMOTE + ".Session", "SelectionRead", GLib.Variant("(s)", (mime,)),
                 GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, 5000, None, None)
         except GLib.Error as error:
             # A fresh session has no owner until GTK publishes its first offer.

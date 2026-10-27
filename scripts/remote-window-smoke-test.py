@@ -12,6 +12,8 @@ import shlex
 import subprocess
 import time
 
+from clipboard_test_support import check_html
+from progress_test_support import ProgressProbe
 from cargo_test_support import cargo_binary
 from test_support import AppFixture, scenario, wait_for
 from wayland_test_support import ensure_wayland_session, WaylandInput
@@ -96,6 +98,19 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
         code = "import os; os.write(1," + repr(sequence) + ")"
         server.rpc("send", pane=original["pane"], text="python3 -c " + shlex.quote(code), enter=True)
         wait_for(lambda: native.clipboard_text() == text)
+    with scenario("remote user copy publishes both GTK MIME formats"), WaylandInput() as native:
+        temporary = receiver.rpc("new", connection="server", name="Rich clipboard")
+        probe = ProgressProbe(server, temporary["pane"])
+        text = "REMOTE <&>界🙂e\u0301"
+        probe.write("\x1b[3J\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07"
+                    + "\x1b[1;38;2;17;34;51m" + text + "\x1b[0m\r\n\x1b]133;D;0\x07")
+        receiver.rpc("action", name="copy-output")
+        wait_for(lambda: native.clipboard_text() == text)
+        html = native.clipboard_text("text/html")
+        check_html(dict(text=text, html=html))
+        assert "rgb(17, 34, 51)" in html and "font-weight: bold" in html
+        receiver.rpc("close-tab", connection="server", tab=temporary["tab"])
+        receiver.rpc("focus", connection="server", pane=original["pane"])
     assert isinstance(command(receiver, "rpc", json.dumps(dict(method="read", pane=original["pane"])))["text"], str)
     assert "absolute" in command(receiver, "new", "--directory", "relative", check=False)
     created = command(receiver, "new", "--directory", "~/project")

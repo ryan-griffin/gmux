@@ -59,7 +59,7 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             first.until(lambda h: h["meta"]["id"] == pane and h["selection"] is not None)
             first.send("copy")
             copied = first.until(lambda h: h["meta"]["id"] == pane and h["copy"] is not None)
-            assert "FIRST_INPUT" in copied["copy"]["text"], copied
+            assert "FIRST_INPUT" in copied["copy"]["content"]["text"], copied
             second.send("copy")
             rejected = second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
             assert rejected["error"] == "Select terminal text to copy it" and rejected["selection"] is None
@@ -68,10 +68,10 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             assert block["selection"] == dict(start=row * second.frame["cols"] + col,
                                                end=(row + 1) * second.frame["cols"] + col + 4, shape="rectangle"), block
             second.send("copy")
-            copied_block = second.until(lambda h: h["copy"] is not None)["copy"]["text"]
+            copied_block = second.until(lambda h: h["copy"] is not None)["copy"]["content"]["text"]
             assert copied_block.split("\n")[0] == "FIRST" and len(copied_block.split("\n")) == 2, copied_block
             first.send("copy")
-            assert "FIRST_INPUT" in first.until(lambda h: h["copy"] is not None)["copy"]["text"]
+            assert "FIRST_INPUT" in first.until(lambda h: h["copy"] is not None)["copy"]["content"]["text"]
             first.send("find", query="line")
             first.until(lambda h: h["meta"]["id"] == pane and h["find"] and h["find"]["total"] == 80 and not h["find"]["pending"])
             second.send("find", query="FIRST_INPUT")
@@ -190,7 +190,7 @@ while control.read_text() != "quit": time.sleep(0.005)
                         and h["frame"]["scrollback"]["offset"] == 0 and "one" in first.text())
             first.send("copy")
             copied = first.until(lambda h: h["copy"] is not None)
-            assert copied["copy"] == dict(destination="clipboard", text="one"), copied
+            assert copied["copy"] == dict(destination="clipboard", content=dict(text="one")), copied
     finally:
         control.write_text("quit")
         first.close()

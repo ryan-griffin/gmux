@@ -1498,48 +1498,107 @@ static int rectangle_padding(GhosttyGridRef ref, uint16_t left, uint16_t right, 
     }
     return 0;
 }
-int gmux_engine_copy(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
-    *written = 0;
+// Isolate unwritten default cells from the pinned styled formatter's deferred
+// blanks, which otherwise inherit the preceding text's background. This only
+// splits formatter ranges; Ghostty still emits every grapheme and CSS style.
+static int format_copy_range(GhosttyTerminal terminal, GhosttyFormatterTerminalOptions options,
+    const GhosttySelection *selection, GhosttyWriter writer, uint16_t cols,
+    uint64_t start, uint64_t end) {
+    if (options.emit == GHOSTTY_FORMATTER_FORMAT_PLAIN)
+        return format_history_range(NULL, terminal, options, selection, writer);
+    GhosttySelection range = *selection;
+    GhosttyGridRef previous = selection->start;
+    bool styled = false;
+    for (uint32_t y = start / cols; y <= end / cols; y++) {
+        uint16_t left = y == start / cols ? start % cols : 0;
+        uint16_t right = y == end / cols ? (uint16_t)(end % cols) : (uint16_t)(cols - 1);
+        GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {left, y}};
+        GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        GhosttyCell cell;
+        GhosttyCellWide wide;
+        if (ghostty_terminal_grid_ref(terminal, point, &ref) || ghostty_grid_ref_cell(&ref, &cell) ||
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide)) return -1;
+        // The formatter includes the complete wide glyph at a left edge.
+        if (left && wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) left--;
+        for (uint32_t x = left; x <= right; x++) {
+            ref.x = x;
+            bool text, styling;
+            if (ghostty_grid_ref_cell(&ref, &cell) ||
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide) ||
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_HAS_TEXT, &text) ||
+                ghostty_cell_get(cell, GHOSTTY_CELL_DATA_HAS_STYLING, &styling)) return -1;
+            if (wide == GHOSTTY_CELL_WIDE_NARROW || wide == GHOSTTY_CELL_WIDE_WIDE) {
+                if (!text && !styling && styled) {
+                    range.end = previous;
+                    if (format_history_range(NULL, terminal, options, &range, writer)) return -1;
+                    range.start = ref;
+                }
+                styled = styling;
+            }
+            previous = ref;
+        }
+    }
+    range.end = selection->end;
+    return format_history_range(NULL, terminal, options, &range, writer);
+}
+int gmux_engine_copy(GmuxEngine *e, bool html, GmuxWriterFn write,
+    void *userdata, GmuxCopyColors *colors) {
     uint64_t start, end;
     bool rectangle;
+    if (!write) return -1;
+    if (html) {
+        GhosttyTerminalModeConfig reverse = {.mode = GHOSTTY_MODE_REVERSE_COLORS};
+        if (!colors ||
+            ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND, colors->foreground) ||
+            ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND, colors->background) ||
+            ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE, colors->palette) ||
+            ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_MODE, &reverse)) return -1;
+        // The color getters do not apply whole-screen reverse video. Match
+        // render-state defaults without changing explicit cell/palette colors.
+        if (reverse.value) {
+            uint8_t swap[3];
+            memcpy(swap, colors->foreground, sizeof(swap));
+            memcpy(colors->foreground, colors->background, sizeof(swap));
+            memcpy(colors->background, swap, sizeof(swap));
+        }
+    }
     if (gmux_engine_selection(e, &start, &end, &rectangle)) return 0;
     GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
     selection.rectangle = rectangle;
-    GhosttyTerminalSelectionFormatOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
-    options.emit=GHOSTTY_FORMATTER_FORMAT_PLAIN; options.unwrap=!rectangle; options.trim=!rectangle; options.selection=&selection;
-    if (!rectangle) {
-        if (ghostty_tracked_grid_ref_snapshot(e->selection_start, &selection.start) ||
-            ghostty_tracked_grid_ref_snapshot(e->selection_end, &selection.end)) return -1;
-        GhosttyResult result=ghostty_terminal_selection_format_buf(e->terminal, options, out, cap, written);
-        return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
-    }
+    GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+    options.emit = html ? GHOSTTY_FORMATTER_FORMAT_HTML : GHOSTTY_FORMATTER_FORMAT_PLAIN;
+    options.unwrap = !rectangle;
+    options.trim = !rectangle;
+    GhosttyWriter writer = {.write = write, .userdata = userdata};
     uint16_t cols;
     if (ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols) || !cols) return -1;
+    if (!rectangle) {
+        if (ghostty_terminal_grid_ref(e->terminal, selection_point(start, cols), &selection.start) ||
+            ghostty_terminal_grid_ref(e->terminal, selection_point(end, cols), &selection.end)) return -1;
+        return format_copy_range(e->terminal, options, &selection, writer, cols, start, end);
+    }
     const uint16_t left = start % cols, right = end % cols;
     const uint32_t bottom = end / cols;
+    uint8_t spaces[128];
+    memset(spaces, ' ', sizeof(spaces));
     for (uint32_t y = start / cols;; y++) {
         GhosttyPoint point = {.tag=GHOSTTY_POINT_TAG_SCREEN, .value.coordinate={left,y}};
         if (ghostty_terminal_grid_ref(e->terminal, point, &selection.start)) return -1;
         selection.end = selection.start;
         selection.end.x = right;
-        size_t padding, bytes = 0;
-        if (rectangle_padding(selection.end, left, right, &padding)) return -1;
-        size_t available = *written < cap ? cap - *written : 0;
-        GhosttyResult result = ghostty_terminal_selection_format_buf(e->terminal, options,
-            available ? out + *written : NULL, available, &bytes);
-        if (result != GHOSTTY_SUCCESS && result != GHOSTTY_OUT_OF_SPACE) return -1;
-        if (bytes > SIZE_MAX - *written) return -1;
-        *written += bytes;
-        if (padding > SIZE_MAX - *written) return -1;
-        available = *written < cap ? cap - *written : 0;
-        if (available) memset(out + *written, ' ', padding < available ? padding : available);
-        *written += padding;
+        size_t padding;
+        if (rectangle_padding(selection.end, left, right, &padding) ||
+            format_copy_range(e->terminal, options, &selection, writer, cols,
+                (uint64_t)y * cols + left, (uint64_t)y * cols + right)) return -1;
+        while (padding) {
+            size_t n = padding < sizeof(spaces) ? padding : sizeof(spaces);
+            if (!write(userdata, spaces, n)) return -1;
+            padding -= n;
+        }
         if (y == bottom) break;
-        if (*written == SIZE_MAX) return -1;
-        if (*written < cap) out[*written] = '\n';
-        (*written)++;
+        if (!write(userdata, (const uint8_t *)"\n", 1)) return -1;
     }
-    return *written > cap ? 1 : 0;
+    return 0;
 }
 
 void gmux_engine_links(GmuxEngine *e, GmuxLinkFn visit, void *userdata) {

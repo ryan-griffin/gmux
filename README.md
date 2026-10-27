@@ -57,12 +57,17 @@ Closing a window leaves its terminals running. Reopen Gmux to reconnect.
 terminals. Remote terminals keep running. After a daemon restart, Gmux restores
 the saved layout and text history with fresh shells. Commands and jobs do not resume.
 
+Copying terminal selections or command output offers plain text and styled
+HTML together. Compatible destinations preserve terminal colors and formatting;
+text destinations receive plain text. See [clipboard behavior](docs/clipboard.md)
+for limits and formatting support.
+
 Terminal programs can write UTF-8 text with OSC 52, including over remote
 connections. Gmux sends each write to one window viewing the pane, preferring
 the last focused eligible window, then the earliest connected window. The `c`
 destination uses the system clipboard and `p` uses primary selection where the
 desktop supports it. An empty OSC 52 payload clears the destination. Secondary
-selection, clipboard reads, and rich MIME contents are unsupported. Writes are
+selection, clipboard reads, and application-submitted rich MIME contents are unsupported. Writes are
 limited to 4 MiB of decoded text and discarded when no eligible window is
 connected. They are never replayed on attachment or session restore.
 

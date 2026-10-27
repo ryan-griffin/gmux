@@ -10,7 +10,7 @@ mod memory;
 mod requests;
 pub use requests::{KeyAction, PasteOptions, SelectionMode, StreamCommand, StreamRequest};
 
-pub const VERSION: u32 = 33;
+pub const VERSION: u32 = 34;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -750,12 +750,56 @@ mod tests {
         packet.header.meta.directory = "/tmp".into();
         packet.header.copy = Some(crate::clipboard::Write {
             destination: crate::clipboard::Destination::Clipboard,
-            text: Some("x".repeat(MAX_PACKET)),
+            content: Some("x".repeat(MAX_PACKET).into()),
         });
         assert!(packet.encode_into(&mut encoded).is_err());
         assert_eq!(encoded, original);
         let decoded = Packet::read(&mut &encoded[..]).unwrap();
         assert!(decoded.cells == packet.cells);
+    }
+
+    #[test]
+    fn rich_clipboard_limits_and_json_fallback_preserve_the_plain_offer() {
+        use crate::clipboard::{Content, Destination, MAX_HTML, Write};
+        let mut content = Content {
+            text: "\"".repeat(MAX_PASTE),
+            html: Some("\\".repeat(MAX_HTML)),
+        };
+        content.bound_html();
+        assert!(content.html.is_none());
+        let mut packet = Packet {
+            header: Header {
+                copy: Some(Write {
+                    destination: Destination::Clipboard,
+                    content: Some(content),
+                }),
+                ..Header::default()
+            },
+            cells: vec![],
+        };
+        let mut wire = vec![];
+        packet.encode_into(&mut wire).unwrap();
+        let decoded = Packet::read(&mut &wire[..]).unwrap();
+        assert_eq!(decoded.header.copy, packet.header.copy);
+        for html in ["x".repeat(MAX_HTML + 1), "bad\0html".into()] {
+            packet
+                .header
+                .copy
+                .as_mut()
+                .unwrap()
+                .content
+                .as_mut()
+                .unwrap()
+                .html = Some(html);
+            wire.clear();
+            assert!(packet.encode_into(&mut wire).is_err());
+            assert!(wire.is_empty());
+            let header = serde_json::to_vec(&packet.header).unwrap();
+            wire.extend_from_slice(&((header.len() + 4) as u32).to_le_bytes());
+            wire.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&header);
+            assert!(Packet::read(&mut &wire[..]).is_err());
+        }
     }
 
     #[test]
@@ -765,7 +809,7 @@ mod tests {
             header: Header {
                 copy: Some(Write {
                     destination: Destination::Clipboard,
-                    text: Some("\u{1}".repeat(MAX_PASTE)),
+                    content: Some("\u{1}".repeat(MAX_PASTE).into()),
                 }),
                 ..Header::default()
             },
@@ -776,7 +820,7 @@ mod tests {
         assert_eq!(encoded, [0; 16]);
         assert!(encoded.capacity() <= 2 * (MAX_PACKET + 20));
         for text in ["x".repeat(MAX_PASTE + 1), "has\0nul".into()] {
-            packet.header.copy.as_mut().unwrap().text = Some(text);
+            packet.header.copy.as_mut().unwrap().content = Some(text.into());
             // Bypass the encoder's checks to test untrusted remote packets.
             let header = serde_json::to_vec(&packet.header).unwrap();
             let mut wire = ((header.len() + 4) as u32).to_le_bytes().to_vec();

@@ -114,7 +114,10 @@ pub enum StreamCommand {
     MarkRead {
         through: u64,
     },
-    Copy,
+    Copy {
+        #[serde(default)]
+        formats: crate::clipboard::Formats,
+    },
     Prompt {
         previous: bool,
         serial: u64,
@@ -124,7 +127,7 @@ pub enum StreamCommand {
         #[serde(default)]
         anchored: bool,
         #[serde(default)]
-        copy: bool,
+        copy: Option<crate::clipboard::Formats>,
         serial: u64,
     },
     AnchorOutput {

@@ -20,6 +20,16 @@ static double seconds(void) {
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
     return time.tv_sec + time.tv_nsec / 1e9;
 }
+typedef struct { uint8_t *bytes; size_t len, cap; } Output;
+static bool copy_bytes(void *ud, const uint8_t *data, size_t len) {
+    Output *out = ud;
+    if (out->bytes) {
+        assert(len <= out->cap - out->len);
+        memcpy(out->bytes + out->len, data, len);
+    }
+    out->len += len;
+    return true;
+}
 int main(int argc, char **argv) {
     const uint32_t history = argc > 1 ? strtoul(argv[1], NULL, 10) : 512;
     const size_t iterations = argc > 2 ? strtoul(argv[2], NULL, 10) : 100000;
@@ -48,16 +58,29 @@ int main(int argc, char **argv) {
 #endif
         }
         double select_us = (seconds() - started) * 1e6 / iterations;
+#ifdef GMUX_LINEAR_BASELINE
         size_t written = 0;
         assert(gmux_engine_copy(engine, NULL, 0, &written) >= 0);
         uint8_t *copy = malloc(written ? written : 1);
         started = seconds();
         for (size_t i = 0; i < 1000; i++)
             assert(!gmux_engine_copy(engine, copy, written, &written));
+        Output output = {.bytes = copy, .len = written};
+#else
+        Output output = {0};
+        assert(!gmux_engine_copy(engine, false, copy_bytes, &output, NULL));
+        output.cap = output.len;
+        output.bytes = malloc(output.cap ? output.cap : 1);
+        started = seconds();
+        for (size_t i = 0; i < 1000; i++) {
+            output.len = 0;
+            assert(!gmux_engine_copy(engine, false, copy_bytes, &output, NULL));
+        }
+#endif
         double copy_us = (seconds() - started) * 1e3;
         printf("{\"history\":%u,\"mode\":%u,\"select_us\":%.4f,\"copy_us\":%.4f,\"copy_bytes\":%zu,\"new_tracked_refs\":%zu}\n",
-            history, mode, select_us, copy_us, written, tracks - initial_tracks);
-        free(copy);
+            history, mode, select_us, copy_us, output.len, tracks - initial_tracks);
+        free(output.bytes);
     }
     gmux_engine_free(engine);
 }

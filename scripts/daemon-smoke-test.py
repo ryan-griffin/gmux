@@ -175,14 +175,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             command("copy", pane=pane)
             reply = copy_reply(lambda header: header["copy"] is not None or header["error"] is not None)
             if selected:
-                assert reply["copy"] == dict(destination="clipboard", text="HEADL") and reply["error"] is None, reply
+                assert reply["copy"] == dict(destination="clipboard", content=dict(text="HEADL")) and reply["error"] is None, reply
             else:
                 assert reply["error"] == "Select terminal text to copy it" and reply["copy"] is None, reply
         # Selected whitespace is still a selection and may copy an empty string.
         command("select", pane=pane, start=[0, 1], end=[0, 1])
         command("copy", pane=pane)
         reply = copy_reply(lambda header: header["copy"] is not None or header["error"] is not None)
-        assert reply["copy"] == dict(destination="clipboard", text="") and reply["error"] is None, reply
+        assert reply["copy"] == dict(destination="clipboard", content=dict(text="")) and reply["error"] is None, reply
         command("clear-selection", pane=pane)
         while select.select([stream], [], [], 0.1)[0]:
             packet()

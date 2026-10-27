@@ -192,7 +192,14 @@ int gmux_engine_clear_screen(GmuxEngine *engine);
 // The active screen must own both tracked corners. Rectangle bounds normalize
 // to top-left/bottom-right using the current grid, including after reflow.
 int gmux_engine_selection(GmuxEngine *engine, uint64_t *start, uint64_t *end, bool *rectangle);
-int gmux_engine_copy(GmuxEngine *engine, uint8_t *bytes, size_t cap, size_t *written);
+typedef struct {
+    uint8_t foreground[3], background[3], palette[256][3];
+} GmuxCopyColors;
+// Formats this view's tracked selection synchronously. A rejecting writer stops
+// generation immediately. HTML callers receive the effective terminal colors;
+// Ghostty's CSS palette references use these colors, never selection colors.
+int gmux_engine_copy(GmuxEngine *engine, bool html, GmuxWriterFn write,
+    void *userdata, GmuxCopyColors *colors);
 int gmux_engine_theme(GmuxEngine *engine, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *palette, bool dark);
 // False for status-only input or an unfinished OSC introducer/body.

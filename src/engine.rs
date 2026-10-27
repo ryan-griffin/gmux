@@ -21,6 +21,9 @@ use ffi::{Cell, Frame};
 #[path = "engine/selection_tests.rs"]
 mod selection_tests;
 
+#[path = "engine/copy_html.rs"]
+mod copy_html;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompressionResult {
     Unsupported,
@@ -120,7 +123,10 @@ unsafe extern "C" fn clipboard_write(
         Some(text.to_owned())
     };
     events.clipboard_bytes += len;
-    events.clipboard.push(Write { destination, text });
+    events.clipboard.push(Write {
+        destination,
+        content: text.map(Into::into),
+    });
     GMUX_CLIPBOARD_SUCCESS as i32
 }
 unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usize) {
@@ -849,28 +855,62 @@ impl Engine {
             })
     }
     pub fn copy(&self) -> anyhow::Result<String> {
-        let mut written = 0;
-        let result =
-            unsafe { gmux_engine_copy(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut written) };
-        anyhow::ensure!(
-            result >= 0 && written <= gmux_client::transport::MAX_PASTE,
-            "Selection is too large to copy"
-        );
-        let mut bytes = vec![0; written];
+        self.format_copy(false, gmux_client::transport::MAX_PASTE)
+            .map(|(text, _)| text)
+    }
+    pub fn copy_content(
+        &self,
+        formats: gmux_client::clipboard::Formats,
+    ) -> anyhow::Result<gmux_client::clipboard::Content> {
+        let text = self.copy()?;
+        let html = if formats == gmux_client::clipboard::Formats::TextHtml {
+            self.format_copy(true, gmux_client::clipboard::MAX_HTML)
+                .ok()
+                .and_then(|(raw, colors)| copy_html::normalize(&raw, &text, &colors))
+        } else {
+            None
+        };
+        let mut content = gmux_client::clipboard::Content { text, html };
+        content.bound_html();
+        Ok(content)
+    }
+    fn format_copy(&self, html: bool, limit: usize) -> anyhow::Result<(String, GmuxCopyColors)> {
+        struct Output {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        unsafe extern "C" fn write(ud: *mut c_void, data: *const u8, len: usize) -> bool {
+            let out = unsafe { &mut *ud.cast::<Output>() };
+            if len > out.limit - out.bytes.len() {
+                return false;
+            }
+            out.bytes
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+            true
+        }
+        let mut out = Output {
+            bytes: Vec::new(),
+            limit,
+        };
+        let mut colors = GmuxCopyColors {
+            foreground: [0; 3],
+            background: [0; 3],
+            palette: [[0; 3]; 256],
+        };
         let result = unsafe {
             gmux_engine_copy(
                 self.raw.as_ptr(),
-                bytes.as_mut_ptr(),
-                bytes.len(),
-                &mut written,
+                html,
+                Some(write),
+                (&mut out as *mut Output).cast(),
+                &mut colors,
             )
         };
         anyhow::ensure!(
-            result == 0 && written <= bytes.len(),
-            "Could not copy terminal selection"
+            result == 0,
+            "Could not copy terminal selection within its size limit"
         );
-        bytes.truncate(written);
-        String::from_utf8(bytes).map_err(Into::into)
+        Ok((String::from_utf8(out.bytes)?, colors))
     }
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }

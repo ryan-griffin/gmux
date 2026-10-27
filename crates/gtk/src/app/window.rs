@@ -523,11 +523,7 @@ impl Ui {
                         Destination::Clipboard => ui.window.clipboard(),
                         Destination::Primary => ui.window.primary_clipboard(),
                     };
-                    if let Some(text) = write.text {
-                        clipboard.set_text(&text);
-                    } else {
-                        let _ = clipboard.set_content(None::<&gdk::ContentProvider>);
-                    }
+                    crate::clipboard::publish(&clipboard, write.content);
                 });
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 let updates_git_changed = updates.values().any(|update| update.git_changed);
