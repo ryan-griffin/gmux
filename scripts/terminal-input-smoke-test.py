@@ -6,6 +6,7 @@ headless Mutter compositor with XWayland disabled and a private PipeWire server.
 """
 import json
 import base64
+from clipboard_test_support import check_html
 from contextlib import contextmanager
 from functools import partial
 from test_support import rpc as shared_rpc, wait_for as shared_wait_for, descendants, DelayedViewport, create_tab_when_connected, assert_stays
@@ -164,6 +165,7 @@ done.touch()
             wait_for(lambda: rpc("_copy", pane=pane)["text"] == "native-output-99")
             rpc("action", name="copy-output")
             wait_for(lambda: native.clipboard_text() == "native-output-99")
+            check_html(dict(text="native-output-99", html=native.clipboard_text("text/html")))
             geometry = appearance()
             sx, sy, _, sb = wait_for(lambda: native.frame(timeout=.1, fresh=False).color_bounds((33, 122, 77)))
             native.move(sx + geometry["cell_width"] * .5, (sy + sb) / 2)
@@ -173,6 +175,9 @@ done.touch()
                 if obj.get_process_id() == app.pid and obj.get_name() == "Copy Command Output"), None))
             Atspi.Action.do_action(item.get_action_iface(), 0)
             wait_for(lambda: native.clipboard_text() == "native-output-98")
+            html = native.clipboard_text("text/html")
+            check_html(dict(text="native-output-98", html=html))
+            assert "rgb(33, 122, 77)" in html, html
             before_prompt = appearance()["scrollback"]["offset"]
             native.key(Gdk.KEY_Control_L, True)
             native.key(Gdk.KEY_Shift_L, True)
@@ -183,9 +188,24 @@ done.touch()
             wait_for(lambda: appearance(lambda s: not s["scroll_pending"] and s["scrollback"]["offset"] < before_prompt))
             rpc("action", name="next-prompt")
             wait_for(lambda: appearance(lambda s: not s["scroll_pending"] and s["scrollback"]["offset"] == before_prompt))
+            rich_text = "<>&\"'界🙂e\u0301"
+            sequence = ("\x1b[?5h\x1b]10;#123456\x07\x1b]11;#654321\x07"
+                        + "\x1b[3J\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07"
+                        + "\x1b[1;3;4:3;9;38;2;17;34;51m" + rich_text
+                        + "\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07").encode()
+            appearance_control.write_bytes(sequence)
+            wait_for(lambda: appearance_applied.read_bytes() == sequence)
+            rpc("action", name="copy-output")
+            wait_for(lambda: native.clipboard_text() == rich_text)
+            html = native.clipboard_text("text/html")
+            check_html(dict(text=rich_text, html=html))
+            assert "color:#654321;background-color:#123456" in html, html
+            for fragment in ["&lt;&gt;&amp;&quot;&#39;", "font-weight: bold", "font-style: italic", "rgb(17, 34, 51)"]:
+                assert fragment in html, html
             # Return to a neutral screen for the remaining input probes.
-            appearance_control.write_bytes(b'\x1b[3J\x1b[2J\x1b[H')
-            wait_for(lambda: appearance_applied.read_bytes() == b'\x1b[3J\x1b[2J\x1b[H')
+            neutral = b'\x1b[?5l\x1b]110\x07\x1b]111\x07\x1b[3J\x1b[2J\x1b[H'
+            appearance_control.write_bytes(neutral)
+            wait_for(lambda: appearance_applied.read_bytes() == neutral)
             # Terminal clipboard writes use the daemon stream and real GDK
             # offers. Primary selection must not overwrite the regular clipboard.
             def program_clipboard(text, destination):
@@ -687,6 +707,7 @@ Path(done).touch()
                 rpc("action", name="copy")
                 wait_for(lambda: native.clipboard_text() == expected,
                          message=f"Selection must copy {expected!r}")
+                check_html(dict(text=expected, html=native.clipboard_text("text/html")), expected)
 
             def selection(start, end, shape="linear"):
                 return dict(start=start, end=end, shape=shape)

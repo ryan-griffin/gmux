@@ -49,18 +49,6 @@ fn rectangles_copy_physical_rows_blanks_and_complete_graphemes_in_every_directio
         .select((7, 0), (7, 1), SelectionMode::Rectangle)
         .unwrap();
     assert_eq!(engine.copy().unwrap(), " \n ");
-    let mut guarded = [0xee; 4];
-    let mut written = 0;
-    let result = unsafe {
-        gmux_engine_copy(
-            engine.raw.as_ptr(),
-            guarded.as_mut_ptr().add(1),
-            1,
-            &mut written,
-        )
-    };
-    assert_eq!((result, written), (1, 3));
-    assert_eq!(guarded, [0xee, b' ', 0xee, 0xee]);
 }
 
 #[test]

@@ -67,9 +67,13 @@ pub enum ExecutionRequest {
     CommandOutput {
         pane: u64,
         point: Option<(u16, u32)>,
+        #[serde(default)]
+        formats: crate::clipboard::Formats,
     },
     Copy {
         pane: u64,
+        #[serde(default)]
+        formats: crate::clipboard::Formats,
     },
 }
 impl ExecutionRequest {
@@ -137,7 +141,11 @@ pub enum InternalRequest {
     #[serde(rename = "_metadata")]
     Metadata { pane: Option<u64> },
     #[serde(rename = "_copy")]
-    Copy { pane: Option<u64> },
+    Copy {
+        pane: Option<u64>,
+        #[serde(default)]
+        formats: crate::clipboard::Formats,
+    },
     #[serde(rename = "_read")]
     Read { pane: Option<u64> },
 }
@@ -162,6 +170,8 @@ pub enum PaneRequest {
     CommandOutput {
         pane: Option<u64>,
         point: Option<(u16, u32)>,
+        #[serde(default)]
+        formats: crate::clipboard::Formats,
     },
     Read {
         pane: Option<u64>,
@@ -236,7 +246,7 @@ impl Request {
                     | ExecutionRequest::Notify { pane: id, .. }
                     | ExecutionRequest::Metadata { pane: id }
                     | ExecutionRequest::CommandOutput { pane: id, .. }
-                    | ExecutionRequest::Copy { pane: id } => *id = resolve_pane(Some(*id))?,
+                    | ExecutionRequest::Copy { pane: id, .. } => *id = resolve_pane(Some(*id))?,
                     _ => (),
                 }
                 (request, false)
@@ -251,9 +261,10 @@ impl Request {
                 },
                 false,
             ),
-            Self::Internal(InternalRequest::Copy { pane: id }) => (
+            Self::Internal(InternalRequest::Copy { pane: id, formats }) => (
                 ExecutionRequest::Copy {
                     pane: resolve_pane(id)?,
+                    formats,
                 },
                 false,
             ),
@@ -394,9 +405,14 @@ impl PaneRequest {
             Self::Metadata { pane } => ExecutionRequest::Metadata {
                 pane: resolve_pane(pane)?,
             },
-            Self::CommandOutput { pane, point } => ExecutionRequest::CommandOutput {
+            Self::CommandOutput {
+                pane,
+                point,
+                formats,
+            } => ExecutionRequest::CommandOutput {
                 pane: resolve_pane(pane)?,
                 point,
+                formats,
             },
             Self::Links { pane } => ExecutionRequest::Links {
                 pane: resolve_pane(pane)?,

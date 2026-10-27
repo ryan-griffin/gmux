@@ -1081,26 +1081,33 @@ impl RemoteSession {
         self.selection_serial.set(serial);
         Ok(())
     }
-    pub fn copy(&self) -> anyhow::Result<()> {
-        self.command(StreamCommand::Copy)
+    pub fn copy(&self, formats: crate::clipboard::Formats) -> anyhow::Result<()> {
+        self.command(StreamCommand::Copy { formats })
     }
     pub fn command_state(&self) -> &crate::shell::CommandState {
         &self.meta.command
     }
-    pub fn select_output(&self, point: Option<(u16, u32)>, copy: bool) -> anyhow::Result<()> {
+    pub fn select_output(
+        &self,
+        point: Option<(u16, u32)>,
+        copy: Option<crate::clipboard::Formats>,
+    ) -> anyhow::Result<()> {
         self.select_output_target(point, false, copy)
     }
     pub fn anchor_output(&self, point: (u16, u32)) -> anyhow::Result<()> {
         self.command(StreamCommand::AnchorOutput { point })
     }
-    pub fn select_anchored_output(&self, copy: bool) -> anyhow::Result<()> {
+    pub fn select_anchored_output(
+        &self,
+        copy: Option<crate::clipboard::Formats>,
+    ) -> anyhow::Result<()> {
         self.select_output_target(None, true, copy)
     }
     fn select_output_target(
         &self,
         point: Option<(u16, u32)>,
         anchored: bool,
-        copy: bool,
+        copy: Option<crate::clipboard::Formats>,
     ) -> anyhow::Result<()> {
         let serial = self.selection_serial.get() + 1;
         self.command(StreamCommand::SelectOutput {
@@ -1727,7 +1734,10 @@ mod tests {
                     },
                     copy: Some(Write {
                         destination,
-                        text: text.map(str::to_owned),
+                        content: text.map(|text| crate::clipboard::Content {
+                            text: text.into(),
+                            html: (text == "last").then(|| "<div>last</div>".into()),
+                        }),
                     }),
                     ..Header::default()
                 },
@@ -1749,7 +1759,7 @@ mod tests {
         assert_eq!(
             writes
                 .iter()
-                .map(|w| (w.destination, w.text.as_deref()))
+                .map(|w| (w.destination, w.content.as_ref().map(|c| c.text.as_str())))
                 .collect::<Vec<_>>(),
             [
                 (Destination::Clipboard, Some("first 界🙂")),
@@ -1757,6 +1767,10 @@ mod tests {
                 (Destination::Clipboard, None),
                 (Destination::Clipboard, Some("last")),
             ]
+        );
+        assert_eq!(
+            writes[3].content.as_ref().unwrap().html.as_deref(),
+            Some("<div>last</div>")
         );
         assert_eq!(handle.borrow().selection, Some(Selection::linear(0, 1)));
         manager.poll_with_clipboard(|_| panic!("replayed clipboard write"));
@@ -2999,7 +3013,10 @@ mod tests {
         assert_eq!(handle.borrow().text(), "ff\ngg");
         handle.borrow_mut().scroll_to(4);
         assert_eq!(handle.borrow().snapshot().cells[0].text(), "e");
-        handle.borrow().copy().unwrap();
+        handle
+            .borrow()
+            .copy(crate::clipboard::Formats::Text)
+            .unwrap();
         assert_eq!(
             wire(receiver.try_recv().unwrap()),
             json!({"method":"scroll-to","pane":1,"row":4,"serial":5})

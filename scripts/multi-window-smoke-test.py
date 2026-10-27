@@ -12,9 +12,11 @@ import gi
 gi.require_version("GioUnix", "2.0")
 from gi.repository import Gio, GioUnix
 
+from clipboard_test_support import check_html
+from progress_test_support import ProgressProbe
 from cargo_test_support import cargo_binary
 from test_support import AppFixture, scenario, stop_process, wait_for
-from wayland_test_support import ensure_wayland_session
+from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
 root = Path(__file__).resolve().parent.parent
@@ -74,6 +76,29 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         wait_for(lambda: len(fixture.rpc("windows")["windows"]) == 2)
         wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
         assert app.poll() is None
+
+    with scenario("each window copies its own selection with both GTK MIME representations"), WaylandInput() as native:
+        temporary = fixture.rpc("new", window=first, name="Clipboard selections")
+        selected_pane = temporary["pane"]
+        for window in [first, second]:
+            fixture.rpc("focus", window=window, pane=selected_pane)
+        probe = ProgressProbe(fixture, selected_pane)
+        def output(text, color):
+            probe.write("\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07"
+                        + f"\x1b[38;2;{color}m" + text + "\x1b[0m\r\n\x1b]133;D;0\x07")
+        output("first <界>e\u0301", "17;34;51")
+        fixture.rpc("action", window=first, name="select-output")
+        wait_for(lambda: fixture.rpc("renderer-info", window=first, pane=selected_pane)["viewport"]["selection"])
+        output("second &🙂", "68;85;102")
+        fixture.rpc("action", window=second, name="select-output")
+        wait_for(lambda: fixture.rpc("renderer-info", window=second, pane=selected_pane)["viewport"]["selection"])
+        for window, text in [(first, "first <界>e\u0301"), (second, "second &🙂"), (first, "first <界>e\u0301")]:
+            fixture.rpc("action", window=window, name="copy")
+            wait_for(lambda: native.clipboard_text() == text)
+            check_html(dict(text=text, html=native.clipboard_text("text/html")))
+        fixture.rpc("close-tab", tab=temporary["tab"])
+        for window in [first, second]:
+            fixture.rpc("focus", window=window, pane=pane)
 
     with scenario("shared tabs and workspaces preserve each window's UI choices"):
         workspace = fixture.rpc("workspace-add", window=first, name="Shared workspace", directory=str(root))["workspace"]

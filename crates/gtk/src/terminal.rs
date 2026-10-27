@@ -759,7 +759,11 @@ impl Terminal {
         self.send_drag_selection();
         // Paint can invalidate the displayed range before a resize reply arrives.
         // The daemon validates its tracked selection in command order.
-        if let Err(error) = self.session.borrow().copy() {
+        if let Err(error) = self
+            .session
+            .borrow()
+            .copy(gmux_client::clipboard::Formats::TextHtml)
+        {
             self.show_status(&error.to_string());
             return false;
         }
@@ -783,13 +787,20 @@ impl Terminal {
     }
     pub fn select_output(&self, point: Option<(u16, u32)>, copy: bool) {
         self.stop_selection_drag();
-        if let Err(error) = self.session.borrow().select_output(point, copy) {
+        if let Err(error) = self.session.borrow().select_output(
+            point,
+            copy.then_some(gmux_client::clipboard::Formats::TextHtml),
+        ) {
             self.show_status(&error.to_string());
         }
     }
     fn select_context_output(&self, copy: bool) {
         self.stop_selection_drag();
-        if let Err(error) = self.session.borrow().select_anchored_output(copy) {
+        if let Err(error) = self
+            .session
+            .borrow()
+            .select_anchored_output(copy.then_some(gmux_client::clipboard::Formats::TextHtml))
+        {
             self.show_status(&error.to_string());
         }
     }

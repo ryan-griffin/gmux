@@ -69,8 +69,17 @@ The `clipboard` headless suite checks OSC 52 through local and remote streams,
 recipient focus and visibility, explicit copy ordering, decoded size limits,
 detach/reconnect without replay, and bounded output when a frontend stops
 reading. It also compiles the native normalized-request policy and reply check.
-The native `terminal-input` suite checks Unicode OSC 52 writes through the GDK
-clipboard and primary-selection paste in the private Wayland session.
+Rich-copy cases compare independently parsed HTML with plain text over both
+transports, including colors, escapes, long graphemes, soft wraps, page boundaries,
+rectangles, blank padding, and bounded styled expansion. A daemon queue test
+checks rich-offer admission and rejection rollback without losing prior offers
+or a following clear event. The `shell` suite also
+checks rich command-output requests and the CLI.
+The native `terminal-input` suite reads both MIME representations from actual
+GTK clipboard offers, checks Unicode OSC 52 writes, and pastes primary selection
+in the private Wayland session. `multi-window` verifies each window's selection;
+`remote-window` reads a remote rich copy through GTK. These reads outlive the
+transient daemon packet and exercise provider ownership.
 
 The `shell` headless suite requires Bash and Zsh. It checks real login startup,
 existing prompt/preexec hooks, scalar and array `PROMPT_COMMAND`, disabled Bash

@@ -82,6 +82,9 @@ enum Command {
         /// Zero-based row in retained history, including the active screen.
         #[arg(long, requires = "column")]
         row: Option<u32>,
+        /// Return JSON with plain text and optional styled HTML.
+        #[arg(long)]
+        html: bool,
     },
     /// Deliver a notification to clients viewing a pane.
     Notify {
@@ -297,7 +300,10 @@ fn run() -> anyhow::Result<()> {
         );
     }
     let stop = matches!(&cli.command, Command::Stop);
-    let plain_text = matches!(&cli.command, Command::Read { .. } | Command::Output { .. });
+    let plain_text = matches!(
+        &cli.command,
+        Command::Read { .. } | Command::Output { html: false, .. }
+    );
     let request = match cli.command {
         Command::Serve(_) => unreachable!(),
         Command::Status => serde_json::to_value(PublicRequest::Status)?,
@@ -325,12 +331,20 @@ fn run() -> anyhow::Result<()> {
         })?,
         Command::Links { pane } => serde_json::to_value(PaneRequest::Links { pane })?,
         Command::Metadata { pane } => serde_json::to_value(PaneRequest::Metadata { pane })?,
-        Command::Output { pane, column, row } => {
-            serde_json::to_value(PaneRequest::CommandOutput {
-                pane,
-                point: column.zip(row),
-            })?
-        }
+        Command::Output {
+            pane,
+            column,
+            row,
+            html,
+        } => serde_json::to_value(PaneRequest::CommandOutput {
+            pane,
+            point: column.zip(row),
+            formats: if html {
+                gmux_client::clipboard::Formats::TextHtml
+            } else {
+                gmux_client::clipboard::Formats::Text
+            },
+        })?,
         Command::Read { pane } => serde_json::to_value(PaneRequest::Read { pane })?,
         Command::Notify { message, pane } => {
             serde_json::to_value(PaneRequest::Notify { pane, message })?

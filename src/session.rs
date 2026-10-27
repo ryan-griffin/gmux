@@ -447,9 +447,13 @@ impl TerminalSession {
         self.engine.command_state()
     }
 
-    pub(crate) fn command_output(&mut self, point: Option<(u16, u32)>) -> anyhow::Result<String> {
+    pub(crate) fn command_output(
+        &mut self,
+        point: Option<(u16, u32)>,
+        formats: gmux_client::clipboard::Formats,
+    ) -> anyhow::Result<gmux_client::clipboard::Content> {
         self.engine.select_output(point)?;
-        self.engine.copy()
+        self.engine.copy_content(formats)
     }
 
     /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.

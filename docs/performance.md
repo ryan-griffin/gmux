@@ -352,3 +352,66 @@ artifacts/hyperlink-benchmark long-output 1000
 Use matching compiler flags and Ghostty builds when comparing revisions. This
 probe does not measure frontend input latency or physical display latency.
 Use the renderer benchmark separately to check row rebuilds and drawing costs.
+
+## Clipboard copy
+
+Plain copy streams one formatter pass into a bounded buffer. HTML is generated
+only on request, with an independent 8 MiB writer budget and final-output limit.
+It adds no work to viewport extraction and no copy cache to engines or views.
+The desktop retains the current offer until it is replaced.
+
+Measure the complete Rust engine path, including HTML normalization and JSON
+size accounting, in fresh processes:
+
+```sh
+GMUX_COPY_CASE=styled GMUX_COPY_CELLS=100000 GMUX_COPY_FORMATS=text-html \
+  cargo test --locked --release -p gmux-core copy_measurements -- --ignored --nocapture
+```
+
+Cases are `uniform`, alternating indexed colors (`styled`), or alternating RGB
+colors with bold, italic and decorations (`heavy`). Formats are `text` and
+`text-html`. Cell counts are multiples of 1,000, up to 131,000. The probe reports
+50-copy mean wall time, actual representation sizes, RSS with the offer alive,
+and peak RSS growth after resetting Linux's ingestion high-water mark. RSS
+includes allocator retention and does not measure GTK, transport, or GPU memory.
+
+HTML normalization copies matching ASCII runs in batches and writes RGB colors
+without general-purpose formatting. It reserves room for inline wrappers and
+caps every output-buffer growth request at the HTML limit. A run that needs
+whitespace reconciliation falls back once, avoiding repeated scans of a long
+prefix before trimmed spaces.
+
+An x86-64 release measurement used three fresh processes per case, with 50
+copies per process. The table reports median process means for 100,000 selected
+characters, including formatting, normalization and JSON accounting:
+
+| Content | Plain + HTML | HTML bytes | Peak RSS growth |
+| --- | ---: | ---: | ---: |
+| Uniform | 2.58 ms | 100,285 | 0.3 MiB |
+| Alternating indexed colors | 39.72 ms | 5,400,285 | 14.7 MiB |
+| Heavy styles | 7.12 ms | Omitted at the limit | 12.7 MiB |
+
+At 2,000 characters, rich copies took 0.10 ms uniform, 0.99 ms with alternating
+indexed colors, and 1.73 ms with heavy styles. Reported peak growth stayed below
+1 MiB. RSS varies with allocator state and page accounting. These are engine
+measurements; destination paste performance varies.
+
+The native plain-copy comparison includes the former size-query pass and the
+new streaming allocation. `copy-benchmark.c` temporarily permits 64 MiB of
+retained terminal data so large selections do not prune themselves:
+
+```sh
+ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
+cc -O2 -std=c11 -DGMUX_VERSION='"benchmark"' -I"$ghostty_prefix/include" \
+  scripts/copy-benchmark.c -L"$ghostty_prefix/lib" \
+  -Wl,-rpath,"$ghostty_prefix/lib" -lghostty-vt -o artifacts/copy-benchmark
+artifacts/copy-benchmark 4000000 styled
+```
+
+To compare another bridge, define `GMUX_BRIDGE_SOURCE` as its quoted absolute C
+source path and `GMUX_COPY_BASELINE` for the former buffer API. Five-process
+median CPU time fell from 0.40 to 0.19 ms for 100,000 uniform characters and
+from 15.97 to 8.05 ms for 4,000,000. Alternating indexed colors took 16.28 ms
+before and 8.34 ms after at 4,000,000 characters. Streaming buffer growth raised
+peak copy scratch from about 4 to 6 MiB at that size. All buffers are temporary;
+plain-only requests allocate no HTML storage.

@@ -40,8 +40,10 @@ impl Packet {
             + header
                 .copy
                 .as_ref()
-                .and_then(|write| write.text.as_ref())
-                .map_or(0, String::capacity)
+                .and_then(|write| write.content.as_ref())
+                .map_or(0, |content| {
+                    content.text.capacity() + content.html.as_ref().map_or(0, String::capacity)
+                })
             + header.find.as_ref().map_or(0, |find| {
                 find.highlights.capacity() * size_of::<(usize, usize, u8)>()
             })
@@ -210,6 +212,27 @@ mod tests {
                 .unwrap();
             assert!(matches!(receiver.try_recv(), Ok(Err(_))), "{name}");
         }
+    }
+
+    #[test]
+    fn rich_clipboard_capacity_counts_toward_incoming_queue_admission() {
+        use crate::clipboard::{Content, Destination, Write};
+        let packet = Packet {
+            header: Header {
+                copy: Some(Write {
+                    destination: Destination::Clipboard,
+                    content: Some(Content {
+                        text: String::with_capacity(8192),
+                        html: Some(String::with_capacity(8192)),
+                    }),
+                }),
+                ..Header::default()
+            },
+            cells: vec![],
+        };
+        assert!(packet.memory_size() >= 16384);
+        let (sender, _) = incoming::channel(12000, 8);
+        assert_eq!(sender.send(Ok(packet)), Err(incoming::SendError::TooLarge));
     }
 
     #[test]

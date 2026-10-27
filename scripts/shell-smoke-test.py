@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 
+from clipboard_test_support import check_html
 from cargo_test_support import cargo_binary
 from progress_test_support import ProgressProbe
 from stream_test_support import Client
@@ -158,15 +159,17 @@ with AppFixture(prefix="gmux-semantic-") as f:
             first.send("prompt", previous=False, serial=2)
             h = first.until(lambda h: h["frame"] and h["scroll_serial"] == 2)
             assert h["frame"]["scrollback"]["offset"] == 2, h
-            first.send("select-output", point=[0, 3], copy=True, serial=1)
+            first.send("select-output", point=[0, 3], copy="text-html", serial=1)
             h = first.until(lambda h: h.get("copy") is not None)
-            assert h["copy"]["text"] == "result1", h
+            check_html(h["copy"]["content"], "result1")
             second.send("copy")
             h = second.until(lambda h: h.get("error") is not None)
             assert "Select terminal text" in h["error"], h
-            second.send("select-output", point=None, copy=True, serial=1)
+            second.send("select-output", point=None, copy="text-html", serial=1)
             h = second.until(lambda h: h.get("copy") is not None)
-            assert h["copy"]["text"] == "result7", h
+            check_html(h["copy"]["content"], "result7")
+            rich = json.loads(subprocess.check_output([str(binary), "command-output", "--pane", str(pane), "--html"], env=f.env, text=True))
+            check_html(rich, "result7")
             result = subprocess.check_output([str(binary), "command-output", "--pane", str(pane)], env=f.env, text=True)
             assert result.rstrip("\n") == "result7", repr(result)
         with scenario("captured output rejects reused cells without affecting another client"):
@@ -178,12 +181,12 @@ with AppFixture(prefix="gmux-semantic-") as f:
             first.barrier(3)
             probe.write("\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07new\r\n"
                         "\x1b]133;C\x07new output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
-            first.send("select-output", point=None, anchored=True, copy=True, serial=2)
+            first.send("select-output", point=None, anchored=True, copy="text", serial=2)
             h = first.until(lambda h: h.get("error") == "No command output available")
             assert h["selection_serial"] == 2 and h.get("copy") is None, h
-            second.send("select-output", point=None, copy=True, serial=2)
+            second.send("select-output", point=None, copy="text", serial=2)
             h = second.until(lambda h: h.get("copy") is not None)
-            assert h["copy"]["text"] == "new output", h
+            assert h["copy"]["content"]["text"] == "new output", h
         with scenario("captured output rejects erasure inside a later command"):
             probe.write("\x1bc\x1b]133;A\x07$ \x1b]133;B\x07old\r\n"
                         "\x1b]133;C\x07old output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
@@ -191,19 +194,19 @@ with AppFixture(prefix="gmux-semantic-") as f:
             first.barrier(4)
             probe.write("new\r\n\x1b]133;C\x07\x1b[2J\x1b[Hnew first\r\nnew second\r\n"
                         "\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
-            first.send("select-output", point=None, anchored=True, copy=True, serial=3)
+            first.send("select-output", point=None, anchored=True, copy="text", serial=3)
             h = first.until(lambda h: h.get("error") == "No command output available")
             assert h["selection_serial"] == 3 and h.get("copy") is None, h
             second.send("anchor-output", point=[0, 0])
             second.barrier(5)
-            second.send("select-output", point=None, anchored=True, copy=True, serial=3)
+            second.send("select-output", point=None, anchored=True, copy="text", serial=3)
             h = second.until(lambda h: h.get("copy") is not None)
-            assert h["copy"]["text"] == "new first\nnew second", h
+            assert h["copy"]["content"]["text"] == "new first\nnew second", h
         with scenario("partial events, alternate screen, reset and process fallback"):
             probe.burst(["\x1b]133;C;cmdline_", "url=partial%20command", "\x07"], .01)
             wait_for(lambda: f.rpc("metadata", pane=pane)["meta"]["command"]["command"] == "partial command")
             probe.write("\x1b[?1049h\x1b]133;D;99\x07\x1b]133;A\x07")
-            first.send("select-output", point=None, copy=False, serial=4)
+            first.send("select-output", point=None, copy=None, serial=4)
             h = first.until(lambda h: h.get("error") == "No command output available")
             assert h["selection_serial"] == 4, h
             assert f.rpc("metadata", pane=pane)["meta"]["command"]["phase"] == "running"

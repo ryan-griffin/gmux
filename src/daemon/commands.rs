@@ -331,18 +331,26 @@ impl Daemon {
                         "program_status_records": session.program_status_records()}),
                 )
             }
-            ExecutionRequest::CommandOutput { pane: id, point } => {
-                let text = self.sessions.get_mut(&id).unwrap().command_output(point)?;
-                Ok(json!({"text":text}))
+            ExecutionRequest::CommandOutput {
+                pane: id,
+                point,
+                formats,
+            } => {
+                let content = self
+                    .sessions
+                    .get_mut(&id)
+                    .unwrap()
+                    .command_output(point, formats)?;
+                Ok(serde_json::to_value(content)?)
             }
-            ExecutionRequest::Copy { pane: id } => {
+            ExecutionRequest::Copy { pane: id, formats } => {
                 let frontend = self
                     .frontends
                     .iter()
                     .filter(|(_, f)| f.views.contains_key(&id))
                     .max_by_key(|(client, f)| (f.focused, **client))
                     .map(|(&client, _)| client);
-                let text = if let Some(client) = frontend {
+                let content = if let Some(client) = frontend {
                     let view = self
                         .frontends
                         .get_mut(&client)
@@ -353,11 +361,11 @@ impl Daemon {
                     self.sessions
                         .get_mut(&id)
                         .unwrap()
-                        .with_view(view, |engine| engine.copy())?
+                        .with_view(view, |engine| engine.copy_content(formats))?
                 } else {
-                    String::new()
+                    String::new().into()
                 };
-                Ok(json!({"text":text}))
+                Ok(serde_json::to_value(content)?)
             }
             ExecutionRequest::Links { pane: id } => self.sessions.get_mut(&id).unwrap().links(),
             ExecutionRequest::Read { pane: id } => {

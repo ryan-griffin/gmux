@@ -4,6 +4,7 @@ mod client;
 mod accessible_terminal;
 mod activity;
 mod app;
+mod clipboard;
 mod commands;
 mod find_field;
 mod font;

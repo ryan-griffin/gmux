@@ -616,12 +616,12 @@ impl Daemon {
                     engine.snapshot()?;
                 }
                 match command {
-                    StreamCommand::Copy => {
+                    StreamCommand::Copy { formats } => {
                         anyhow::ensure!(
                             engine.selection().is_some(),
                             "Select terminal text to copy it"
                         );
-                        copy = Some(engine.copy()?);
+                        copy = Some(engine.copy_content(formats)?);
                     }
                     StreamCommand::SelectOutput {
                         point,
@@ -635,8 +635,8 @@ impl Daemon {
                         } else {
                             engine.select_output(point)?;
                         }
-                        if should_copy {
-                            copy = Some(engine.copy()?);
+                        if let Some(formats) = should_copy {
+                            copy = Some(engine.copy_content(formats)?);
                         }
                     }
                     StreamCommand::AnchorOutput { point } => engine.anchor_output(point)?,
@@ -660,12 +660,12 @@ impl Daemon {
                 Ok(())
             })?,
         }
-        if let Some(text) = copy {
+        if let Some(content) = copy {
             frontend.queue_clipboard(
                 id,
                 gmux_client::clipboard::Write {
                     destination: gmux_client::clipboard::Destination::Clipboard,
-                    text: Some(text),
+                    content: Some(content),
                 },
             )?;
         }
@@ -1193,6 +1193,56 @@ mod tests {
         frontend.visible.insert(1);
         frontend.sizes.insert(1, size);
         (frontend, peer)
+    }
+
+    #[test]
+    fn rich_clipboard_queue_rejects_overflow_without_losing_prior_offers_or_clear() {
+        use gmux_client::clipboard::{Content, Destination, Write};
+        let (mut frontend, _peer) = client((80, 24, 8, 16, 640, 384));
+        let offer = |character: char| {
+            let text = character.to_string().repeat(transport::MAX_PASTE);
+            let html = Some(format!("<div>{text}</div>"));
+            Write {
+                destination: Destination::Clipboard,
+                content: Some(Content { text, html }),
+            }
+        };
+        for character in ['a', 'b', 'c'] {
+            frontend.queue_clipboard(1, offer(character)).unwrap();
+        }
+        let previous = frontend.output.len();
+        assert!(frontend.queue_clipboard(1, offer('d')).is_err());
+        assert_eq!(frontend.output.len(), previous);
+        assert!(previous <= MAX_PENDING);
+        frontend
+            .queue_clipboard(
+                1,
+                Write {
+                    destination: Destination::Clipboard,
+                    content: None,
+                },
+            )
+            .unwrap();
+        let mut reader = frontend.output.as_slice();
+        for character in ['a', 'b', 'c'] {
+            let packet = Packet::read(&mut reader).unwrap();
+            let content = packet.header.copy.unwrap().content.unwrap();
+            assert!(content.text.chars().all(|c| c == character));
+            assert_eq!(
+                content.html.unwrap(),
+                format!("<div>{}</div>", content.text)
+            );
+        }
+        assert!(
+            Packet::read(&mut reader)
+                .unwrap()
+                .header
+                .copy
+                .unwrap()
+                .content
+                .is_none()
+        );
+        assert!(reader.is_empty());
     }
 
     #[test]

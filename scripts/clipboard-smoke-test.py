@@ -7,6 +7,7 @@ import subprocess
 import socket
 import time
 
+from clipboard_test_support import check_html
 from cargo_test_support import cargo_binary
 from progress_test_support import ProgressProbe
 from stream_test_support import Client
@@ -73,8 +74,8 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
         return writes
 
     def expect(peer, text, destination="clipboard"):
-        collect(peer, lambda h: h.get("copy") == dict(destination=destination, text=text))
-        assert take(peer) == [dict(destination=destination, text=text)]
+        collect(peer, lambda h: h.get("copy") == dict(destination=destination, content=None if text is None else dict(text=text)))
+        assert take(peer) == [dict(destination=destination, content=None if text is None else dict(text=text))]
 
     try:
         with scenario("detached writes are discarded before a frontend attaches"):
@@ -111,10 +112,78 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
                 first.send("select", start=[0, 0], end=[end, 0], serial=end)
                 first.send("copy")
             barrier(first)
-            assert [w["text"] for w in received[first]] == ["selection", "sel"], received[first]
+            assert [w["content"]["text"] for w in received[first]] == ["selection", "sel"], received[first]
             received[first].clear()
             emit(osc("after copy"))
             expect(first, "after copy")
+        with scenario("rich local and remote copies retain per-view bounds, escapes, styles and physical padding"):
+            second.send("subscribe", panes=[pane])
+            for peer in [first, second]:
+                peer.send("resize", cols=10, rows=400)
+                barrier(peer)
+            cases = [
+                ("01界e\u0301XYZ\r\nabcdefgh\r\nq\r\n\r\nlast", [2, 0], [4, 1], "rectangle", "界e\u0301\ncde"),
+                ("01界e\u0301XYZ\r\nabcdefgh", [3, 0], [3, 1], "rectangle", "界\nd"),
+                ("q\r\n\r\nlast", [1, 0], [3, 2], "rectangle", "   \n   \nast"),
+                ("abcdefghijklmnopqrst12", [1, 0], [3, 2], "rectangle", "bcd\nlmn\n2  "),
+                ("abcdefghijklmnopqrst12", [1, 0], [1, 2], "cell", "bcdefghijklmnopqrst12"),
+                ("<>&\"'界🙂e\u0301", [0, 0], [9, 1], "cell", "<>&\"'界🙂e\u0301"),
+                ("\x1b[31mred   \x1b[0m\r\n\r\n\x1b[1;3;4:3;9;48;2;11;22;33mlast  \x1b[0m", [0, 0], [9, 2], "cell", "red\n\nlast"),
+                ("123456789界Z", [9, 0], [9, 1], "rectangle", " \n "),
+                ("123456789界Z", [0, 0], [9, 0], "cell", "123456789界"),
+                ("e" + "\u0301" * 80 + "界", [0, 0], [2, 0], "cell", "e" + "\u0301" * 64 + "界"),
+                ("\x1b[48;2;11;22;33mA\x1b[0m\x1b[5GB", [0, 0], [9, 0], "cell", "A   B"),
+                ("\x1b]8;;https://example.test/a?x=1&y=2\x07\x1b[31mA\x1b[32mB\x1b]8;;\x07\x1b[0m", [0, 0], [1, 0], "cell", "AB"),
+                # Cross many native pages while unwrapping, with styled spaces.
+                (("\x1b[31mabcd  \x1b[0mXYZ " * 300), [0, 0], [9, 299], "cell", "abcd  XYZ " * 299 + "abcd  XYZ"),
+            ]
+            for data, start, end, mode, expected in cases:
+                emit("\x1b[3J\x1b[2J\x1b[H\x1b[0m" + data)
+                for peer in [first, second]:
+                    peer.send("clear-selection", serial=1)
+                    peer.send("select", start=start, end=end, mode=mode, serial=2)
+                    peer.send("copy", formats="text-html")
+                    collect(peer, lambda h: h.get("copy") is not None)
+                    writes = take(peer)
+                    assert len(writes) == 1, writes
+                    parsed = check_html(writes[0]["content"], expected)
+                    if "48;2;11;22;33" in data:
+                        assert "rgb(11, 22, 33)" in writes[0]["content"]["html"]
+                    if expected == "A   B":
+                        assert all("rgb(11, 22, 33)" not in "".join(styles) for text, styles in parsed.runs if "   " in text), parsed.runs
+                assert not take(observer)
+            # Each stream owns its tracked selection, even on the same pane.
+            emit("\x1b[3J\x1b[2J\x1b[H\x1b[0m\x1b]10;#123456\x07\x1b]11;#654321\x07\x1b]4;1;#abcdef\x07\x1b[31m0123456789")
+            for peer, start, end, expected in [(first, 0, 2, "012"), (second, 5, 8, "5678")]:
+                peer.send("clear-selection", serial=3)
+                peer.send("select", start=[start, 0], end=[end, 0], serial=4)
+                peer.send("copy", formats="text-html")
+                collect(peer, lambda h: h.get("copy") is not None)
+                content = take(peer)[0]["content"]
+                check_html(content, expected)
+                assert "color: #abcdef" in content["html"] and "color:#123456" in content["html"]
+                assert "background-color:#654321" in content["html"]
+            # Rich selection data is transient and does not change OSC 52 policy.
+            emit(osc("after rich copy"))
+            expect(second, "after rich copy")
+            assert not take(first)
+        with scenario("styled expansion falls back to plain text on both transports"):
+            for peer in [first, second]:
+                peer.send("resize", cols=1000, rows=100)
+                barrier(peer)
+            emit("\x1b[3J\x1b[2J\x1b[H\x1b[0m" + "\x1b[1;3;4:3;9;38;2;11;22;33;48;2;44;55;66mx\x1b[38;2;77;88;99mx" * 50_000)
+            for peer in [first, second]:
+                peer.send("clear-selection", serial=5)
+                peer.send("select", start=[0, 0], end=[999, 99], serial=6)
+                peer.send("copy", formats="text-html")
+                collect(peer, lambda h: h.get("copy") is not None)
+                content = take(peer)[0]["content"]
+                assert content == dict(text="x" * 100_000), (content.keys(), len(content["text"]))
+            for peer in [first, second]:
+                peer.send("resize", cols=80, rows=24)
+                barrier(peer)
+            second.send("subscribe", panes=[])
+            barrier(second)
         with scenario("decoded payload limit accepts the boundary and rejects the whole oversized write"):
             text = "x" * (4 * 1024 * 1024)
             began = time.monotonic()
