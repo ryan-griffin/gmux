@@ -1,4 +1,4 @@
-//! Layout commands and their ordered persistence.
+//! Control commands and their ordered persistence.
 use super::*;
 use gmux_client::control::{ExecutionRequest, InternalRequest, Request};
 
@@ -34,6 +34,7 @@ struct ControlReply {
 pub(super) struct PendingControl {
     reply: ControlReply,
     pub(super) id: u64,
+    limits: Option<gmux_client::retention::ScrollbackLimits>,
 }
 impl PendingControl {
     pub(super) fn start(
@@ -47,6 +48,7 @@ impl PendingControl {
                 .try_send(json!({"error":"Daemon is shutting down"}));
             return None;
         }
+        let mut limits = None;
         let mut kind = ReplyKind::Direct;
         let mut broadcast = false;
         let result: anyhow::Result<Value> = (|| {
@@ -56,6 +58,17 @@ impl PendingControl {
             let (request, output_only) = request
                 .body
                 .into_execution(|pane| daemon.resolve_pane(pane))?;
+            if let ExecutionRequest::Scrollback {
+                max_bytes,
+                max_lines,
+            } = request
+                && (max_bytes.is_some() || max_lines.is_some())
+            {
+                let candidate = daemon.limits.update(max_bytes, max_lines)?;
+                daemon.pending_write = Some(Save::Settings(candidate));
+                limits = Some(candidate);
+                return Ok(json!({"limits": candidate, "saved": false, "applied": false}));
+            }
             broadcast = request.changes_layout();
             if broadcast && !output_only {
                 kind = ReplyKind::Snapshot;
@@ -77,8 +90,16 @@ impl PendingControl {
         let save = daemon.pending_write.take();
         if !failed && let Some(save) = save {
             match worker.submit(save, false) {
-                Ok(id) => return Some(Self { reply, id }),
-                Err(error) => reply.save_failed(error.to_string()).send(daemon),
+                Ok(id) => return Some(Self { reply, id, limits }),
+                Err(error) => {
+                    if limits.is_some() {
+                        reply
+                            .settings_failed(error.to_string(), daemon.limits)
+                            .send(daemon);
+                    } else {
+                        reply.save_failed(error.to_string()).send(daemon);
+                    }
+                }
             }
         } else {
             reply.send(daemon);
@@ -86,15 +107,40 @@ impl PendingControl {
         None
     }
     pub(super) fn complete(self, daemon: &mut Daemon, result: Result<(), String>) {
-        let Self { reply, .. } = self;
-        if let Err(error) = result {
-            reply.save_failed(error).send(daemon);
-        } else {
-            reply.send(daemon);
+        let Self {
+            mut reply, limits, ..
+        } = self;
+        match result {
+            Ok(()) => {
+                if let Some(limits) = limits {
+                    reply.value = daemon.apply_scrollback_limits(limits);
+                }
+            }
+            Err(error) => {
+                reply = if limits.is_some() {
+                    reply.settings_failed(error, daemon.limits)
+                } else {
+                    reply.save_failed(error)
+                };
+            }
         }
+        reply.send(daemon);
     }
 }
 impl ControlReply {
+    fn settings_failed(
+        mut self,
+        error: String,
+        current: gmux_client::retention::ScrollbackLimits,
+    ) -> Self {
+        self.value["limits"] = json!(current);
+        self.value["error"] = json!(format!(
+            "Could not durably save scrollback settings; running limits and history are unchanged: {error}"
+        ));
+        self.value["saved"] = json!(false);
+        self.value["applied"] = json!(false);
+        self
+    }
     fn save_failed(mut self, error: String) -> Self {
         let result = if self.kind == ReplyKind::Snapshot {
             &mut self.value["result"]
@@ -122,6 +168,29 @@ impl ControlReply {
     }
 }
 impl Daemon {
+    fn apply_scrollback_limits(
+        &mut self,
+        limits: gmux_client::retention::ScrollbackLimits,
+    ) -> Value {
+        // Publication precedes irreversible pruning. Never roll back a policy
+        // after applying it to only part of the history.
+        self.limits = limits;
+        let mut failures = Vec::new();
+        for (&id, session) in &mut self.sessions {
+            if let Err(error) = session.set_scrollback_limits(limits) {
+                failures.push(json!({"pane": id, "error": error.to_string()}));
+            }
+            self.changed.insert(id);
+        }
+        let mut result = json!({"limits": limits, "saved": true, "applied": failures.is_empty()});
+        if !failures.is_empty() {
+            result["error"] = json!(
+                "Settings were saved, but some terminals could not apply them. Removed history cannot be restored"
+            );
+            result["failures"] = json!(failures);
+        }
+        result
+    }
     pub(super) fn list(&mut self) -> anyhow::Result<Value> {
         self.refresh_state();
         let tabs: Vec<_> = self
@@ -191,6 +260,7 @@ impl Daemon {
                     CursorStyle::default(),
                     &Theme::adwaita(true),
                     None,
+                    self.limits,
                 )?;
                 self.sessions.insert(pane, session);
                 let name = name.filter(|n| !n.trim().is_empty());
@@ -240,6 +310,7 @@ impl Daemon {
                     CursorStyle::default(),
                     &Theme::adwaita(true),
                     None,
+                    self.limits,
                 )?;
                 self.sessions.insert(pane, session);
                 let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
@@ -294,6 +365,7 @@ impl Daemon {
                 tab.custom_name = false;
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
+            ExecutionRequest::Scrollback { .. } => Ok(json!({"limits": self.limits})),
             ExecutionRequest::Status => Ok(json!({
                 "version": transport::VERSION,
                 "daemon": self.id,
@@ -308,6 +380,7 @@ impl Daemon {
                 "uptime_seconds": self.started.elapsed().as_secs(),
                 "snapshots": self.snapshots,
                 "sent_rows": self.sent_rows,
+                "scrollback_limits": self.limits,
                 "terminal_memory": self.sessions.values()
                     .map(TerminalSession::memory_usage).collect::<anyhow::Result<Vec<_>>>()?,
                 "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),

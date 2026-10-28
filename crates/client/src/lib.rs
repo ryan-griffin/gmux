@@ -15,6 +15,7 @@ pub mod network;
 pub mod program_status;
 pub mod progress;
 pub mod remote;
+pub mod retention;
 pub mod scroll_cache;
 pub mod search;
 pub mod selection;

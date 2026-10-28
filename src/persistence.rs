@@ -32,12 +32,14 @@ fn identity_at(path: &Path) -> anyhow::Result<DaemonId> {
 }
 pub(crate) enum Save {
     Execution(ExecutionState),
+    Settings(gmux_client::retention::ScrollbackLimits),
     Checkpoint(Checkpoint),
     Prune,
 }
 impl Save {
     fn write(self) -> anyhow::Result<()> {
         match self {
+            Self::Settings(value) => storage::save("daemon-settings.json", &value),
             Self::Execution(value) => crate::scrollback::save_execution(&value),
             Self::Checkpoint(value) => value.write(),
             Self::Prune => crate::scrollback::prune_committed(),

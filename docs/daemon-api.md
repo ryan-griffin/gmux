@@ -110,6 +110,11 @@ Local and TCP control connections support these methods:
   attached Unix and TCP stream counts in `local_clients` and `remote_clients`,
   and execution statistics. Connection display names are client-owned aliases; `hostname`
   always identifies the daemon's host.
+- `scrollback` inspects or updates the daemon's saved per-terminal byte and
+  physical-line limits. Optional `max_bytes` and `max_lines` fields accept an
+  unsigned integer, `"default"`, or `"unlimited"`. Omission leaves a dimension
+  unchanged. Updates save before pruning existing history. See
+  [scrollback retention](scrollback.md) for zero semantics, responses, and failures.
 - `list` returns this daemon's tabs, topology, and pane metadata. Tab and pane
   references contain `daemon` and `id`.
 - `new` creates a tab. Optional `directory` and `name` fields choose its working

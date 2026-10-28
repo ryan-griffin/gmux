@@ -2,70 +2,20 @@
 """Check idle compression and measure daemon memory, work, and input latency."""
 import argparse
 from contextlib import contextmanager
-import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import platform
-import statistics
 import subprocess
 import tempfile
 import time
 
 from cargo_test_support import cargo_binary
+from history_test_support import (
+    HISTORY_SHELL, binary_metadata, distribution, idle_sample, prepare_history, process_sample,
+)
 from stream_test_support import Client
 from test_support import AppFixture, scenario, wait_for
-
-
-WORKER = r'''
-import os, tty
-tty.setraw(0)
-os.write(1, b"BOOT")
-sequence = 0
-while True:
-    key = os.read(0, 1)
-    if not key or key == b"q":
-        break
-    if key == b"g":
-        lines = int(os.environ["GMUX_COMPRESSION_LINES"])
-        for start in range(0, lines, 256):
-            data = "".join(
-                f"\x1b[38;5;{row % 16}m{row:06d} build src/module_{row % 97:02d}.rs "
-                f"compiled successfully 界é \x1b[0m\x1b]8;;https://example.com/log/{row % 32}\x07details\x1b]8;;\x07\r\n"
-                for row in range(start, min(start + 256, lines)))
-            os.write(1, data.encode())
-        os.write(1, b"READY")
-    else:
-        sequence += 1
-        os.write(1, f"\r\x1b[2KACK{sequence:06d}".encode())
-'''
-
-
-def process_sample(pid):
-    fields = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines()
-                  if ":" in line)
-    main = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/task/{pid}/status").read_text().splitlines()
-                if ":" in line)
-    stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-    return dict(rss_bytes=int(fields["VmRSS"].split()[0]) * 1024,
-                cpu_seconds=(int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK"),
-                main_waits=int(main["voluntary_ctxt_switches"]),
-                wait_channel=Path(f"/proc/{pid}/wchan").read_text().strip())
-
-
-def distribution(values):
-    return dict(samples=len(values), median_ms=statistics.median(values),
-                p95_ms=sorted(values)[math.ceil(len(values) * .95) - 1], max_ms=max(values))
-
-
-def binary_metadata(target, baseline):
-    linkage = subprocess.check_output(["ldd", str(target)], text=True)
-    library = next(Path(line.split()[2]).resolve() for line in linkage.splitlines()
-                   if line.strip().startswith("libghostty-vt.so") and "=>" in line)
-    return dict(path=str(target), baseline=baseline,
-                sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
-                ghostty_library=str(library), ghostty_sha256=hashlib.sha256(library.read_bytes()).hexdigest())
 
 
 @contextmanager
@@ -93,29 +43,17 @@ def completed(rows):
     return rows and all(row["compression"]["steps"] and not row["scheduled"] for row in rows)
 
 
-def idle_sample(pid, seconds=5.5):
-    # No RPCs during this interval. Inspect only /proc from the observer.
-    time.sleep(.15)
-    before = process_sample(pid)
-    time.sleep(seconds)
-    after = process_sample(pid)
-    return dict(seconds=seconds, main_wakeups=after["main_waits"] - before["main_waits"],
-                cpu_seconds=after["cpu_seconds"] - before["cpu_seconds"],
-                wait_channel=after["wait_channel"])
-
-
 def run(binary, mode, args, baseline=False, reference=None, daemon_env=None):
     label = "baseline" if baseline else "compression"
     log_path = args.report.with_name(f"{args.report.stem}-{label}-{mode}.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with AppFixture(prefix="gmux-compression-", env=daemon_env, shell_script=
-                    '#!/bin/sh\nexec python3 "$GMUX_COMPRESSION_WORKER"\n') as fixture:
-        worker = fixture.path / "worker.py"
-        worker.write_text(WORKER)
-        fixture.env.update(GMUX_COMPRESSION_WORKER=str(worker), GMUX_COMPRESSION_LINES=str(args.lines))
+    with AppFixture(prefix="gmux-compression-", env=daemon_env, shell_script=HISTORY_SHELL) as fixture:
+        prepare_history(fixture, args.lines)
         with log_path.open("w") as log:
             daemon = fixture.start(binary, "serve", stdout=log, stderr=log)
             wait_for(lambda: fixture.rpc("status"))
+            if args.history_mib is not None and not baseline:
+                fixture.rpc("scrollback", max_bytes=args.history_mib * 1024 * 1024)
             panes = [fixture.rpc("new")["pane"]]
             for _ in range(args.panes - 1):
                 panes.append(fixture.rpc("split", pane=panes[0])["pane"])
