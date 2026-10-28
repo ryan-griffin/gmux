@@ -91,7 +91,8 @@ def main():
 
     # curl honors HTTPS_PROXY in environments where Zig's downloader cannot
     # resolve external hosts. Zig still verifies each dependency's package hash.
-    command = [str(zig), "build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast", "--prefix", str(DEPS / "ghostty"), "-j4"]
+    # Cached installations must run on other CPUs of the same architecture.
+    command = [str(zig), "build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast", "-Dcpu=baseline", "--prefix", str(DEPS / "ghostty"), "-j4"]
     fetched = set()
     for _ in range(50):
         print("Building libghostty-vt...", flush=True)
