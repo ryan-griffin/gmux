@@ -12,7 +12,7 @@ This project is pre-alpha. Saved data formats may change between builds.
 
 ## Build and run
 
-Requires Linux, Rust 1.99+, a C compiler, libclang, pkg-config, curl, and Python
+Requires Linux, Rust 1.99+, a C compiler, libclang, pkg-config, curl, patch, and Python
 3.12+. The GNOME client also requires GTK 4.22+, libadwaita 1.9+, and
 `glib-compile-resources`. The checked-in Rust toolchain file selects the
 development compiler with rustup.
@@ -56,6 +56,10 @@ Closing a window leaves its terminals running. Reopen Gmux to reconnect.
 **Quit Gmux** or Ctrl+Shift+Q stops the app's connected local daemon and its
 terminals. Remote terminals keep running. After a daemon restart, Gmux restores
 the saved layout and text history with fresh shells. Commands and jobs do not resume.
+
+Media and volume keys delivered by the desktop work in terminal programs that
+enable the Kitty keyboard protocol. See [keyboard input](docs/keyboard.md) for
+supported keys and browser-key limitations.
 
 Copying terminal selections or command output offers plain text and styled
 HTML together. Compatible destinations preserve terminal colors and formatting;

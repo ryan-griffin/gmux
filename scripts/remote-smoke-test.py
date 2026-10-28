@@ -203,7 +203,8 @@ finally:
 Path(output).write_bytes(data)
 """)
         for remote in (False, True):
-            for flags, expected in [(31, b"\x1b[97;;97u\x1b[97;1:2;97u\x1b[97;1:2;97u\x1b[97;1:3u!"),
+            for flags, expected in [(31, b"\x1b[97;;97u\x1b[97;1:2;97u\x1b[97;1:2;97u\x1b[97;1:3u"
+                                        b"\x1b[57435;5u\x1b[57435;5:2u\x1b[57435;5:2u\x1b[57435;5:3u!"),
                                     (0, b"aaa!")]:
                 output = server.path / f"keyboard-{remote}-{flags}"
                 stream = Client(client, pane, connection="server") if remote else Client(server, pane)
@@ -214,6 +215,9 @@ Path(output).write_bytes(data)
                     for action in ("press", "repeat", "repeat", "release"):
                         stream.send("key", name="a", cp=97, mods=0, action=action,
                                     text="" if action == "release" else "a")
+                    for name in ("AudioNext", "Back"):
+                        for action in ("press", "repeat", "repeat", "release"):
+                            stream.send("key", name=name, cp=0, mods=2, action=action, text="")
                     # A trailing byte proves that legacy release emitted nothing.
                     stream.send("input", bytes=[ord("!")])
                     wait_for(output.exists)

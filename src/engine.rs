@@ -2595,6 +2595,90 @@ mod tests {
     }
 
     #[test]
+    fn media_keys_encode_standard_kitty_codes_and_actions() {
+        use KeyAction::{Press, Release, Repeat};
+        let mut engine = Engine::new().unwrap();
+        // Codes from Kitty's functional-key definitions, not Ghostty's enum values.
+        for (name, code) in [
+            ("AudioPlay", 57430),
+            ("AudioStop", 57432),
+            ("AudioNext", 57435),
+            ("AudioPrev", 57436),
+            ("AudioLowerVolume", 57438),
+            ("AudioRaiseVolume", 57439),
+            ("AudioMute", 57440),
+        ] {
+            for flags in [0, 1, 2, 3, 8, 11, 31] {
+                engine.write(format!("\x1b[={flags}u").as_bytes());
+                for (mods, parameter) in
+                    [(0, 1), (1, 2), (2, 5), (4, 3), (8, 9), (16, 65), (15, 16)]
+                {
+                    for (action, event) in [(Press, 1), (Repeat, 2), (Release, 3)] {
+                        let expected = if flags == 0 || (action == Release && flags & 2 == 0) {
+                            String::new()
+                        } else if flags & 2 != 0 && action != Press {
+                            format!("\x1b[{code};{parameter}:{event}u")
+                        } else if mods != 0 {
+                            format!("\x1b[{code};{parameter}u")
+                        } else {
+                            format!("\x1b[{code}u")
+                        };
+                        assert_eq!(
+                            engine.key(name, 0, mods, action, ""),
+                            expected.as_bytes(),
+                            "{name}, flags={flags}, mods={mods}, action={action:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Popping the application's negotiation restores legacy behavior.
+        engine.write(b"\x1b[=0u\x1b[>3u");
+        assert_eq!(engine.key("AudioPlay", 0, 0, Press, ""), b"\x1b[57430u");
+        engine.write(b"\x1b[<u\x1b[>4;2m\x1b[?1h\x1b=");
+        assert!(engine.key("AudioPlay", 0, 0, Press, "").is_empty());
+        assert_eq!(engine.key("c", 99, 2, Press, "c"), b"\x1b[27;5;99~");
+        engine.write(b"\x1b[>4m");
+        assert_eq!(engine.key("c", 99, 2, Press, "c"), b"\x03");
+    }
+
+    #[test]
+    fn unsupported_browser_keys_never_insert_terminal_bytes() {
+        use KeyAction::{Press, Release, Repeat};
+        let mut engine = Engine::new().unwrap();
+        for mode in [
+            b"\x1b[=0u".as_slice(),
+            b"\x1b[>4;2m",
+            b"\x1b[=1u",
+            b"\x1b[=31u",
+        ] {
+            engine.write(mode);
+            for name in [
+                "Back",
+                "Forward",
+                "Refresh",
+                "Reload",
+                "Stop",
+                "Search",
+                "Favorites",
+                "HomePage",
+                "AudioPause",
+            ] {
+                for mods in [0, 1, 2, 4, 8, 15] {
+                    for action in [Press, Repeat, Release] {
+                        // Reuse the event after text input to catch stale UTF-8/codepoints.
+                        assert!(!engine.key("a", 97, 0, Press, "a").is_empty());
+                        assert!(
+                            engine.key(name, 0, mods, action, "").is_empty(),
+                            "{name}, mods={mods}, action={action:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn keypad_keys_respect_application_mode() {
         let mut e = Engine::new().unwrap();
         assert_eq!(e.key("KP_1", '1' as u32, 0, KeyAction::Press, "1"), b"1");

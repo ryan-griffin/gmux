@@ -62,9 +62,9 @@ jobs:
             .ci-cache/cargo/git
             .ci-cache/rustup
             .ci-cache/target
-          key: rust-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ steps.rust.outputs.version }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py') }}-${{ hashFiles('Cargo.lock') }}
+          key: rust-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ steps.rust.outputs.version }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py', 'scripts/patches/**') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            rust-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ steps.rust.outputs.version }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py') }}-
+            rust-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ steps.rust.outputs.version }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py', 'scripts/patches/**') }}-
 
       - name: Cache Ghostty and Zig dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -72,7 +72,7 @@ jobs:
           path: |
             .deps
             .ci-cache/zig
-          key: ghostty-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py') }}
+          key: ghostty-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py', 'scripts/patches/**') }}
 
       - name: Bootstrap Ghostty and run the headless checks
         env:

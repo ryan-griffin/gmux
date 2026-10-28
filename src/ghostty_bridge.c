@@ -1257,8 +1257,22 @@ static GhosttyKey key_for(uint32_t cp, const char *name) {
     KEY("Up", ARROW_UP); KEY("Down", ARROW_DOWN); KEY("Left", ARROW_LEFT); KEY("Right", ARROW_RIGHT);
     KEY("Home", HOME); KEY("End", END); KEY("Insert", INSERT); KEY("Delete", DELETE);
     KEY("Page_Up", PAGE_UP); KEY("Page_Down", PAGE_DOWN);
-    #undef KEY
     if (name[0] == 'F') { int n = atoi(name + 1); if (n >= 1 && n <= 25) return GHOSTTY_KEY_F1 + n - 1; }
+    // Keep text and existing functional keys out of the extra name lookups.
+    if (cp) return GHOSTTY_KEY_UNIDENTIFIED;
+    // GDK's canonical names omit the XKB "XF86" prefix. AudioPlay is the
+    // play/pause toggle; the separate AudioPause has no Ghostty identifier.
+    KEY("AudioPlay", MEDIA_PLAY_PAUSE); KEY("AudioStop", MEDIA_STOP);
+    KEY("AudioNext", MEDIA_TRACK_NEXT); KEY("AudioPrev", MEDIA_TRACK_PREVIOUS);
+    KEY("AudioLowerVolume", AUDIO_VOLUME_DOWN); KEY("AudioRaiseVolume", AUDIO_VOLUME_UP);
+    KEY("AudioMute", AUDIO_VOLUME_MUTE);
+    // Recognize browser keys, but leave encoding to Ghostty. Kitty defines
+    // no browser functional codes, so these currently emit no terminal bytes.
+    KEY("Back", BROWSER_BACK); KEY("Forward", BROWSER_FORWARD);
+    KEY("Refresh", BROWSER_REFRESH); KEY("Reload", BROWSER_REFRESH);
+    KEY("Stop", BROWSER_STOP); KEY("Search", BROWSER_SEARCH);
+    KEY("Favorites", BROWSER_FAVORITES); KEY("HomePage", BROWSER_HOME);
+    #undef KEY
     return GHOSTTY_KEY_UNIDENTIFIED;
 }
 size_t gmux_engine_key(GmuxEngine *e, const char *name, uint32_t cp, uint16_t mods,
