@@ -22,7 +22,7 @@ while (( $# )); do
     shift
 done
 gmux_ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
-if [[ ! -f "$gmux_ghostty_prefix/include/ghostty/vt/terminal.h" ]]; then
+if [[ -z ${GHOSTTY_PREFIX:-} ]]; then
     ./scripts/bootstrap-ghostty.sh
 fi
 gmux_build_options=(--release)

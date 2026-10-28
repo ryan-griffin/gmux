@@ -2,7 +2,8 @@
 
 Run commands from the repository root. The [README](../README.md#build-and-run)
 lists build prerequisites. Bootstrap the pinned Ghostty library before the first
-build, or set `GHOSTTY_PREFIX` to a build of the same source revision.
+build, or set `GHOSTTY_PREFIX` to a build of the same source revision with the
+checked-in [integration patch](keyboard.md#native-library) applied.
 
 ```sh
 ./scripts/bootstrap-ghostty.sh
@@ -49,14 +50,24 @@ target-only packets, independent viewports, holds, reconnect and clear. It also
 compiles a native ownership check for hold release, timeout and host clear.
 The native `terminal-input` suite checks rectangular drag preview with paused and
 delayed replies, Unicode and blank block copy, physical soft wraps, accessible
-row ranges, mouse-tracking overrides, cached-history scrolling, and
-compositor-generated keyboard repeats,
-Kitty event negotiation, legacy typing, modifiers, composition, shortcuts, and
+row ranges, mouse-tracking overrides, cached-history scrolling,
+compositor-generated keyboard repeats, Kitty media/volume bytes, unsupported browser keys,
+event negotiation, legacy typing, modifiers, composition, shortcuts, and
 key tracking across pane and window focus changes. It also installs a private
 test URI handler and checks hover, contextual copy and modifier-click against
 delayed and held frames. It never launches a browser. The renderer suite checks
 shared hover/OSC 22 pointer ownership alongside fractional alignment, retained
 rows and cursor scheduling.
+
+Engine tests check exact media/audio codes, modifier parameters, and negotiated
+press/repeat/release behavior. The `remote` suite checks media events and silent
+browser events through local and remote socket streams. Those checks bypass GTK;
+the native `terminal-input` cases exercise compositor input through GDK and GTK
+to the terminal program. Unsupported-key checks also observe the frontend's
+requests, so a swallowed event cannot pass as a correctly silent key.
+Native browser checks use the keysyms present in the fixture's keymap; `Refresh`
+and browser `Stop` have engine coverage only. The private compositor delivering
+a key does not imply that a desktop with system key grabs will deliver it.
 
 The `scrollback-limits` headless suite checks saved policy and restart, complete
 request validation before mutation, blocked and failed saves, successive partial

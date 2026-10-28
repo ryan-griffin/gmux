@@ -72,12 +72,18 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
                GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"), XDG_DATA_HOME=str(data_home))
     app = daemon = None
     pane = None
+    observed_keys = None
+
+    def observe_request(request):
+        if observed_keys is not None and request.get("method") == "key":
+            observed_keys.append((request["name"], request["action"], request["cp"],
+                                  request["mods"], request["text"]))
 
     def rpc(method, **params):
         return shared_rpc(env["GMUX_SOCKET"], method, check=True, **params)
 
     with (artifacts / "terminal-input-smoke.log").open("w") as log, WaylandInput() as native, \
-            DelayedViewport(env["GMUX_SOCKET"], temp / "frontend") as proxy, AccessibilityFixture():
+            DelayedViewport(env["GMUX_SOCKET"], temp / "frontend", observe_request=observe_request) as proxy, AccessibilityFixture():
         try:
             daemon = subprocess.Popen([str(cargo_binary("gmux")), "serve"], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("status"))
@@ -506,6 +512,51 @@ Path(done).touch()
                 assert read_keys() == expected, (read_keys(), expected)
                 held(read_keys, 30, b"\x1b[97;;97u", b"\x1b[97;1:2;97u", b"\x1b[97;1:3u")
                 held(read_keys, 103, b"\x1b[1;1:1A", b"\x1b[1;1:2A", b"\x1b[1;1:3A")
+                # Native GDK dispatch, not a socket-injected key name. These
+                # events are delivered by this private compositor; desktop
+                # media-key grabs can keep them from reaching a real app.
+                start = len(read_keys())
+                expected = b""
+                for symbol, code in [(Gdk.KEY_AudioPlay, 57430), (Gdk.KEY_AudioStop, 57432),
+                                     (Gdk.KEY_AudioNext, 57435), (Gdk.KEY_AudioPrev, 57436),
+                                     (Gdk.KEY_AudioLowerVolume, 57438), (Gdk.KEY_AudioRaiseVolume, 57439),
+                                     (Gdk.KEY_AudioMute, 57440)]:
+                    tap(symbol)
+                    expected += f"\x1b[{code}u\x1b[{code};1:3u".encode()
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[57440;1:3u"))
+                assert read_keys()[start:] == expected, read_keys()[start:]
+                # Volume holds must preserve genuine compositor repeats.
+                held(read_keys, 115, b"\x1b[57439u", b"\x1b[57439;1:2u", b"\x1b[57439;1:3u")
+                start = len(read_keys())
+                native.key(Gdk.KEY_Control_L, True)
+                tap(Gdk.KEY_AudioNext)
+                native.key(Gdk.KEY_Control_L, False)
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[57442;1:3u"))
+                assert read_keys()[start:] == (b"\x1b[57442;5u\x1b[57435;5u"
+                                              b"\x1b[57435;5:3u\x1b[57442;1:3u")
+                start = len(read_keys())
+                observed_keys = []
+                # This keymap exposes Reload, not Refresh, and has no browser
+                # Stop. Engine tests cover those two names without native input.
+                browser_keys = [Gdk.KEY_Back, Gdk.KEY_Forward, Gdk.KEY_Reload,
+                                Gdk.KEY_Search, Gdk.KEY_Favorites, Gdk.KEY_HomePage]
+                for symbol in browser_keys:
+                    tap(symbol)
+                # Keysym injection can synthesize Shift to reach AudioPause on
+                # the toggle key. Use the dedicated KEY_PAUSECD hardware code.
+                native.keycode(201, True)
+                native.keycode(201, False)
+                tap(Gdk.KEY_b)  # Ordered marker after unsupported press/release events.
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[98;1:3u"))
+                assert read_keys()[start:] == b"\x1b[98;;98u\x1b[98;1:3u", read_keys()[start:]
+                # Silence is only meaningful if GTK actually forwarded each
+                # unsupported press/release with no text or Unicode fallback.
+                assert observed_keys == [
+                    (Gdk.keyval_name(symbol), action, 0, 0, "")
+                    for symbol in browser_keys + [Gdk.KEY_AudioPause]
+                    for action in ("press", "release")
+                ] + [("b", "press", 98, 0, "b"), ("b", "release", 98, 0, "")], observed_keys
+                observed_keys = None
                 # Repeat classification follows hardware identity when Shift
                 # changes the keyval and text while the same key stays down.
                 native.keycode(30, True)
@@ -616,6 +667,9 @@ Path(done).touch()
 
             # With no event reporting, real native holds retain legacy bytes.
             with keyboard_capture(0) as read_keys:
+                for symbol in [Gdk.KEY_AudioPlay, Gdk.KEY_AudioNext, Gdk.KEY_AudioRaiseVolume,
+                               Gdk.KEY_Back, Gdk.KEY_Reload]:
+                    tap(symbol)
                 native.keycode(30, True)
                 try:
                     wait_for(lambda: len(read_keys()) >= 3)

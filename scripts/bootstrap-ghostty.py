@@ -15,6 +15,7 @@ REVISION = "8f0dd3709050b1026f6324368805033197d8b4a5"
 SOURCE_SHA256 = "f4869fc667ea0a1c93705e363ceca06d394b67ad1d3dde756a7fa5c15691f9cb"
 # Must match the source's build.zig.zon and src/build/zig.zig requirement.
 ZIG_VERSION = "0.16.0"
+PATCHES = [ROOT / "scripts/patches/ghostty-media-keys.patch"]
 
 
 def download(url, destination, checksum=None):
@@ -42,14 +43,17 @@ def download(url, destination, checksum=None):
         temporary.unlink(missing_ok=True)
 
 
-def extract(archive_path, destination):
+def extract(archive_path, destination, *, tree_name=None, patches=()):
     # Publish only a complete tree so a failed extraction is retried next time.
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix=f".{destination.name}.") as directory:
         with tarfile.open(archive_path) as archive:
             archive.extractall(directory, filter="data")
-        tree = Path(directory, destination.name)
+        tree = Path(directory, tree_name or destination.name)
         if not tree.is_dir():
-            raise SystemExit(f"{archive_path} does not contain {destination.name}")
+            raise SystemExit(f"{archive_path} does not contain {tree.name}")
+        for patch in patches:
+            subprocess.run(["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(patch)],
+                           cwd=tree, check=True)
         tree.replace(destination)
 
 
@@ -59,11 +63,22 @@ def main():
         raise SystemExit("Bootstrap supports x86_64 and aarch64 Linux. Set GHOSTTY_PREFIX for another platform.")
     DEPS.mkdir(exist_ok=True)
 
+    # Keep patched sources separate from pristine or older patched caches.
+    patch_hash = hashlib.sha256(b"".join(patch.read_bytes() for patch in PATCHES)).hexdigest()
+    build_id = hashlib.sha256(Path(__file__).read_bytes() + patch_hash.encode() + arch.encode()).hexdigest()
+    stamp = DEPS / "ghostty/.bootstrap-id"
+    if (stamp.is_file() and stamp.read_text() == build_id
+            and (DEPS / "ghostty/include/ghostty/vt/terminal.h").is_file()
+            and (DEPS / "ghostty/lib/libghostty-vt.so").is_file()):
+        print(f"libghostty-vt is ready in {DEPS / 'ghostty'}")
+        return
+    stamp.unlink(missing_ok=True)
+
     source_archive = DEPS / "ghostty.tar.gz"
     download(f"https://codeload.github.com/ghostty-org/ghostty/tar.gz/{REVISION}", source_archive, SOURCE_SHA256)
-    source = DEPS / f"ghostty-{REVISION}"
+    source = DEPS / f"ghostty-{REVISION}-{patch_hash[:12]}"
     if not source.is_dir():
-        extract(source_archive, source)
+        extract(source_archive, source, tree_name=f"ghostty-{REVISION}", patches=PATCHES)
 
     zig_dir = DEPS / f"zig-{arch}-linux-{ZIG_VERSION}"
     zig = zig_dir / "zig"
@@ -82,6 +97,7 @@ def main():
         print("Building libghostty-vt...", flush=True)
         result = subprocess.run(command, cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode == 0:
+            stamp.write_text(build_id)
             print(f"libghostty-vt is ready in {DEPS / 'ghostty'}")
             break
         urls = re.findall(r'\.url\s*=\s*"(https://[^\"]+)"', result.stdout)

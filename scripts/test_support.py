@@ -182,9 +182,10 @@ class AccessibilityFixture:
 
 class DelayedViewport:
     """Delay and count the first frontend stream; relay other windows normally."""
-    def __init__(self, socket_path, proxy_path):
+    def __init__(self, socket_path, proxy_path, *, observe_request=None):
         self.socket_path = str(socket_path)
         self.proxy_path = str(proxy_path)
+        self.observe_request = observe_request
         self.delay = 0
         self.reply_bytes = 0
         self.reply_cell_bytes = 0
@@ -229,9 +230,18 @@ class DelayedViewport:
         listener.listen()
         self.sockets.append(listener)
 
-        def relay(source, destination, delayed=False):
+        def relay(source, destination, delayed=False, requests=False):
+            pending = bytearray()
             try:
                 while data := source.recv(65536):
+                    if requests and self.observe_request is not None:
+                        # Split each chunk once, including large paste requests.
+                        # Keep framing local to this frontend's connection.
+                        lines = data.split(b'\n')
+                        pending.extend(lines[0])
+                        for line in lines[1:]:
+                            self.observe_request(json.loads(pending))
+                            pending = bytearray(line)
                     if delayed:
                         self.reply_bytes += len(data)
                         self._count_reply_cells(data)
@@ -255,8 +265,8 @@ class DelayedViewport:
                     backend = socket.socket(socket.AF_UNIX)
                     self.sockets.extend((client, backend))
                     backend.connect(self.socket_path + ".stream")
-                    for source, destination, delay in ((client, backend, False), (backend, client, delayed)):
-                        worker = threading.Thread(target=relay, args=(source, destination, delay), daemon=True)
+                    for source, destination, delay, requests in ((client, backend, False, True), (backend, client, delayed, False)):
+                        worker = threading.Thread(target=relay, args=(source, destination, delay, requests), daemon=True)
                         self.threads.append(worker)
                         worker.start()
                     delayed = False
