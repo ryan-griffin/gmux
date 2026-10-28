@@ -4,6 +4,78 @@ Benchmarks write local reports under `artifacts/`, which Git ignores. Keep sourc
 revisions and matching frontend/daemon binaries with reports when comparing
 builds. Results depend on the compositor, driver, font, and machine.
 
+## Blinking text
+
+Measure retained text phases separately from output and cursor changes:
+
+```sh
+cargo build --release --locked -p gmux-gtk --example renderer-benchmark
+GTK_A11Y=none GSK_RENDERER=cairo target/release/examples/renderer-benchmark \
+  --blink --frames 60 --cols 120 --rows 40 --output artifacts/text-blink-renderer
+python3 scripts/cargo_build.py --release gmux gmux-gtk
+GSK_RENDERER=gl python3 scripts/text-blink-benchmark.py \
+  --binary target/release/gmux-gtk --seconds 5 --output artifacts/text-blink-cpu.json
+```
+
+The renderer benchmark alternates visible and hidden phases over ASCII, Unicode,
+fallback, ligatures and decorated cells, with no, one-cell, full-screen and
+alternating-cell blink. Warmed phase changes assert zero rebuilt rows and zero
+new glyph nodes. The shape cache remains unchanged. Rust allocation counters
+measure scene preparation and exclude GTK/Pango/GSK allocations. The 75-byte
+shared/wire cell retains its size; phase nodes share glyphs and backgrounds
+instead of storing a second cell grid.
+
+The process benchmark uses a private Wayland session, disables the terminal
+cursor and sets a 1200 ms desktop cycle. It measures ordinary, sparse, dense and
+alternating decorated text, a hidden blinking tab, removed blink and detached
+idle. Samples contain no RPCs or writer output. Each interval checks that daemon
+snapshot and sent-row counters stay unchanged. CPU is a percentage of one core;
+main-thread context switches approximate wakeups and include compositor event
+delivery. RSS samples include shared libraries, caches and the rest of the app.
+The detached sample measures only the daemon. Native prerequisites are listed
+in [testing](testing.md#native-prerequisites).
+
+An i7-13700H run with GTK 4.24.1, Monospace 12 and Cairo measured these
+120 × 40 preparation medians across 60 warmed frames:
+
+| Blink density | Mixed Unicode | Colored decorations |
+| --- | ---: | ---: |
+| None | 0.280 ms | 0.412 ms |
+| One cell | 0.280 ms | 0.402 ms |
+| Every cell | 0.268 ms | 0.369 ms |
+| Alternating cells | 0.342 ms | 0.952 ms |
+
+Every warmed phase sample rebuilt zero rows, created zero glyph nodes and made
+zero Rust allocations. Ordinary static preparation before/after blink support
+was 0.071/0.082 ms for ASCII, 0.312/0.292 ms for mixed Unicode, and 0.423/0.414 ms
+for decorated text. Ordinary full-row update preparation was 0.459/0.436,
+2.480/2.500 and 3.430/3.479 ms respectively, with identical allocation counts,
+shape-cache entries and glyph-node counts. These are individual run medians,
+rather than regression thresholds. Completed rendering includes texture readback
+and costs more than preparation; alternating decoration fragments increase that
+cost even though their nodes remain retained.
+
+The native 84 × 28 decorated viewport used the following frontend CPU across
+five-second intervals on the same machine:
+
+| Content | Cairo, % of one core | OpenGL, % of one core |
+| --- | ---: | ---: |
+| Ordinary | 0 observed ticks | 0 observed ticks |
+| One blinking cell | 0.4% | 0.4% |
+| Every cell blinking | 2.0% | 1.2% |
+| Alternating blinking cells | 5.4% | 3.4% |
+| Hidden blinking tab | 0 observed ticks | 0 observed ticks |
+| Blink removed | 0 observed ticks | 0 observed ticks |
+
+Active blinking produced about 6–21 main-thread context switches per second,
+depending on density and backend. Hidden text measured 0 switches/s on Cairo
+and 0.2/s on OpenGL; removing blink measured 0/s on both. Detached daemon idle
+had zero CPU ticks and switches. All intervals produced zero daemon viewport
+snapshots and sent rows. The clock resolution was 0.2% of one core per sample.
+Frontend RSS across the four visible cases was 64.93–65.12 MiB on Cairo and
+285.38–285.45 MiB on OpenGL. Backend/driver memory is included, so these totals
+do not isolate retained-node storage.
+
 ## Program status
 
 OSC 7501 callbacks update a session-owned set of at most 64 records directly.

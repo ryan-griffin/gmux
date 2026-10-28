@@ -1614,7 +1614,7 @@ mod tests {
         old.write(
             concat!(
                 "\x1b[31;44mINDEX\x1b[38;5;201;48;5;22mEXTENDED\x1b[0m\r\n",
-                "\x1b[38;2;12;34;56;48;2;78;90;123;1;3;4;9m你好 e\u{301} 🦀 wrapped",
+                "\x1b[38;2;12;34;56;48;2;78;90;123;1;3;4;5;9m你好 e\u{301} 🦀 wrapped",
                 "\x1b[0m plain\r\n\r\n",
                 "\x1b[4:2;53;58;2;200;30;70mDOUBLE\x1b[4:3mCURLY\x1b[4:4mDOT\x1b[4:5mDASH\x1b[0m\r\n",
                 "\x1b[7;2;8mATTR\x1b[0m\r\n",
@@ -2914,6 +2914,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn text_blink_sgr_resets_history_holds_and_screens() {
+        let mut e = Engine::new().unwrap();
+        e.resize(12, 3, 0, 0).unwrap();
+        e.write("\x1b[5mA\x1b[25mB\x1b[6m界e\u{301}\x1b[0mC".as_bytes());
+        e.snapshot().unwrap();
+        assert_eq!(
+            e.cells[..6].iter().map(Cell::blink).collect::<Vec<_>>(),
+            [true, false, true, true, true, false]
+        );
+        let expected = e.cells[..12].to_vec();
+        e.write(b"\x1b[?2026h\r\x1b[25mZ");
+        e.snapshot().unwrap();
+        assert!(e.cells[..12] == expected);
+        e.write(b"\x1b[?2026l");
+        e.snapshot().unwrap();
+        assert!(!e.cells[0].blink());
+        e.write(b"\r\x1b[5mA\x1b[25m\r\nline2\r\nline3\r\nline4");
+        e.snapshot().unwrap();
+        let (cached, _) = e.cache_rows(0..1).unwrap();
+        assert!(
+            cached == expected,
+            "Styled history must retain wide/combining blink"
+        );
+        e.scroll_to(0);
+        e.snapshot().unwrap();
+        assert!(e.cells[..12] == expected);
+        e.write(b"\x1b[?1049h\x1b[H\x1b[6mX\x1b[25mY");
+        e.snapshot().unwrap();
+        assert!(e.cells[0].blink() && !e.cells[1].blink());
+        e.write(b"\x1b[?1049l");
+        e.scroll_to(0);
+        e.snapshot().unwrap();
+        assert!(e.cells[..12] == expected);
+        e.resize(16, 3, 0, 0).unwrap();
+        e.scroll_to(0);
+        e.snapshot().unwrap();
+        assert!(e.cells[..12] == expected);
     }
 
     #[test]

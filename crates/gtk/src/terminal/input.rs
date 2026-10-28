@@ -354,7 +354,7 @@ impl Terminal {
         self.area.set_snapshot_func(move |snapshot, w, h| {
             if let Some(t) = weak.upgrade() {
                 t.paint(w, h, |renderer, scene, font, context| {
-                    renderer.snapshot(snapshot, scene, font, context);
+                    renderer.snapshot(snapshot, scene, font, context)
                 });
             }
         });

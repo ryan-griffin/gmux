@@ -48,6 +48,8 @@ class Client:
             self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
             hello = fixture.rpc("_hello")
         self.cells = {}
+        self.cell_bytes = {}
+        self.cached_cell_bytes = b""
         self.git = {}
         self.frame = None
         self.links = dict(targets=[], spans=[])
@@ -83,11 +85,14 @@ class Client:
                 frame = header["frame"]
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells.clear()
+                    self.cell_bytes.clear()
                     self.links = dict(targets=[], spans=[])
                 shift = header.get("row_shift", 0)
                 if shift:
                     self.cells = {(row, col): self.cells.get((row + shift, col), " ")
                                   for row in range(frame["rows"]) for col in range(frame["cols"])}
+                    self.cell_bytes = {(row, col): self.cell_bytes.get((row + shift, col), bytes(75))
+                                       for row in range(frame["rows"]) for col in range(frame["cols"])}
                 self.frame = frame
                 if "hyperlinks" in header:
                     self.links = header["hyperlinks"]
@@ -96,6 +101,8 @@ class Client:
                     for col in range(frame["cols"]):
                         start = (index * frame["cols"] + col) * 75
                         self.cells[row, col] = cells[start:start + 64].split(b"\0", 1)[0].decode()
+                        self.cell_bytes[row, col] = cells[start:start + 75]
+                self.cached_cell_bytes = cells[len(header["rows"]) * frame["cols"] * 75:]
             if predicate(header):
                 return header
         raise AssertionError("Client did not receive expected state")

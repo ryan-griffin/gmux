@@ -207,6 +207,11 @@ mod tests {
         for row in 0..10 {
             let mut cell = Cell::default();
             cell.text[0] = b'a' + row;
+            cell.flags = if row % 2 == 1 {
+                crate::cells::flags::BLINK
+            } else {
+                0
+            };
             cache.insert(row as u64, &[cell; 2], &[row % 2]);
         }
         cache.truncate(8);
@@ -227,6 +232,13 @@ mod tests {
         assert_eq!(cells[0].text(), "d");
         assert_eq!(cells[6].text(), "g");
         assert_eq!(flags, [1, 0, 1, 0]);
+        assert_eq!(
+            cells
+                .chunks(2)
+                .map(|row| row[0].blink())
+                .collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
         assert!(!cache.copy_view(3, 2, &mut cells, &mut flags));
         cache.invalidate(2);
         assert!(!cache.copy_view(0, 1, &mut cells, &mut flags));

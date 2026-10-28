@@ -55,6 +55,9 @@ struct Options {
     /// Measure changing linear and rectangular selections over unchanged text.
     #[arg(long)]
     selection: bool,
+    /// Alternate retained text phases with no, sparse, dense and alternating blink.
+    #[arg(long)]
+    blink: bool,
     #[arg(long, default_value_t = 120)]
     cols: u16,
     #[arg(long, default_value_t = 40)]
@@ -174,7 +177,14 @@ fn main() -> anyhow::Result<()> {
         "unique",
         "decorations",
     ] {
-        let workloads: &[&str] = if options.selection {
+        let workloads: &[&str] = if options.blink {
+            &[
+                "no-blink",
+                "sparse-blink",
+                "dense-blink",
+                "alternating-blink",
+            ]
+        } else if options.selection {
             &["linear-selection", "rectangle-selection"]
         } else {
             &[
@@ -236,6 +246,16 @@ fn main() -> anyhow::Result<()> {
                     cell.underline_color = theme.palette[1 + (index / options.cols as usize) % 7];
                 }
             }
+            for (index, cell) in cells.iter_mut().enumerate() {
+                if match workload {
+                    "sparse-blink" => index == (options.rows as usize / 2) * options.cols as usize,
+                    "dense-blink" => true,
+                    "alternating-blink" => index % 2 == 0,
+                    _ => false,
+                } {
+                    cell.flags |= gmux_client::cells::flags::BLINK;
+                }
+            }
             let highlights = vec![0; cells.len()];
             let mut prepare = Vec::new();
             let mut complete = Vec::new();
@@ -249,7 +269,10 @@ fn main() -> anyhow::Result<()> {
             let mut allocated_bytes = 0;
             let mut pixels = vec![0; width as usize * height as usize * 4];
             for iteration in 0..options.frames + 5 {
-                if !options.selection && !matches!(workload, "static" | "cursor-blink") {
+                if !options.blink
+                    && !options.selection
+                    && !matches!(workload, "static" | "cursor-blink")
+                {
                     if workload == "full-screen" {
                         cells.rotate_left(options.cols as usize);
                     }
@@ -333,6 +356,7 @@ fn main() -> anyhow::Result<()> {
                     matches: &highlights,
                     focused: workload == "cursor-blink",
                     exited: false,
+                    text_blink_visible: !options.blink || iteration % 2 == 0,
                 };
                 let started = Instant::now();
                 let snapshot = gtk::Snapshot::new();
@@ -353,7 +377,8 @@ fn main() -> anyhow::Result<()> {
                 let rendered = gpu_started.elapsed().as_secs_f64() * 1000.0;
                 if iteration >= 5 {
                     let expected = match workload {
-                        "static" => 0,
+                        "static" | "no-blink" | "sparse-blink" | "dense-blink"
+                        | "alternating-blink" => 0,
                         "single-row" => 1,
                         "all-rows" => options.rows as usize,
                         // Moving from a wide glyph's head to its spacer tail
@@ -370,6 +395,13 @@ fn main() -> anyhow::Result<()> {
                         "Row cache invalidation in {workload}"
                     );
                     expected_rebuilt_rows += expected;
+                    if options.blink {
+                        assert_eq!(
+                            (stats.background_rows, stats.text_nodes),
+                            (0, 0),
+                            "Blink must retain every node"
+                        );
+                    }
                     allocations += frame_allocations;
                     allocated_bytes += frame_bytes;
                     prepare.push(prepared);

@@ -111,6 +111,7 @@ pub struct Terminal {
     settings: Rc<RefCell<Settings>>,
     renderer: RefCell<Renderer>,
     cursor: Rc<cursor::Cursor>,
+    text_blink: Rc<text_blink::TextBlink>,
     render_font: RefCell<Option<(pango::FontDescription, pango::Context, u32)>>,
     im: gtk::IMMulticontext,
     mouse_position: ValueCell<(f64, f64)>,
@@ -122,6 +123,7 @@ pub struct Terminal {
 mod cursor;
 mod input;
 mod links;
+mod text_blink;
 pub(crate) use input::KeyboardState;
 use input::mods;
 
@@ -259,6 +261,7 @@ impl Terminal {
                 eprintln!("{error}");
             }
         });
+        let text_blink = text_blink::TextBlink::new(&area);
         let terminal = Rc::new(Self {
             id,
             root,
@@ -301,6 +304,7 @@ impl Terminal {
             zoom: ValueCell::new(0.0),
             renderer: RefCell::new(Renderer::new()),
             cursor,
+            text_blink,
             render_font: RefCell::new(None),
             im,
             mouse_position: ValueCell::new((0.0, 0.0)),
@@ -736,6 +740,8 @@ impl Terminal {
             "title_bar_visible": self.title_bar.is_visible(), "cursor_style": frame.cursor_style,
             "cursor_blink": frame.cursor_blink, "cursor_blink_running": self.cursor.running(),
             "cursor_phase_visible": self.cursor.visible(), "mouse_shape": frame.mouse_shape,
+            "text_blink_running": self.text_blink.running(),
+            "text_blink_phase_visible": self.text_blink.visible(),
             "pointer_name": self.area.cursor().and_then(|cursor| cursor.name()).map(|name| name.to_string()),
             "scale": scale, "origin": [origin.0, origin.1], "focused": self.area.has_focus(),
             "scrollback": session.snapshot().frame.scrollback,
@@ -864,7 +870,12 @@ impl Terminal {
         self: &Rc<Self>,
         width: i32,
         height: i32,
-        draw: impl FnOnce(&mut Renderer, &Scene<'_>, &pango::FontDescription, &pango::Context),
+        draw: impl FnOnce(
+            &mut Renderer,
+            &Scene<'_>,
+            &pango::FontDescription,
+            &pango::Context,
+        ) -> crate::renderer::RenderStats,
     ) {
         let font = self
             .render_font
@@ -954,8 +965,10 @@ impl Terminal {
             matches,
             focused: self.area.has_focus(),
             exited,
+            text_blink_visible: self.text_blink.visible(),
         };
-        draw(&mut self.renderer.borrow_mut(), &scene, &font, &context);
+        let stats = draw(&mut self.renderer.borrow_mut(), &scene, &font, &context);
+        self.text_blink.update(stats.blinking_rows != 0 && !exited);
         // This span is already painted. Refresh pointer state below without
         // scheduling another frame just because the displayed map changed.
         self.link_hover.set(scene.hovered_link);

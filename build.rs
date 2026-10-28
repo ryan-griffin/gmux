@@ -46,7 +46,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
         .allowlist_var(
-            "GMUX_(UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION|KEY_ACTION|CLIPBOARD)_.*",
+            "GMUX_(CELL|UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION|KEY_ACTION|CLIPBOARD)_.*",
         )
         .allowlist_function("gmux_engine_.*")
         .allowlist_function("gmux_checkpoint_history")
@@ -78,6 +78,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
     // Check every named protocol code against the toolkit-free client values.
     // The C implementation maps pinned Ghostty enum names explicitly.
     for (prefix, module) in [
+        ("GMUX_CELL_", "cells::flags"),
         ("GMUX_UNDERLINE_", "cells::underline"),
         ("GMUX_MOUSE_SHAPE_", "cells::mouse_shape"),
         ("GMUX_DECORATION_", "cells::decoration"),
