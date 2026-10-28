@@ -91,22 +91,23 @@ struct Events {
     command: gmux_client::shell::CommandState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
-const _: () = assert!(GMUX_CLIPBOARD_MAX_BYTES as usize == gmux_client::transport::MAX_PASTE);
+const _: () =
+    assert!(GMUX_CLIPBOARD_MAX_BYTES as usize == gmux_client::clipboard::MAX_APPLICATION_BYTES);
+const _: () =
+    assert!(GMUX_CLIPBOARD_MAX_CONTENTS as usize == gmux_client::clipboard::MAX_REPRESENTATIONS);
 
 unsafe extern "C" fn clipboard_write(
     ud: *mut c_void,
     destination: u8,
-    data: *const u8,
-    len: usize,
+    contents: *const GmuxClipboardContent,
+    count: usize,
 ) -> i32 {
-    use gmux_client::clipboard::{Destination, Write};
+    use gmux_client::clipboard::{self, Destination, InvalidOffer, Offer, Representation, Write};
     let events = unsafe { &mut *ud.cast::<Events>() };
-    if len > gmux_client::transport::MAX_PASTE {
+    if count > clipboard::MAX_REPRESENTATIONS || (count > 0 && contents.is_null()) {
         return GMUX_CLIPBOARD_INVALID as i32;
     }
-    if events.clipboard.len() >= MAX_CLIPBOARD_EVENTS
-        || len > gmux_client::transport::MAX_PASTE - events.clipboard_bytes
-    {
+    if events.clipboard.len() >= MAX_CLIPBOARD_EVENTS {
         return GMUX_CLIPBOARD_BUSY as i32;
     }
     let destination = match u32::from(destination) {
@@ -114,22 +115,61 @@ unsafe extern "C" fn clipboard_write(
         GMUX_CLIPBOARD_PRIMARY => Destination::Primary,
         _ => return GMUX_CLIPBOARD_INVALID as i32,
     };
-    let text = if data.is_null() {
-        None
-    } else {
-        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return GMUX_CLIPBOARD_INVALID as i32;
-        };
-        if text.contains('\0') {
+    // C has bounded and checked these slices. Keep upstream layouts in C and
+    // inspect the complete borrowed offer before allocating or queuing anything.
+    let mut borrowed = [("", &[][..]); clipboard::MAX_REPRESENTATIONS];
+    let mut len = 0;
+    for (index, content) in (0..count).map(|i| (i, unsafe { &*contents.add(i) })) {
+        if content.mime.len > "text/plain;charset=utf-8".len() {
+            return GMUX_CLIPBOARD_UNSUPPORTED as i32;
+        }
+        if content.mime.ptr.is_null() || (content.data.len > 0 && content.data.ptr.is_null()) {
             return GMUX_CLIPBOARD_INVALID as i32;
         }
-        Some(text.to_owned())
-    };
+        if content.data.len > clipboard::MAX_APPLICATION_BYTES - len {
+            return GMUX_CLIPBOARD_INVALID as i32;
+        }
+        len += content.data.len;
+        let mime = unsafe { std::slice::from_raw_parts(content.mime.ptr, content.mime.len) };
+        let Ok(mime) = std::str::from_utf8(mime) else {
+            return GMUX_CLIPBOARD_UNSUPPORTED as i32;
+        };
+        let data = if content.data.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(content.data.ptr, content.data.len) }
+        };
+        borrowed[index] = (mime, data);
+    }
+    // Capacity admission precedes UTF-8/NUL scans of a potentially large value.
+    if len > clipboard::MAX_APPLICATION_BYTES - events.clipboard_bytes {
+        return GMUX_CLIPBOARD_BUSY as i32;
+    }
+    if count != 0 {
+        match clipboard::validate_representations(
+            borrowed[..count].iter().copied(),
+            clipboard::MAX_APPLICATION_BYTES,
+        ) {
+            Ok(_) => {}
+            Err(InvalidOffer::Unsupported) => return GMUX_CLIPBOARD_UNSUPPORTED as i32,
+            Err(InvalidOffer::InvalidData) => return GMUX_CLIPBOARD_INVALID as i32,
+        }
+    }
+    let content = (count != 0).then(|| {
+        Offer(
+            borrowed[..count]
+                .iter()
+                .map(|(mime, data)| Representation {
+                    mime: (*mime).into(),
+                    data: data.to_vec(),
+                })
+                .collect(),
+        )
+    });
     events.clipboard_bytes += len;
     events.clipboard.push(Write {
         destination,
-        content: text.map(Into::into),
+        content,
     });
     GMUX_CLIPBOARD_SUCCESS as i32
 }

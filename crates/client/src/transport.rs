@@ -1,4 +1,4 @@
-//! Versioned viewport packets: JSON metadata followed by fixed-width cell rows.
+//! Versioned packets: JSON metadata followed by cell rows or clipboard bytes.
 use crate::{Cell, Frame};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,7 +12,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 35;
+pub const VERSION: u32 = 36;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -87,6 +87,7 @@ pub struct Header {
     pub selection_serial: u64,
     #[serde(default)]
     pub selection_origin: Option<u64>,
+    #[serde(default, with = "crate::clipboard::wire")]
     pub copy: Option<crate::clipboard::Write>,
 }
 
@@ -99,8 +100,7 @@ pub struct Packet {
     pub cells: Vec<Cell>,
 }
 
-/// JSON escaping can expand control text sixfold. Stop encoding at the packet
-/// limit, before an oversized header can grow the frontend's transport buffer.
+/// Bound clipboard metadata separately from its binary payload.
 struct HeaderWriter<'a> {
     bytes: &'a mut Vec<u8>,
     end: usize,
@@ -120,20 +120,53 @@ impl Write for HeaderWriter<'_> {
 
 impl Packet {
     pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
+        self.encode_into_limit(bytes, MAX_PACKET + 4)
+    }
+
+    /// Limit the complete record before copying clipboard payloads to the queue.
+    pub fn encode_into_limit(&self, bytes: &mut Vec<u8>, limit: usize) -> anyhow::Result<()> {
         let start = bytes.len();
+        let limit = limit.min(MAX_PACKET + 4);
+        let clipboard_payload = if let Some(write) = &self.header.copy {
+            let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
+            // Reject backpressure before scanning text or growing the queue.
+            anyhow::ensure!(8 + payload <= limit, "Clipboard queue is full");
+            anyhow::ensure!(
+                self.clipboard_only() && self.cells.is_empty(),
+                "Clipboard offers require a dedicated packet"
+            );
+            write.validate()?;
+            Some(payload)
+        } else {
+            None
+        };
         // Serialize into the reusable output buffer, then fill the lengths.
         // A failed packet must leave previously queued packets untouched.
         bytes.extend_from_slice(&[0; 8]);
         let result = (|| {
-            if self.header.copy.is_some() {
-                self.encode_clipboard_header(bytes, start + 4 + MAX_PACKET)?;
+            if let Some(payload) = clipboard_payload {
+                serde_json::to_writer(
+                    HeaderWriter {
+                        bytes,
+                        end: start
+                            + 8
+                            + (limit - 8 - payload).min(crate::clipboard::MAX_HEADER_BYTES),
+                    },
+                    &self.header,
+                )?;
             } else {
                 // Keep ordinary viewport traffic on serde's direct Vec writer.
                 serde_json::to_writer(&mut *bytes, &self.header)?;
             }
             let header_size = bytes.len() - start - 8;
-            let size = 4 + header_size + self.cells.len() * CELL_BYTES;
-            anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
+            if let Some(content) = self.header.copy.as_ref().and_then(|w| w.content.as_ref()) {
+                bytes.reserve(content.byte_len());
+                for representation in &content.0 {
+                    bytes.extend_from_slice(&representation.data);
+                }
+            }
+            let size = bytes.len() - start - 4 + self.cells.len() * CELL_BYTES;
+            anyhow::ensure!(size + 4 <= limit, "Viewport packet or queue is too large");
             bytes[start..start + 4].copy_from_slice(&(size as u32).to_le_bytes());
             bytes[start + 4..start + 8].copy_from_slice(&(header_size as u32).to_le_bytes());
             bytes.reserve(self.cells.len() * CELL_BYTES);
@@ -153,11 +186,18 @@ impl Packet {
         result
     }
 
-    #[cold]
-    fn encode_clipboard_header(&self, bytes: &mut Vec<u8>, end: usize) -> anyhow::Result<()> {
-        self.header.copy.as_ref().unwrap().validate()?;
-        serde_json::to_writer(HeaderWriter { bytes, end }, &self.header)?;
-        Ok(())
+    fn clipboard_only(&self) -> bool {
+        let h = &self.header;
+        h.frame.is_none()
+            && h.rows.is_empty()
+            && h.cache.is_none()
+            && h.row_shift == 0
+            && h.state.is_none()
+            && h.git.is_none()
+            && h.hyperlinks.is_none()
+            && h.selection.is_none()
+            && h.notifications.is_empty()
+            && h.find.is_none()
     }
 
     /// Decode one packet, skipping heartbeat replies and leaving following data buffered.
@@ -190,8 +230,28 @@ impl Packet {
             reader.read_exact(&mut bytes)?;
             serde_json::from_slice::<Header>(&bytes)?
         };
-        if let Some(write) = &header.copy {
+        if header.copy.is_some() {
+            let mut packet = Self {
+                header,
+                cells: Vec::new(),
+            };
+            anyhow::ensure!(
+                header_size <= crate::clipboard::MAX_HEADER_BYTES && packet.clipboard_only(),
+                "Invalid clipboard packet"
+            );
+            let write = packet.header.copy.as_mut().unwrap();
+            let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
+            anyhow::ensure!(
+                size - 4 - header_size == payload,
+                "Invalid clipboard payload length"
+            );
+            if let Some(content) = &mut write.content {
+                for representation in &mut content.0 {
+                    reader.read_exact(&mut representation.data)?;
+                }
+            }
             write.validate()?;
+            return Ok(Some(packet));
         }
         if let Some(end) = header.cache_valid_before {
             anyhow::ensure!(
@@ -762,75 +822,158 @@ mod tests {
         assert!(decoded.cells == packet.cells);
     }
 
-    #[test]
-    fn rich_clipboard_limits_and_json_fallback_preserve_the_plain_offer() {
-        use crate::clipboard::{Content, Destination, MAX_HTML, Write};
-        let mut content = Content {
-            text: "\"".repeat(MAX_PASTE),
-            html: Some("\\".repeat(MAX_HTML)),
-        };
-        content.bound_html();
-        assert!(content.html.is_none());
-        let mut packet = Packet {
+    fn offer(contents: &[(&str, &[u8])]) -> Packet {
+        use crate::clipboard::{Destination, Offer, Representation, Write};
+        Packet {
             header: Header {
                 copy: Some(Write {
-                    destination: Destination::Clipboard,
-                    content: Some(content),
+                    destination: Destination::Primary,
+                    content: Some(Offer(
+                        contents
+                            .iter()
+                            .map(|(mime, data)| Representation {
+                                mime: (*mime).into(),
+                                data: data.to_vec(),
+                            })
+                            .collect(),
+                    )),
                 }),
                 ..Header::default()
             },
             cells: vec![],
-        };
-        let mut wire = vec![];
-        packet.encode_into(&mut wire).unwrap();
-        let decoded = Packet::read(&mut &wire[..]).unwrap();
-        assert_eq!(decoded.header.copy, packet.header.copy);
-        for html in ["x".repeat(MAX_HTML + 1), "bad\0html".into()] {
-            packet
-                .header
-                .copy
-                .as_mut()
-                .unwrap()
-                .content
-                .as_mut()
-                .unwrap()
-                .html = Some(html);
-            wire.clear();
-            assert!(packet.encode_into(&mut wire).is_err());
-            assert!(wire.is_empty());
-            let header = serde_json::to_vec(&packet.header).unwrap();
-            wire.extend_from_slice(&((header.len() + 4) as u32).to_le_bytes());
-            wire.extend_from_slice(&(header.len() as u32).to_le_bytes());
-            wire.extend_from_slice(&header);
-            assert!(Packet::read(&mut &wire[..]).is_err());
         }
     }
 
     #[test]
-    fn clipboard_text_limits_apply_to_decode_and_bound_json_escape_growth() {
-        use crate::clipboard::{Destination, Write};
-        let mut packet = Packet {
-            header: Header {
-                copy: Some(Write {
-                    destination: Destination::Clipboard,
-                    content: Some("\u{1}".repeat(MAX_PASTE).into()),
-                }),
-                ..Header::default()
-            },
-            cells: vec![],
-        };
-        let mut encoded = vec![0; 16];
-        assert!(packet.encode_into(&mut encoded).is_err());
-        assert_eq!(encoded, [0; 16]);
-        assert!(encoded.capacity() <= 2 * (MAX_PACKET + 20));
-        for text in ["x".repeat(MAX_PASTE + 1), "has\0nul".into()] {
-            packet.header.copy.as_mut().unwrap().content = Some(text.into());
-            // Bypass the encoder's checks to test untrusted remote packets.
-            let header = serde_json::to_vec(&packet.header).unwrap();
-            let mut wire = ((header.len() + 4) as u32).to_le_bytes().to_vec();
+    fn clipboard_binary_alternatives_roundtrip_without_json_amplification() {
+        let png = include_bytes!("../../../scripts/fixtures/clipboard.png");
+        let packet = offer(&[
+            ("image/png", png),
+            ("text/html", b"<b>html</b>\0"),
+            ("text/plain;charset=utf-8", "plain 界🙂".as_bytes()),
+            ("text/plain", "plain 界🙂".as_bytes()),
+        ]);
+        let mut bytes = vec![];
+        packet.encode_into(&mut bytes).unwrap();
+        let header_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        assert_eq!(
+            header["copy"]["content"][0],
+            serde_json::json!({"mime":"image/png", "len":png.len()})
+        );
+        assert_eq!(&bytes[8 + header_len..][..png.len()], png);
+        // Read through very small buffers to cross header and binary boundaries.
+        for capacity in [1, 3, 79, 65536] {
+            let decoded =
+                Packet::read(&mut BufReader::with_capacity(capacity, bytes.as_slice())).unwrap();
+            assert_eq!(decoded.header.copy, packet.header.copy);
+        }
+        let packet = offer(&[(
+            "image/png",
+            &vec![0; crate::clipboard::MAX_APPLICATION_BYTES],
+        )]);
+        bytes.clear();
+        packet.encode_into(&mut bytes).unwrap();
+        assert!(bytes.len() < crate::clipboard::MAX_APPLICATION_BYTES + 1024);
+        assert!(Packet::read(&mut bytes.as_slice()).is_ok());
+        let mut queue = vec![1; 20];
+        let capacity = queue.capacity();
+        assert!(packet.encode_into_limit(&mut queue, 4096).is_err());
+        assert_eq!(queue, [1; 20]);
+        assert_eq!(queue.capacity(), capacity); // No queue growth on rejection.
+    }
+
+    #[test]
+    fn clipboard_header_and_queue_limits_apply_at_the_exact_boundary() {
+        let mut packet = offer(&[("text/plain", b"value")]);
+        let original_header = serde_json::to_vec(&packet.header).unwrap().len();
+        packet.header.meta.title = "x".repeat(crate::clipboard::MAX_HEADER_BYTES - original_header);
+        let mut bytes = vec![];
+        packet.encode_into(&mut bytes).unwrap();
+        let header_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        assert_eq!(header_len, crate::clipboard::MAX_HEADER_BYTES);
+        let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.header.copy, packet.header.copy);
+
+        let mut queue = bytes.clone();
+        packet.encode_into_limit(&mut queue, bytes.len()).unwrap();
+        assert_eq!(queue.len(), 2 * bytes.len());
+        assert!(
+            packet
+                .encode_into_limit(&mut queue, bytes.len() - 1)
+                .is_err()
+        );
+        assert_eq!(queue.len(), 2 * bytes.len());
+        packet.header.meta.title.push('x');
+        assert!(packet.encode_into(&mut queue).is_err());
+        assert_eq!(queue.len(), 2 * bytes.len());
+
+        // Bypass encoding to verify the same metadata bound on remote input.
+        let header = serde_json::to_vec(&packet.header).unwrap();
+        let mut oversized = ((4 + header.len() + 5) as u32).to_le_bytes().to_vec();
+        oversized.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        oversized.extend_from_slice(&header);
+        oversized.extend_from_slice(b"value");
+        assert!(Packet::read(&mut oversized.as_slice()).is_err());
+    }
+
+    #[test]
+    fn clipboard_rejects_invalid_descriptors_payloads_and_mixed_packets() {
+        let valid_packet = offer(&[("text/plain", b"ok"), ("text/html", b"<b>ok</b>")]);
+        let header = serde_json::to_value(&valid_packet.header).unwrap();
+        let mut cases = Vec::new();
+        for content in [
+            serde_json::json!([]),
+            serde_json::json!([{"mime":"image/jpeg","len":0}]),
+            serde_json::json!([{"mime":"image/png","len":usize::MAX}]),
+            serde_json::json!([
+                {"mime":"image/png","len":0}, {"mime":"text/html","len":0},
+                {"mime":"text/plain","len":0}, {"mime":"text/plain;charset=utf-8","len":0},
+                {"mime":"image/png","len":0}
+            ]),
+            serde_json::json!([
+                {"mime":"image/png","len":crate::clipboard::MAX_HTML},
+                {"mime":"text/html","len":crate::clipboard::MAX_HTML}
+            ]),
+            serde_json::json!([{"mime":"text/plain","len":0},{"mime":"text/plain","len":0}]),
+            serde_json::json!([{"mime":"text/plain","len":1}]), // NUL text.
+            serde_json::json!([{"mime":"text/plain","len":2}]), // Truncated.
+        ] {
+            let mut h = header.clone();
+            h["copy"]["content"] = content;
+            cases.push(h);
+        }
+        let mut mixed = header.clone();
+        mixed["frame"] = serde_json::to_value(packet().header.frame).unwrap();
+        cases.push(mixed);
+        for header in cases {
+            let header = serde_json::to_vec(&header).unwrap();
+            let mut wire = ((header.len() + 5) as u32).to_le_bytes().to_vec();
             wire.extend_from_slice(&(header.len() as u32).to_le_bytes());
             wire.extend_from_slice(&header);
-            assert!(Packet::read(&mut &wire[..]).is_err());
+            wire.push(0);
+            assert!(Packet::read(&mut wire.as_slice()).is_err());
+        }
+        let mut valid = vec![];
+        valid_packet.encode_into(&mut valid).unwrap();
+        for cut in [1, 4, 7, valid.len() - 1] {
+            assert!(Packet::read(&mut &valid[..cut]).is_err());
+        }
+        for contents in [
+            vec![("text/plain", b"bad\0".as_slice())],
+            vec![
+                ("text/plain", b"one".as_slice()),
+                ("text/plain;charset=utf-8", b"two".as_slice()),
+            ],
+            vec![
+                ("text/html", b"ok".as_slice()),
+                ("application/octet-stream", b"no".as_slice()),
+            ],
+        ] {
+            let invalid = offer(&contents);
+            let mut queue = valid.clone();
+            assert!(invalid.encode_into(&mut queue).is_err());
+            assert_eq!(queue, valid);
         }
     }
 }

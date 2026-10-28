@@ -112,6 +112,72 @@ handlers and maintain a shared snapshot between focus-entry queries.
 Wayland translates base characters
 directly, without allocating a keymap entry list.
 
+## Application clipboard writes
+
+Measure admission and binary transport independently of GTK:
+
+```sh
+cargo run --locked --release -p gmux-client --example clipboard-benchmark > artifacts/clipboard-transport-benchmark.json
+cargo test --locked --release -p gmux-core clipboard_admission_measurements -- --ignored --nocapture
+python3 scripts/check.py --native --only clipboard clipboard-ui
+```
+
+The client benchmark performs 100 encode/decode/byte-comparison iterations per
+case with a reusable output buffer. Allocation counts cover Rust allocation and
+reallocation calls during those iterations, excluding source construction and
+GTK/native allocators. Binary cases use synthetic NUL bytes with the PNG MIME
+type; native tests separately transfer a real PNG. Text cases include bytes
+that JSON would escape. The whole payload travels as raw bytes.
+
+On an x86-64 i7-13700H release build, a 4 MiB binary offer took a median 0.48 ms
+and maximum 0.71 ms for encoding, decoding and comparison. Its wire record added
+575 bytes. Each iteration allocated five times, totaling 4,195,056 bytes,
+including one decoded payload allocation. A 4 MiB three-format offer allocated
+nine times, totaling 4,195,242 bytes, and added 646 wire bytes. The source offer,
+reusable transport buffer, and decoded offer each retain one payload copy.
+GDK takes ownership of the decoded byte vectors without another payload copy;
+actual plain text also needs a String provider.
+
+Borrowed 4 MiB PNG admission took a median 0.12 ms and maximum 1.15 ms over 100
+requests, including the first allocation. The event queue retained the payload
+plus bounded MIME/vector metadata. A second large request returned busy without
+copying its payload. Queue-overflow tests also verify that rejected encoding
+does not allocate a payload-sized output buffer or lose earlier offers.
+
+The same benchmarks measure full-queue rejection separately. Size admission runs
+before UTF-8/NUL validation, so backpressure never scans a rejected payload. A
+4 MiB plain-text request took a median 112 ns to return busy from engine admission
+and 58 ns to reject in transport encoding. Transport rejection allocated only its
+72-byte error object and left the queue buffer's length and capacity unchanged.
+These timings exclude native protocol decoding, which precedes the callback.
+
+The `clipboard` smoke suite records `artifacts/clipboard-stream-measurements.json`.
+It sends 48 one-MiB rich writes at 5 ms intervals to a stopped reader, observes
+the daemon detaching that recipient, and verifies a replacement receives no old
+offers. A debug-build run completed in 1.01 s including fixture file I/O and the
+intentional pauses. Another PTY processed input in 1.98 ms during the flood.
+Daemon RSS was 54,144 KiB before, 111,464 KiB at its process high-water mark, and
+63,772 KiB after. Idle sampling with writes enabled and disabled recorded zero
+daemon CPU ticks over 1.1 s in each case. These short idle samples do not measure
+sub-tick work. Clipboard delivery adds no polling timer.
+
+The native decoded-data limit does not bound repeated Kitty alias metadata
+before commit. Measure that separately against the pinned library:
+
+```sh
+cc -O2 -std=c11 '-DGMUX_VERSION="test"' -I.deps/ghostty/include \
+  scripts/clipboard-alias-benchmark.c -L.deps/ghostty/lib \
+  -Wl,-rpath,"$PWD/.deps/ghostty/lib" -lghostty-vt \
+  -o artifacts/clipboard-alias-benchmark
+artifacts/clipboard-alias-benchmark 1000000
+```
+
+One byte of data and a million repetitions of the same alias retained about
+9 MiB of extra native memory before commit, while the embedding callback had
+not yet run. Commit released that transaction storage. This is an upstream
+parser allocation limit, not a Gmux queue overflow. See the
+[current clipboard limits](clipboard.md#application-writes).
+
 ## Program status
 
 OSC 7501 callbacks update a session-owned set of at most 64 records directly.

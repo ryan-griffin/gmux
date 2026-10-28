@@ -37,7 +37,93 @@ to return JSON containing `text` and optional `html`. Socket clients can request
 `formats: "text-html"`; the default is `"text"`. See the
 [daemon API](daemon-api.md) for stream requests and clipboard events.
 
-Terminal applications can submit UTF-8 text through OSC 52. They cannot submit
-rich MIME content or read the desktop clipboard. An empty OSC 52 payload clears
-the destination; offering an empty text value is a separate operation. See the
-[README](../README.md) for destination and recipient rules.
+## Application writes
+
+Terminal applications can write through OSC 52, iTerm2 OSC 1337 `Copy`, and Kitty
+OSC 5522. The pinned libghostty normalizes these protocols into one atomic write
+callback. Gmux does not parse a second copy of these protocols. Clipboard reads
+remain disabled, including Kitty reads and OSC 52 `?`.
+
+Kitty writes can offer these exact MIME names together:
+
+| MIME name | Data |
+| --- | --- |
+| `text/plain` | UTF-8 without NUL |
+| `text/plain;charset=utf-8` | UTF-8 without NUL |
+| `text/html` | Exact bytes |
+| `image/png` | Exact bytes |
+
+Gmux preserves MIME names and data, including NUL in HTML and PNG. It does not
+parse HTML, decode images, or derive text from either format. Only supplied plain
+text adds GTK's String fallback and its text targets. If both plain MIME names
+are supplied, their bytes must agree. Duplicate MIME names and any unsupported
+representation reject the entire normalized request. Libghostty resolves Kitty
+aliases and repeated protocol entries before admission.
+
+Application requests have at most four representations and 4 MiB of decoded
+data in total, counting each expanded alias. Libghostty also limits the Kitty
+transaction's accumulated decoded data to 4 MiB before the callback. Each engine
+poll admits at most 64 events with 4 MiB of data in total. Local and remote
+streams carry small MIME/length descriptors followed by binary data, without
+base64 or JSON byte arrays. Explicit user copy retains its separate 4 MiB text
+and 8 MiB HTML limits. A stream packet is at most 16 MiB; clipboard metadata is
+at most 16 KiB. Daemon output and client input queues are each limited to 32 MiB;
+the client also limits its queue to 64 packets. A stalled recipient is detached
+when its daemon output queue fills, without blocking terminal output.
+
+The pinned native parser does not charge repeated Kitty alias metadata against
+its decoded-data budget. An unfinished transaction can therefore grow native
+memory through repeated aliases until commit or abort. The normalized callback
+only runs at commit, so Gmux's admission bounds cannot prevent that earlier
+allocation. A native dependency fix is required for a hard bound on all parser
+memory.
+
+The standard clipboard and primary selection are supported. The separate
+`selection` destination is unsupported. Existing recipient policy applies to
+all application writes: select one attached, capable frontend viewing the pane,
+prefer the focused frontend, then connection order. Headless observers do not
+receive writes. Requests completed without an eligible frontend are discarded.
+Offers are ordered across panes and explicit copies, transient, and never saved
+or replayed when a frontend attaches or reconnects.
+
+Zero representations clears the destination. An empty representation offers
+that MIME type with zero bytes. An empty OSC 52 payload retains its existing
+clear behavior. A single GDK union provider publishes all alternatives together.
+Rejected requests leave the existing desktop clipboard unchanged.
+
+Kitty receives `DONE` after synchronous bounded admission, `ENOSYS` for unsupported
+destinations/formats or no eligible frontend, `EINVAL` for invalid data or an
+oversized expanded offer, and `EBUSY` when engine admission is full. Libghostty
+returns `EFBIG` if the transaction exceeds its decoded-data budget before commit.
+OSC 52 and iTerm2 writes have no acknowledgement. Admission does not wait for GTK
+and cannot promise delivery after a disconnect. A later transport failure
+detaches the recipient; a GTK publication failure is logged and retains the old
+clipboard. Gmux never retains a borrowed callback or reply pointer and never
+records a session permission grant.
+
+For example, run this inside a Gmux terminal to offer HTML and plain text:
+
+```python
+import base64
+import sys
+
+def packet(metadata, data=None):
+    payload = "" if data is None else ";" + base64.b64encode(data).decode()
+    sys.stdout.write("\x1b]5522;" + metadata + payload + "\x1b\\")
+
+packet("type=write")
+for mime, data in [("text/html", b"<b>Hello</b>"), ("text/plain", b"Hello")]:
+    packet("type=wdata:mime=" + base64.b64encode(mime.encode()).decode(), data)
+packet("type=wdata")
+sys.stdout.flush()
+```
+
+For larger data, split each MIME's base64 stream across `wdata` packets rather
+than putting the whole file in one OSC sequence. The same transaction can include
+an `image/png` representation containing the file's exact bytes.
+
+The [pinned callback contract](https://github.com/ghostty-org/ghostty/blob/8f0dd3709050b1026f6324368805033197d8b4a5/include/ghostty/vt/terminal.h)
+defines borrowing, atomicity, and protocol replies. GDK documents
+[byte providers](https://docs.gtk.org/gdk4/ctor.ContentProvider.new_for_bytes.html),
+[union ordering](https://docs.gtk.org/gdk4/ctor.ContentProvider.new_union.html), and
+[publication failure behavior](https://docs.gtk.org/gdk4/method.Clipboard.set_content.html).

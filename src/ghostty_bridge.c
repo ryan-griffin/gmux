@@ -396,10 +396,6 @@ static GhosttyString xtversion(GhosttyTerminal t, void *ud) {
     static const uint8_t version[] = "gmux " GMUX_VERSION;
     return (GhosttyString){.ptr = version, .len = sizeof(version) - 1};
 }
-static bool string_equal(GhosttyString value, const char *text) {
-    size_t len = strlen(text);
-    return value.len == len && value.ptr && !memcmp(value.ptr, text, len);
-}
 static void clipboard_write(GhosttyTerminal t, void *ud, const GhosttyClipboardWrite *write) {
     (void)t;
     // No request or reply pointer may escape this callback. Unknown layouts
@@ -417,26 +413,33 @@ static void clipboard_write(GhosttyTerminal t, void *ud, const GhosttyClipboardW
     }
     // Accept the whole atomic request, never just one representation of rich
     // clipboard contents. Zero representations means clear, not empty text.
-    const uint8_t *data = NULL;
-    size_t len = 0;
-    if (write->contents_len == 1 && write->contents) {
-        const GhosttyClipboardContent *content = write->contents;
-        if (!string_equal(content->mime, "text/plain") &&
-            !string_equal(content->mime, "text/plain;charset=utf-8")) goto done;
-        data = content->data.ptr;
-        len = content->data.len;
-        if (len > GMUX_CLIPBOARD_MAX_BYTES || (len && !data)) {
+    if (write->contents_len > GMUX_CLIPBOARD_MAX_CONTENTS) goto done;
+    GmuxClipboardContent contents[GMUX_CLIPBOARD_MAX_CONTENTS];
+    size_t total = 0;
+    if (write->contents_len && !write->contents) {
+        reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+        goto done;
+    }
+    for (size_t i = 0; i < write->contents_len; i++) {
+        const GhosttyClipboardContent *content = &write->contents[i];
+        if (content->data.len > GMUX_CLIPBOARD_MAX_BYTES - total ||
+            (content->data.len && !content->data.ptr) ||
+            !content->mime.ptr || !content->mime.len) {
             reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
             goto done;
         }
-        // Keep empty text distinct even if the library uses a NULL slice.
-        if (!data) data = (const uint8_t *)"";
-    } else if (write->contents_len != 0) goto done;
+        total += content->data.len;
+        contents[i] = (GmuxClipboardContent){
+            .mime = {content->mime.ptr, content->mime.len},
+            .data = {content->data.ptr, content->data.len},
+        };
+    }
     reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
     if (e->clipboard) {
-        switch (e->clipboard(e->userdata, destination, data, len)) {
+        switch (e->clipboard(e->userdata, destination, contents, write->contents_len)) {
             case GMUX_CLIPBOARD_SUCCESS: reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS; break;
             case GMUX_CLIPBOARD_INVALID: reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA; break;
+            case GMUX_CLIPBOARD_UNSUPPORTED: reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED; break;
             default: break;
         }
     }

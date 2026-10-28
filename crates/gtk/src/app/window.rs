@@ -523,7 +523,9 @@ impl Ui {
                         Destination::Clipboard => ui.window.clipboard(),
                         Destination::Primary => ui.window.primary_clipboard(),
                     };
-                    crate::clipboard::publish(&clipboard, write.content);
+                    if let Err(error) = crate::clipboard::publish(&clipboard, write.content) {
+                        eprintln!("Could not publish clipboard offer: {error}");
+                    }
                 });
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 let updates_git_changed = updates.values().any(|update| update.git_changed);

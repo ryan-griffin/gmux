@@ -48,8 +48,19 @@ fn clipboard_admission_bounds_bytes_and_event_count_and_recovers_after_drain() {
     assert_eq!(engine.take_clipboard_writes().len(), MAX_CLIPBOARD_EVENTS);
     let text = vec![b'x'; gmux_client::transport::MAX_PASTE];
     let ud = (&mut *engine.events as *mut Events).cast();
-    let admit =
-        |len| unsafe { clipboard_write(ud, GMUX_CLIPBOARD_STANDARD as u8, text.as_ptr(), len) };
+    let admit = |len| {
+        let content = GmuxClipboardContent {
+            mime: GmuxText {
+                ptr: b"text/plain".as_ptr(),
+                len: 10,
+            },
+            data: GmuxText {
+                ptr: text.as_ptr(),
+                len,
+            },
+        };
+        unsafe { clipboard_write(ud, GMUX_CLIPBOARD_STANDARD as u8, &content, 1) }
+    };
     assert_eq!(admit(text.len()), GMUX_CLIPBOARD_SUCCESS as i32);
     assert_eq!(admit(1), GMUX_CLIPBOARD_BUSY as i32);
     assert_eq!(admit(text.len() + 1), GMUX_CLIPBOARD_INVALID as i32);
@@ -58,7 +69,8 @@ fn clipboard_admission_bounds_bytes_and_event_count_and_recovers_after_drain() {
             .content
             .as_ref()
             .unwrap()
-            .text
+            .plain_text()
+            .unwrap()
             .len(),
         text.len()
     );
@@ -67,9 +79,124 @@ fn clipboard_admission_bounds_bytes_and_event_count_and_recovers_after_drain() {
         engine.take_clipboard_writes()[0]
             .content
             .as_ref()
-            .map(|c| c.text.as_str()),
+            .and_then(|c| c.plain_text()),
         Some("")
     );
+}
+
+#[test]
+fn rich_application_requests_are_atomic_owned_and_reply_to_the_program() {
+    let mut engine = Engine::new().unwrap();
+    engine.set_clipboard_enabled(true);
+    // Exercise our integration with normalized requests, not the parser's grammar.
+    engine.write(concat!(
+        "\x1b]5522;type=write:id=rich\x1b\\",
+        "\x1b]5522;type=wdata:mime=aW1hZ2UvcG5n;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMQVDL+DwACFAFmBODefwAAAABJRU5ErkJggg==\x1b\\",
+        "\x1b]5522;type=wdata:mime=dGV4dC9odG1s;PGI+cmljaDwvYj4A\x1b\\",
+        "\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbjtjaGFyc2V0PXV0Zi04;cmljaA==\x1b\\",
+    ).as_bytes());
+    assert!(engine.take_clipboard_writes().is_empty());
+    assert!(engine.take_events().0.is_empty());
+    engine.write(b"\x1b]5522;type=wdata\x1b\\");
+    let writes = engine.take_clipboard_writes();
+    assert_eq!(writes.len(), 1);
+    let offer = writes[0].content.as_ref().unwrap();
+    assert_eq!(
+        offer.get("image/png"),
+        Some(include_bytes!("../../scripts/fixtures/clipboard.png").as_slice())
+    );
+    assert_eq!(offer.get("text/html"), Some(b"<b>rich</b>\0".as_slice()));
+    assert_eq!(offer.plain_text(), Some("rich"));
+    assert_eq!(
+        engine.take_events().0,
+        b"\x1b]5522;type=write:status=DONE:id=rich\x1b\\"
+    );
+
+    for (mime, payload, status) in [
+        ("aW1hZ2UvanBlZw==", "eA==", "ENOSYS"), // Unsupported JPEG.
+        ("dGV4dC9wbGFpbg==", "YQBi", "EINVAL"), // NUL in plain text.
+        ("dGV4dC9wbGFpbg==", "/w==", "EINVAL"), // Invalid UTF-8.
+    ] {
+        engine.write(format!(
+            "\x1b]5522;type=write:id=reject\x1b\\\x1b]5522;type=wdata:mime=dGV4dC9odG1s;PGI+\x1b\\\x1b]5522;type=wdata:mime={mime};{payload}\x1b\\\x1b]5522;type=wdata\x1b\\"
+        ).as_bytes());
+        assert!(engine.take_clipboard_writes().is_empty());
+        assert_eq!(
+            engine.take_events().0,
+            format!("\x1b]5522;type=write:status={status}:id=reject\x1b\\").as_bytes()
+        );
+    }
+    for _ in 0..MAX_CLIPBOARD_EVENTS {
+        engine.write(b"\x1b]52;c;\x07");
+    }
+    engine.write(b"\x1b]5522;type=write:id=busy\x1b\\\x1b]5522;type=wdata\x1b\\");
+    assert_eq!(
+        engine.take_events().0,
+        b"\x1b]5522;type=write:status=EBUSY:id=busy\x1b\\"
+    );
+    assert_eq!(engine.take_clipboard_writes().len(), MAX_CLIPBOARD_EVENTS);
+    // Disabling writes never registers the separate clipboard-read callback.
+    engine.write(b"\x1b]52;c;?\x07\x1b]5522;type=read:id=read;dGV4dC9wbGFpbg==\x1b\\");
+    assert!(engine.take_clipboard_writes().is_empty());
+    assert_eq!(
+        engine.take_events().0,
+        b"\x1b]5522;type=read:status=EPERM:id=read\x1b\\"
+    );
+}
+
+#[test]
+#[ignore = "clipboard admission latency and transient memory measurement"]
+fn clipboard_admission_measurements() {
+    for (mime, fill) in [("image/png", 0), ("text/plain", b'x')] {
+        let mut engine = Engine::new().unwrap();
+        let data = vec![fill; gmux_client::clipboard::MAX_APPLICATION_BYTES];
+        let content = GmuxClipboardContent {
+            mime: GmuxText {
+                ptr: mime.as_ptr(),
+                len: mime.len(),
+            },
+            data: GmuxText {
+                ptr: data.as_ptr(),
+                len: data.len(),
+            },
+        };
+        let ud = (&mut *engine.events as *mut Events).cast();
+        let mut times = Vec::with_capacity(100);
+        let mut busy_times = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let began = std::time::Instant::now();
+            assert_eq!(
+                unsafe { clipboard_write(ud, 0, &content, 1) },
+                GMUX_CLIPBOARD_SUCCESS as i32
+            );
+            times.push(began.elapsed().as_secs_f64() * 1000.0);
+            let retained: usize = engine
+                .events
+                .clipboard
+                .iter()
+                .map(|w| w.content.as_ref().unwrap().memory_size())
+                .sum();
+            assert!(retained <= data.len() + 256);
+            // A full queue must reject a second large write before copying its data.
+            let began = std::time::Instant::now();
+            assert_eq!(
+                unsafe { clipboard_write(ud, 0, &content, 1) },
+                GMUX_CLIPBOARD_BUSY as i32
+            );
+            busy_times.push(began.elapsed().as_nanos());
+            drop(engine.take_clipboard_writes());
+        }
+        times.sort_by(f64::total_cmp);
+        busy_times.sort_unstable();
+        println!(
+            "4 MiB borrowed {mime} admission: median={:.3}ms max={:.3}ms; retained payload={} bytes; busy median={}ns max={}ns",
+            times[50],
+            times[99],
+            data.len(),
+            busy_times[50],
+            busy_times[99]
+        );
+    }
 }
 
 #[test]

@@ -1,5 +1,32 @@
 """Validate formatted clipboard content independently of the native formatter."""
 from html.parser import HTMLParser
+import base64
+from pathlib import Path
+
+
+PNG = (Path(__file__).resolve().parent / "fixtures/clipboard.png").read_bytes()
+
+
+def kitty_write(contents, *, destination="clipboard", commit=True, aliases=()):
+    """Encode test application requests; libghostty owns all protocol parsing."""
+    def packet(metadata, data=None):
+        return "\x1b]5522;" + metadata + (";" + data if data is not None else "") + "\x1b\\"
+
+    def encoded(data):
+        return base64.b64encode(data).decode()
+
+    parts = [packet("type=write:loc=" + destination)]
+    for mime, data in contents:
+        payload = encoded(data)
+        metadata = "type=wdata:mime=" + encoded(mime.encode())
+        # Split the base64 stream into bounded OSC sequences, including empties.
+        for start in range(0, max(1, len(payload)), 4096):
+            parts.append(packet(metadata, payload[start:start + 4096]))
+    for target, names in aliases:
+        parts.append(packet("type=walias:mime=" + encoded(target.encode()), encoded(" ".join(names).encode())))
+    if commit:
+        parts.append(packet("type=wdata"))
+    return "".join(parts)
 
 
 class ClipboardHTML(HTMLParser):

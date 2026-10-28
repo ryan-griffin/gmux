@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Check terminal clipboard events through local and remote frontend streams."""
 import base64
+import json
 import os
 from pathlib import Path
 import subprocess
 import socket
 import time
 
-from clipboard_test_support import check_html
+from clipboard_test_support import PNG, check_html, kitty_write
 from cargo_test_support import cargo_binary
 from progress_test_support import ProgressProbe
 from stream_test_support import Client
@@ -38,6 +39,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
     clients = []
     received = {}
     serial = 0
+    measurements = {}
 
     def client(*, remote=False, capable=True):
         peer = Client(fixture, pane, address=address if remote else None)
@@ -79,7 +81,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
 
     try:
         with scenario("detached writes are discarded before a frontend attaches"):
-            emit(osc("detached"))
+            emit(osc("detached") + kitty_write([("image/png", PNG)]))
             observer = client(capable=False)
             first = client()
             second = client(remote=True)
@@ -116,6 +118,40 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
             received[first].clear()
             emit(osc("after copy"))
             expect(first, "after copy")
+        with scenario("atomic PNG, HTML and plain alternatives preserve bytes on local and remote streams"):
+            formats = [("image/png", PNG), ("text/html", b"<b>rich</b>\0"),
+                       ("text/plain;charset=utf-8", "rich 界🙂".encode())]
+            expected = dict(destination="clipboard", content={
+                "image/png": PNG, "html": "<b>rich</b>\0", "text/plain;charset=utf-8": "rich 界🙂".encode()})
+            for peer, other in [(first, second), (second, first)]:
+                peer.send("subscribe", panes=[pane])
+                peer.send("focused", active=True)
+                barrier(peer)
+                emit(kitty_write(formats, commit=False))
+                assert not take(peer), "Uncommitted alternatives escaped"
+                emit("\x1b]5522;type=wdata\x1b\\")
+                collect(peer, lambda h: h.get("copy") == expected)
+                assert take(peer) == [expected]
+                assert not take(other) and not take(observer)
+                emit(kitty_write([("text/plain", b"")], destination="primary"))
+                expect(peer, "", "primary")
+                emit(kitty_write([], destination="primary"))
+                expect(peer, None, "primary")
+                for rejected in [
+                    [("text/plain", b"partial"), ("image/jpeg", PNG)],
+                    [("image/png", PNG), ("text/plain", b"bad\0text")],
+                    [("text/html", b"x" * (4 * 1024 * 1024)), ("text/plain", b"x")],
+                ]:
+                    emit(kitty_write(rejected))
+                    assert not take(peer), "Rejected request partially delivered"
+                # Aliases count toward admission after Ghostty expands them.
+                emit(kitty_write([("text/html", b"x" * (3 * 1024 * 1024))],
+                                aliases=[("text/html", ["text/plain"])]))
+                assert not take(peer)
+                emit("\x1b]1337;Copy=:aVRlcm0=\x1b\\")
+                expect(peer, "iTerm")
+            second.send("subscribe", panes=[])
+            barrier(second)
         with scenario("rich local and remote copies retain per-view bounds, escapes, styles and physical padding"):
             second.send("subscribe", panes=[pane])
             for peer in [first, second]:
@@ -189,7 +225,8 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
             began = time.monotonic()
             emit(osc(text))
             expect(first, text)
-            print(f"4 MiB OSC 52 delivery: {time.monotonic() - began:.3f}s including fixture I/O", flush=True)
+            measurements["osc52_4mib_seconds_with_fixture_io"] = time.monotonic() - began
+            print(f"4 MiB OSC 52 delivery: {measurements['osc52_4mib_seconds_with_fixture_io']:.3f}s including fixture I/O", flush=True)
             emit(osc(text + "x"))
             assert not take(first)
             emit(osc("recovered"))
@@ -197,7 +234,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
         with scenario("disconnect, detach, and reconnect never replay old writes"):
             first.close()
             clients.remove(first)
-            emit(osc("nobody visible"))
+            emit(kitty_write([("image/png", PNG)]))
             assert not take(second) and not take(observer)
             second.send("subscribe", panes=[pane])
             barrier(second)
@@ -206,7 +243,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
             expect(second, "remote reconnect")
             second.close()
             clients.remove(second)
-            emit(osc("no remote"))
+            emit(kitty_write([("image/png", PNG)]))
             second = client(remote=True)
             assert not take(second)
             emit(osc("new remote write"))
@@ -217,13 +254,35 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
             clients.clear()
             slow = client()
             slow.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            responsive = fixture.rpc("new", directory=str(fixture.path))["pane"]
+            def cpu_ticks():
+                fields = Path(f"/proc/{process.pid}/stat").read_text().split()
+                return int(fields[13]) + int(fields[14])
+            idle = cpu_ticks()
+            time.sleep(1.1)  # Observe idle without waking the daemon with requests.
+            measurements["idle_cpu_ticks_over_1_1_seconds"] = cpu_ticks() - idle
+            slow.send("clipboard-writes", enabled=False)
+            barrier(slow)
+            idle = cpu_ticks()
+            time.sleep(1.1)
+            measurements["idle_cpu_ticks_without_writes_over_1_1_seconds"] = cpu_ticks() - idle
+            slow.send("clipboard-writes", enabled=True)
+            barrier(slow)
             before = int(Path(f"/proc/{process.pid}/status").read_text().split("VmRSS:")[1].split()[0])
-            chunk = osc("x" * (1024 * 1024))
-            emit(chunk * 48)
+            chunk = kitty_write([("image/png", PNG + b"\0" * (1024 * 1024 - len(PNG)))])
+            began = time.monotonic()
+            probe.burst([chunk] * 48, .005, wait=False)
+            input_began = time.monotonic()
+            fixture.rpc("send", pane=responsive, text="printf '\\033]2;PTY_RESPONSIVE\\007'", enter=True)
+            wait_for(lambda: fixture.rpc("_metadata", pane=responsive)["meta"]["title"] == "PTY_RESPONSIVE")
+            measurements["other_pty_input_seconds_during_flood"] = time.monotonic() - input_began
+            probe.wait_applied()
             wait_for(lambda: fixture.rpc("status")["local_clients"] == 0)
             after = int(Path(f"/proc/{process.pid}/status").read_text().split("VmRSS:")[1].split()[0])
             peak = int(Path(f"/proc/{process.pid}/status").read_text().split("VmHWM:")[1].split()[0])
-            print(f"Stopped reader RSS: before={before} KiB, after={after} KiB, peak={peak} KiB", flush=True)
+            measurements.update(stopped_reader_48mib_seconds=time.monotonic() - began,
+                                rss_before_kib=before, rss_after_kib=after, rss_peak_kib=peak)
+            print(f"48 MiB rich writes to stopped reader: {measurements['stopped_reader_48mib_seconds']:.3f}s; RSS before={before} KiB, after={after} KiB, peak={peak} KiB; other PTY input={measurements['other_pty_input_seconds_during_flood']:.3f}s; idle ticks={measurements['idle_cpu_ticks_over_1_1_seconds']}", flush=True)
             assert peak - before < 96 * 1024, (before, after, peak)
             slow.close()
             clients.remove(slow)
@@ -234,4 +293,5 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
     finally:
         for peer in clients:
             peer.close()
+    (artifacts / "clipboard-stream-measurements.json").write_text(json.dumps(measurements, indent=2) + "\n")
 print("PASS: local/remote OSC 52 routing, Unicode, clear, limits, ordered copy, transient disconnect and bounded backpressure")

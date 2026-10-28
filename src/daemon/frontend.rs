@@ -133,11 +133,7 @@ impl Frontend {
     pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
         self.compact_output();
         let start = self.output.len();
-        packet.encode_into(&mut self.output)?;
-        if self.output.len() - self.offset > MAX_PENDING {
-            self.output.truncate(start);
-            anyhow::bail!("Frontend is too slow");
-        }
+        packet.encode_into_limit(&mut self.output, MAX_PENDING - (start - self.offset))?;
         Ok(())
     }
     pub(super) fn queue_encoded(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -665,7 +661,7 @@ impl Daemon {
                 id,
                 gmux_client::clipboard::Write {
                     destination: gmux_client::clipboard::Destination::Clipboard,
-                    content: Some(content),
+                    content: Some(content.into()),
                 },
             )?;
         }
@@ -1205,7 +1201,7 @@ mod tests {
             let html = Some(format!("<div>{text}</div>"));
             Write {
                 destination: Destination::Clipboard,
-                content: Some(Content { text, html }),
+                content: Some(Content { text, html }.into()),
             }
         };
         for character in ['a', 'b', 'c'] {
@@ -1228,10 +1224,11 @@ mod tests {
         for character in ['a', 'b', 'c'] {
             let packet = Packet::read(&mut reader).unwrap();
             let content = packet.header.copy.unwrap().content.unwrap();
-            assert!(content.text.chars().all(|c| c == character));
+            let text = content.plain_text().unwrap();
+            assert!(text.chars().all(|c| c == character));
             assert_eq!(
-                content.html.unwrap(),
-                format!("<div>{}</div>", content.text)
+                content.get("text/html").unwrap(),
+                format!("<div>{text}</div>").as_bytes()
             );
         }
         assert!(
