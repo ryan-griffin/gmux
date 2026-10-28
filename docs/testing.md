@@ -4,6 +4,8 @@ Run commands from the repository root. The [README](../README.md#build-and-run)
 lists build prerequisites. Bootstrap the pinned Ghostty library before the first
 build, or set `GHOSTTY_PREFIX` to a build of the same source revision with the
 checked-in [integration patch](keyboard.md#native-library) applied.
+The bootstrap uses the architecture's baseline CPU target so cached libraries
+remain portable between machines. Ghostty's SIMD dispatch remains enabled.
 
 ```sh
 ./scripts/bootstrap-ghostty.sh
