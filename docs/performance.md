@@ -76,6 +76,42 @@ Frontend RSS across the four visible cases was 64.93–65.12 MiB on Cairo and
 285.38–285.45 MiB on OpenGL. Backend/driver memory is included, so these totals
 do not isolate retained-node storage.
 
+## Keyboard input
+
+Run `python3 scripts/keyboard-benchmark.py` to measure the native encoder bridge
+and the production GTK layout lookup/device snapshot in a private Wayland
+display. It builds the release GTK example and an optimized C probe, and writes
+samples, source/binary hashes and summaries to `artifacts/keyboard-benchmark.json`.
+The native desktop prerequisites in [testing](testing.md) apply. To compare an
+older bridge, pass `--baseline-source /path/to/ghostty_bridge.c` with its matching
+header alongside it. The C probe uses an indirect call to preserve the FFI
+boundary, and the public Ghostty allocator API to count key-object allocations.
+
+An x86-64 Linux run on an Intel Core i7-13700H with GTK 4.24.1 used seven samples
+of one million operations. The baseline was `bb733cf`, using the same pinned
+library and media-key patch. Median CPU nanoseconds per operation were:
+
+| Path | Baseline | Current |
+| --- | ---: | ---: |
+| Native bridge, legacy | 241.5 | 62.2 |
+| Native bridge, Kitty | 341.7 | 157.1 |
+| GTK metadata, Wayland | unavailable | 564.6 |
+
+Median wall times were 62.5/158.2 ns for the current legacy/Kitty bridge and
+558.5 ns for Wayland metadata. The C workload cycles press, repeat and
+release of Shift+A; both revisions emit identical bytes. Metadata timing covers
+the layout lookup and lock-state snapshot, excluding event dispatch, JSON, IPC,
+PTY handling and presentation. The frontend-input smoke test separately checks
+socket-to-viewport responsiveness under output and metadata loads.
+
+The measured loops made zero native key-object allocations and zero Rust
+metadata allocations. GDK's C allocations are not counted by the Rust probe.
+The compiled physical-key lookup occupied 780 bytes of read-only data. Consumed
+shortcuts bypass layout translation. Lock notifications use a fixed pair of
+handlers and maintain a shared snapshot between focus-entry queries.
+Wayland translates base characters
+directly, without allocating a keymap entry list.
+
 ## Program status
 
 OSC 7501 callbacks update a session-owned set of at most 64 records directly.

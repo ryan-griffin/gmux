@@ -90,10 +90,10 @@ with (artifacts / "program-status-smoke.log").open("w") as log, AppFixture() as 
             for peer in clients:
                 peer.barrier("prompt")
                 peer.send("mark-read", through=0)
-                peer.send("key", name="a", cp=97, mods=0, action="release", text="")
+                peer.send("key", name="a", unshifted=97, mods=0, action="release", text="")
                 peer.barrier("read")
             assert metadata()["meta"]["program_status"] == status
-            clients[1].send("key", name="a", cp=97, mods=0, action="press", text="a")
+            clients[1].send("key", name="a", unshifted=97, mods=0, action="press", text="a")
             receive(expected("idle"))
             probe.write(osc("clear"))
             wait_for(lambda: metadata()["meta"]["program_status"] is None)
@@ -218,7 +218,7 @@ os._exit(0)
             wait_for(lambda: (m := owner.rpc("metadata", pane=dead)["meta"])["exited"] and m["program_status"])
             peer = Client(owner, dead)
             peer.until(lambda h: h["meta"]["id"] == dead and h["meta"]["exited"])
-            peer.send("key", name="Return", cp=13, mods=0, action="press", text="\r")
+            peer.send("key", name="Return", unshifted=13, mods=0, action="press", text="\r")
             wait_for(lambda: "error" in owner.rpc("metadata", pane=dead, check=False))
             peer.close()
     finally:

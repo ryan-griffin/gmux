@@ -236,7 +236,8 @@ bool gmux_engine_expire_render_hold(GmuxEngine *engine);
 size_t gmux_engine_string(GmuxEngine *engine, int pwd, uint8_t *out, size_t cap);
 int gmux_engine_mode(GmuxEngine *engine, int mode);
 int gmux_engine_paste(GmuxEngine *engine, const uint8_t *data, size_t len, bool clipboard);
-size_t gmux_engine_key(GmuxEngine *engine, const char *name, uint32_t cp, uint16_t mods,
+size_t gmux_engine_key(GmuxEngine *engine, const char *name, uint16_t physical,
+    uint32_t unshifted, uint16_t consumed_mods, uint16_t mods,
     uint8_t action, const char *text, size_t len, uint8_t *out, size_t cap);
 size_t gmux_engine_mouse(GmuxEngine *engine, float x, float y, uint32_t cw, uint32_t ch,
     int action, int button, uint16_t mods, bool pressed, uint8_t *out, size_t cap);

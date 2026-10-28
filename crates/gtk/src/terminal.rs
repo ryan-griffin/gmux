@@ -7,7 +7,7 @@ use crate::{
 };
 use gmux_client::{
     Frame,
-    transport::{KeyAction, SelectionMode},
+    transport::{KeyAction, KeyLayout, SelectionMode},
 };
 use gmux_client::{remote::SessionHandle, session::SessionUpdate};
 use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
@@ -122,10 +122,11 @@ pub struct Terminal {
 }
 mod cursor;
 mod input;
+mod keyboard;
 mod links;
 mod text_blink;
 pub(crate) use input::KeyboardState;
-use input::mods;
+use keyboard::mods;
 
 impl Terminal {
     pub(crate) fn new(
@@ -533,11 +534,11 @@ impl Terminal {
         self.cursor.restart();
         self.session.borrow().send_with_enter(bytes, enter)
     }
-    fn key_input(&self, name: &str, cp: u32, mods: u16, action: KeyAction, text: &str) {
+    fn key_input(&self, name: &str, layout: KeyLayout, mods: u16, action: KeyAction, text: &str) {
         if action != KeyAction::Release {
             self.cursor.restart();
         }
-        if let Err(error) = self.session.borrow().key(name, cp, mods, action, text) {
+        if let Err(error) = self.session.borrow().key(name, layout, mods, action, text) {
             self.show_status(&error.to_string());
         }
     }

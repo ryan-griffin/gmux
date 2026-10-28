@@ -555,12 +555,12 @@ impl Daemon {
             }
             StreamCommand::Key {
                 name,
-                cp,
+                layout,
                 mods,
                 action,
                 text,
             } => {
-                let bytes = session.key(&name, cp, mods, action, &text);
+                let bytes = session.key(&name, layout, mods, action, &text);
                 if !bytes.is_empty() {
                     if action != KeyAction::Release {
                         session.with_view(view, |engine| engine.scroll(0, true));

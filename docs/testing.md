@@ -79,6 +79,12 @@ colored decorations, hover, selections, search and block/bar/underline cursors.
 Native lifecycle fixtures check reduced-animation preferences, focus-independent
 text, inactive windows, hidden/unrooted widgets and source removal on teardown.
 
+`terminal-input` also checks focus-entry Num Lock after an external toggle,
+active/inactive keypad input, native repeat/release, shifted punctuation and the
+ISO extra key. Engine tests separately check international layout data and exact
+negotiated encoder output. The Wayland fixture uses its default US keymap;
+non-US layout cases currently have direct encoder/model coverage.
+
 The `scrollback-limits` headless suite checks saved policy and restart, complete
 request validation before mutation, blocked and failed saves, successive partial
 updates while saving, new and existing panes, and immediate local/remote cache updates with queued replies. Engine tests

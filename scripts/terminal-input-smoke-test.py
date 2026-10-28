@@ -73,10 +73,13 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     app = daemon = None
     pane = None
     observed_keys = None
+    observed_layouts = None
 
     def observe_request(request):
+        if observed_layouts is not None and request.get("method") == "key":
+            observed_layouts.append(request)
         if observed_keys is not None and request.get("method") == "key":
-            observed_keys.append((request["name"], request["action"], request["cp"],
+            observed_keys.append((request["name"], request["action"], request["unshifted"],
                                   request["mods"], request["text"]))
 
     def rpc(method, **params):
@@ -491,6 +494,49 @@ Path(done).touch()
                 actual = read()[start:]
                 repeats = actual.count(repeat)
                 assert actual == press + repeat * repeats + release, (actual, press, repeat, release)
+
+            # Num Lock can change while another window owns keyboard focus.
+            # The first key after focus entry must report that actual state.
+            with keyboard_capture(27) as read_keys:
+                probe_window = Gtk.Window(title="External Num Lock focus")
+                probe_window.set_default_size(180, 100)
+                probe_window.present()
+                wait_for(lambda: not rpc("renderer-info", pane=pane)["window_active"],
+                         context=GLib.MainContext.default())
+                tap(Gdk.KEY_Num_Lock)
+                probe_window.destroy()
+                wait_for(lambda: rpc("renderer-info", pane=pane)["window_active"],
+                         context=GLib.MainContext.default())
+                tap(Gdk.KEY_a)
+                wait_for(lambda: read_keys().endswith(b"\x1b[97;129:3u"))
+                assert read_keys() == b"\x1b[97;129;97u\x1b[97;129:3u", read_keys()
+                held(read_keys, 79, b"\x1b[57400;129;49u", b"\x1b[57400;129:2;49u", b"\x1b[57400;129:3u")
+                tap(Gdk.KEY_Num_Lock)
+                wait_for(lambda: read_keys().endswith(b"\x1b[57360;1:3u"))
+                start = len(read_keys())
+                native.keycode(79, True)
+                native.keycode(79, False)
+                tap(Gdk.KEY_a)
+                wait_for(lambda: read_keys()[start:].endswith(b"\x1b[97;1:3u"))
+                assert read_keys()[start:] == b"\x1b[57424u\x1b[57424;1:3u\x1b[97;;97u\x1b[97;1:3u", read_keys()[start:]
+
+            # GTK must provide the layout base of shifted punctuation and the
+            # ISO key's physical identity, including synchronous IM commits.
+            with keyboard_capture(31) as read_keys:
+                observed_layouts = []
+                native.key(Gdk.KEY_Shift_L, True)
+                native.keycode(2, True)
+                native.keycode(2, False)
+                native.key(Gdk.KEY_Shift_L, False)
+                native.keycode(86, True)
+                native.keycode(86, False)
+                wait_for(lambda: any(r["physical"] == 86 and r["action"] == "release" for r in observed_layouts))
+                punctuation = [r for r in observed_layouts if r["physical"] == 2]
+                assert [(r["unshifted"], r["mods"], r["text"]) for r in punctuation] == [(49, 1, "!"), (49, 1, "")], punctuation
+                assert punctuation[0]["consumed_mods"] & 1, punctuation
+                assert b"\x1b[49:33;2;33u\x1b[49;2:3u" in read_keys(), read_keys()
+                assert all(r["unshifted"] == 60 for r in observed_layouts if r["physical"] == 86), observed_layouts
+                observed_layouts = None
 
             # Modifier releases must retain the other side's held state.
             with keyboard_capture(31) as read_keys:
@@ -1298,7 +1344,7 @@ finally:
             expected_hash = hashlib.sha256(b"\x1b[200~" + encoded + b"\x1b[201~").hexdigest()
             wait_for(lambda: expected_hash in rpc("read", pane=pane)["text"], context=GLib.MainContext.default())
             assert rpc("status")["local_clients"] and app.poll() is None
-            print("PASS: native Wayland keyboard input, Kitty press/repeat/release and focus resets, composition and shortcut holds, Kitty modifier presses/releases with both sides and Caps Lock, "
+            print("PASS: native Wayland keyboard input, Kitty press/repeat/release and focus resets, composition and shortcut holds, Kitty modifier presses/releases with both sides, Caps Lock and focus-entry Num Lock, active/inactive keypad input and shifted punctuation/ISO identity, "
                   "OSC 8 hover/copy/Ctrl-click through an isolated URI handler with held and delayed frames, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "

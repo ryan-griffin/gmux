@@ -4,7 +4,7 @@ use crate::{
     engine::Engine,
     title::{ForegroundProcess, PaneTitle},
 };
-use gmux_client::transport::KeyAction;
+use gmux_client::transport::{KeyAction, KeyLayout};
 use gmux_client::{ipc, model::CursorStyle, session::SessionUpdate, theme::Theme};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -520,12 +520,12 @@ impl TerminalSession {
     pub(crate) fn key(
         &mut self,
         name: &str,
-        cp: u32,
+        layout: KeyLayout,
         mods: u16,
         action: KeyAction,
         text: &str,
     ) -> Vec<u8> {
-        self.engine.key(name, cp, mods, action, text)
+        self.engine.key(name, layout, mods, action, text)
     }
 
     pub(crate) fn mouse(

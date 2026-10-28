@@ -86,6 +86,19 @@ pub enum KeyAction {
     Release,
 }
 
+/// Layout information supplied by the input platform, independently of produced text.
+/// Zero means unavailable. Physical keys use Linux evdev codes, never keysyms or
+/// Ghostty enum values. Text-only callers can leave this empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyLayout {
+    #[serde(default)]
+    pub physical: u16,
+    #[serde(default)]
+    pub unshifted: u32,
+    #[serde(default)]
+    pub consumed_mods: u16,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum StreamCommand {
@@ -174,8 +187,8 @@ pub enum StreamCommand {
     Key {
         #[serde(default)]
         name: String,
-        #[serde(default)]
-        cp: u32,
+        #[serde(flatten)]
+        layout: KeyLayout,
         #[serde(default)]
         mods: u16,
         action: KeyAction,
@@ -241,7 +254,9 @@ mod tests {
             json!({"method":"key","pane":7,"action":"unknown"}),
             json!({"method":"key","pane":7,"release":false}),
             json!({"method":"key","pane":7,"action":"press","mods":65536}),
-            json!({"method":"key","pane":7,"action":"press","cp":4294967296u64}),
+            json!({"method":"key","pane":7,"action":"press","physical":65536}),
+            json!({"method":"key","pane":7,"action":"press","consumed_mods":65536}),
+            json!({"method":"key","pane":7,"action":"press","unshifted":4294967296u64}),
             json!({"method":"resize","pane":7,"cols":65537,"rows":24}),
             json!({"method":"paste-data","pane":7,"text":false}),
             json!({"method":"scroll-to","pane":7,"row":-1,"serial":1}),

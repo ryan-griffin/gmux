@@ -186,11 +186,22 @@ focused view controls a pane's PTY size.
 Use `input` with a byte array to write terminal input, or `key`, `mouse`, and
 `paste` for terminal-aware input. `focused` declares the connection's focus.
 Each `key` requires `action`: `"press"`, `"repeat"`, or `"release"`, alongside
-optional `name`, `cp`, `mods`, and `text`. For example:
+optional `name`, `physical`, `unshifted`, `consumed_mods`, `mods`, and `text`.
+`physical` is a Linux evdev keycode, independent of the layout. `unshifted` is
+the Unicode scalar at the active layout's base level. Zero means unavailable
+for either field. `text` is the produced UTF-8 string. For example, Shift+1 on US:
 
 ```json
-{"method":"key","pane":2,"name":"a","cp":97,"mods":0,"action":"repeat","text":"a"}
+{"method":"key","pane":2,"name":"exclam","physical":2,"unshifted":49,"consumed_mods":1,"mods":1,"action":"repeat","text":"!"}
 ```
+
+Modifier bits are Shift `1`, Control `2`, Alt `4`, Super `8`, Caps Lock `16`,
+and Num Lock `32`. `consumed_mods` uses the same bits for modifiers used to
+produce text. Lock bits describe the active state, including on subsequent keys.
+Callers without a native event should omit physical/layout information they
+cannot supply. A text-only commit uses `name: ""`, zero modifiers and layout
+fields, and `action: "press"`. Gmux does not guess a US physical key or lowercase
+produced text. See [keyboard input](keyboard.md) for platform limits.
 
 The originating frontend classifies hardware key events independently of other
 windows and connections. The daemon encodes each action using the terminal's

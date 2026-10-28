@@ -204,8 +204,9 @@ Path(output).write_bytes(data)
 """)
         for remote in (False, True):
             for flags, expected in [(31, b"\x1b[97;;97u\x1b[97;1:2;97u\x1b[97;1:2;97u\x1b[97;1:3u"
-                                        b"\x1b[57435;5u\x1b[57435;5:2u\x1b[57435;5:2u\x1b[57435;5:3u!"),
-                                    (0, b"aaa!")]:
+                                        b"\x1b[57435;5u\x1b[57435;5:2u\x1b[57435;5:2u\x1b[57435;5:3u"
+                                        b"\x1b[49:33;130;33u\x1b[49:33;130:2;33u\x1b[49;130:3u!"),
+                                    (0, b"aaa!!!")]:
                 output = server.path / f"keyboard-{remote}-{flags}"
                 stream = Client(client, pane, connection="server") if remote else Client(server, pane)
                 try:
@@ -213,11 +214,14 @@ Path(output).write_bytes(data)
                         map(str, [probe, flags, output, output.name, len(expected)]))), enter=True)
                     stream.until(lambda h: h["meta"]["title"] == output.name)
                     for action in ("press", "repeat", "repeat", "release"):
-                        stream.send("key", name="a", cp=97, mods=0, action=action,
+                        stream.send("key", name="a", unshifted=97, mods=0, action=action,
                                     text="" if action == "release" else "a")
                     for name in ("AudioNext", "Back"):
                         for action in ("press", "repeat", "repeat", "release"):
-                            stream.send("key", name=name, cp=0, mods=2, action=action, text="")
+                            stream.send("key", name=name, unshifted=0, mods=2, action=action, text="")
+                    for action in ("press", "repeat", "release"):
+                        stream.send("key", name="exclam", physical=2, unshifted=49, consumed_mods=1,
+                                    mods=33, action=action, text="" if action == "release" else "!")
                     # A trailing byte proves that legacy release emitted nothing.
                     stream.send("input", bytes=[ord("!")])
                     wait_for(output.exists)
