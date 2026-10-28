@@ -1,14 +1,10 @@
 //! Keyboard, pointer, selection, clipboard, and scrolling controllers.
 use super::*;
+use keyboard::{ALT, CAPS_LOCK, CONTROL, NUM_LOCK, SHIFT, SUPER, mods};
 
-const SHIFT: u16 = 1 << 0;
-const CONTROL: u16 = 1 << 1;
-const ALT: u16 = 1 << 2;
-const SUPER: u16 = 1 << 3;
-const CAPS_LOCK: u16 = 1 << 4;
 // Action-only modifiers, removed before encoding terminal input.
-const META: u16 = 1 << 5;
-const HYPER: u16 = 1 << 6;
+const META: u16 = 1 << 14;
+const HYPER: u16 = 1 << 15;
 
 // GDK has no public repeat flag. Linux keycodes (including the XKB offset)
 // fit here. Unknown/zero codes are always presses rather than guessed repeats.
@@ -52,6 +48,7 @@ impl HeldKeys {
 
 #[derive(Default)]
 pub(crate) struct KeyboardState {
+    native: Option<Rc<keyboard::NativeKeyboard>>,
     // Two bits per modifier, in protocol order: Shift L/R, Control L/R,
     // Alt L/R, Super L/R, Meta L/R, Hyper L/R. Each pair preserves the other
     // side on release; Meta/Hyper do not change VT input encoding.
@@ -73,6 +70,15 @@ impl KeyboardState {
         changed: impl Fn(bool) + 'static,
     ) {
         let window = window.as_ref();
+        keyboard.borrow_mut().native = Some(keyboard::NativeKeyboard::new(
+            gtk::prelude::WidgetExt::display(window),
+        ));
+        if let Some(device) = gtk::prelude::WidgetExt::display(window)
+            .default_seat()
+            .and_then(|seat| seat.keyboard())
+        {
+            keyboard.borrow_mut().sync_locks(&device);
+        }
         let changed = Rc::new(changed);
         // GTK can activate application accelerators before the terminal's key
         // controller runs. Remember those physical keys here as well.
@@ -95,6 +101,7 @@ impl KeyboardState {
             let shortcut = application_shortcut(controller, &press_shortcuts);
             let (before, active) = {
                 let mut keyboard = pressed.borrow_mut();
+                keyboard.sync_event_locks(controller);
                 let before = keyboard.links_active();
                 let action = keyboard.keys.press(code);
                 if shortcut {
@@ -119,6 +126,7 @@ impl KeyboardState {
             let shortcut = application_shortcut(controller, &shortcuts);
             let (before, active) = {
                 let mut keyboard = released.borrow_mut();
+                keyboard.sync_event_locks(controller);
                 let before = keyboard.links_active();
                 keyboard.keys.release(code);
                 keyboard.ignored_event = keyboard.ignored_keys.release(code);
@@ -142,14 +150,49 @@ impl KeyboardState {
             keyboard.action = KeyAction::Press;
         });
         let teardown = keyboard.clone();
-        window.connect_unrealize(move |_| *teardown.borrow_mut() = Self::default());
+        window.connect_unrealize(move |_| teardown.borrow_mut().reset());
         let focus = keyboard.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
-                *focus.borrow_mut() = Self::default();
+                focus.borrow_mut().reset();
                 changed(false);
+            } else if let Some(device) = gtk::prelude::WidgetExt::display(window)
+                .default_seat()
+                .and_then(|seat| seat.keyboard())
+            {
+                focus.borrow_mut().sync_locks(&device);
             }
         });
+    }
+
+    fn reset(&mut self) {
+        let native = self.native.take();
+        *self = Self {
+            native,
+            ..Self::default()
+        };
+    }
+
+    fn sync_locks(&mut self, device: &gdk::Device) {
+        if let Some(native) = &self.native {
+            self.encoded = (self.encoded & !(CAPS_LOCK | NUM_LOCK)) | native.refresh_locks(device);
+        }
+    }
+
+    fn sync_event_locks(&mut self, controller: &gtk::EventControllerKey) {
+        if let Some(device) = controller.current_event().and_then(|event| event.device())
+            && let Some(native) = &self.native
+        {
+            self.encoded = (self.encoded & !(CAPS_LOCK | NUM_LOCK)) | native.locks(&device);
+        }
+    }
+
+    fn layout(&self, controller: &gtk::EventControllerKey) -> KeyLayout {
+        controller
+            .current_event()
+            .and_then(|event| event.downcast::<gdk::KeyEvent>().ok())
+            .zip(self.native.as_ref())
+            .map_or_else(KeyLayout::default, |(event, native)| native.layout(&event))
     }
 
     fn links_active(&self) -> bool {
@@ -159,7 +202,7 @@ impl KeyboardState {
     fn update(&mut self, key: gdk::Key, modifiers: gdk::ModifierType, action: KeyAction) -> u16 {
         self.action = action;
         let release = action == KeyAction::Release;
-        let mut encoded = mods(modifiers);
+        let mut encoded = mods(modifiers) | (self.encoded & NUM_LOCK);
         for (mask, flag) in [
             (gdk::ModifierType::META_MASK, META),
             (gdk::ModifierType::HYPER_MASK, HYPER),
@@ -361,7 +404,9 @@ impl Terminal {
     }
     pub(super) fn install_keyboard(self: &Rc<Self>, keyboard: Rc<RefCell<KeyboardState>>) {
         let key = gtk::EventControllerKey::new();
-        let pending_key = Rc::new(ValueCell::new(None::<(gdk::Key, u16, KeyAction)>));
+        let pending_key = Rc::new(ValueCell::new(
+            None::<(gdk::Key, KeyLayout, u16, KeyAction)>,
+        ));
         let pending = pending_key.clone();
         let weak = Rc::downgrade(self);
         self.im.connect_commit(move |_, text| {
@@ -372,20 +417,20 @@ impl Terminal {
                 // Only a synchronous, unchanged text commit belongs to this
                 // physical key. Composition and asynchronous commits are text
                 // input, with no stale key identity, modifiers, or repeat action.
-                if let Some((key, mods, action)) = pending.take()
+                if let Some((key, layout, mods, action)) = pending.take()
                     && let Some(cp) = key.to_unicode()
                     && text.len() == cp.len_utf8()
                     && text.starts_with(cp)
                 {
                     t.key_input(
                         key.name().as_deref().unwrap_or(""),
-                        cp as u32,
+                        layout,
                         mods,
                         action,
                         text,
                     );
                 } else {
-                    t.key_input("", 0, 0, KeyAction::Press, text);
+                    t.key_input("", KeyLayout::default(), 0, KeyAction::Press, text);
                 }
             }
         });
@@ -435,14 +480,14 @@ impl Terminal {
             if ignored {
                 return glib::Propagation::Stop;
             }
-            let cp = key.to_unicode().map(|c| c as u32).unwrap_or(0);
+            let layout = press_keyboard.borrow().layout(controller);
             if !modifiers.intersects(
                 gdk::ModifierType::CONTROL_MASK
                     | gdk::ModifierType::ALT_MASK
                     | gdk::ModifierType::SUPER_MASK,
             ) && let Some(event) = controller.current_event()
             {
-                pending_key.set(Some((key, encoded_modifiers, action)));
+                pending_key.set(Some((key, layout, encoded_modifiers, action)));
                 let filtered = t.im.filter_keypress(&event);
                 let committed = pending_key.take().is_none();
                 if filtered || committed {
@@ -464,7 +509,7 @@ impl Terminal {
                 .unwrap_or_default();
             t.key_input(
                 key.name().as_deref().unwrap_or(""),
-                cp,
+                layout,
                 encoded_modifiers,
                 action,
                 &text,
@@ -472,7 +517,7 @@ impl Terminal {
             glib::Propagation::Stop
         });
         let weak = Rc::downgrade(self);
-        key.connect_key_released(move |_, key, _, modifiers| {
+        key.connect_key_released(move |controller, key, _, modifiers| {
             let (encoded_modifiers, ignored) = {
                 let keyboard = keyboard.borrow();
                 (
@@ -489,9 +534,10 @@ impl Terminal {
             if let Some(t) = weak.upgrade()
                 && !t.context_menu.is_visible()
             {
+                let layout = keyboard.borrow().layout(controller);
                 t.key_input(
                     key.name().as_deref().unwrap_or(""),
-                    key.to_unicode().map(|c| c as u32).unwrap_or(0),
+                    layout,
                     encoded_modifiers,
                     KeyAction::Release,
                     "",
@@ -775,19 +821,6 @@ fn modifier_event(controller: &gtk::EventControllerKey) -> bool {
             .is_some_and(|key| key.is_modifier())
     })
 }
-pub(super) fn mods(m: gdk::ModifierType) -> u16 {
-    [
-        (gdk::ModifierType::SHIFT_MASK, SHIFT),
-        (gdk::ModifierType::CONTROL_MASK, CONTROL),
-        (gdk::ModifierType::ALT_MASK, ALT),
-        (gdk::ModifierType::SUPER_MASK, SUPER),
-        (gdk::ModifierType::LOCK_MASK, CAPS_LOCK),
-    ]
-    .into_iter()
-    .fold(0, |encoded, (mask, flag)| {
-        encoded | if m.contains(mask) { flag } else { 0 }
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -849,6 +882,35 @@ mod tests {
             mods(gdk::ModifierType::LOCK_MASK | gdk::ModifierType::CONTROL_MASK),
             18
         );
+    }
+
+    #[test]
+    fn num_lock_is_protocol_state_and_never_an_action_only_modifier() {
+        let mut keyboard = KeyboardState {
+            encoded: NUM_LOCK,
+            ..Default::default()
+        };
+        let control = gdk::ModifierType::CONTROL_MASK;
+        assert_eq!(
+            keyboard.update(gdk::Key::a, control, KeyAction::Press),
+            NUM_LOCK | CONTROL
+        );
+        assert!(keyboard.links_active());
+        for extra in [gdk::ModifierType::META_MASK, gdk::ModifierType::HYPER_MASK] {
+            assert_eq!(
+                keyboard.update(gdk::Key::a, control | extra, KeyAction::Repeat),
+                NUM_LOCK | CONTROL
+            );
+            assert!(!keyboard.links_active());
+        }
+        assert_eq!(
+            keyboard.update(gdk::Key::a, control, KeyAction::Release),
+            NUM_LOCK | CONTROL
+        );
+        assert!(keyboard.links_active());
+        keyboard.reset();
+        assert_eq!(keyboard.encoded, 0);
+        assert!(!keyboard.links_active());
     }
 
     #[test]

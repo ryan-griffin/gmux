@@ -46,3 +46,7 @@ test = false
 [[example]]
 name = "program-status-check"
 test = false
+
+[[example]]
+name = "keyboard-benchmark"
+test = false

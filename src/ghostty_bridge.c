@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ghostty_bridge.h"
+#include <linux/input-event-codes.h>
 #include <ghostty/vt.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1209,7 +1210,144 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
     ghostty_render_state_clean(e->render);
     return dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE;
 }
-static GhosttyKey key_for(uint32_t cp, const char *name) {
+// Linux evdev identities are stable protocol data; Ghostty enums stay in C.
+static GhosttyKey physical_key(uint16_t code) {
+    static const GhosttyKey keys[] = {
+        [KEY_A] = GHOSTTY_KEY_A,
+        [KEY_B] = GHOSTTY_KEY_B,
+        [KEY_C] = GHOSTTY_KEY_C,
+        [KEY_D] = GHOSTTY_KEY_D,
+        [KEY_E] = GHOSTTY_KEY_E,
+        [KEY_F] = GHOSTTY_KEY_F,
+        [KEY_G] = GHOSTTY_KEY_G,
+        [KEY_H] = GHOSTTY_KEY_H,
+        [KEY_I] = GHOSTTY_KEY_I,
+        [KEY_J] = GHOSTTY_KEY_J,
+        [KEY_K] = GHOSTTY_KEY_K,
+        [KEY_L] = GHOSTTY_KEY_L,
+        [KEY_M] = GHOSTTY_KEY_M,
+        [KEY_N] = GHOSTTY_KEY_N,
+        [KEY_O] = GHOSTTY_KEY_O,
+        [KEY_P] = GHOSTTY_KEY_P,
+        [KEY_Q] = GHOSTTY_KEY_Q,
+        [KEY_R] = GHOSTTY_KEY_R,
+        [KEY_S] = GHOSTTY_KEY_S,
+        [KEY_T] = GHOSTTY_KEY_T,
+        [KEY_U] = GHOSTTY_KEY_U,
+        [KEY_V] = GHOSTTY_KEY_V,
+        [KEY_W] = GHOSTTY_KEY_W,
+        [KEY_X] = GHOSTTY_KEY_X,
+        [KEY_Y] = GHOSTTY_KEY_Y,
+        [KEY_Z] = GHOSTTY_KEY_Z,
+        [KEY_0] = GHOSTTY_KEY_DIGIT_0,
+        [KEY_1] = GHOSTTY_KEY_DIGIT_1,
+        [KEY_2] = GHOSTTY_KEY_DIGIT_2,
+        [KEY_3] = GHOSTTY_KEY_DIGIT_3,
+        [KEY_4] = GHOSTTY_KEY_DIGIT_4,
+        [KEY_5] = GHOSTTY_KEY_DIGIT_5,
+        [KEY_6] = GHOSTTY_KEY_DIGIT_6,
+        [KEY_7] = GHOSTTY_KEY_DIGIT_7,
+        [KEY_8] = GHOSTTY_KEY_DIGIT_8,
+        [KEY_9] = GHOSTTY_KEY_DIGIT_9,
+        [KEY_GRAVE] = GHOSTTY_KEY_BACKQUOTE,
+        [KEY_BACKSLASH] = GHOSTTY_KEY_BACKSLASH,
+        [KEY_LEFTBRACE] = GHOSTTY_KEY_BRACKET_LEFT,
+        [KEY_RIGHTBRACE] = GHOSTTY_KEY_BRACKET_RIGHT,
+        [KEY_COMMA] = GHOSTTY_KEY_COMMA,
+        [KEY_EQUAL] = GHOSTTY_KEY_EQUAL,
+        [KEY_MINUS] = GHOSTTY_KEY_MINUS,
+        [KEY_DOT] = GHOSTTY_KEY_PERIOD,
+        [KEY_APOSTROPHE] = GHOSTTY_KEY_QUOTE,
+        [KEY_SEMICOLON] = GHOSTTY_KEY_SEMICOLON,
+        [KEY_SLASH] = GHOSTTY_KEY_SLASH,
+        [KEY_102ND] = GHOSTTY_KEY_INTL_BACKSLASH,
+        [KEY_RO] = GHOSTTY_KEY_INTL_RO,
+        [KEY_YEN] = GHOSTTY_KEY_INTL_YEN,
+        [KEY_HENKAN] = GHOSTTY_KEY_CONVERT,
+        [KEY_MUHENKAN] = GHOSTTY_KEY_NON_CONVERT,
+        [KEY_KATAKANAHIRAGANA] = GHOSTTY_KEY_KANA_MODE,
+        [KEY_SPACE] = GHOSTTY_KEY_SPACE,
+        [KEY_ENTER] = GHOSTTY_KEY_ENTER,
+        [KEY_TAB] = GHOSTTY_KEY_TAB,
+        [KEY_ESC] = GHOSTTY_KEY_ESCAPE,
+        [KEY_BACKSPACE] = GHOSTTY_KEY_BACKSPACE,
+        [KEY_LEFTSHIFT] = GHOSTTY_KEY_SHIFT_LEFT,
+        [KEY_RIGHTSHIFT] = GHOSTTY_KEY_SHIFT_RIGHT,
+        [KEY_LEFTCTRL] = GHOSTTY_KEY_CONTROL_LEFT,
+        [KEY_RIGHTCTRL] = GHOSTTY_KEY_CONTROL_RIGHT,
+        [KEY_LEFTALT] = GHOSTTY_KEY_ALT_LEFT,
+        [KEY_RIGHTALT] = GHOSTTY_KEY_ALT_RIGHT,
+        [KEY_LEFTMETA] = GHOSTTY_KEY_META_LEFT,
+        [KEY_RIGHTMETA] = GHOSTTY_KEY_META_RIGHT,
+        [KEY_CAPSLOCK] = GHOSTTY_KEY_CAPS_LOCK,
+        [KEY_NUMLOCK] = GHOSTTY_KEY_NUM_LOCK,
+        [KEY_SCROLLLOCK] = GHOSTTY_KEY_SCROLL_LOCK,
+        [KEY_SYSRQ] = GHOSTTY_KEY_PRINT_SCREEN,
+        [KEY_PAUSE] = GHOSTTY_KEY_PAUSE,
+        [KEY_COMPOSE] = GHOSTTY_KEY_CONTEXT_MENU,
+        [KEY_UP] = GHOSTTY_KEY_ARROW_UP,
+        [KEY_DOWN] = GHOSTTY_KEY_ARROW_DOWN,
+        [KEY_LEFT] = GHOSTTY_KEY_ARROW_LEFT,
+        [KEY_RIGHT] = GHOSTTY_KEY_ARROW_RIGHT,
+        [KEY_HOME] = GHOSTTY_KEY_HOME,
+        [KEY_END] = GHOSTTY_KEY_END,
+        [KEY_INSERT] = GHOSTTY_KEY_INSERT,
+        [KEY_DELETE] = GHOSTTY_KEY_DELETE,
+        [KEY_PAGEUP] = GHOSTTY_KEY_PAGE_UP,
+        [KEY_PAGEDOWN] = GHOSTTY_KEY_PAGE_DOWN,
+        [KEY_F1] = GHOSTTY_KEY_F1,
+        [KEY_F2] = GHOSTTY_KEY_F2,
+        [KEY_F3] = GHOSTTY_KEY_F3,
+        [KEY_F4] = GHOSTTY_KEY_F4,
+        [KEY_F5] = GHOSTTY_KEY_F5,
+        [KEY_F6] = GHOSTTY_KEY_F6,
+        [KEY_F7] = GHOSTTY_KEY_F7,
+        [KEY_F8] = GHOSTTY_KEY_F8,
+        [KEY_F9] = GHOSTTY_KEY_F9,
+        [KEY_F10] = GHOSTTY_KEY_F10,
+        [KEY_F11] = GHOSTTY_KEY_F11,
+        [KEY_F12] = GHOSTTY_KEY_F12,
+        [KEY_F13] = GHOSTTY_KEY_F13,
+        [KEY_F14] = GHOSTTY_KEY_F14,
+        [KEY_F15] = GHOSTTY_KEY_F15,
+        [KEY_F16] = GHOSTTY_KEY_F16,
+        [KEY_F17] = GHOSTTY_KEY_F17,
+        [KEY_F18] = GHOSTTY_KEY_F18,
+        [KEY_F19] = GHOSTTY_KEY_F19,
+        [KEY_F20] = GHOSTTY_KEY_F20,
+        [KEY_F21] = GHOSTTY_KEY_F21,
+        [KEY_F22] = GHOSTTY_KEY_F22,
+        [KEY_F23] = GHOSTTY_KEY_F23,
+        [KEY_F24] = GHOSTTY_KEY_F24,
+        [KEY_KP0] = GHOSTTY_KEY_NUMPAD_0,
+        [KEY_KP1] = GHOSTTY_KEY_NUMPAD_1,
+        [KEY_KP2] = GHOSTTY_KEY_NUMPAD_2,
+        [KEY_KP3] = GHOSTTY_KEY_NUMPAD_3,
+        [KEY_KP4] = GHOSTTY_KEY_NUMPAD_4,
+        [KEY_KP5] = GHOSTTY_KEY_NUMPAD_5,
+        [KEY_KP6] = GHOSTTY_KEY_NUMPAD_6,
+        [KEY_KP7] = GHOSTTY_KEY_NUMPAD_7,
+        [KEY_KP8] = GHOSTTY_KEY_NUMPAD_8,
+        [KEY_KP9] = GHOSTTY_KEY_NUMPAD_9,
+        [KEY_KPPLUS] = GHOSTTY_KEY_NUMPAD_ADD,
+        [KEY_KPMINUS] = GHOSTTY_KEY_NUMPAD_SUBTRACT,
+        [KEY_KPASTERISK] = GHOSTTY_KEY_NUMPAD_MULTIPLY,
+        [KEY_KPSLASH] = GHOSTTY_KEY_NUMPAD_DIVIDE,
+        [KEY_KPDOT] = GHOSTTY_KEY_NUMPAD_DECIMAL,
+        [KEY_KPCOMMA] = GHOSTTY_KEY_NUMPAD_COMMA,
+        [KEY_KPEQUAL] = GHOSTTY_KEY_NUMPAD_EQUAL,
+        [KEY_KPENTER] = GHOSTTY_KEY_NUMPAD_ENTER,
+    };
+    return code < sizeof(keys) / sizeof(keys[0]) ? keys[code] : GHOSTTY_KEY_UNIDENTIFIED;
+}
+
+static GhosttyKey key_for(uint16_t physical, const char *name) {
+    GhosttyKey native = physical_key(physical);
+    // Navigation keysyms on the numeric pad select Ghostty's keypad variants.
+    // Other known native keys need no string comparisons.
+    if (native != GHOSTTY_KEY_UNIDENTIFIED &&
+        !(physical >= KEY_KP7 && physical <= KEY_KPDOT) &&
+        physical != KEY_KPCOMMA) return native;
     // Keypad keys must stay distinct even when they produce the same Unicode
     // character as a writing-system key. Application keypad mode relies on it.
     #define KEY(n, k) if (!strcmp(name, n)) return GHOSTTY_KEY_##k
@@ -1236,31 +1374,17 @@ static GhosttyKey key_for(uint32_t cp, const char *name) {
     KEY("Caps_Lock", CAPS_LOCK); KEY("Num_Lock", NUM_LOCK);
     KEY("Scroll_Lock", SCROLL_LOCK); KEY("Print", PRINT_SCREEN); KEY("Pause", PAUSE);
     KEY("Menu", CONTEXT_MENU);
-    if (cp >= 'A' && cp <= 'Z') cp += 'a' - 'A';
-    if (cp >= 'a' && cp <= 'z') return GHOSTTY_KEY_A + cp - 'a';
-    if (cp >= '0' && cp <= '9') return GHOSTTY_KEY_DIGIT_0 + cp - '0';
-    switch (cp) {
-        case ' ': return GHOSTTY_KEY_SPACE;
-        case '-': case '_': return GHOSTTY_KEY_MINUS;
-        case '=': case '+': return GHOSTTY_KEY_EQUAL;
-        case '[': case '{': return GHOSTTY_KEY_BRACKET_LEFT;
-        case ']': case '}': return GHOSTTY_KEY_BRACKET_RIGHT;
-        case '\\': case '|': return GHOSTTY_KEY_BACKSLASH;
-        case ';': case ':': return GHOSTTY_KEY_SEMICOLON;
-        case '\'': case '"': return GHOSTTY_KEY_QUOTE;
-        case ',': case '<': return GHOSTTY_KEY_COMMA;
-        case '.': case '>': return GHOSTTY_KEY_PERIOD;
-        case '/': case '?': return GHOSTTY_KEY_SLASH;
-        case '`': case '~': return GHOSTTY_KEY_BACKQUOTE;
-    }
+    if (native != GHOSTTY_KEY_UNIDENTIFIED) return native;
+    // No native identity is available for text-only callers or unknown codes.
+    // Never infer a physical writing-system key from the resulting character.
+    KEY("Henkan_Mode", CONVERT); KEY("Henkan", CONVERT); KEY("Muhenkan", NON_CONVERT);
+    KEY("Hiragana_Katakana", KANA_MODE);
     KEY("Return", ENTER); KEY("BackSpace", BACKSPACE);
     KEY("Tab", TAB); KEY("ISO_Left_Tab", TAB); KEY("Escape", ESCAPE);
     KEY("Up", ARROW_UP); KEY("Down", ARROW_DOWN); KEY("Left", ARROW_LEFT); KEY("Right", ARROW_RIGHT);
     KEY("Home", HOME); KEY("End", END); KEY("Insert", INSERT); KEY("Delete", DELETE);
     KEY("Page_Up", PAGE_UP); KEY("Page_Down", PAGE_DOWN);
     if (name[0] == 'F') { int n = atoi(name + 1); if (n >= 1 && n <= 25) return GHOSTTY_KEY_F1 + n - 1; }
-    // Keep text and existing functional keys out of the extra name lookups.
-    if (cp) return GHOSTTY_KEY_UNIDENTIFIED;
     // GDK's canonical names omit the XKB "XF86" prefix. AudioPlay is the
     // play/pause toggle; the separate AudioPause has no Ghostty identifier.
     KEY("AudioPlay", MEDIA_PLAY_PAUSE); KEY("AudioStop", MEDIA_STOP);
@@ -1276,7 +1400,16 @@ static GhosttyKey key_for(uint32_t cp, const char *name) {
     #undef KEY
     return GHOSTTY_KEY_UNIDENTIFIED;
 }
-size_t gmux_engine_key(GmuxEngine *e, const char *name, uint32_t cp, uint16_t mods,
+static GhosttyMods key_mods(uint16_t mods) {
+    return ((mods & (1 << 0)) ? GHOSTTY_MODS_SHIFT : 0) |
+        ((mods & (1 << 1)) ? GHOSTTY_MODS_CTRL : 0) |
+        ((mods & (1 << 2)) ? GHOSTTY_MODS_ALT : 0) |
+        ((mods & (1 << 3)) ? GHOSTTY_MODS_SUPER : 0) |
+        ((mods & (1 << 4)) ? GHOSTTY_MODS_CAPS_LOCK : 0) |
+        ((mods & (1 << 5)) ? GHOSTTY_MODS_NUM_LOCK : 0);
+}
+size_t gmux_engine_key(GmuxEngine *e, const char *name, uint16_t physical,
+    uint32_t unshifted, uint16_t consumed_mods, uint16_t mods,
     uint8_t action, const char *text, size_t len, uint8_t *out, size_t cap) {
     ghostty_key_encoder_setopt_from_terminal(e->encoder, e->terminal);
     GhosttyKeyAction ghostty_action;
@@ -1287,11 +1420,12 @@ size_t gmux_engine_key(GmuxEngine *e, const char *name, uint32_t cp, uint16_t mo
         default: return 0;
     }
     ghostty_key_event_set_action(e->key, ghostty_action);
-    ghostty_key_event_set_key(e->key, key_for(cp, name));
-    ghostty_key_event_set_mods(e->key, mods);
-    ghostty_key_event_set_consumed_mods(e->key, len ? mods & GHOSTTY_MODS_SHIFT : 0);
+    ghostty_key_event_set_key(e->key, key_for(physical, name));
+    ghostty_key_event_set_mods(e->key, key_mods(mods));
+    ghostty_key_event_set_consumed_mods(e->key, len ? key_mods(consumed_mods & mods) : 0);
     ghostty_key_event_set_utf8(e->key, text, len);
-    ghostty_key_event_set_unshifted_codepoint(e->key, cp >= 'A' && cp <= 'Z' ? cp + 32 : cp);
+    ghostty_key_event_set_unshifted_codepoint(e->key,
+        unshifted <= 0x10ffff && !(unshifted >= 0xd800 && unshifted <= 0xdfff) ? unshifted : 0);
     size_t written = 0;
     if (ghostty_key_encoder_encode(e->encoder, e->key, (char *)out, cap, &written)) return 0;
     return written;

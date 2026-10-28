@@ -7,7 +7,9 @@ use crate::{
     selection::Selection,
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
-    transport::{self, KeyAction, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest},
+    transport::{
+        self, KeyAction, KeyLayout, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest,
+    },
 };
 #[cfg(test)]
 use serde_json::{Value, json};
@@ -1023,14 +1025,14 @@ impl RemoteSession {
     pub fn key(
         &self,
         name: &str,
-        cp: u32,
+        layout: KeyLayout,
         mods: u16,
         action: KeyAction,
         text: &str,
     ) -> anyhow::Result<()> {
         self.command(StreamCommand::Key {
             name: name.to_owned(),
-            cp,
+            layout,
             mods,
             action,
             text: text.to_owned(),
@@ -1343,6 +1345,12 @@ impl RemoteSession {
 
 #[cfg(test)]
 mod tests {
+    fn layout(unshifted: u32) -> crate::transport::KeyLayout {
+        crate::transport::KeyLayout {
+            unshifted,
+            ..Default::default()
+        }
+    }
     use super::*;
     use crate::cells::{decoration, underline};
     use std::os::unix::net::UnixStream;
@@ -3071,11 +3079,24 @@ mod tests {
             (KeyAction::Repeat, "repeat"),
             (KeyAction::Release, "release"),
         ] {
-            session.borrow().key("a", 97, 0, action, "").unwrap();
+            session
+                .borrow()
+                .key(
+                    "exclam",
+                    KeyLayout {
+                        physical: 2,
+                        unshifted: 49,
+                        consumed_mods: 1,
+                    },
+                    33,
+                    action,
+                    "!",
+                )
+                .unwrap();
             let request = wire(receiver.try_recv().unwrap());
             assert_eq!(
                 request,
-                json!({"method":"key","pane":1,"name":"a","cp":97,"mods":0,"action":expected,"text":""})
+                json!({"method":"key","pane":1,"name":"exclam","physical":2,"unshifted":49,"consumed_mods":1,"mods":33,"action":expected,"text":"!"})
             );
             assert!(
                 matches!(StreamRequest::decode(&serde_json::to_vec(&request).unwrap()).command,
@@ -3136,7 +3157,7 @@ mod tests {
                 .unwrap();
             session
                 .borrow()
-                .key("a", b'a' as u32, 0, KeyAction::Release, "")
+                .key("a", layout(b'a' as u32), 0, KeyAction::Release, "")
                 .unwrap();
             manager.poll();
             let commands: Vec<_> = receiver.try_iter().map(wire).collect();
@@ -3290,7 +3311,7 @@ mod tests {
         other.borrow_mut().scroll_to(30);
         session
             .borrow()
-            .key("a", b'a' as u32, 0, KeyAction::Press, "a")
+            .key("a", layout(b'a' as u32), 0, KeyAction::Press, "a")
             .unwrap();
         session.borrow_mut().scroll_to(10);
         session.borrow_mut().scroll_to(20);
@@ -3304,7 +3325,7 @@ mod tests {
         // viewport-dependent input never overtakes older scrolls.
         session
             .borrow()
-            .key("b", b'b' as u32, 0, KeyAction::Press, "b")
+            .key("b", layout(b'b' as u32), 0, KeyAction::Press, "b")
             .unwrap();
         let commands: Vec<_> = receiver.try_iter().take(2).map(wire).collect();
         assert_eq!(commands.len(), 2);
