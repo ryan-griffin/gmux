@@ -69,6 +69,14 @@ Native browser checks use the keysyms present in the fixture's keymap; `Refresh`
 and browser `Stop` have engine coverage only. The private compositor delivering
 a key does not imply that a desktop with system key grabs will deliver it.
 
+The `text-blink` headless suite calls libghostty's style API directly to check
+SGR 5/6 and 25/0. It also checks mixed wide/combining text through Unix and TCP
+streams, synchronized-output holds, cached history, scrolling, reconnect and
+screen lifetime. Renderer fixtures check hidden/shown pixels and row retention,
+colored decorations, hover, selections, search and block/bar/underline cursors.
+Native lifecycle fixtures check reduced-animation preferences, focus-independent
+text, inactive windows, hidden/unrooted widgets and source removal on teardown.
+
 The `scrollback-limits` headless suite checks saved policy and restart, complete
 request validation before mutation, blocked and failed saves, successive partial
 updates while saving, new and existing panes, and immediate local/remote cache updates with queued replies. Engine tests

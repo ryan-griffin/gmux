@@ -20,8 +20,8 @@ rectangles to preserve coverage and blending.
 
 Adjacent printable ASCII cells with matching text styles and foreground colors
 shape together, enabling the selected font's default ligatures and contextual
-substitutions. Whitespace, style and foreground color changes, selection boundaries,
-block cursors, and row ends separate these runs. Background colors paint separately
+substitutions. Whitespace, style and foreground color changes, text blink boundaries,
+selection boundaries, block cursors, and row ends separate these runs. Background colors paint separately
 and do not split shaping. Each shaped cluster starts at its terminal column, so
 ligatures preserve cursor and selection geometry. Unicode cells retain independent
 shaping for combining characters, fallback fonts, and wide glyphs.
@@ -43,6 +43,31 @@ hover with Ctrl changes only affected row backgrounds and decorations, retaining
 glyph nodes and shaped text. The active captured span uses Ghostty's single/double
 underline rule with the program's underline color, opacity and concealment.
 Link hit testing and styling add no socket requests and copy no URI strings.
+
+SGR 5 and 6 both blink text and its decorations at GTK's cursor blink cycle;
+libghostty exposes one boolean for both sequences. SGR 25 or 0 resets the attribute.
+The bridge and wire protocol use cell flag bit 3 without enlarging the 75-byte
+cell. Visible snapshots, styled history, scroll caches and restored history
+preserve this flag.
+
+Text blinking retains shown and hidden row nodes, sharing unchanged glyphs and
+backgrounds. Phase changes rebuild no rows, create no glyph nodes and do no
+shaping. Blink boundaries separate shaping and glyph batches; compatible batches
+can still span nonoverlapping ink. Underlines, hover underlines, overlines and
+strikethrough blink with their cells. Cell and selection backgrounds and cursor
+geometry follow their own state. Selection, explicit underline colors, faint text,
+concealment and wide glyphs keep their normal rules.
+
+Each pane with visible blinking ink uses one sleeping timeout for the next
+half-cycle. Blank cells without decorations, concealed text and ink outside the
+allocation do not keep it running. Text blinks in mapped panes of the active
+window, independently of keyboard focus and cursor visibility. Unmapping,
+unrooting, window deactivation, exit, removal of blinking content and teardown
+stop the source and restore readable text. Disabling GTK's `gtk-enable-animations`
+or `gtk-cursor-blink` also shows steady text. Changing `gtk-cursor-blink-time`
+restarts the visible phase with the new timing. The cursor's inactivity timeout
+applies only to the cursor. Text phase changes stay in the frontend and do not
+alter accessible text, selection, search, copy output or daemon state.
 
 Font, Pango context, cell metrics, theme, and pixel alignment changes invalidate
 the relevant caches. Scrolling reuses rows after comparing overlapping content.
@@ -71,13 +96,19 @@ represent half of a wide glyph, so those ranges include the complete glyph.
 ## Validation
 
 ```sh
-python3 scripts/check.py --native --only renderer terminal-input
+python3 scripts/check.py --native --only text-blink renderer terminal-input
 GSK_RENDERER=gl python3 scripts/check.py --native --skip-build --only renderer
 ```
 
 `renderer-check` compares text nodes against independent Pango layout drawing
 and checks cell graphics, styles, selection, cursors, fractional alignment,
 and retained rows. Cache comparisons use exact pixels from a Cairo renderer.
+Blink checks compare both phases, decorated blanks, concealment, colored emoji,
+wide/combining glyphs, selection, search, hover and all cursor shapes. An independent
+concealment transformation checks hidden-phase pixels with the independent Pango
+oracle's per-cell tolerance for synthetic italic edge clipping. Cache comparisons
+remain exact. Blink fixtures also check scroll reuse, shaping boundaries, desktop
+preferences, source reuse, focus independence, unmapping, unrooting and teardown.
 The renderer suite also drives allocated cursor test widgets through native
 Wayland input, checking pointer initialization, focus, unmapping, window
 activation, activity deadlines, timing preferences, default notifications, input
@@ -123,6 +154,10 @@ The unique-text fixture changes identifiers on every update to measure shaping
 when the text is absent from the cache. The decoration fixture draws all five
 underline styles with independent colors and overlines. The cursor-blink workload
 alternates block cursor visibility without changing terminal cells.
+Use `--blink` for no-blink, one-cell, full-screen and alternating-cell text
+phases. These workloads assert that warmed phase changes rebuild no rows or
+glyph nodes. Allocation counters cover Rust scene preparation; GTK/Pango/GSK
+allocations are outside those counters.
 
 The benchmark records scene preparation separately from rendering and texture
 readback, plus row rebuilds, shape-cache entries, and cache payload bytes.

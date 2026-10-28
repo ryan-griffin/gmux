@@ -335,7 +335,7 @@ mod tests {
         let mut cell = Cell::default();
         cell.text[..5].copy_from_slice("界é".as_bytes());
         cell.fg = [1, 2, 3];
-        cell.flags = 65;
+        cell.flags = 65 | crate::cells::flags::BLINK;
         cell.decoration = underline::CURLY | decoration::OVERLINE | decoration::UNDERLINE_COLOR;
         cell.underline_color = [6, 7, 8];
         Packet {
@@ -387,10 +387,12 @@ mod tests {
             row_flags: vec![0, 1, 0],
         });
         packet.cells.resize(8, Cell::default());
+        packet.cells[2] = packet.cells[0];
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         let decoded = Packet::read(&mut &bytes[..]).unwrap();
         assert_eq!(decoded.cells.len(), 8);
+        assert!(decoded.cells[0].blink() && decoded.cells[2].blink());
         assert_eq!(decoded.header.cache_origin, 42);
         assert_eq!(decoded.header.cache_valid_before, Some(200));
         assert_eq!(decoded.header.cache.unwrap().row_flags, [0, 1, 0]);

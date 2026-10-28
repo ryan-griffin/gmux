@@ -1,7 +1,7 @@
 use crate::render::{self, Rect};
 use gmux_client::{
     Cell, Frame,
-    cells::{decoration, underline},
+    cells::{decoration, flags, underline},
     theme::Theme,
 };
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
@@ -25,6 +25,7 @@ pub struct Scene<'a> {
     pub matches: &'a [u8],
     pub focused: bool,
     pub exited: bool,
+    pub text_blink_visible: bool,
 }
 
 impl Scene<'_> {
@@ -265,6 +266,7 @@ pub struct RenderStats {
     pub text_nodes: usize,
     pub cached_shapes: usize,
     pub cached_shape_bytes: usize,
+    pub blinking_rows: usize,
 }
 
 #[derive(PartialEq)]
@@ -286,6 +288,65 @@ struct CachedRow {
     pixel_phase: f64,
     background: Option<gsk::RenderNode>,
     foreground: Option<gsk::RenderNode>,
+    hidden_background: Option<gsk::RenderNode>,
+    hidden_foreground: Option<gsk::RenderNode>,
+    blink: bool,
+    blink_start: Option<u16>,
+}
+
+/// Retain both phases with shared nodes. Segment boundaries preserve paint
+/// order even when italic/fallback ink overlaps adjacent steady and blink cells.
+/// Ordinary rows use just one snapshot, with no extra nodes or snapshots.
+struct RowPhases {
+    current: gtk::Snapshot,
+    phases: Option<(gtk::Snapshot, gtk::Snapshot)>,
+    blinking: bool,
+}
+
+impl RowPhases {
+    fn new(blink: bool) -> Self {
+        Self::with_snapshot(gtk::Snapshot::new(), blink)
+    }
+
+    fn with_snapshot(current: gtk::Snapshot, blink: bool) -> Self {
+        Self {
+            current,
+            phases: blink.then(|| (gtk::Snapshot::new(), gtk::Snapshot::new())),
+            blinking: false,
+        }
+    }
+
+    fn append_segment(
+        current: gtk::Snapshot,
+        (shown, hidden): &(gtk::Snapshot, gtk::Snapshot),
+        blinking: bool,
+    ) {
+        if let Some(node) = current.to_node() {
+            shown.append_node(&node);
+            if !blinking {
+                hidden.append_node(&node);
+            }
+        }
+    }
+
+    fn set_blink(&mut self, blink: bool) {
+        if let Some(phases) = &self.phases
+            && self.blinking != blink
+        {
+            let current = std::mem::replace(&mut self.current, gtk::Snapshot::new());
+            Self::append_segment(current, phases, self.blinking);
+            self.blinking = blink;
+        }
+    }
+
+    fn finish(self) -> (Option<gsk::RenderNode>, Option<gsk::RenderNode>) {
+        if let Some(phases) = self.phases {
+            Self::append_segment(self.current, &phases, self.blinking);
+            (phases.0.to_node(), phases.1.to_node())
+        } else {
+            (self.current.to_node(), None)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -488,11 +549,33 @@ impl Renderer {
                         ),
                     );
                 }
+                // Reuse the background scan for the ordinary no-blink path.
+                // Empty and concealed blink cells cannot change visible ink.
+                row.blink = flags & flags::BLINK != 0;
+                row.blink_start = row
+                    .blink
+                    .then(|| {
+                        cells.iter().enumerate().position(|(x, cell)| {
+                            cell.blink()
+                                && cell.flags & 32 == 0
+                                && ((!cell.text().is_empty() && cell.text() != " ")
+                                    || cell.underline() != underline::NONE
+                                    || cell.overline()
+                                    || cell.flags & 16 != 0
+                                    || hovered_link.is_some_and(|(start, end)| {
+                                        (start as usize..end as usize).contains(&x)
+                                    }))
+                        })
+                    })
+                    .flatten()
+                    // Row-local columns are bounded by Frame::cols.
+                    .map(|x| x as u16);
+                let mut background = RowPhases::with_snapshot(background, row.blink);
                 // Ghostty paints underlines and overlines below glyphs so
                 // contrasting colors cannot cover descenders or tall ink.
                 if decorations & decoration::UNDERLINE_MASK != 0 || hovered_link.is_some() {
                     append_decorations(
-                        &background,
+                        &mut background,
                         &colors,
                         cells,
                         base,
@@ -502,7 +585,7 @@ impl Renderer {
                 }
                 if decorations & decoration::OVERLINE != 0 {
                     append_decorations(
-                        &background,
+                        &mut background,
                         &colors,
                         cells,
                         base,
@@ -510,12 +593,12 @@ impl Renderer {
                         DecorationKind::Overline,
                     );
                 }
-                row.background = background.to_node();
+                (row.background, row.hidden_background) = background.finish();
                 row.hovered_link = hovered_link;
                 stats.background_rows += 1;
             }
             if rebuild {
-                let row_snapshot = gtk::Snapshot::new();
+                let mut foreground = RowPhases::new(row.blink);
                 let mut x = 0;
                 while x < cells.len() {
                     let cell = &cells[x];
@@ -537,11 +620,12 @@ impl Renderer {
                         && render::graphic_rects(text, rect, |rect| {
                             // Flush once before graphics to preserve glyph order.
                             if first_rect {
-                                stats.text_nodes += batch.flush(&row_snapshot);
+                                stats.text_nodes += batch.flush(&mut foreground);
+                                foreground.set_blink(cell.blink());
                                 first_rect = false;
                             }
                             append_row_rect(
-                                &row_snapshot,
+                                &foreground.current,
                                 scene,
                                 y as f64 * scene.metrics.1,
                                 rgb,
@@ -576,7 +660,8 @@ impl Renderer {
                             // layout, baseline, and terminal-defined visual order.
                             while end < limit
                                 && ascii_cell(&cells[end])
-                                && cells[end].flags & (1 | 2 | 4) == cell.flags & (1 | 2 | 4)
+                                && cells[end].flags & (1 | 2 | 4 | flags::BLINK)
+                                    == cell.flags & (1 | 2 | 4 | flags::BLINK)
                                 && colors.foreground(base + end, &cells[end]) == (rgb, alpha)
                             {
                                 self.text.push(cells[end].text[0] as char);
@@ -592,10 +677,11 @@ impl Renderer {
                             .iter()
                         {
                             stats.text_nodes += batch.append(
-                                &row_snapshot,
+                                &mut foreground,
                                 run,
                                 rgba(rgb, alpha),
                                 (rect.0 * pango::SCALE as f64) as i32,
+                                cell.blink(),
                             );
                         }
                         x = end;
@@ -603,11 +689,11 @@ impl Renderer {
                         x += 1;
                     }
                 }
-                stats.text_nodes += batch.flush(&row_snapshot);
+                stats.text_nodes += batch.flush(&mut foreground);
                 // Strikethrough stays above the glyphs, matching Ghostty.
                 if flags & 16 != 0 {
                     append_decorations(
-                        &row_snapshot,
+                        &mut foreground,
                         &colors,
                         cells,
                         base,
@@ -615,7 +701,7 @@ impl Renderer {
                         DecorationKind::Strike,
                     );
                 }
-                row.foreground = row_snapshot.to_node();
+                (row.foreground, row.hidden_foreground) = foreground.finish();
                 row.cells.clear();
                 row.cells.extend_from_slice(cells);
                 row.highlights.clear();
@@ -625,7 +711,18 @@ impl Renderer {
                 row.pixel_phase = pixel_phase;
                 stats.rebuilt_rows += 1;
             }
-            if let Some(node) = &row.background {
+            if row
+                .blink_start
+                .is_some_and(|x| x as f64 * scene.metrics.0 < scene.width as f64)
+                && (y as f64 * scene.metrics.1) < scene.height as f64
+            {
+                stats.blinking_rows += 1;
+            }
+            if let Some(node) = if row.blink && !scene.text_blink_visible {
+                &row.hidden_background
+            } else {
+                &row.background
+            } {
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new(
                     0.0,
@@ -637,7 +734,11 @@ impl Renderer {
         }
         // Paint every background before any text, including wide and tall glyphs.
         for (y, row) in self.rows.iter().enumerate() {
-            if let Some(node) = &row.foreground {
+            if let Some(node) = if row.blink && !scene.text_blink_visible {
+                &row.hidden_foreground
+            } else {
+                &row.foreground
+            } {
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new(
                     0.0,
@@ -674,6 +775,7 @@ struct TextBatch {
     color: Option<gdk::RGBA>,
     glyphs: Vec<pango::GlyphInfo>,
     right: i32,
+    blink: bool,
 }
 
 // Fallback fonts often alternate within a terminal row. Reuse a compatible
@@ -687,13 +789,16 @@ struct TextBatches {
 impl TextBatches {
     fn append(
         &mut self,
-        snapshot: &gtk::Snapshot,
+        phases: &mut RowPhases,
         run: &GlyphRun,
         color: gdk::RGBA,
         x: i32,
+        blink: bool,
     ) -> usize {
         let compatible = self.batches[..self.used].iter().rposition(|batch| {
-            batch.font.as_ref() == Some(&run.font) && batch.color == Some(color)
+            batch.font.as_ref() == Some(&run.font)
+                && batch.color == Some(color)
+                && batch.blink == blink
         });
         let left = x.saturating_add(run.ink.0);
         let right = x.saturating_add(run.ink.1);
@@ -708,7 +813,7 @@ impl TextBatches {
         } else {
             // Bound the search even when every cell has a different color.
             if self.used == 8 {
-                flushed = self.flush(snapshot);
+                flushed = self.flush(phases);
             }
             if self.used == self.batches.len() {
                 self.batches.push(TextBatch::default());
@@ -717,6 +822,7 @@ impl TextBatches {
             batch.font = Some(run.font.clone());
             batch.color = Some(color);
             batch.right = i32::MIN;
+            batch.blink = blink;
             self.used += 1;
             self.used - 1
         };
@@ -731,10 +837,11 @@ impl TextBatches {
         flushed
     }
 
-    fn flush(&mut self, snapshot: &gtk::Snapshot) -> usize {
+    fn flush(&mut self, phases: &mut RowPhases) -> usize {
         let mut nodes = 0;
         for batch in &mut self.batches[..self.used] {
-            nodes += batch.flush(snapshot);
+            phases.set_blink(batch.blink);
+            nodes += batch.flush(&phases.current);
         }
         self.used = 0;
         nodes
@@ -991,7 +1098,7 @@ fn append_decoration(
 }
 
 fn append_decorations(
-    snapshot: &gtk::Snapshot,
+    phases: &mut RowPhases,
     colors: &RowColors<'_, '_>,
     cells: &[Cell],
     base: usize,
@@ -1005,11 +1112,14 @@ fn append_decorations(
             continue;
         };
         let mut end = start + 1;
-        while end < cells.len() && decoration(colors, base + end, &cells[end], kind) == Some(style)
+        while end < cells.len()
+            && decoration(colors, base + end, &cells[end], kind) == Some(style)
+            && cells[end].blink() == cells[start].blink()
         {
             end += 1;
         }
-        append_decoration(snapshot, colors.scene, y, start, end, kind, style);
+        phases.set_blink(cells[start].blink());
+        append_decoration(&phases.current, colors.scene, y, start, end, kind, style);
         start = end;
     }
 }

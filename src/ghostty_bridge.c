@@ -69,6 +69,7 @@ static GhosttyColorRgb resolve_color(GhosttyStyleColor color, GhosttyColorRgb fa
 static inline void cell_style(GmuxCell *cell, const GhosttyStyle *style,
     const GhosttyRenderStateColors *colors) {
     cell->flags = style->bold | (style->italic << 1) | (style->faint << 2) |
+        (style->blink ? GMUX_CELL_BLINK : 0) |
         (style->strikethrough << 4) | (style->invisible << 5);
     cell->decoration = underline_code(style->underline) |
         (style->overline ? GMUX_DECORATION_OVERLINE : 0);

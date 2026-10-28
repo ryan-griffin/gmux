@@ -1,5 +1,10 @@
 //! Terminal viewport values, independent of the terminal engine's native library.
 
+pub mod flags {
+    /// SGR 5 and 6 share one native blink attribute.
+    pub const BLINK: u8 = 8;
+}
+
 /// Underline codes stored in the low bits of `Cell::decoration`.
 /// The byte remains raw so unknown protocol/FFI values are valid Rust values.
 pub mod underline {
@@ -116,6 +121,9 @@ impl Default for Cell {
     }
 }
 impl Cell {
+    pub fn blink(&self) -> bool {
+        self.flags & flags::BLINK != 0
+    }
     pub fn underline(&self) -> u8 {
         self.decoration & decoration::UNDERLINE_MASK
     }

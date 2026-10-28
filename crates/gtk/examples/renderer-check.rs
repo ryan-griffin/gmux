@@ -15,6 +15,20 @@ mod cursor {
         (cursor.deadline.get(), source.ready_time())
     }
 }
+mod text_blink {
+    include!("../src/terminal/text_blink.rs");
+
+    pub(super) fn source_id(blink: &TextBlink) -> Option<u32> {
+        blink.source.borrow().as_ref().map(glib::SourceId::as_raw)
+    }
+    pub(super) fn ready_time(blink: &TextBlink) -> i64 {
+        let source = blink.source.borrow();
+        glib::MainContext::default()
+            .find_source_by_id(source.as_ref().unwrap())
+            .unwrap()
+            .ready_time()
+    }
+}
 #[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
@@ -95,6 +109,7 @@ fn scene(cells: &[Cell], theme: Theme) -> Scene<'_> {
         matches: &[],
         focused: true,
         exited: false,
+        text_blink_visible: true,
     }
 }
 
@@ -370,26 +385,45 @@ fn validate_overlapping_fallbacks(
             [0, 2, 4, 6][index / 40 % 4],
         );
         target.fg = theme.palette[1 + index % 3];
+        if index % 3 == 0 {
+            target.flags |= gmux_client::cells::flags::BLINK;
+        }
     }
     let mut scene = scene(&cells, theme);
     // Force ink across neighboring cells to exercise paint-order checks, with
     // alternating fallback fonts, colors, italics, and node opacity.
     scene.metrics.0 = 3.0;
     scene.width = 120;
-    let actual = node(&mut Renderer::new(), &scene, font, context).0;
-    let expected = reference(&scene, font, context);
-    let actual = pixels(&render(gpu, &actual, &scene));
-    let expected = pixels(&render(gpu, &expected, &scene));
-    let delta = actual
-        .iter()
-        .zip(&expected)
-        .map(|(&a, &b)| (a as f64 - b as f64).abs())
-        .sum::<f64>()
-        / actual.len() as f64;
-    assert!(
-        delta < 1.0,
-        "Overlapping fallback glyphs changed paint order: {delta}"
-    );
+    for shown in [true, false] {
+        scene.text_blink_visible = shown;
+        let actual = node(&mut Renderer::new(), &scene, font, context).0;
+        let mut expected_cells = cells.clone();
+        for cell in &mut expected_cells {
+            if cell.blink() && !shown {
+                cell.flags |= 32;
+            }
+        }
+        let expected = reference(
+            &Scene {
+                cells: &expected_cells,
+                ..scene
+            },
+            font,
+            context,
+        );
+        let actual = pixels(&render(gpu, &actual, &scene));
+        let expected = pixels(&render(gpu, &expected, &scene));
+        let delta = actual
+            .iter()
+            .zip(&expected)
+            .map(|(&a, &b)| (a as f64 - b as f64).abs())
+            .sum::<f64>()
+            / actual.len() as f64;
+        assert!(
+            delta < 1.0,
+            "Overlapping blink/fallback glyphs changed paint order: {delta}"
+        );
+    }
 }
 
 fn assert_ligature_layout(
@@ -497,6 +531,8 @@ fn validate_ligatures(
             "foreground",
             "background",
             "bold",
+            "blink",
+            "blink-hidden",
             "selection",
             "search",
             "cursor",
@@ -523,6 +559,7 @@ fn validate_ligatures(
                 "foreground" => cells[1].fg = theme.palette[1],
                 "background" => cells[1].bg = theme.palette[4],
                 "bold" => cells[1].flags = 1,
+                "blink" | "blink-hidden" => cells[1].flags = 8,
                 // Boundaries must split shaping even when the effective
                 // foreground matches the neighboring text.
                 "selection" => cells[1].fg = theme.selection_foreground,
@@ -544,6 +581,7 @@ fn validate_ligatures(
             scene.width = (scene.metrics.0 * 16.0).ceil() as i32;
             scene.height = (ch + 2) * 2;
             scene.matches = &matches;
+            scene.text_blink_visible = case != "blink-hidden";
             if case == "selection" {
                 scene.selection = Some(gmux_client::selection::Selection::linear(0, 0));
             }
@@ -562,6 +600,7 @@ fn validate_ligatures(
             // draws these layouts without interpreting selection or cursor metadata.
             let mut expected_cells = cells.clone();
             match case {
+                "blink-hidden" => expected_cells[1].flags |= 32,
                 "selection" | "search" => {
                     let index = if case == "selection" { 0 } else { 1 };
                     expected_cells[index].fg = theme.selection_foreground;
@@ -697,6 +736,8 @@ fn validate_cursor_lifecycle(output: &Path) {
     let defaults = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let observed = defaults.clone();
     let cursor = cursor::Cursor::new(&area, move |blink| observed.borrow_mut().push(blink));
+    let text_blink = text_blink::TextBlink::new(&area);
+    assert!(!text_blink.running() && text_blink.visible());
     let mut frame = Frame {
         cols: 80,
         rows: 24,
@@ -729,6 +770,34 @@ fn validate_cursor_lifecycle(output: &Path) {
     area.grab_focus();
     activate(&window, [60, 120, 180]);
     wait(|| cursor.running());
+    assert!(
+        !text_blink.running(),
+        "Ordinary text must not schedule animation"
+    );
+    let animations = settings.is_gtk_enable_animations();
+    settings.set_gtk_enable_animations(true);
+    text_blink.update(true);
+    wait(|| !text_blink.visible());
+    let source = text_blink::source_id(&text_blink);
+    let ready = text_blink::ready_time(&text_blink);
+    for _ in 0..1000 {
+        text_blink.update(true);
+        cursor.restart();
+    }
+    assert_eq!(text_blink::source_id(&text_blink), source);
+    assert_eq!(text_blink::ready_time(&text_blink), ready);
+    settings.set_gtk_enable_animations(false);
+    assert!(!text_blink.running() && text_blink.visible());
+    assert!(
+        cursor.running(),
+        "Text animation preferences must preserve cursor behavior"
+    );
+    settings.set_gtk_enable_animations(true);
+    assert!(text_blink.running());
+    wait(|| !text_blink.visible());
+    text_blink.update(false);
+    assert!(!text_blink.running() && text_blink.visible());
+    text_blink.update(true);
     wait(|| !cursor.visible());
     // Text input must restart blinking even with identical terminal coordinates.
     cursor.restart();
@@ -801,6 +870,12 @@ fn validate_cursor_lifecycle(output: &Path) {
             (before.1 + micros..=after.1 + micros + 1000).contains(&ready_time),
             "Timing preference did not reschedule the pending source"
         );
+        assert!(
+            (before.1 + micros..=after.1 + micros + 1000)
+                .contains(&text_blink::ready_time(&text_blink)),
+            "Timing preference did not reschedule text blinking"
+        );
+        assert!(text_blink.visible());
         assert!(cursor.visible());
     }
     let lengthened_deadline = cursor::timing(&cursor).0;
@@ -829,6 +904,7 @@ fn validate_cursor_lifecycle(output: &Path) {
     }
     settings.set_gtk_cursor_blink(false);
     assert!(!cursor.running());
+    assert!(!text_blink.running() && text_blink.visible());
     settings.set_gtk_cursor_blink_time(400);
     assert_eq!(*defaults.borrow(), [false]);
     settings.set_gtk_cursor_blink_timeout(10);
@@ -850,10 +926,15 @@ fn validate_cursor_lifecycle(output: &Path) {
     other.grab_focus();
     wait(|| !cursor.running());
     assert!(cursor.visible());
+    assert!(
+        text_blink.running(),
+        "Visible text is independent of pane focus"
+    );
     area.grab_focus();
     wait(|| cursor.running());
     window.set_visible(false);
     assert!(!cursor.running());
+    assert!(!text_blink.running() && text_blink.visible());
     area.grab_focus();
     activate(&window, [60, 120, 180]);
     wait(|| cursor.running());
@@ -866,6 +947,7 @@ fn validate_cursor_lifecycle(output: &Path) {
     cover.set_child(Some(&cover_area));
     activate(&cover, [180, 100, 60]);
     wait(|| !window.is_active());
+    assert!(!text_blink.running() && text_blink.visible());
     assert!(
         !cursor.running(),
         "An inactive window must stop its blink source"
@@ -884,6 +966,10 @@ fn validate_cursor_lifecycle(output: &Path) {
     assert_eq!(*defaults.borrow(), [false, true, false, true]);
     wait(|| !cursor.running());
     assert!(cursor.visible());
+    assert!(
+        text_blink.running(),
+        "Cursor inactivity timeout applies only to the cursor"
+    );
     cursor.restart();
     assert!(cursor.running());
     cursor.update(frame, true);
@@ -899,7 +985,32 @@ fn validate_cursor_lifecycle(output: &Path) {
         weak.upgrade().is_none(),
         "Blink source must not retain its owner"
     );
+    let source = text_blink::source_id(&text_blink).unwrap();
+    let weak = std::rc::Rc::downgrade(&text_blink);
+    drop(text_blink);
+    assert!(weak.upgrade().is_none());
+    // Source IDs cannot be reconstructed, so inspect the context through GLib.
+    use glib::translate::ToGlibPtr;
+    assert!(
+        unsafe {
+            glib::ffi::g_main_context_find_source_by_id(
+                glib::MainContext::default().to_glib_none().0,
+                source,
+            )
+        }
+        .is_null(),
+        "Dropping the controller must remove its sleeping source"
+    );
+    let blink = text_blink::TextBlink::new(&area);
+    blink.update(true);
+    assert!(blink.running());
+    content.remove(&area);
+    assert!(!blink.running() && blink.visible());
+    content.append(&area);
+    wait(|| blink.running());
     window.destroy();
+    assert!(!blink.running() && blink.visible());
+    settings.set_gtk_enable_animations(animations);
     settings.set_gtk_cursor_blink(old.0);
     settings.set_gtk_cursor_blink_time(old.1);
     settings.set_gtk_cursor_blink_timeout(old.2);
@@ -1496,6 +1607,179 @@ fn validate_cache(
     assert_eq!((stats.cached_shapes, stats.cached_shape_bytes), (0, 0));
 }
 
+fn validate_text_blink(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+    output: &Path,
+) {
+    let theme = Theme::adwaita(true);
+    let mut cells = fixture(theme);
+    // Alternate inside ASCII words, with wide/combining/fallback glyphs and
+    // graphics in the same row. Backgrounds remain visible in both phases.
+    for (index, cell) in cells.iter_mut().enumerate() {
+        if index % 4 < 2 {
+            cell.flags |= gmux_client::cells::flags::BLINK;
+        }
+        cell.bg = [30, 45, 60];
+        cell.decoration = underline::STYLES[(index / 40) % 5]
+            | decoration::OVERLINE
+            | decoration::UNDERLINE_COLOR;
+        cell.underline_color = [210, 40, 80];
+    }
+    cells[41] = cell("█", theme, 8 | 16);
+    cells[3].flags |= 8;
+    cells[4].flags |= 8;
+    cells[42] = cell("e\u{301}", theme, 8 | 4 | 16);
+    cells[43] = cell("hidden", theme, 8 | 32 | 16);
+    let mut highlights = vec![0; cells.len()];
+    highlights[81..90].fill(2);
+    highlights[123..132].fill(1);
+    for scale in [1.0, 1.5] {
+        for cursor_style in [0, 1, 2] {
+            for selection in [
+                None,
+                Some(gmux_client::selection::Selection::linear(1, 87)),
+                Some(gmux_client::selection::Selection::rectangle(1, 87, 40)),
+            ] {
+                let mut renderer = Renderer::new();
+                let mut scene = scene(&cells, theme);
+                scene.scale = scale;
+                scene.origin = (0.25, 0.5);
+                scene.matches = &highlights;
+                scene.selection = selection;
+                scene.hovered_link = Some((0, 83));
+                scene.frame.cursor_style = cursor_style;
+                scene.frame.cursor_visible = 1;
+                scene.frame.cursor_x = 3; // Wide cluster head in this fixture.
+                for (step, shown) in [true, false, true, false].into_iter().enumerate() {
+                    scene.text_blink_visible = shown;
+                    let (actual, stats) = node(&mut renderer, &scene, font, context);
+                    assert_eq!(stats.blinking_rows, 8);
+                    if step > 0 {
+                        assert_eq!(
+                            (stats.rebuilt_rows, stats.background_rows, stats.text_nodes),
+                            (0, 0, 0)
+                        );
+                    }
+                    // Independent cell transformation is the oracle: conceal
+                    // only blink ink, preserving original cell/background/cursor
+                    // geometry, selection, search and hyperlink ownership.
+                    let mut expected = cells.clone();
+                    for cell in &mut expected {
+                        if !shown && cell.blink() {
+                            cell.flags |= 32;
+                        }
+                        if !shown {
+                            cell.flags &= !gmux_client::cells::flags::BLINK;
+                        }
+                    }
+                    let expected_scene = Scene {
+                        cells: &expected,
+                        text_blink_visible: true,
+                        ..scene
+                    };
+                    let expected = node(&mut Renderer::new(), &expected_scene, font, context).0;
+                    if shown {
+                        assert_render_eq(
+                            gpu,
+                            &actual,
+                            &expected,
+                            &scene,
+                            output,
+                            "text-blink-shown-cache",
+                        );
+                    } else {
+                        let actual_pixels = pixels(&render(gpu, &actual, &scene));
+                        let expected_pixels = pixels(&render(gpu, &expected, &scene));
+                        let width = (scene.width as f64 * scale).ceil() as usize;
+                        // Different text-node partitions can change synthetic
+                        // italic edge clipping in GSK. Apply the independent
+                        // Pango oracle's tolerance to each cell, so one missing
+                        // glyph cannot be diluted in a mostly blank viewport.
+                        for y in 0..8 {
+                            for x in 0..40 {
+                                let left = (x as f64 * scene.metrics.0 * scale) as usize;
+                                let right = ((x + 1) as f64 * scene.metrics.0 * scale) as usize;
+                                let top = (y as f64 * scene.metrics.1 * scale) as usize;
+                                let bottom = ((y + 1) as f64 * scene.metrics.1 * scale) as usize;
+                                let mut delta = 0;
+                                for py in top..bottom {
+                                    for channel in (py * width + left) * 4..(py * width + right) * 4
+                                    {
+                                        delta += actual_pixels[channel]
+                                            .abs_diff(expected_pixels[channel])
+                                            as usize;
+                                    }
+                                }
+                                let mean =
+                                    delta as f64 / ((right - left) * (bottom - top) * 4) as f64;
+                                if mean >= 1.0 {
+                                    assert_render_eq(
+                                        gpu,
+                                        &actual,
+                                        &expected,
+                                        &scene,
+                                        output,
+                                        &format!(
+                                            "text-blink-hidden-{scale}-{cursor_style}-{x}-{y}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // Hyperlink hover must retain the glyph nodes even in the
+                // hidden phase, including blank blinking cells gaining ink.
+                scene.hovered_link = None;
+                let (cached, stats) = node(&mut renderer, &scene, font, context);
+                assert_eq!((stats.rebuilt_rows, stats.text_nodes), (0, 0));
+                let fresh = node(&mut Renderer::new(), &scene, font, context).0;
+                assert_render_eq(gpu, &cached, &fresh, &scene, output, "text-blink-hover");
+                for (visible, focused) in [(0, true), (1, true), (1, false)] {
+                    scene.frame.cursor_visible = visible;
+                    scene.focused = focused;
+                    let (cached, stats) = node(&mut renderer, &scene, font, context);
+                    assert_eq!(stats.rebuilt_rows, usize::from(cursor_style == 1));
+                    let fresh = node(&mut Renderer::new(), &scene, font, context).0;
+                    assert_render_eq(
+                        gpu,
+                        &cached,
+                        &fresh,
+                        &scene,
+                        output,
+                        "text-blink-cursor-phase",
+                    );
+                }
+            }
+        }
+    }
+    // Blank or concealed cells and blinking ink outside the allocation must
+    // not keep a source alive. A hovered blank link is visible decoration.
+    let mut blanks = vec![cell(" ", theme, 8); 320];
+    blanks[0] = cell("X", theme, 8 | 32);
+    let mut renderer = Renderer::new();
+    let mut s = scene(&blanks, theme);
+    assert_eq!(node(&mut renderer, &s, font, context).1.blinking_rows, 0);
+    s.hovered_link = Some((1, 4));
+    assert_eq!(node(&mut renderer, &s, font, context).1.blinking_rows, 1);
+    s.text_blink_visible = false;
+    let cached = node(&mut renderer, &s, font, context).0;
+    let fresh = node(&mut Renderer::new(), &s, font, context).0;
+    assert_render_eq(gpu, &cached, &fresh, &s, output, "text-blink-blank-hover");
+    s.width = 10;
+    assert_eq!(node(&mut renderer, &s, font, context).1.blinking_rows, 0);
+    s.width = 400;
+    s.height = 0;
+    assert_eq!(
+        renderer
+            .snapshot(&gtk::Snapshot::new(), &s, font, context)
+            .blinking_rows,
+        0
+    );
+}
+
 fn validate_scroll_cache(
     gpu: &gsk::Renderer,
     font: &pango::FontDescription,
@@ -1507,6 +1791,9 @@ fn validate_scroll_cache(
         for origin in [(0.0, 0.0), (0.25, 0.5)] {
             let mut renderer = Renderer::new();
             let mut cells = fixture(theme);
+            for cell in cells.iter_mut().step_by(3) {
+                cell.flags |= gmux_client::cells::flags::BLINK;
+            }
             let mut highlights = vec![0; cells.len()];
             for (step, delta) in [0_isize, 1, -1, 3, -2, 7, -7].into_iter().enumerate() {
                 if delta > 0 {
@@ -1529,6 +1816,7 @@ fn validate_scroll_cache(
                 }
                 let mut scene = scene(&cells, theme);
                 scene.metrics.1 = 21.0;
+                scene.text_blink_visible = step % 2 == 0;
                 scene.height = 168;
                 scene.scale = scale;
                 scene.origin = origin;
@@ -1843,6 +2131,7 @@ fn main() -> anyhow::Result<()> {
     validate_batched_patterns(cache_gpu, &font, &context, &options.output);
     validate_batched_patterns(&gpu, &font, &context, &options.output);
     validate_link_hover(cache_gpu, &font, &context, &options.output);
+    validate_text_blink(cache_gpu, &font, &context, &options.output);
     std::fs::write(
         options.output.join("checks.json"),
         serde_json::to_string_pretty(&json!({
@@ -1852,7 +2141,8 @@ fn main() -> anyhow::Result<()> {
             "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
                        "font and context changes", "fractional blocks", "linear and rectangular selection and search", "link hover SGR pixels and glyph cache retention",
                        "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
-                       "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts"]
+                       "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts",
+                       "text blink phases, decorations, cursor and selection pixels", "text blink retains row and glyph nodes"]
         }))?,
     )?;
     println!(

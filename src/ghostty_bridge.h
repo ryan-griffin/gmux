@@ -69,13 +69,15 @@
 #define GMUX_DECORATION_OVERLINE 8
 #define GMUX_DECORATION_UNDERLINE_COLOR 16
 
+#define GMUX_CELL_BLINK 8
+
 // Source of truth for the Gmux C/Rust ABI. Keep upstream Ghostty types in the
 // implementation; build.rs generates Rust declarations and layout checks here.
 typedef struct {
     uint8_t text[64];
     uint8_t fg[3];
     uint8_t bg[3];
-    uint8_t flags; // bold, italic, faint, reserved, strike, invisible, wide tail/head
+    uint8_t flags; // bold, italic, faint, blink, strike, invisible, wide tail/head
     uint8_t decoration; // underline style (bits 0-2), overline (3), underline color (4)
     uint8_t underline_color[3];
 } GmuxCell;
