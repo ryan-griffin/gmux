@@ -117,6 +117,12 @@ typedef struct {
     uint64_t prompt_anchors;
     uint64_t prompt_anchor_bytes;
 } GmuxMemoryUsage;
+// Stable optional size values. Zero is a finite limit, separate from unlimited.
+typedef struct { size_t value; bool unlimited; } GmuxRetentionLimit;
+typedef struct {
+    GmuxRetentionLimit max_bytes, max_lines;
+} GmuxRetentionLimits;
+int gmux_engine_retention(GmuxEngine *engine, const GmuxRetentionLimits *limits);
 int gmux_engine_memory_usage(GmuxEngine *engine, GmuxMemoryUsage *out);
 int gmux_engine_compression_activity(GmuxEngine *engine, uint64_t *activity);
 // One bounded incremental step, serialized with all other terminal access.

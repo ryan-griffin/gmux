@@ -1133,6 +1133,7 @@ mod tests {
         // Actual progress values/expiry delivery are covered by the stream smoke.
         let mut daemon = Daemon {
             sessions: HashMap::new(),
+            limits: Default::default(),
             id: DaemonId::generate().unwrap(),
             remote_access: Default::default(),
             state: Default::default(),

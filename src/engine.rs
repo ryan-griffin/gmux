@@ -21,6 +21,10 @@ use ffi::{Cell, Frame};
 #[path = "engine/selection_tests.rs"]
 mod selection_tests;
 
+#[cfg(test)]
+#[path = "engine/retention_tests.rs"]
+mod retention_tests;
+
 #[path = "engine/copy_html.rs"]
 mod copy_html;
 
@@ -280,6 +284,7 @@ pub struct Engine {
     size: (u16, u16),
     find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
+    retention_revision: u64,
 }
 
 /// Presentation state for one client, independent of the PTY and terminal modes.
@@ -288,6 +293,7 @@ pub(crate) struct EngineView {
     held_frame: Frame,
     find: gmux_client::search::HistorySearch,
     find_row: Vec<Cell>,
+    retention_revision: u64,
 }
 impl EngineView {
     pub(crate) fn set_active(&mut self, active: bool) {
@@ -371,6 +377,26 @@ impl Engine {
         anyhow::ensure!(result == 0, "No command output available");
         Ok(())
     }
+    pub(crate) fn set_scrollback_limits(
+        &mut self,
+        limits: gmux_client::retention::ScrollbackLimits,
+    ) -> anyhow::Result<()> {
+        let (max_bytes, max_lines) = limits.resolve_values()?;
+        let limit = |value: Option<usize>| GmuxRetentionLimit {
+            value: value.unwrap_or(0),
+            unlimited: value.is_none(),
+        };
+        let limits = GmuxRetentionLimits {
+            max_bytes: limit(max_bytes),
+            max_lines: limit(max_lines),
+        };
+        let result = unsafe { gmux_engine_retention(self.raw.as_ptr(), &limits) };
+        self.revision = self.revision.wrapping_add(1);
+        self.retention_revision = self.retention_revision.wrapping_add(1);
+        self.find.restart();
+        anyhow::ensure!(result == 0, "Ghostty retention update failed ({result})");
+        Ok(())
+    }
     pub(crate) fn memory_usage(&self) -> anyhow::Result<MemoryUsage> {
         let mut usage = MemoryUsage::default();
         let result = unsafe { gmux_engine_memory_usage(self.raw.as_ptr(), &mut usage) };
@@ -427,6 +453,7 @@ impl Engine {
                 .ok_or_else(|| anyhow::anyhow!("Could not create terminal view"))?,
             find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
+            retention_revision: 0,
             held_frame: Frame::default(),
         })
     }
@@ -435,6 +462,10 @@ impl Engine {
         view: &mut EngineView,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
+        if view.retention_revision != self.retention_revision {
+            view.restart_find();
+            view.retention_revision = self.retention_revision;
+        }
         unsafe { gmux_engine_view_enter(self.raw.as_ptr(), view.raw.as_ptr()) }
         self.swap_view(view);
         let held = self.mode(2026);
@@ -570,6 +601,7 @@ impl Engine {
             size: (80, 24),
             find: gmux_client::search::HistorySearch::default(),
             find_row: Vec::new(),
+            retention_revision: 0,
             held_cells: Vec::new(),
             held_row_flags: Vec::new(),
             held_hyperlinks: Default::default(),

@@ -28,6 +28,15 @@ enum Command {
     Serve(ServeOptions),
     /// Inspect the daemon's identity, connections, and execution statistics.
     Status,
+    /// Inspect or change this daemon's saved per-terminal history retention.
+    Scrollback {
+        /// Maximum retained allocation in bytes: integer, default, or unlimited. Zero disables history.
+        #[arg(long)]
+        max_bytes: Option<gmux_client::retention::Limit>,
+        /// Maximum physical history lines: integer, default, or unlimited. Zero still permits a native page.
+        #[arg(long)]
+        max_lines: Option<gmux_client::retention::Limit>,
+    },
     /// List tabs, panes, working directories, program status, progress, and unread indicators.
     List,
     /// Create a terminal tab.
@@ -306,6 +315,13 @@ fn run() -> anyhow::Result<()> {
     );
     let request = match cli.command {
         Command::Serve(_) => unreachable!(),
+        Command::Scrollback {
+            max_bytes,
+            max_lines,
+        } => serde_json::to_value(gmux_client::control::ExecutionRequest::Scrollback {
+            max_bytes,
+            max_lines,
+        })?,
         Command::Status => serde_json::to_value(PublicRequest::Status)?,
         Command::List => serde_json::to_value(PublicRequest::List)?,
         Command::New { name, directory } => serde_json::to_value(TerminalCommand::New {

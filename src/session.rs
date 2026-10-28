@@ -62,6 +62,12 @@ pub(crate) struct TerminalSession {
 }
 
 impl TerminalSession {
+    pub(crate) fn set_scrollback_limits(
+        &mut self,
+        limits: gmux_client::retention::ScrollbackLimits,
+    ) -> anyhow::Result<()> {
+        self.engine.set_scrollback_limits(limits)
+    }
     pub(crate) fn compression_deadline(&self) -> Option<Instant> {
         self.compression.deadline
     }
@@ -143,6 +149,7 @@ impl TerminalSession {
         cursor_style: CursorStyle,
         theme: &Theme,
         history: Option<&[u8]>,
+        limits: gmux_client::retention::ScrollbackLimits,
     ) -> anyhow::Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut command = CommandBuilder::new(&shell);
@@ -150,7 +157,7 @@ impl TerminalSession {
         command.arg("-l");
         command.env("GMUX_TAB", tab.to_string());
         command.env("GMUX_PANE", id.to_string());
-        Self::spawn_command(id, directory, cursor_style, theme, command, history)
+        Self::spawn_command(id, directory, cursor_style, theme, command, history, limits)
     }
 
     fn spawn_command(
@@ -160,9 +167,11 @@ impl TerminalSession {
         theme: &Theme,
         mut command: CommandBuilder,
         history: Option<&[u8]>,
+        limits: gmux_client::retention::ScrollbackLimits,
     ) -> anyhow::Result<Self> {
         // Complete fallible setup before spawning a process we must clean up.
         let mut engine = Engine::new()?;
+        engine.set_scrollback_limits(limits)?;
         if let Some(history) = history
             && let Err(error) = engine.restore_history(history)
         {
@@ -170,6 +179,7 @@ impl TerminalSession {
                 "Could not restore scrollback for pane {id}: {error}. Starting with empty history"
             );
             engine = Engine::new()?;
+            engine.set_scrollback_limits(limits)?;
         }
         engine.set_cursor_style(cursor_style)?;
         engine.set_theme(theme)?;
@@ -644,6 +654,7 @@ mod tests {
             &Theme::adwaita(true),
             command,
             None,
+            Default::default(),
         )
         .unwrap()
     }

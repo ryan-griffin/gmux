@@ -58,6 +58,14 @@ delayed and held frames. It never launches a browser. The renderer suite checks
 shared hover/OSC 22 pointer ownership alongside fractional alignment, retained
 rows and cursor scheduling.
 
+The `scrollback-limits` headless suite checks saved policy and restart, complete
+request validation before mutation, blocked and failed saves, successive partial
+updates while saving, new and existing panes, and immediate local/remote cache updates with queued replies. Engine tests
+cover Unicode/style history, linear and rectangular selections, Find restarts,
+prompt/output anchors, independent viewports, alternate screens, pruning during
+synchronized-output holds, and byte/line zero semantics. Existing client tests exercise cache predictions and rebasing
+through delayed replies and pruning.
+
 The `compression` headless suite checks attached and detached multi-pane
 compression, input during incremental work, transparent history access, and
 deadline removal after completion and pane teardown. It observes idle periods

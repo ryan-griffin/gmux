@@ -7,7 +7,13 @@ fn client_request(body: &Value) -> anyhow::Result<Option<Request>> {
     match Request::decode(body.clone()) {
         Ok(request) => Ok(Some(request)),
         Err(error) => {
-            if gmux_client::control::Request::decode(body.clone()).is_ok() {
+            // Connection selection belongs to this client, not to the strict
+            // daemon request. Validate execution fields without that selector.
+            let mut execution = body.clone();
+            if let Some(fields) = execution.as_object_mut() {
+                fields.remove("connection");
+            }
+            if gmux_client::control::Request::decode(execution).is_ok() {
                 Ok(None)
             } else {
                 Err(error)
@@ -80,6 +86,16 @@ mod tests {
             assert!(client_request(&body).is_err());
         }
         assert!(client_request(&json!({"method":"stop"})).unwrap().is_none());
+        assert!(
+            client_request(&json!({"method":"scrollback", "connection":"server", "max_bytes":0}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(client_request(&json!({"method":"scrollback", "connection":"server", "max_bytes":0, "max_lines":null})).is_err());
+        assert!(
+            client_request(&json!({"method":"scrollback", "connection":"server", "unknown":true}))
+                .is_err()
+        );
         assert!(
             client_request(&json!({"method":"read"}))
                 .unwrap()

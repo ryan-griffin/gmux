@@ -94,6 +94,7 @@ struct Daemon {
     id: DaemonId,
     remote_access: remote_access::RemoteAccess,
     state: ExecutionState,
+    limits: gmux_client::retention::ScrollbackLimits,
     frontends: HashMap<u64, Frontend>,
     next_frontend: u64,
     revision: u64,
@@ -137,6 +138,9 @@ impl Daemon {
         }
     }
     fn new() -> anyhow::Result<Self> {
+        let limits =
+            storage::load::<gmux_client::retention::ScrollbackLimits>("daemon-settings.json")?
+                .resolve()?;
         let mut execution = storage::load::<ExecutionState>("execution.json")?;
         let id = crate::persistence::daemon_id()?;
         let scrollback = std::mem::take(&mut execution.scrollback);
@@ -151,6 +155,7 @@ impl Daemon {
         let saved = execution;
         let mut daemon = Self {
             sessions: HashMap::new(),
+            limits,
             id,
             remote_access: Default::default(),
             state: ExecutionState {
@@ -227,6 +232,7 @@ impl Daemon {
                         CursorStyle::default(),
                         &Theme::adwaita(true),
                         history.as_deref(),
+                        daemon.limits,
                     )?;
                     if history.is_some()
                         && let Some(name) = scrollback.get(id)

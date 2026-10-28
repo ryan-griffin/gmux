@@ -75,6 +75,15 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
         configuration("connection-edit", connection="local", name="desktop")
         assert configuration("connection-list")["local"]["name"] == "desktop"
         assert configuration("_connection-call", connection="server", request=dict(method="status"))["daemon"] == original["daemon"]
+        # Daemon settings have strict fields. The GTK router must consume its
+        # own connection selector before validating and forwarding the request.
+        assert configuration("scrollback", connection="server", max_lines=1234)["applied"]
+        assert server.rpc("scrollback")["limits"]["max_lines"] == 1234
+        assert other.rpc("scrollback")["limits"]["max_lines"] == "unlimited"
+        reset = command(receiver, "--connection", "server", "rpc",
+                        json.dumps(dict(method="scrollback", max_lines="default")))
+        assert reset["limits"]["max_lines"] == "unlimited"
+        assert not (receiver.config / "daemon-settings.json").exists()
         configuration("connection-edit", connection="other", name="temporary")
         configuration("connection-remove", connection="temporary")
         assert [remote["name"] for remote in configuration("connection-list")["remotes"]] == ["server"]

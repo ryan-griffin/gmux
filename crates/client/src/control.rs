@@ -17,6 +17,20 @@ pub enum ExecutionRequest {
     State,
     List,
     Status,
+    Scrollback {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::retention::update_field"
+        )]
+        max_bytes: Option<crate::retention::Limit>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::retention::update_field"
+        )]
+        max_lines: Option<crate::retention::Limit>,
+    },
     Stop,
     New {
         directory: Option<PathBuf>,
@@ -77,6 +91,21 @@ pub enum ExecutionRequest {
     },
 }
 impl ExecutionRequest {
+    pub fn mutates_state(&self) -> bool {
+        self.changes_layout()
+            || matches!(
+                self,
+                Self::Stop
+                    | Self::Scrollback {
+                        max_bytes: Some(_),
+                        ..
+                    }
+                    | Self::Scrollback {
+                        max_lines: Some(_),
+                        ..
+                    }
+            )
+    }
     pub fn changes_layout(&self) -> bool {
         matches!(
             self,
@@ -126,7 +155,7 @@ pub enum TabCommand {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "method")]
+#[serde(tag = "method", deny_unknown_fields)]
 pub enum InternalRequest {
     #[serde(rename = "_hello")]
     Hello,
@@ -291,7 +320,7 @@ impl Request {
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
         Ok(if Command::supports(method) {
             Self::Layout(serde_json::from_value(value)?)
-        } else if matches!(method, "state" | "busy" | "copy") {
+        } else if matches!(method, "state" | "busy" | "copy" | "scrollback") {
             Self::Execution(serde_json::from_value(value)?)
         } else if method.starts_with('_') {
             Self::Internal(serde_json::from_value(value)?)
@@ -301,11 +330,9 @@ impl Request {
     }
     pub fn mutates_state(&self) -> bool {
         match self {
-            Self::Execution(request) => request.changes_layout(),
-            Self::Internal(InternalRequest::Execution {
-                request: ExecutionRequest::Stop,
-            }) => true,
-            Self::Internal(InternalRequest::Execution { request }) => request.changes_layout(),
+            Self::Execution(request) | Self::Internal(InternalRequest::Execution { request }) => {
+                request.mutates_state()
+            }
             Self::Layout(_)
             | Self::Internal(InternalRequest::Command { .. })
             | Self::Public(PublicRequest::Stop) => true,

@@ -74,6 +74,7 @@ State lives under `$XDG_CONFIG_HOME/gmux/`, normally `~/.config/gmux/`:
   defaults to false. It controls the Local Daemon toggle, starts or attaches on
   launch, and enables automatic recovery if the daemon stops while GTK is open.
 - `daemon-id.json`: persistent daemon identity.
+- `daemon-settings.json`: daemon-owned per-terminal scrollback retention policy.
 - `execution.json`: local tabs and their creation times, pane topology,
   directories, checkpoint references, and the tab/pane ID allocation counter.
 - `clients/gtk/state.json`: frontend-owned workspace definitions, starting
@@ -107,6 +108,9 @@ those records cannot start local processes.
 Build and install the frontend and daemon from the same revision.
 
 ## Scrollback checkpoints
+
+[Runtime retention limits](scrollback.md) apply before restored text enters a
+fresh terminal. They do not change the checkpoint safety budgets below.
 
 Explicit Quit and orderly daemon shutdown checkpoint primary-screen text history.
 A restart restores tabs and directories with fresh shells. Commands, jobs,

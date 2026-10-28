@@ -215,6 +215,51 @@ prompts check the prior prompt's active row for erasure, without visiting histor
 Compression activity changes when a requested target needs decompression;
 ordinary marker bookkeeping and command metadata reads do not keep history awake.
 
+## Scrollback retention
+
+```sh
+python3 scripts/cargo_build.py --release gmux
+python3 scripts/scrollback-limits-smoke-test.py --binary target/release/gmux \
+  --measure --panes 4 --lines 20000 --samples 100 \
+  --report artifacts/scrollback-limits-release.json
+```
+
+The Linux probe generates styled Unicode logs with hyperlinks and gives each
+pane a 64 MiB byte allowance. It measures library page allocation and process
+RSS before and after lowering all panes to 256 KiB and 200 physical lines.
+The update duration includes ordered disk publication and native pruning.
+It samples socket control and input-to-changed-cell latency before and after
+pruning on one visible pane while the other panes remain detached. Input timing
+includes the PTY worker and daemon frame pacing, excluding GTK and display
+presentation. It repeats pruning after history compresses, then erases history
+with byte zero and observes the idle main thread for 5.5 seconds without RPCs
+after compression completes.
+
+Page `virtual_bytes` describe reserved logical page allocation; `resident_bytes`
+and `compressed_bytes` describe native page storage. Whole-process RSS also
+includes allocator retention, engine bookkeeping, stacks, and caches. Neither
+page statistic is an RSS cap. The report records binary and library hashes.
+See [retention configuration](scrollback.md) for defaults and page granularity.
+
+An x86-64 Linux release run on an Intel Core i7-13700H used 100 samples per
+latency phase. The first workload
+had four panes with 20,000 generated lines each; the second had twelve panes
+with 12,000 lines each. Values below sum native memory across all panes.
+
+| Workload | Page virtual MiB, before / after | Page resident MiB, before / after | Process RSS MiB, before / after | Save + prune |
+| --- | ---: | ---: | ---: | ---: |
+| 4 panes | 102.27 / 8.23 | 96.14 / 2.11 | 102.70 / 11.45 | 6.20 ms |
+| 12 panes | 192.19 / 26.25 | 173.81 / 7.88 | 180.57 / 19.45 | 15.62 ms |
+
+Input p95 was 15.97 / 15.93 ms for four panes and 15.66 / 15.75 ms for twelve.
+Control p95 was 0.74 / 0.75 ms and 0.86 / 0.89 ms respectively. These are
+single-process observations, not latency guarantees. After compression, pruning
+took 2.86 ms and 3.55 ms, removing 140 and 252 compressed pages respectively.
+Their compressed payloads occupied 12.07 MiB and 21.76 MiB before pruning.
+Neither detached daemon woke its main thread during the final 5.5-second idle
+observation. Byte zero erased remaining history while preserving active-page
+allocations, so native page bytes did not fall further in that step.
+
 ## Idle scrollback compression
 
 The daemon starts compressing a pane after its libghostty compression activity
@@ -266,9 +311,10 @@ python3 scripts/compression-smoke-test.py --binary target/release/gmux \
   --report artifacts/compression-large.json
 ```
 
-`--history-mib` builds a Linux `LD_PRELOAD` interposer that sets the public
-libghostty scrollback byte limit at terminal creation in both builds. The
-temporary interposer applies to the test daemons and their children. Reports
+`--history-mib` sets the candidate daemon's saved scrollback byte limit before
+creating panes. A Linux `LD_PRELOAD` interposer sets the same public libghostty
+limit at terminal creation for older baseline builds without retention controls.
+The temporary interposer applies to test daemons and their children. Reports
 identify this override and hash the binaries. Keep these results separate from
 production-retention measurements.
 Process CPU includes control sampling and input work; `work_ns` measures only

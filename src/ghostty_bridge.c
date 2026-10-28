@@ -286,10 +286,12 @@ void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
         GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
     }
     GhosttyPointCoordinate point;
-    if (v->viewport && !ghostty_tracked_grid_ref_point(v->viewport, GHOSTTY_POINT_TAG_SCREEN, &point))
-        gmux_engine_scroll_to(e, point.y);
-    else
-        gmux_engine_scroll(e, 0, true);
+    if (v->viewport) {
+        // A discarded viewport follows the oldest retained row, while a live
+        // viewport keeps its tracked position and bottom-following stays separate.
+        gmux_engine_scroll_to(e, ghostty_tracked_grid_ref_point(v->viewport,
+            GHOSTTY_POINT_TAG_SCREEN, &point) ? 0 : point.y);
+    } else gmux_engine_scroll(e, 0, true);
 }
 void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
     GhosttyTerminalScrollbar bar;
@@ -590,6 +592,62 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
         &continuation_max)) { gmux_engine_free(e); return NULL; }
     return e;
+}
+
+static bool retention_in_history(GhosttyTrackedGridRef ref) {
+    GhosttyPointCoordinate point;
+    return ref && ghostty_tracked_grid_ref_point(ref, GHOSTTY_POINT_TAG_ACTIVE, &point);
+}
+static void retention_clear_selection(GmuxEngine *e) {
+    if (e->selection_screen == GHOSTTY_TERMINAL_SCREEN_PRIMARY &&
+        (retention_in_history(e->selection_start) || retention_in_history(e->selection_end) ||
+            retention_in_history(e->selection_anchor))) gmux_engine_clear_selection(e);
+}
+static void retention_clear_output(OutputAnchor *anchor) {
+    if (retention_in_history(anchor->point)) shell_output_clear(anchor);
+}
+
+int gmux_engine_retention(GmuxEngine *e, const GmuxRetentionLimits *limits) {
+    // Validate the complete pair before either setter can discard history.
+    if (!limits || (!limits->max_bytes.unlimited && limits->max_bytes.value == SIZE_MAX) ||
+        (!limits->max_lines.unlimited && limits->max_lines.value == SIZE_MAX)) return -1;
+    if (!limits->max_bytes.unlimited && limits->max_bytes.value == 0) {
+        // Byte zero also erases the historical portion of the boundary page.
+        // That path clamps erased refs to the first active cell. Discard those
+        // references before erasure so they cannot select unrelated live text.
+        retention_clear_selection(e);
+        retention_clear_output(&e->output_anchor);
+        retention_clear_output(&e->output);
+        retention_clear_output(&e->completed_output);
+        while (e->prompt_count && retention_in_history(shell_prompt(e, 0)->point)) {
+            ghostty_tracked_grid_ref_free(shell_prompt(e, 0)->point);
+            *shell_prompt(e, 0) = (PromptAnchor){0};
+            e->prompt_head = (e->prompt_head + 1) % e->prompt_capacity;
+            e->prompt_count--;
+        }
+        for (GmuxView *v = e->views; v; v = v->next) {
+            swap_view(e, v);
+            retention_clear_selection(e);
+            retention_clear_output(&e->output_anchor);
+            swap_view(e, v);
+        }
+    }
+    // The pinned setters only set limits and prune. They allocate nothing and
+    // cannot fail for these valid options and an owned terminal.
+    int result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+        limits->max_bytes.unlimited ? NULL : &limits->max_bytes.value);
+    if (!result) result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES,
+        limits->max_lines.unlimited ? NULL : &limits->max_lines.value);
+    // Pruning is terminal activity even without a VT write. Retain tracked
+    // references so surviving selections and each view's viewport stay put.
+    e->text_generation++;
+    shell_prune(e);
+    GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
+    ghostty_render_state_set(e->render, GHOSTTY_RENDER_STATE_OPTION_DIRTY, &dirty);
+    for (GmuxView *v = e->views; v; v = v->next) {
+        if (v->render) ghostty_render_state_set(v->render, GHOSTTY_RENDER_STATE_OPTION_DIRTY, &dirty);
+    }
+    return result;
 }
 
 int gmux_engine_memory_usage(GmuxEngine *e, GmuxMemoryUsage *out) {

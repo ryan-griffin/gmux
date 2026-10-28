@@ -87,6 +87,11 @@ gmux command-output
 gmux notify 'Tests finished'
 ```
 
+Use `gmux scrollback` to inspect the daemon's saved history limits, or
+`gmux scrollback --max-bytes 10000000 --max-lines 10000` to change them for all
+its panes. See [scrollback retention](docs/scrollback.md) for defaults, remote
+controls, and pruning behavior.
+
 Run `gmux --help` for commands. Pane commands use the calling shell's pane;
 otherwise pass `--pane` to choose one. Use `gmux-gtk` for workspace and window actions.
 
