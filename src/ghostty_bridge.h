@@ -171,10 +171,14 @@ typedef struct {
 #define GMUX_CLIPBOARD_SUCCESS 0
 #define GMUX_CLIPBOARD_BUSY 1
 #define GMUX_CLIPBOARD_INVALID 2
+#define GMUX_CLIPBOARD_UNSUPPORTED 3
 #define GMUX_CLIPBOARD_MAX_BYTES (4 * 1024 * 1024)
-// Synchronous admission only. Validate and copy borrowed text before success.
-// A NULL pointer clears the destination; non-NULL with len == 0 is empty text.
-typedef int (*GmuxClipboardFn)(void *userdata, uint8_t destination, const uint8_t *data, size_t len);
+#define GMUX_CLIPBOARD_MAX_CONTENTS 4
+typedef struct { GmuxText mime, data; } GmuxClipboardContent;
+// Synchronous admission of the complete borrowed array. Copy before success.
+// Zero contents clears; an entry with zero data bytes offers an empty value.
+typedef int (*GmuxClipboardFn)(void *userdata, uint8_t destination,
+    const GmuxClipboardContent *contents, size_t count);
 void gmux_engine_clipboard_callback(GmuxEngine *engine, GmuxClipboardFn callback);
 // Called synchronously; true accepts all borrowed bytes, false aborts formatting.
 typedef bool (*GmuxWriterFn)(void *userdata, const uint8_t *data, size_t len);

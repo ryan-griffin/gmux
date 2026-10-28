@@ -174,6 +174,9 @@ class WaylandInput:
             self.stream, None, Gio.DBusSignalFlags.NONE, self._stream_added)
         self.call(REMOTE, self.remote, REMOTE + ".Session", "Start")
         wait_for(lambda: self.node)
+        self.clipboard_formats = None
+        self.selection_subscription = self.bus.signal_subscribe(REMOTE, REMOTE + ".Session",
+            "SelectionOwnerChanged", self.remote, None, Gio.DBusSignalFlags.NONE, self._selection_changed)
         self.call(REMOTE, self.remote, REMOTE + ".Session", "EnableClipboard", "(a{sv})", ({},))
         self.clipboard_subscription = None
         # Headless Mutter has no physical seat devices. Advertise a keyboard
@@ -201,6 +204,9 @@ class WaylandInput:
 
     def _stream_added(self, connection, sender, path, interface, signal, parameters):
         self.node = parameters.unpack()[0]
+
+    def _selection_changed(self, connection, sender, path, interface, signal, parameters):
+        self.clipboard_formats = parameters.unpack()[0].get("mime-types", ([],))[0]
 
     def frame(self, timeout=5, fresh=True):
         sample = self.sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
@@ -245,6 +251,10 @@ class WaylandInput:
         return bounds
 
     def clipboard_text(self, mime="text/plain;charset=utf-8"):
+        data = self.clipboard_bytes(mime)
+        return data.decode() if data is not None else None
+
+    def clipboard_bytes(self, mime):
         try:
             result, descriptors = self.bus.call_with_unix_fd_list_sync(REMOTE, self.remote,
                 REMOTE + ".Session", "SelectionRead", GLib.Variant("(s)", (mime,)),
@@ -264,7 +274,7 @@ class WaylandInput:
                 assert select.select([fd], [], [], remaining)[0], "Clipboard transfer timed out"
                 chunk = os.read(fd, 65536)
                 if not chunk:
-                    return b"".join(chunks).decode()
+                    return b"".join(chunks)
                 chunks.append(chunk)
         finally:
             os.close(fd)
@@ -302,6 +312,7 @@ class WaylandInput:
             ({"mime-types": GLib.Variant("as", ["text/plain;charset=utf-8", "text/plain"])},))
 
     def close(self):
+        self.bus.signal_unsubscribe(self.selection_subscription)
         self.pipeline.set_state(Gst.State.NULL)
         self.bus.signal_unsubscribe(self.subscription)
         if self.clipboard_subscription is not None:

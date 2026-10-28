@@ -10,11 +10,15 @@ static GhosttyClipboardWriteResult result;
 static void event(void *ud, int kind, const uint8_t *data, size_t len) {
     (void)ud; (void)kind; (void)data; (void)len;
 }
-static int accept(void *ud, uint8_t location, const uint8_t *data, size_t len) {
+static int accept(void *ud, uint8_t location, const GmuxClipboardContent *contents, size_t count) {
     (void)ud;
-    assert(len == 0 || (len == 4 && !memcmp(data, "text", 4)));
+    assert(count <= GMUX_CLIPBOARD_MAX_CONTENTS);
+    for (size_t i = 0; i < count; i++) {
+        assert(contents[i].data.len == 0 ||
+            (contents[i].data.len == 4 && !memcmp(contents[i].data.ptr, "text", 4)));
+    }
     calls++;
-    cleared = !data;
+    cleared = count == 0;
     destination = location;
     return admission;
 }
@@ -56,10 +60,10 @@ int main(void) {
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED, 0);
     write.location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD;
     write.contents_len = 2;
-    request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED, 0);
+    request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS, 1);
     write.contents = contents + 1;
     write.contents_len = 1;
-    request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED, 0);
+    request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS, 1);
     write.contents = contents;
     contents[0].data.len = GMUX_CLIPBOARD_MAX_BYTES + 1;
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA, 0);
@@ -74,6 +78,11 @@ int main(void) {
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY, 1);
     admission = GMUX_CLIPBOARD_INVALID;
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA, 1);
+    admission = GMUX_CLIPBOARD_UNSUPPORTED;
+    request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED, 1);
+    write.contents_len = GMUX_CLIPBOARD_MAX_CONTENTS + 1;
+    request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED, 0);
+    write.contents_len = 0;
     gmux_engine_clipboard_callback(engine, NULL);
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY, 0);
     calls = replies = 0;
@@ -81,5 +90,5 @@ int main(void) {
     clipboard_write(engine->terminal, engine, &write);
     assert(!calls && !replies); // Unknown layouts follow the library's default denial.
     gmux_engine_free(engine);
-    puts("PASS: atomic text policy, destinations, clear/empty, limits, synchronous replies and unavailable recipient");
+    puts("PASS: atomic MIME forwarding, destinations, clear/empty, limits, synchronous replies and unavailable recipient");
 }

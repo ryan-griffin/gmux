@@ -260,7 +260,8 @@ with connection order as the fallback. Detached writes are dropped immediately.
 
 Replies are binary viewport packets. Each packet begins with a little-endian
 32-bit payload length. The payload begins with a little-endian 32-bit JSON
-header length, then that many UTF-8 JSON bytes, then cell bytes. The header
+header length, then that many UTF-8 JSON bytes, then cell bytes or a dedicated
+clipboard payload. The header
 contains pane `meta`, an optional `frame`, changed `rows`, and optional execution
 `state`, Git metadata, notifications, search results, selection, clipboard offers, or
 errors. A full viewport arrives on subscription; later packets contain changed
@@ -271,20 +272,29 @@ packets have no cell data.
 
 Clipboard packets are dedicated transient events. Their `copy` field is an
 object with `destination` (`"clipboard"` or `"primary"`) and `content`.
-A null `content` clears that destination. Otherwise `content` contains `text`
-and optional `html`, published together as a single offer. `{"text":""}` offers
-an empty text value. Apply each
+A null `content` clears that destination. Otherwise `content` is a nonempty list
+of descriptors, for example `[{"mime":"image/png","len":70},
+{"mime":"text/plain","len":5}]`. The bytes for each representation follow the
+JSON header in descriptor order, without separators or padding. The record
+contains exactly the sum of these lengths and no cell data. A descriptor with
+`len: 0` offers an empty value; an empty descriptor list is invalid. Apply each
 event in wire order across all panes, without applying its default viewport or
 selection metadata. Both explicit `copy` replies and unsolicited writes use
 these packets. `SessionManager::poll_with_clipboard` delivers them in order.
 They are neither coalesced into pane updates nor saved or replayed on reconnect.
-Decoded UTF-8 text is limited to 4 MiB and HTML to 8 MiB; NUL is rejected.
-HTML is omitted if generation or normalization fails or if JSON escaping would
-exceed the 16 MiB packet budget with 4 KiB reserved for metadata. Plain-text
-copying remains available. Unsolicited terminal writes offer text only.
+Supported exact MIME names are `image/png`, `text/html`, `text/plain`, and
+`text/plain;charset=utf-8`. Plain text must be NUL-free UTF-8; other formats
+preserve arbitrary bytes. Both plain aliases must agree when supplied together.
+Names are unique, and a packet carries at most four representations. Plain
+text is limited to 4 MiB per representation and HTML/PNG to 8 MiB each, with
+12 MiB total data and 16 KiB of clipboard metadata within the 16 MiB packet limit.
+Application admission has a stricter 4 MiB total limit, including aliases.
+Explicit user copy still omits HTML if generation or normalization fails or its
+control-JSON budget would be exceeded. Clipboard stream data is always binary.
 See [clipboard behavior](clipboard.md) for formatter limitations.
-A stalled frontend's
-output is bounded by the existing 32 MiB transport queue.
+A stalled frontend's output is bounded by the 32 MiB transport queue and is
+detached on overflow. The client reader separately bounds retained storage to
+32 MiB and 64 packets, including representation capacities.
 
 `generation` identifies cached history for this pane and view. Clears, reflow,
 screen switches, and resolved palette or appearance changes advance it. Discard

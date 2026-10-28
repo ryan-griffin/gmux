@@ -1734,6 +1734,20 @@ mod tests {
             (1, Destination::Clipboard, None),
             (2, Destination::Clipboard, Some("last")),
         ] {
+            let content = text.map(|text| {
+                let mut offer: crate::clipboard::Offer = crate::clipboard::Content {
+                    text: text.into(),
+                    html: (text == "last").then(|| "<div>last</div>".into()),
+                }
+                .into();
+                if text == "last" {
+                    offer.0.push(crate::clipboard::Representation {
+                        mime: "image/png".into(),
+                        data: include_bytes!("../../../scripts/fixtures/clipboard.png").to_vec(),
+                    });
+                }
+                offer
+            });
             let packet = Packet {
                 header: Header {
                     meta: Metadata {
@@ -1742,10 +1756,7 @@ mod tests {
                     },
                     copy: Some(Write {
                         destination,
-                        content: text.map(|text| crate::clipboard::Content {
-                            text: text.into(),
-                            html: (text == "last").then(|| "<div>last</div>".into()),
-                        }),
+                        content,
                     }),
                     ..Header::default()
                 },
@@ -1767,7 +1778,10 @@ mod tests {
         assert_eq!(
             writes
                 .iter()
-                .map(|w| (w.destination, w.content.as_ref().map(|c| c.text.as_str())))
+                .map(|w| (
+                    w.destination,
+                    w.content.as_ref().and_then(|c| c.plain_text())
+                ))
                 .collect::<Vec<_>>(),
             [
                 (Destination::Clipboard, Some("first 界🙂")),
@@ -1777,8 +1791,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            writes[3].content.as_ref().unwrap().html.as_deref(),
-            Some("<div>last</div>")
+            writes[3].content.as_ref().unwrap().get("text/html"),
+            Some(b"<div>last</div>".as_slice())
+        );
+        assert_eq!(
+            writes[3].content.as_ref().unwrap().get("image/png"),
+            Some(include_bytes!("../../../scripts/fixtures/clipboard.png").as_slice())
         );
         assert_eq!(handle.borrow().selection, Some(Selection::linear(0, 1)));
         manager.poll_with_clipboard(|_| panic!("replayed clipboard write"));

@@ -100,10 +100,12 @@ longer than the five-second compression delay without sending daemon requests.
 See [performance measurements](performance.md#idle-scrollback-compression) for
 release-build comparisons and larger retained-history workloads.
 
-The `clipboard` headless suite checks OSC 52 through local and remote streams,
+The `clipboard` headless suite checks OSC 52, iTerm2 Copy and atomic Kitty writes through local and remote streams,
 recipient focus and visibility, explicit copy ordering, decoded size limits,
 detach/reconnect without replay, and bounded output when a frontend stops
-reading. It also compiles the native normalized-request policy and reply check.
+reading. Binary cases preserve actual PNG bytes with NUL, HTML/plain alternatives,
+empty values, clear, unsupported/oversized whole-request rejection and expanded
+alias budgets. It also compiles the native normalized-request policy and reply check.
 Rich-copy cases compare independently parsed HTML with plain text over both
 transports, including colors, escapes, long graphemes, soft wraps, page boundaries,
 rectangles, blank padding, and bounded styled expansion. A daemon queue test
@@ -115,6 +117,10 @@ GTK clipboard offers, checks Unicode OSC 52 writes, and pastes primary selection
 in the private Wayland session. `multi-window` verifies each window's selection;
 `remote-window` reads a remote rich copy through GTK. These reads outlive the
 transient daemon packet and exercise provider ownership.
+The `clipboard-ui` suite uses the same native Wayland fixture to read exact PNG,
+HTML and plain bytes from local and remote GTK offers. It checks atomic rejection,
+no invented text, empty versus clear, and command-output copy. It does not render
+application clipboard data.
 
 The `shell` headless suite requires Bash and Zsh. It checks real login startup,
 existing prompt/preexec hooks, scalar and array `PROMPT_COMMAND`, disabled Bash

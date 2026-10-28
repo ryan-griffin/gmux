@@ -41,9 +41,7 @@ impl Packet {
                 .copy
                 .as_ref()
                 .and_then(|write| write.content.as_ref())
-                .map_or(0, |content| {
-                    content.text.capacity() + content.html.as_ref().map_or(0, String::capacity)
-                })
+                .map_or(0, crate::clipboard::Offer::memory_size)
             + header.find.as_ref().map_or(0, |find| {
                 find.highlights.capacity() * size_of::<(usize, usize, u8)>()
             })
@@ -221,10 +219,13 @@ mod tests {
             header: Header {
                 copy: Some(Write {
                     destination: Destination::Clipboard,
-                    content: Some(Content {
-                        text: String::with_capacity(8192),
-                        html: Some(String::with_capacity(8192)),
-                    }),
+                    content: Some(
+                        Content {
+                            text: String::with_capacity(8192),
+                            html: Some(String::with_capacity(8192)),
+                        }
+                        .into(),
+                    ),
                 }),
                 ..Header::default()
             },

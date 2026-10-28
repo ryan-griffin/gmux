@@ -79,6 +79,26 @@ class Client:
             body = self.exact(size)
             header_size, = struct.unpack("<I", body[:4])
             header = json.loads(body[4:4 + header_size])
+            if (write := header.get("copy")) is not None:
+                offset = 4 + header_size
+                if write["content"] is not None:
+                    representations = {}
+                    for item in write["content"]:
+                        end = offset + item["len"]
+                        assert end <= len(body)
+                        representations[item["mime"]] = bytes(body[offset:end])
+                        offset = end
+                    # Keep existing selected-text fixture assertions readable.
+                    # Unrecognized formats retain their exact MIME key and bytes.
+                    write["content"] = {}
+                    for mime, data in representations.items():
+                        if mime == "text/plain":
+                            write["content"]["text"] = data.decode()
+                        elif mime == "text/html":
+                            write["content"]["html"] = data.decode()
+                        else:
+                            write["content"][mime] = data
+                assert offset == len(body), (offset, len(body))
             if value := header.get("git"):
                 self.git[value["id"]] = value
             if header["meta"]["id"] == self.pane and header["frame"]:
