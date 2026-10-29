@@ -1,4 +1,6 @@
-//! Transient, ordered clipboard offers to one frontend.
+mod read;
+pub use read::*;
+// Transient, ordered clipboard offers to one frontend.
 use serde::{Deserialize, Serialize};
 
 pub const MAX_HTML: usize = 8 * 1024 * 1024;

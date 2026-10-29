@@ -8,7 +8,7 @@ use gmux_client::transport::{KeyAction, KeyLayout};
 use gmux_client::{ipc, model::CursorStyle, session::SessionUpdate, theme::Theme};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -59,6 +59,12 @@ pub(crate) struct TerminalSession {
     exited: bool,
     title: PaneTitle,
     title_polled: Instant,
+    output_tail: Vec<u8>,
+    read_responding: bool,
+    read_reservation: Cell<usize>,
+    clipboard_queued: Cell<usize>,
+    after_response: RefCell<Vec<u8>>,
+    delayed_resize: Option<(u16, u16, u32, u32, u16, u16)>,
 }
 
 impl TerminalSession {
@@ -244,6 +250,12 @@ impl TerminalSession {
             exited: false,
             title: PaneTitle::default(),
             title_polled: Instant::now(),
+            output_tail: Vec::new(),
+            read_responding: false,
+            read_reservation: Cell::new(0),
+            clipboard_queued: Cell::new(0),
+            after_response: RefCell::default(),
+            delayed_resize: None,
         })
     }
 
@@ -278,23 +290,144 @@ impl TerminalSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Session is closed"))?;
         let mut pending = pty.pending.borrow_mut();
+        let mut after = self.after_response.borrow_mut();
         anyhow::ensure!(
-            pending.len() + bytes.len() + usize::from(enter)
-                <= 2 * gmux_client::transport::MAX_PASTE,
+            pending.len()
+                + after.len()
+                + self.read_reservation.get()
+                + bytes.len()
+                + usize::from(enter)
+                <= 2 * gmux_client::transport::MAX_PASTE - 64 * 1024,
             "Terminal input queue is full"
         );
-        pending.extend(bytes);
-        if enter {
-            pending.push_back(b'\r');
+        if self.read_responding {
+            after.extend(bytes);
+            if enter {
+                after.push(b'\r');
+            }
+        } else {
+            pending.extend(bytes);
+            if enter {
+                pending.push_back(b'\r');
+            }
         }
         Ok(())
     }
 
     pub(crate) fn send_text(&mut self, text: &str, enter: bool) -> anyhow::Result<()> {
-        let bytes = self.paste(text, false)?;
+        let bytes = self.paste(text)?;
         self.send_with_enter(&bytes, enter)
     }
 
+    pub(crate) fn clipboard_queue_budget(&self) -> usize {
+        self.clipboard_queued.get()
+    }
+    pub(crate) fn read_pending(&self) -> u64 {
+        self.engine.read_pending()
+    }
+    pub(crate) fn set_read_enabled(&mut self, enabled: bool) {
+        self.engine.set_read_enabled(
+            enabled && !self.exited && self.pty.as_ref().is_some_and(|p| p.child.is_some()),
+        );
+    }
+    pub(crate) fn take_read_request(&mut self) -> Option<gmux_client::clipboard::ReadRequest> {
+        self.engine.take_read_request()
+    }
+    pub(crate) fn clear_grants(&mut self) {
+        self.engine.clear_grants();
+    }
+    pub(crate) fn has_output_tail(&self) -> bool {
+        !self.output_tail.is_empty() && self.read_pending() == 0
+    }
+    pub(crate) fn complete_read(
+        &mut self,
+        result: &gmux_client::clipboard::ReadResult,
+        data: &[u8],
+        reservation: usize,
+    ) -> anyhow::Result<()> {
+        use gmux_client::clipboard::ReadStatus;
+        if result.status == ReadStatus::Success {
+            anyhow::ensure!(
+                self.clipboard_queued.get() == 0,
+                "A previous clipboard reply is queued"
+            );
+            let pty = self
+                .pty
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Session is closed"))?;
+            anyhow::ensure!(
+                pty.pending.borrow().len() + self.after_response.borrow().len() + reservation
+                    <= 2 * gmux_client::transport::MAX_PASTE - 64 * 1024,
+                "Terminal input is busy"
+            );
+        }
+        let bytes = self.engine.complete_read(result, data)?;
+        if !bytes.is_empty()
+            && let Some(pty) = &self.pty
+        {
+            anyhow::ensure!(
+                pty.pending.borrow().len() + bytes.len() <= 2 * gmux_client::transport::MAX_PASTE,
+                "Terminal reply queue is full"
+            );
+            pty.pending.borrow_mut().extend(bytes);
+        }
+        if result.status == ReadStatus::Success {
+            self.read_responding = true;
+            self.read_reservation.set(reservation);
+            self.clipboard_queued.set(reservation);
+        }
+        Ok(())
+    }
+    pub(crate) fn step_read(&mut self) -> anyhow::Result<bool> {
+        if self.exited || self.read_pending() == 0 {
+            return Ok(true);
+        }
+        let (done, bytes) = self.engine.step_read()?;
+        let reserved = self.read_reservation.get();
+        anyhow::ensure!(
+            bytes.len() <= reserved,
+            "Native clipboard response exceeded reservation"
+        );
+        self.read_reservation.set(reserved - bytes.len());
+        if let Some(pty) = &self.pty {
+            pty.pending.borrow_mut().extend(bytes);
+        }
+        if done {
+            self.read_responding = false;
+            self.read_reservation.set(0);
+            if let Some(pty) = &self.pty {
+                pty.pending
+                    .borrow_mut()
+                    .extend(self.after_response.borrow_mut().drain(..));
+            }
+        }
+        Ok(done)
+    }
+    pub(crate) fn abort_read(&mut self) {
+        // A failed encoder may have emitted an incomplete OSC. Close the PTY
+        // rather than allowing unrelated bytes to continue inside that frame.
+        self.pty.take();
+        self.engine.discard_read();
+        self.engine.clear_grants();
+        self.exited = true;
+        self.read_responding = false;
+        self.read_reservation.set(0);
+        self.clipboard_queued.set(0);
+        self.after_response.borrow_mut().clear();
+        self.output_tail.clear();
+    }
+    pub(crate) fn user_paste(
+        &mut self,
+        destination: gmux_client::clipboard::Destination,
+        mimes: &[String],
+    ) -> anyhow::Result<()> {
+        let bytes = self.engine.user_paste(destination, mimes)?;
+        if let Err(error) = self.send(&bytes) {
+            self.engine.clear_grants();
+            return Err(error);
+        }
+        Ok(())
+    }
     pub(crate) fn poll_with_clipboard(
         &mut self,
         enabled: bool,
@@ -309,6 +442,16 @@ impl TerminalSession {
             changed: self.engine.expire_render_hold(),
             ..SessionUpdate::default()
         };
+        if self.read_pending() == 0 {
+            if let Some((cols, rows, cw, ch, width, height)) = self.delayed_resize.take() {
+                let _ = self.resize(cols, rows, cw, ch, width, height);
+            }
+            if !self.output_tail.is_empty() {
+                let (changed, consumed) = self.engine.feed(&self.output_tail);
+                update.changed |= changed;
+                self.output_tail.drain(..consumed);
+            }
+        }
         let mut read_budget_exhausted = false;
         if let Some(pty) = &mut self.pty {
             if matches!(
@@ -316,6 +459,20 @@ impl TerminalSession {
                 Some(Ok(Some(_)))
             ) {
                 pty.child = None;
+            }
+            if pty.child.is_none() {
+                self.engine.set_read_enabled(false);
+                if self.engine.read_pending() != 0 {
+                    // Reaping must cancel even when an unread tail is parked
+                    // behind the request. Drain that tail without desktop effects.
+                    self.engine.discard_read();
+                    self.engine.clear_grants();
+                    self.read_responding = false;
+                    self.read_reservation.set(0);
+                    self.clipboard_queued.set(0);
+                    self.after_response.borrow_mut().clear();
+                    pty.pending.borrow_mut().clear();
+                }
             }
             let fd = pty.master.as_raw_fd().unwrap();
             let mut pending = pty.pending.borrow_mut();
@@ -338,17 +495,27 @@ impl TerminalSession {
                     break;
                 }
             }
+            if pending.is_empty() && !self.read_responding {
+                self.clipboard_queued.set(0);
+            }
             // Bound work per session so a noisy process cannot block its owner.
             let mut buffer = [0u8; 16384];
             read_budget_exhausted = !pty.eof;
             for _ in 0..32 {
-                if pty.eof {
-                    read_budget_exhausted = false;
+                if pty.eof
+                    || self.engine.read_pending() != 0
+                    || !self.output_tail.is_empty()
+                    || pending.len() > 2 * gmux_client::transport::MAX_PASTE - 512 * 1024
+                {
+                    read_budget_exhausted = !self.output_tail.is_empty();
                     break;
                 }
                 let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
                 if n > 0 {
-                    update.changed |= self.engine.write(&buffer[..n as usize]);
+                    let (changed, consumed) = self.engine.feed(&buffer[..n as usize]);
+                    update.changed |= changed;
+                    self.output_tail
+                        .extend_from_slice(&buffer[consumed..n as usize]);
                 } else if n == 0 {
                     pty.eof = true;
                     read_budget_exhausted = false;
@@ -368,8 +535,10 @@ impl TerminalSession {
         }
         let (replies, notifications) = self.engine.take_events();
         update.notifications = notifications;
-        if !replies.is_empty() {
-            let _ = self.send(&replies);
+        if !replies.is_empty()
+            && let Err(error) = self.send(&replies)
+        {
+            update.error = Some(error.to_string());
         }
         update.changed |= self.engine.poll_find();
         if self.engine.take_directory_update() {
@@ -389,6 +558,15 @@ impl TerminalSession {
             self.exited |= pty.child.is_none() && !read_budget_exhausted;
         }
         if self.exited {
+            self.engine.discard_read();
+            self.engine.clear_grants();
+            self.read_responding = false;
+            self.read_reservation.set(0);
+            self.clipboard_queued.set(0);
+            self.after_response.borrow_mut().clear();
+            if let Some(pty) = &self.pty {
+                pty.pending.borrow_mut().clear();
+            }
             self.engine.clear_progress();
             self.engine.program_status_mut().end_execution();
         }
@@ -476,6 +654,11 @@ impl TerminalSession {
         width: u16,
         height: u16,
     ) -> anyhow::Result<bool> {
+        if self.read_pending() != 0 {
+            self.delayed_resize = Some((cols, rows, cw, ch, width, height));
+            return Ok(false);
+        }
+
         anyhow::ensure!(
             gmux_client::viewport::valid(cols as u64, rows as u64),
             "Invalid terminal size"
@@ -507,14 +690,15 @@ impl TerminalSession {
     }
 
     pub(crate) fn clear_screen(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.read_pending() == 0, "Clipboard read is pending");
         self.engine.clear_screen()
     }
     pub(crate) fn mode(&self, mode: i32) -> bool {
         self.engine.mode(mode)
     }
 
-    pub(crate) fn paste(&mut self, text: &str, clipboard: bool) -> anyhow::Result<Vec<u8>> {
-        self.engine.paste(text, clipboard)
+    pub(crate) fn paste(&mut self, text: &str) -> anyhow::Result<Vec<u8>> {
+        self.engine.paste(text)
     }
 
     pub(crate) fn key(
@@ -543,17 +727,20 @@ impl TerminalSession {
 
     pub(crate) fn poll_fd(&self) -> Option<(libc::c_int, libc::c_short)> {
         let pty = self.pty.as_ref()?;
-        if pty.eof && pty.pending.borrow().is_empty() {
+        if (pty.eof || self.read_pending() != 0) && pty.pending.borrow().is_empty() {
             return None;
         }
         Some((
             pty.master.as_raw_fd()?,
-            if pty.eof { 0 } else { libc::POLLIN }
-                | if pty.pending.borrow().is_empty() {
-                    0
-                } else {
-                    libc::POLLOUT
-                },
+            if pty.eof || self.read_pending() != 0 {
+                0
+            } else {
+                libc::POLLIN
+            } | if pty.pending.borrow().is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            },
         ))
     }
 
@@ -674,6 +861,72 @@ mod tests {
         let update = session.poll();
         assert!(update.error.is_none(), "{:?}", update.error);
         update.notifications.iter().any(|message| message == text)
+    }
+
+    #[test]
+    fn exit_cancels_a_deferred_read_before_draining_its_parked_tail() {
+        let directory = TestDirectory::new();
+        let mut session = start(1, &directory.0, "printf '\\033]52;c;?\\007TAIL'; sleep 0.1");
+        session.set_read_enabled(true);
+        wait_for(|| {
+            session.poll();
+            session.read_pending() != 0
+        });
+        assert!(!session.output_tail.is_empty());
+        assert!(session.take_read_request().is_some());
+        wait_for(|| session.poll().exited);
+        assert_eq!(session.read_pending(), 0);
+        assert!(session.text().unwrap().contains("TAIL"));
+    }
+
+    #[test]
+    fn user_paste_waits_for_the_complete_clipboard_response_transaction() {
+        use gmux_client::clipboard::{Destination, ReadDescriptor, ReadResult, ReadStatus};
+        let directory = TestDirectory::new();
+        let mut session = start(1, &directory.0, "sleep 5");
+        session.engine.write(b"\x1b[?5522h");
+        session.set_read_enabled(true);
+        session.engine.feed(b"\x1b]52;c;?\x07");
+        let request = session.take_read_request().unwrap();
+        let data = vec![b'x'; 128 * 1024];
+        session
+            .complete_read(
+                &ReadResult {
+                    id: request.id,
+                    status: ReadStatus::Success,
+                    epoch: 1,
+                    available: vec![],
+                    contents: vec![ReadDescriptor {
+                        mime: "text/plain".into(),
+                        len: data.len(),
+                    }],
+                },
+                &data,
+                1024 * 1024,
+            )
+            .unwrap();
+        assert!(!session.step_read().unwrap());
+        let prefix = session.pty.as_ref().unwrap().pending.borrow().len();
+        session
+            .user_paste(Destination::Clipboard, &["text/plain".into()])
+            .unwrap();
+        assert!(!session.after_response.borrow().is_empty());
+        assert_eq!(session.pty.as_ref().unwrap().pending.borrow().len(), prefix);
+        while !session.step_read().unwrap() {}
+        assert!(session.after_response.borrow().is_empty());
+        let bytes: Vec<_> = session
+            .pty
+            .as_ref()
+            .unwrap()
+            .pending
+            .borrow()
+            .iter()
+            .copied()
+            .collect();
+        let end = bytes.iter().position(|&b| b == 7).unwrap();
+        assert!(bytes[..end].starts_with(b"\x1b]52;c;"));
+        assert!(bytes[end + 1..].starts_with(b"\x1b]5522;"));
+        assert!(bytes[end + 1..].windows(4).any(|s| s == b":pw="));
     }
 
     #[test]

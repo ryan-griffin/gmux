@@ -12,7 +12,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 37;
+pub const VERSION: u32 = 38;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -90,6 +90,8 @@ pub struct Header {
     pub selection_origin: Option<u64>,
     #[serde(default, with = "crate::clipboard::wire")]
     pub copy: Option<crate::clipboard::Write>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_read: Option<crate::clipboard::ReadEvent>,
 }
 
 fn is_zero(value: &i16) -> bool {
@@ -128,6 +130,13 @@ impl Packet {
     pub fn encode_into_limit(&self, bytes: &mut Vec<u8>, limit: usize) -> anyhow::Result<()> {
         let start = bytes.len();
         let limit = limit.min(MAX_PACKET + 4);
+        if let Some(event) = &self.header.clipboard_read {
+            event.validate()?;
+            anyhow::ensure!(
+                self.clipboard_only() && self.header.copy.is_none() && self.cells.is_empty(),
+                "Mixed clipboard read packet"
+            );
+        }
         let clipboard_payload = if let Some(write) = &self.header.copy {
             let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
             // Reject backpressure before scanning text or growing the queue.
@@ -216,6 +225,7 @@ impl Packet {
             && h.selection.is_none()
             && h.notifications.is_empty()
             && h.find.is_none()
+            && h.error.is_none()
     }
 
     /// Decode one packet, skipping heartbeat replies and leaving following data buffered.
@@ -248,6 +258,21 @@ impl Packet {
             reader.read_exact(&mut bytes)?;
             serde_json::from_slice::<Header>(&bytes)?
         };
+        if let Some(event) = &header.clipboard_read {
+            event.validate()?;
+            anyhow::ensure!(
+                header_size <= crate::clipboard::MAX_HEADER_BYTES
+                    && size == 4 + header_size
+                    && header.copy.is_none(),
+                "Invalid clipboard read packet"
+            );
+            let packet = Self {
+                header,
+                cells: Vec::new(),
+            };
+            anyhow::ensure!(packet.clipboard_only(), "Mixed clipboard read packet");
+            return Ok(Some(packet));
+        }
         if header.copy.is_some() {
             let mut packet = Self {
                 header,

@@ -82,20 +82,40 @@ struct Connection {
     commands: mpsc::SyncSender<Outgoing>,
     pending_bytes: Arc<AtomicUsize>,
     socket: ipc::Stream,
+    clipboard_epochs: [ValueCell<u64>; 2],
 }
 enum Outgoing {
     Close,
+    ClipboardReply {
+        pane: u64,
+        result: crate::clipboard::ReadResult,
+        contents: Vec<crate::clipboard::Representation>,
+    },
     Command(Vec<u8>),
     Paste {
         pane: Option<u64>,
         text: String,
         options: PasteOptions,
+        user: Option<(u64, u64)>,
     },
 }
 
 impl Outgoing {
     fn prepare(request: StreamRequest) -> anyhow::Result<Self> {
-        if let StreamCommand::Paste { text, options } = request.command {
+        if let StreamCommand::UserPasteText {
+            serial,
+            epoch,
+            text,
+        } = request.command
+        {
+            anyhow::ensure!(text.len() <= transport::MAX_PASTE, "Paste is too large");
+            Ok(Self::Paste {
+                pane: request.pane,
+                text,
+                options: PasteOptions::default(),
+                user: Some((serial, epoch)),
+            })
+        } else if let StreamCommand::Paste { text, options } = request.command {
             anyhow::ensure!(
                 text.len() <= transport::MAX_PASTE,
                 "Paste is too large. The limit is 4 MiB."
@@ -104,17 +124,33 @@ impl Outgoing {
                 pane: request.pane,
                 text,
                 options,
+                user: None,
             })
         } else {
             // Reject oversized commands before handing them to the writer. A
             // local validation error must not close the frontend connection.
-            Ok(Self::Command(transport::command_bytes(&request)?))
+            let mut encoded = transport::command_bytes(&request)?;
+            if let StreamCommand::ClipboardReadData { size, bytes, .. } = request.command {
+                anyhow::ensure!(
+                    size == bytes.len() && size <= crate::clipboard::READ_CHUNK,
+                    "Invalid clipboard chunk"
+                );
+                encoded.extend_from_slice(&bytes);
+            }
+            Ok(Self::Command(encoded))
         }
     }
 
     fn bytes(&self) -> usize {
         match self {
             Self::Close => 0,
+            Self::ClipboardReply { contents, .. } => {
+                contents
+                    .iter()
+                    .map(|c| c.data.len() + c.mime.len())
+                    .sum::<usize>()
+                    + 16 * 1024
+            }
             Self::Command(bytes) => bytes.len(),
             Self::Paste { text, .. } => text.len(),
         }
@@ -128,24 +164,77 @@ impl Outgoing {
         match self {
             Self::Close => return Ok(()),
             Self::Command(bytes) => writer.write_all(&bytes)?,
+            Self::ClipboardReply {
+                pane,
+                result,
+                contents,
+            } => {
+                let id = result.id;
+                transport::command(
+                    writer,
+                    &StreamRequest::pane(pane, StreamCommand::ClipboardReadResult { result }),
+                )?;
+                for c in contents {
+                    for bytes in c.data.chunks(crate::clipboard::READ_CHUNK) {
+                        transport::command(
+                            writer,
+                            &StreamRequest::pane(
+                                pane,
+                                StreamCommand::ClipboardReadData {
+                                    id,
+                                    size: bytes.len(),
+                                    bytes: vec![],
+                                },
+                            ),
+                        )?;
+                        writer.write_all(bytes)?;
+                        heartbeat.check(writer)?;
+                    }
+                }
+                transport::command(
+                    writer,
+                    &StreamRequest::pane(pane, StreamCommand::ClipboardReadEnd { id }),
+                )?;
+            }
             Self::Paste {
                 pane,
                 text,
                 options,
-            } => write_paste(writer, pane, &text, options, heartbeat)?,
+                user,
+            } => write_paste(writer, pane, &text, options, user, heartbeat)?,
         }
         heartbeat.check(writer)
     }
 }
 
 impl Connection {
+    fn clipboard_changed(
+        &self,
+        destination: crate::clipboard::Destination,
+        epoch: u64,
+    ) -> anyhow::Result<()> {
+        // Every pane in a window reports through this connection. Serialize a
+        // generation once, and allow retries if the outgoing queue was full.
+        let sent = &self.clipboard_epochs[destination as usize];
+        if sent.get() == epoch {
+            return Ok(());
+        }
+        self.send(StreamRequest::connection(StreamCommand::ClipboardChanged {
+            destination,
+            epoch,
+        }))?;
+        sent.set(epoch);
+        Ok(())
+    }
     fn close(&self) {
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
         // Cached viewports may retain this sender after their manager is gone.
         let _ = self.commands.try_send(Outgoing::Close);
     }
     fn send(&self, request: StreamRequest) -> anyhow::Result<()> {
-        let outgoing = Outgoing::prepare(request)?;
+        self.enqueue(Outgoing::prepare(request)?)
+    }
+    fn enqueue(&self, outgoing: Outgoing) -> anyhow::Result<()> {
         let bytes = outgoing.bytes();
         self.pending_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
@@ -165,15 +254,24 @@ fn write_paste(
     pane: Option<u64>,
     text: &str,
     options: PasteOptions,
+    user: Option<(u64, u64)>,
     heartbeat: &mut Heartbeat,
 ) -> anyhow::Result<()> {
     transport::command(
         writer,
         &StreamRequest {
             pane,
-            command: StreamCommand::PasteBegin {
-                size: text.len(),
-                options,
+            command: if let Some((serial, epoch)) = user {
+                StreamCommand::UserPasteBegin {
+                    serial,
+                    epoch,
+                    size: text.len(),
+                }
+            } else {
+                StreamCommand::PasteBegin {
+                    size: text.len(),
+                    options,
+                }
             },
         },
     )?;
@@ -368,6 +466,7 @@ impl SessionManager {
             endpoint,
             daemon,
             connection: Rc::new(Connection {
+                clipboard_epochs: Default::default(),
                 commands,
                 pending_bytes,
                 socket,
@@ -429,6 +528,12 @@ impl SessionManager {
             }))?;
         self.clipboard_writes = enabled;
         Ok(())
+    }
+    pub fn set_clipboard_reads(&self, enabled: bool) -> anyhow::Result<()> {
+        self.connection
+            .send(StreamRequest::connection(StreamCommand::ClipboardReads {
+                enabled,
+            }))
     }
     pub fn set_frame_interval(&mut self, interval: Duration) {
         let interval = interval.clamp(Duration::from_millis(1), Duration::from_secs(1));
@@ -604,6 +709,16 @@ impl SessionManager {
         &mut self,
         mut clipboard: impl FnMut(crate::clipboard::Write),
     ) -> HashMap<u64, SessionUpdate> {
+        self.poll_with_clipboard_events(|event| {
+            if let crate::clipboard::Event::Write(write) = event {
+                clipboard(write);
+            }
+        })
+    }
+    pub fn poll_with_clipboard_events(
+        &mut self,
+        mut clipboard: impl FnMut(crate::clipboard::Event),
+    ) -> HashMap<u64, SessionUpdate> {
         // A full command queue must not lose a tab's viewport subscription.
         let _ = self.subscribe();
         self.flush_reads();
@@ -619,7 +734,14 @@ impl SessionManager {
             match self.receiver.try_recv() {
                 Ok(Ok(mut packet)) => {
                     if let Some(write) = packet.header.copy.take() {
-                        clipboard(write);
+                        clipboard(crate::clipboard::Event::Write(write));
+                        continue;
+                    }
+                    if let Some(event) = packet.header.clipboard_read.take() {
+                        clipboard(crate::clipboard::Event::Read {
+                            pane: packet.header.meta.id,
+                            event,
+                        });
                         continue;
                     }
                     if let Some(git) = packet.header.git.take() {
@@ -992,6 +1114,38 @@ impl RemoteSession {
             _ => false,
         }
     }
+    pub fn clipboard_changed(
+        &self,
+        destination: crate::clipboard::Destination,
+        epoch: u64,
+    ) -> anyhow::Result<()> {
+        self.connection.clipboard_changed(destination, epoch)
+    }
+    pub fn clipboard_command(&self, command: StreamCommand) -> anyhow::Result<()> {
+        self.connection
+            .send(StreamRequest::pane(self.id(), command))
+    }
+    pub fn clipboard_reply(
+        &self,
+        result: crate::clipboard::ReadResult,
+        contents: Vec<crate::clipboard::Representation>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            result.byte_len()? == contents.iter().map(|c| c.data.len()).sum::<usize>()
+                && result
+                    .contents
+                    .iter()
+                    .zip(&contents)
+                    .all(|(d, c)| d.mime == c.mime && d.len == c.data.len())
+                && result.contents.len() == contents.len(),
+            "Invalid clipboard reply payload"
+        );
+        self.connection.enqueue(Outgoing::ClipboardReply {
+            pane: self.id(),
+            result,
+            contents,
+        })
+    }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
         self.send_with_enter(bytes, false)
     }
@@ -1016,7 +1170,6 @@ impl RemoteSession {
         self.command(StreamCommand::Paste {
             text: text.to_owned(),
             options: PasteOptions {
-                clipboard: true,
                 bottom: true,
                 ..PasteOptions::default()
             },
@@ -1345,6 +1498,56 @@ impl RemoteSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipboard_results_stream_as_one_reserved_operation_with_raw_chunks() {
+        use crate::clipboard::{ReadDescriptor, ReadResult, ReadStatus, Representation};
+        use std::io::{BufRead, Read};
+        let data = (0..=255).cycle().take(40_000).collect::<Vec<u8>>();
+        let outgoing = Outgoing::ClipboardReply {
+            pane: 7,
+            result: ReadResult {
+                id: 42,
+                status: ReadStatus::Success,
+                epoch: 2,
+                available: vec![],
+                contents: vec![ReadDescriptor {
+                    mime: "application/octet-stream".into(),
+                    len: data.len(),
+                }],
+            },
+            contents: vec![Representation {
+                mime: "application/octet-stream".into(),
+                data: data.clone(),
+            }],
+        };
+        assert!(outgoing.bytes() >= data.len());
+        let mut encoded = Vec::new();
+        outgoing
+            .write(&mut encoded, &mut Heartbeat::new(HEARTBEAT_INTERVAL))
+            .unwrap();
+        let mut reader = std::io::Cursor::new(encoded);
+        let mut received = Vec::new();
+        let mut methods = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let header: serde_json::Value = serde_json::from_str(&line).unwrap();
+            methods.push(header["method"].as_str().unwrap().to_owned());
+            if header["method"] == "clipboard-read-data" {
+                let len = header["size"].as_u64().unwrap() as usize;
+                assert!(len <= crate::clipboard::READ_CHUNK);
+                let mut bytes = vec![0; len];
+                reader.read_exact(&mut bytes).unwrap();
+                received.extend(bytes);
+            }
+        }
+        assert_eq!(methods.first().unwrap(), "clipboard-read-result");
+        assert_eq!(methods.last().unwrap(), "clipboard-read-end");
+        assert_eq!(received, data);
+    }
+
     fn layout(unshifted: u32) -> crate::transport::KeyLayout {
         crate::transport::KeyLayout {
             unshifted,
@@ -1499,7 +1702,6 @@ mod tests {
             .collect();
         assert_eq!(commands[0]["method"], "paste-begin");
         assert_eq!(commands[0]["size"], text.len());
-        assert_eq!(commands[0]["clipboard"], true);
         assert_eq!(commands[0]["enter"], true);
         assert_eq!(commands.last().unwrap()["method"], "paste-end");
         let mut received = String::new();
@@ -1517,6 +1719,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(2);
         let connection = Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1553,6 +1756,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(2);
         let connection = Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1588,6 +1792,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(16);
         let connection = Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1614,6 +1819,7 @@ mod tests {
         let (socket, _) = UnixStream::pair().unwrap();
         let (commands, _) = mpsc::sync_channel(1);
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -1695,11 +1901,67 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_generations_coalesce_across_panes_and_retry_after_queue_pressure() {
+        use crate::clipboard::Destination::{Clipboard, Primary};
+        let (mut manager, _, first) = manager();
+        manager.metadata.insert(
+            2,
+            Metadata {
+                id: 2,
+                ..first.borrow().meta.clone()
+            },
+        );
+        let second = manager.attach(2, &Theme::adwaita(true)).unwrap();
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        first.borrow_mut().connection = connection.clone();
+        second.borrow_mut().connection = connection;
+        for index in 0..128 {
+            let session = if index % 2 == 0 { &first } else { &second };
+            session.borrow().clipboard_changed(Clipboard, 1).unwrap();
+        }
+        assert!(second.borrow().clipboard_changed(Clipboard, 2).is_err());
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"clipboard-changed","destination":"clipboard","epoch":1})
+        );
+        second.borrow().clipboard_changed(Clipboard, 2).unwrap();
+        assert!(first.borrow().clipboard_changed(Primary, 1).is_err());
+        assert_eq!(wire(receiver.try_recv().unwrap())["epoch"], 2);
+        first.borrow().clipboard_changed(Primary, 1).unwrap();
+        second.borrow().clipboard_changed(Primary, 1).unwrap();
+        assert_eq!(
+            wire(receiver.try_recv().unwrap()),
+            json!({"method":"clipboard-changed","destination":"primary","epoch":1})
+        );
+        assert!(receiver.try_recv().is_err());
+
+        // A replacement connection must advertise its own initial generation.
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        second.borrow_mut().connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
+            commands,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+        });
+        second.borrow().clipboard_changed(Clipboard, 2).unwrap();
+        assert_eq!(wire(receiver.try_recv().unwrap())["epoch"], 2);
+    }
+
+    #[test]
     fn clipboard_capability_changes_coalesce_and_failed_advertisements_can_retry() {
         let (mut manager, _, _) = manager();
         let (commands, receiver) = mpsc::sync_channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         manager.connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -1897,6 +2159,7 @@ mod tests {
         let (commands, _receiver) = mpsc::sync_channel(32);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2270,6 +2533,7 @@ mod tests {
         let (commands, receiver) = mpsc::sync_channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         manager.connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -2306,6 +2570,7 @@ mod tests {
         let (commands, _outgoing) = mpsc::sync_channel(8);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2644,6 +2909,7 @@ mod tests {
         let (commands, _outgoing) = mpsc::sync_channel(16);
         let (socket, _peer) = UnixStream::pair().unwrap();
         session.borrow_mut().connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2725,6 +2991,7 @@ mod tests {
         let (commands, _outgoing) = mpsc::sync_channel(32);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2845,6 +3112,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let mut session = handle.borrow_mut();
         session.connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2885,6 +3153,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let mut session = handle.borrow_mut();
         session.connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2924,6 +3193,7 @@ mod tests {
         let (commands, outgoing) = mpsc::sync_channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2949,6 +3219,7 @@ mod tests {
         let (commands, receiver) = mpsc::sync_channel(32);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -3107,6 +3378,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(8);
         session.borrow_mut().connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -3148,6 +3420,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(128);
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -3243,6 +3516,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(8);
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -3300,6 +3574,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(1);
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -3332,6 +3607,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let (commands, receiver) = mpsc::sync_channel(2);
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -3383,6 +3659,7 @@ mod tests {
             .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
             .unwrap();
         let connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -3437,6 +3714,7 @@ mod tests {
             .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
             .unwrap();
         manager.connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
@@ -3485,6 +3763,7 @@ mod tests {
             .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
             .unwrap();
         manager.connection = Rc::new(Connection {
+            clipboard_epochs: Default::default(),
             commands,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),

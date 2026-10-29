@@ -44,6 +44,10 @@ name = "progress-check"
 test = false
 
 [[example]]
+name = "clipboard-banner-check"
+test = false
+
+[[example]]
 name = "program-status-check"
 test = false
 

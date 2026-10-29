@@ -271,7 +271,18 @@ impl Connection {
     pub fn poll_at_with_clipboard(
         &mut self,
         now: Instant,
-        clipboard: impl FnMut(crate::clipboard::Write),
+        mut clipboard: impl FnMut(crate::clipboard::Write),
+    ) -> Update {
+        self.poll_at_with_clipboard_events(now, |event| {
+            if let crate::clipboard::Event::Write(write) = event {
+                clipboard(write);
+            }
+        })
+    }
+    pub fn poll_at_with_clipboard_events(
+        &mut self,
+        now: Instant,
+        clipboard: impl FnMut(crate::clipboard::Event),
     ) -> Update {
         let mut update = Update::default();
         if self.next_retry().is_some_and(|at| at <= now) {
@@ -304,7 +315,7 @@ impl Connection {
             }
         }
         if let State::Connected(manager) = &mut self.state {
-            update.panes = manager.poll_with_clipboard(clipboard);
+            update.panes = manager.poll_with_clipboard_events(clipboard);
             if let Some(state) = manager.take_state() {
                 manager.install_metadata(&state.metadata, state.revision);
                 update.state = Some(state);

@@ -50,6 +50,11 @@ pub(super) struct Frontend {
     pub(super) paste: Option<Paste>,
     pub(super) views: HashMap<u64, crate::engine::EngineView>,
     clipboard_writes: bool,
+    pub(super) clipboard_reads: bool,
+    pub(super) clipboard_epochs: [u64; 2],
+    pub(super) paste_serial: u64,
+    binary: Option<StreamRequest>,
+    pub(super) binary_deadline: Option<Instant>,
     pub(super) errors: HashMap<u64, String>,
     pub(super) state_revision: Option<u64>,
     pub(super) sizes: HashMap<u64, TerminalSize>,
@@ -65,6 +70,7 @@ pub(super) struct Paste {
     pub(super) size: usize,
     pub(super) text: String,
     pub(super) options: PasteOptions,
+    user: Option<(u64, u64)>,
 }
 impl Frontend {
     fn queue_clipboard(
@@ -109,6 +115,11 @@ impl Frontend {
             paste: None,
             views: HashMap::new(),
             clipboard_writes: false,
+            clipboard_reads: false,
+            clipboard_epochs: [0; 2],
+            paste_serial: 0,
+            binary: None,
+            binary_deadline: None,
             errors: HashMap::new(),
             state_revision: None,
             sizes: HashMap::new(),
@@ -190,6 +201,25 @@ impl Frontend {
                     Err(e) => return Err(e.into()),
                 }
             }
+            if let Some(mut request) = self.binary.take() {
+                let StreamCommand::ClipboardReadData { size, bytes, .. } = &mut request.command
+                else {
+                    unreachable!()
+                };
+                let n = (*size - bytes.len())
+                    .min(budget)
+                    .min(self.read_buffer.len() - self.read_offset);
+                bytes.extend_from_slice(&self.read_buffer[self.read_offset..self.read_offset + n]);
+                self.read_offset += n;
+                budget -= n;
+                if bytes.len() == *size {
+                    self.binary_deadline = None;
+                    requests.push(request);
+                } else {
+                    self.binary = Some(request);
+                }
+                continue;
+            }
             let end = self.read_buffer.len().min(self.read_offset + budget);
             for part in self.read_buffer[self.read_offset..end].split_inclusive(|c| *c == b'\n') {
                 if requests.len() == MAX_REQUESTS_PER_TURN {
@@ -210,8 +240,37 @@ impl Frontend {
                 }
                 self.input.extend_from_slice(part);
                 if complete {
-                    requests.push(StreamRequest::decode(&self.input));
+                    if self.input.len() > gmux_client::clipboard::MAX_HEADER_BYTES {
+                        #[derive(serde::Deserialize)]
+                        struct Method {
+                            method: Option<String>,
+                        }
+                        let method = serde_json::from_slice::<Method>(&self.input)
+                            .ok()
+                            .and_then(|m| m.method);
+                        anyhow::ensure!(
+                            !matches!(
+                                method.as_deref(),
+                                Some(
+                                    "clipboard-read-result" | "user-paste" | "clipboard-read-data"
+                                )
+                            ),
+                            "Clipboard metadata is too large"
+                        );
+                    }
+                    let request = StreamRequest::decode(&self.input);
                     self.input.clear();
+                    if let StreamCommand::ClipboardReadData { size, .. } = &request.command {
+                        anyhow::ensure!(
+                            (1..=gmux_client::clipboard::READ_CHUNK).contains(size),
+                            "Invalid clipboard chunk length"
+                        );
+                        self.binary = Some(request);
+                        self.binary_deadline =
+                            Some(Instant::now() + gmux_client::clipboard::TRANSFER_TIMEOUT);
+                        break;
+                    }
+                    requests.push(request);
                 }
             }
         }
@@ -366,6 +425,23 @@ impl Daemon {
             frontend.clipboard_writes = enabled;
             return Ok(());
         }
+        if let StreamCommand::ClipboardReads { enabled } = command {
+            frontend.clipboard_reads = enabled;
+            if !enabled {
+                self.cancel_frontend_reads(frontend_id);
+            }
+            return Ok(());
+        }
+        if let StreamCommand::ClipboardChanged { destination, epoch } = command {
+            let previous = &mut frontend.clipboard_epochs[destination as usize];
+            anyhow::ensure!(epoch >= *previous, "Stale clipboard generation");
+            if epoch == *previous {
+                return Ok(());
+            }
+            *previous = epoch;
+            self.clipboard_changed(frontend_id, destination);
+            return Ok(());
+        }
         if let StreamCommand::Focused { active } = command {
             // Keep the last focused client as size owner while another app has focus.
             if active {
@@ -414,6 +490,9 @@ impl Daemon {
                 return Err(error);
             }
         };
+        if self.clipboard_input(frontend_id, frontend, id, &command)? {
+            return Ok(());
+        }
         if let StreamCommand::Resize {
             cols,
             rows,
@@ -445,6 +524,27 @@ impl Daemon {
                     size,
                     text: String::with_capacity(size),
                     options,
+                    user: None,
+                });
+                return Ok(());
+            }
+            StreamCommand::UserPasteBegin {
+                serial,
+                epoch,
+                size,
+            } => {
+                anyhow::ensure!(
+                    frontend.clipboard_reads
+                        && frontend.visible.contains(&id)
+                        && size <= transport::MAX_PASTE,
+                    "Invalid desktop paste transfer"
+                );
+                frontend.paste = Some(Paste {
+                    pane: id,
+                    size,
+                    text: String::with_capacity(size),
+                    options: Default::default(),
+                    user: Some((serial, epoch)),
                 });
                 return Ok(());
             }
@@ -477,9 +577,17 @@ impl Daemon {
                     frontend,
                     StreamRequest::pane(
                         id,
-                        StreamCommand::Paste {
-                            text: paste.text,
-                            options: paste.options,
+                        if let Some((serial, epoch)) = paste.user {
+                            StreamCommand::UserPasteText {
+                                serial,
+                                epoch,
+                                text: paste.text,
+                            }
+                        } else {
+                            StreamCommand::Paste {
+                                text: paste.text,
+                                options: paste.options,
+                            }
                         },
                     ),
                 );
@@ -540,7 +648,7 @@ impl Daemon {
                     text.len() <= transport::MAX_PASTE,
                     "Paste is too large. The limit is 4 MiB."
                 );
-                let mut bytes = session.paste(&text, options.clipboard)?;
+                let mut bytes = session.paste(&text)?;
                 if options.enter {
                     bytes.push(b'\r');
                 }
@@ -1106,6 +1214,7 @@ impl Daemon {
                     selection_serial,
                     selection_origin,
                     copy: None,
+                    clipboard_read: None,
                 },
                 cells,
             })?;
@@ -1124,10 +1233,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clipboard_binary_chunks_preserve_newlines_and_following_commands() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut frontend = Frontend::new(socket);
+        let mut header =
+            serde_json::to_vec(&json!({"method":"clipboard-read-data","pane":1,"id":7,"size":6}))
+                .unwrap();
+        header.push(b'\n');
+        peer.write_all(&header).unwrap();
+        peer.write_all(b"a\n").unwrap();
+        assert!(frontend.requests().unwrap().is_empty());
+        assert!(frontend.binary_deadline.is_some());
+        peer.write_all(b"\0{}x").unwrap();
+        let mut ping = serde_json::to_vec(&json!({"method":"ping"})).unwrap();
+        ping.push(b'\n');
+        peer.write_all(&ping).unwrap();
+        let requests = frontend.requests().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(&requests[0].command, StreamCommand::ClipboardReadData { id: 7, size: 6, bytes } if bytes == b"a\n\0{}x")
+        );
+        assert!(matches!(requests[1].command, StreamCommand::Ping));
+        assert!(frontend.binary_deadline.is_none());
+    }
+
+    #[test]
     fn metadata_dirty_ids_survive_a_skipped_frontend_deadline() {
         // Exercise the fan-out and due filter without PTYs, snapshots or sleeps.
         // Actual progress values/expiry delivery are covered by the stream smoke.
         let mut daemon = Daemon {
+            clipboard: Default::default(),
             sessions: HashMap::new(),
             limits: Default::default(),
             id: DaemonId::generate().unwrap(),

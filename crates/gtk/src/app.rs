@@ -96,6 +96,7 @@ pub struct Ui {
     workspace_editor_dialog: management::EditorDialog,
     tabs: RefCell<Vec<Tab>>,
     sessions: RefCell<connections::Connections>,
+    clipboard: Rc<crate::clipboard::Desktop>,
     catalog: RefCell<WorkspaceCatalog>,
     filter: Cell<TabFilter>,
     filter_title: adw::WindowTitle,

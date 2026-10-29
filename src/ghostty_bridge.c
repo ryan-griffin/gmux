@@ -135,6 +135,9 @@ struct GmuxEngine {
     GhosttyMouseEvent mouse;
     GmuxEventFn callback;
     GmuxClipboardFn clipboard;
+    GmuxClipboardReadFn clipboard_read;
+    uint64_t read_id;
+    bool feed_osc, feed_escape, feed_st;
     void *userdata;
     uint32_t cell_width, cell_height;
     bool dark;
@@ -442,6 +445,68 @@ static void clipboard_write(GhosttyTerminal t, void *ud, const GhosttyClipboardW
 done:
     write->reply(write, &reply);
 }
+static void clipboard_read(GhosttyTerminal terminal, void *ud, const GhosttyClipboardRead *read) {
+    GmuxEngine *e = ud;
+    GhosttyClipboardReadReply reply = GHOSTTY_INIT_SIZED(GhosttyClipboardReadReply);
+    reply.result = GHOSTTY_CLIPBOARD_READ_RESULT_UNSUPPORTED;
+    if (read->size < sizeof(*read) || !read->reply) return;
+    if (read->location != GHOSTTY_CLIPBOARD_LOCATION_STANDARD && read->location != GHOSTTY_CLIPBOARD_LOCATION_PRIMARY) goto reject;
+    reply.result = GHOSTTY_CLIPBOARD_READ_RESULT_BUSY;
+    if (!e->clipboard_read || e->read_id || read->mimes_len > 4 || read->name.len > 256) goto reject;
+    GmuxText mimes[4];
+    for (size_t i = 0; i < read->mimes_len; i++) {
+        if (!read->mimes[i].len || read->mimes[i].len > 256) goto reject;
+        mimes[i] = (GmuxText){read->mimes[i].ptr, read->mimes[i].len};
+    }
+    GmuxClipboardRead request = {
+        .destination = read->location == GHOSTTY_CLIPBOARD_LOCATION_PRIMARY ? GMUX_CLIPBOARD_PRIMARY : GMUX_CLIPBOARD_STANDARD,
+        .mimes = mimes, .count = read->mimes_len, .list = read->list,
+        .granted = read->granted, .name = {read->name.ptr, read->name.len},
+    };
+    int admission = e->clipboard_read(e->userdata, &request);
+    if (admission != GMUX_CLIPBOARD_SUCCESS) {
+        if (admission == GMUX_CLIPBOARD_UNSUPPORTED) reply.result = GHOSTTY_CLIPBOARD_READ_RESULT_UNSUPPORTED;
+        goto reject;
+    }
+    if (ghostty_terminal_clipboard_read_defer(terminal, read, &e->read_id)) goto reject;
+    request.id = e->read_id;
+    // Admission was checked synchronously; no state can change between calls.
+    e->clipboard_read(e->userdata, &request);
+    return;
+reject:
+    read->reply(read, &reply);
+}
+void gmux_engine_read_callback(GmuxEngine *e, GmuxClipboardReadFn callback) {
+    e->clipboard_read = callback;
+    ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ, callback ? clipboard_read : NULL);
+}
+uint64_t gmux_engine_read_pending(GmuxEngine *e) { return e->read_id; }
+int gmux_engine_read_complete(GmuxEngine *e, uint64_t id, uint8_t result,
+    const GmuxClipboardContent *contents, size_t count, const GmuxText *available, size_t targets) {
+    if (!id || e->read_id != id || count > 4 || targets > 16 || result > 4) return -1;
+    GhosttyClipboardContent values[4]; GhosttyString names[16];
+    for (size_t i = 0; i < count; i++) values[i] = (GhosttyClipboardContent){
+        {contents[i].mime.ptr, contents[i].mime.len}, {contents[i].data.ptr, contents[i].data.len}};
+    for (size_t i = 0; i < targets; i++) names[i] = (GhosttyString){available[i].ptr, available[i].len};
+    GhosttyClipboardReadReply reply = GHOSTTY_INIT_SIZED(GhosttyClipboardReadReply);
+    reply.result = (GhosttyClipboardReadResult)result;
+    reply.contents = values; reply.contents_len = count;
+    reply.available = names; reply.available_len = targets;
+    int rc = ghostty_terminal_clipboard_read_complete(e->terminal, id, &reply);
+    if (!rc && result) e->read_id = 0;
+    return rc;
+}
+int gmux_engine_read_step(GmuxEngine *e, bool *done) {
+    int rc = ghostty_terminal_clipboard_read_step(e->terminal, e->read_id, done);
+    if (!rc && *done) e->read_id = 0;
+    return rc;
+}
+void gmux_engine_read_discard(GmuxEngine *e) {
+    if (e->read_id) ghostty_terminal_clipboard_read_discard(e->terminal, e->read_id);
+    e->read_id = 0;
+}
+void gmux_engine_grants_clear(GmuxEngine *e) { ghostty_terminal_clipboard_grants_clear(e->terminal); }
+
 void gmux_engine_clipboard_callback(GmuxEngine *e, GmuxClipboardFn callback) {
     if (e->clipboard == callback) return;
     e->clipboard = callback;
@@ -585,13 +650,9 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &terminfo_name)) {
         gmux_engine_free(e); return NULL;
     }
-    // Track only a bounded unfinished sequence for shutdown snapshots.
-    size_t continuation_max = 64 * 1024;
     size_t clipboard_max = GMUX_CLIPBOARD_MAX_BYTES;
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES,
         &clipboard_max)) { gmux_engine_free(e); return NULL; }
-    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
-        &continuation_max)) { gmux_engine_free(e); return NULL; }
     return e;
 }
 
@@ -689,7 +750,9 @@ int gmux_engine_compress(GmuxEngine *e, int *out) {
 
 // Serialized terminal state, distinct from gmux_engine_snapshot's viewport.
 int gmux_engine_checkpoint(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
-    GhosttyResult result = ghostty_snapshot_encode_buf(e->terminal, out, cap, written);
+    // Restoring history never resumes parser input. Exclude unfinished OSCs,
+    // which can contain clipboard data or program-supplied passwords.
+    GhosttyResult result = ghostty_snapshot_encode_buf_state(e->terminal, out, cap, written);
     return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
 }
 
@@ -915,6 +978,63 @@ bool gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
     }
     return changed;
 }
+bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *consumed) {
+    *consumed = 0;
+    if (e->read_id) return false;
+    bool changed = false;
+    unsigned stops = 0;
+    while (*consumed < len && !e->read_id && stops++ < 64) {
+        const uint8_t *part = data + *consumed;
+        size_t left = len - *consumed;
+        // OSC_END stops on ESC, before the ST backslash. Completing that
+        // terminator cannot mutate cells, and must not dirty status-only feeds.
+        if (e->feed_st && part[0] == 0x5c) {
+            ghostty_terminal_vt_write(e->terminal, part, 1);
+            (*consumed)++;
+            e->feed_st = false;
+            e->feed_escape = false;
+            continue;
+        }
+        bool prior_escape = e->feed_escape || e->feed_st;
+        e->feed_st = false;
+        e->feed_escape = false;
+        bool was_ground = false;
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &was_ground);
+        if (e->clear_pending && was_ground) gmux_engine_clear_screen(e);
+        GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
+        uint32_t boundaries = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
+        if (e->clear_pending && !was_ground) boundaries |= GHOSTTY_TERMINAL_BOUNDARY_GROUND;
+        int rc = ghostty_terminal_vt_write_until(e->terminal, part, left, boundaries, &stop);
+        if (rc != GHOSTTY_SUCCESS && rc != GHOSTTY_NO_VALUE) break;
+        if (stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_START) {
+            size_t intro = stop.introducer == GHOSTTY_TERMINAL_STRING_INTRODUCER_C1 ? 1 : (prior_escape ? 1 : 2);
+            changed |= stop.consumed > intro || (!was_ground && !prior_escape && !e->feed_osc);
+            e->feed_osc = true;
+            e->status_reported = false;
+        } else if (stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_END) {
+            changed |= !e->feed_osc || !e->status_reported;
+            e->feed_osc = false;
+            e->feed_st = stop.end == GHOSTTY_TERMINAL_STRING_END_ST_ESC;
+        } else if (!e->feed_osc) {
+            bool bare_escape = was_ground && stop.consumed == 1 && part[0] == 0x1b;
+            e->feed_escape = bare_escape;
+            changed |= !bare_escape;
+        }
+        *consumed += stop.consumed;
+        if (!stop.consumed) break;
+    }
+    if (e->clear_pending && !e->read_id) {
+        bool ground = false;
+        ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground);
+        if (ground) gmux_engine_clear_screen(e);
+    }
+    if (changed) {
+        e->text_generation++;
+        if (e->prompt_count || e->output.point || e->completed_output.point) shell_prune(e);
+    }
+    return changed;
+}
+
 int gmux_engine_clear_screen(GmuxEngine *e) {
     e->clear_pending = false;
     GhosttyTerminalScreen screen;
@@ -1014,18 +1134,33 @@ static bool read_paste(void *ud, GhosttyString mime, GhosttyWriter writer) {
     const GhosttyString *text = ud;
     return !text->len || writer.write(writer.userdata, (const uint8_t *)text->ptr, text->len);
 }
-int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len, bool clipboard) {
+int gmux_engine_paste(GmuxEngine *e, const uint8_t *data, size_t len) {
     GhosttyString text = {.ptr = data, .len = len};
     GhosttyString mime = {.ptr = (const uint8_t *)"text/plain", .len = 10};
     GhosttyPaste paste = GHOSTTY_INIT_SIZED(GhosttyPaste);
     paste.location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD;
-    paste.source = clipboard ? GHOSTTY_PASTE_SOURCE_CLIPBOARD : GHOSTTY_PASTE_SOURCE_TEXT;
+    // Scripted/text pastes never create clipboard permission grants.
+    paste.source = GHOSTTY_PASTE_SOURCE_TEXT;
     paste.mimes = &mime;
     paste.mimes_len = 1;
     paste.reader = (GhosttyMimeReader){.read = read_paste, .userdata = &text};
     // Preserve explicit paste/send behavior, including multi-line input.
     // Ghostty still encodes newlines and strips control bytes for the active mode.
     paste.allow_unsafe = true;
+    return ghostty_terminal_paste(e->terminal, &paste, NULL);
+}
+static bool no_paste_data(void *ud, GhosttyString mime, GhosttyWriter writer) {
+    (void)ud; (void)mime; (void)writer; return false;
+}
+int gmux_engine_user_paste(GmuxEngine *e, uint8_t destination, const GmuxText *mimes, size_t count) {
+    if (count > 16 || destination > GMUX_CLIPBOARD_PRIMARY || !gmux_engine_mode(e, 5522)) return -1;
+    GhosttyString names[16];
+    for (size_t i = 0; i < count; i++) names[i] = (GhosttyString){mimes[i].ptr, mimes[i].len};
+    GhosttyPaste paste = GHOSTTY_INIT_SIZED(GhosttyPaste);
+    paste.source = GHOSTTY_PASTE_SOURCE_CLIPBOARD;
+    paste.location = destination == GMUX_CLIPBOARD_PRIMARY ? GHOSTTY_CLIPBOARD_LOCATION_PRIMARY : GHOSTTY_CLIPBOARD_LOCATION_STANDARD;
+    paste.mimes = names; paste.mimes_len = count;
+    paste.reader = (GhosttyMimeReader){.read = no_paste_data};
     return ghostty_terminal_paste(e->terminal, &paste, NULL);
 }
 static int update_history_cache(GmuxEngine *e, const GmuxFrame *frame,

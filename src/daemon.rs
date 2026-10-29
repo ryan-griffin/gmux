@@ -28,6 +28,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod clipboard;
 mod commands;
 mod event_loop;
 mod frontend;
@@ -96,6 +97,7 @@ struct Daemon {
     state: ExecutionState,
     limits: gmux_client::retention::ScrollbackLimits,
     frontends: HashMap<u64, Frontend>,
+    clipboard: clipboard::Broker,
     next_frontend: u64,
     revision: u64,
     changed: HashSet<u64>,
@@ -163,6 +165,7 @@ impl Daemon {
                 ..Default::default()
             },
             frontends: HashMap::new(),
+            clipboard: Default::default(),
             next_frontend: 0,
             revision: 0,
             changed: HashSet::new(),

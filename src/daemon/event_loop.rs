@@ -73,6 +73,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut exited = Vec::new();
     let mut compression_budget = crate::compression::CompressionBudget::new(Instant::now());
     loop {
+        daemon.maintain_clipboard();
         let now = Instant::now();
         if quit_at.is_some_and(|deadline| now >= deadline) {
             break;
@@ -146,6 +147,12 @@ pub fn run() -> anyhow::Result<()> {
             .min();
         let mut deadline = quit_at;
         for next in [
+            daemon.clipboard_deadline(),
+            daemon
+                .sessions
+                .values()
+                .any(TerminalSession::has_output_tail)
+                .then_some(now),
             (saving.is_none() && !controls.is_empty()).then_some(now),
             // Socket readiness cannot report commands already read into userspace.
             daemon
@@ -258,8 +265,14 @@ pub fn run() -> anyhow::Result<()> {
                     for request in requests {
                         let pane = daemon.resolve_pane(request.pane).ok();
                         let attach = request.is_attach();
+                        let clipboard_result = matches!(
+                            &request.command,
+                            transport::StreamCommand::ClipboardReadResult { .. }
+                                | transport::StreamCommand::ClipboardReadData { .. }
+                                | transport::StreamCommand::ClipboardReadEnd { .. }
+                        );
                         if let Err(error) = daemon.input(id, &mut frontend, request) {
-                            if attach {
+                            if attach || clipboard_result {
                                 connected = false;
                                 break;
                             }
@@ -277,6 +290,7 @@ pub fn run() -> anyhow::Result<()> {
             if connected {
                 daemon.frontends.insert(id, frontend);
             } else {
+                daemon.cancel_frontend_reads(id);
                 daemon.git_dirty = true;
                 daemon.resize_sessions(None);
             }
@@ -331,13 +345,23 @@ pub fn run() -> anyhow::Result<()> {
                 .is_some_and(|at| Instant::now() >= at)
                 .then_some(id)
         }));
+        ready.extend(
+            daemon
+                .sessions
+                .iter()
+                .filter_map(|(&id, s)| s.has_output_tail().then_some(id)),
+        );
         exited.clear();
         for id in ready.drain() {
             let recipient = daemon.clipboard_recipient(id);
+            let read_recipient = daemon.read_recipient(id);
             let Some(session) = daemon.sessions.get_mut(&id) else {
                 continue;
             };
+            session.set_read_enabled(read_recipient.is_some());
             let (update, clipboard) = session.poll_with_clipboard(recipient.is_some());
+            session.set_read_enabled(false);
+            let read = session.take_read_request();
             if update.progress_changed || update.program_status_changed {
                 daemon.metadata_changed.insert(id);
             }
@@ -362,6 +386,9 @@ pub fn run() -> anyhow::Result<()> {
                 && let Some(recipient) = recipient
             {
                 daemon.deliver_clipboard(recipient, id, clipboard);
+            }
+            if let Some(request) = read {
+                daemon.admit_read(id, read_recipient, request);
             }
         }
         if metadata_due {

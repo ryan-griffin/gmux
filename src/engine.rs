@@ -228,6 +228,10 @@ struct Events {
     program_status: crate::program_status::Records,
     clipboard: Vec<gmux_client::clipboard::Write>,
     clipboard_bytes: usize,
+    read_enabled: bool,
+    read_request: Option<gmux_client::clipboard::ReadRequest>,
+    read_tokens: f64,
+    read_refill: Option<std::time::Instant>,
     command: gmux_client::shell::CommandState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
@@ -313,6 +317,55 @@ unsafe extern "C" fn clipboard_write(
     });
     GMUX_CLIPBOARD_SUCCESS as i32
 }
+unsafe extern "C" fn clipboard_read(ud: *mut c_void, request: *const GmuxClipboardRead) -> i32 {
+    use gmux_client::clipboard::{Destination, ReadRequest, valid_mime};
+    let events = unsafe { &mut *ud.cast::<Events>() };
+    let request = unsafe { &*request };
+    if !events.read_enabled {
+        return GMUX_CLIPBOARD_UNSUPPORTED as i32;
+    }
+    if events.read_request.is_some() || request.count > 4 {
+        return GMUX_CLIPBOARD_BUSY as i32;
+    }
+    let now = std::time::Instant::now();
+    let previous = events.read_refill.replace(now);
+    events.read_tokens = previous.map_or(4.0, |t| {
+        (events.read_tokens + now.duration_since(t).as_secs_f64()).min(4.0)
+    });
+    if events.read_tokens < 1.0 {
+        return GMUX_CLIPBOARD_BUSY as i32;
+    }
+    let mimes = unsafe { std::slice::from_raw_parts(request.mimes, request.count) };
+    let names: Result<Vec<_>, _> = mimes
+        .iter()
+        .map(|m| std::str::from_utf8(unsafe { std::slice::from_raw_parts(m.ptr, m.len) }))
+        .collect();
+    let Ok(names) = names else {
+        return GMUX_CLIPBOARD_BUSY as i32;
+    };
+    if names.iter().any(|m| !valid_mime(m)) {
+        return GMUX_CLIPBOARD_BUSY as i32;
+    }
+    if request.id != 0 {
+        events.read_tokens -= 1.0;
+        let name = unsafe { std::slice::from_raw_parts(request.name.ptr, request.name.len) };
+        events.read_request = Some(ReadRequest {
+            id: request.id,
+            destination: if u32::from(request.destination) == GMUX_CLIPBOARD_PRIMARY {
+                Destination::Primary
+            } else {
+                Destination::Clipboard
+            },
+            mimes: names.into_iter().map(str::to_owned).collect(),
+            list: request.list,
+            name: String::from_utf8_lossy(name).into_owned(),
+            granted: request.granted,
+            epoch: None,
+        });
+    }
+    GMUX_CLIPBOARD_SUCCESS as i32
+}
+
 unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usize) {
     // The C engine calls synchronously on the thread owning the session.
     // Its userdata is a stable Box owned by Engine, valid until gmux_engine_free.
@@ -614,6 +667,121 @@ impl Engine {
             gmux_engine_clipboard_callback(self.raw.as_ptr(), enabled.then_some(clipboard_write))
         }
     }
+    pub(crate) fn set_read_enabled(&mut self, enabled: bool) {
+        self.events.read_enabled = enabled;
+    }
+    pub(crate) fn take_read_request(&mut self) -> Option<gmux_client::clipboard::ReadRequest> {
+        self.events.read_request.take()
+    }
+    pub(crate) fn read_pending(&self) -> u64 {
+        unsafe { gmux_engine_read_pending(self.raw.as_ptr()) }
+    }
+    pub(crate) fn discard_read(&mut self) {
+        unsafe { gmux_engine_read_discard(self.raw.as_ptr()) };
+        self.events.read_request = None;
+    }
+    pub(crate) fn clear_grants(&mut self) {
+        unsafe { gmux_engine_grants_clear(self.raw.as_ptr()) };
+    }
+    pub(crate) fn complete_read(
+        &mut self,
+        result: &gmux_client::clipboard::ReadResult,
+        data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            result.byte_len()? == data.len(),
+            "Invalid clipboard payload length"
+        );
+        let start = self.events.replies.len();
+        let mut offset = 0;
+        let values: Vec<_> = result
+            .contents
+            .iter()
+            .map(|c| {
+                let bytes = &data[offset..offset + c.len];
+                offset += c.len;
+                GmuxClipboardContent {
+                    mime: GmuxText {
+                        ptr: c.mime.as_ptr(),
+                        len: c.mime.len(),
+                    },
+                    data: GmuxText {
+                        ptr: bytes.as_ptr(),
+                        len: bytes.len(),
+                    },
+                }
+            })
+            .collect();
+        let available: Vec<_> = result
+            .available
+            .iter()
+            .map(|s| GmuxText {
+                ptr: s.as_ptr(),
+                len: s.len(),
+            })
+            .collect();
+        let rc = unsafe {
+            gmux_engine_read_complete(
+                self.raw.as_ptr(),
+                result.id,
+                result.status as u8,
+                values.as_ptr(),
+                values.len(),
+                available.as_ptr(),
+                available.len(),
+            )
+        };
+        anyhow::ensure!(rc == 0, "Native clipboard read completion failed ({rc})");
+        Ok(self.events.replies.split_off(start))
+    }
+    pub(crate) fn step_read(&mut self) -> anyhow::Result<(bool, Vec<u8>)> {
+        let start = self.events.replies.len();
+        let mut done = false;
+        let rc = unsafe { gmux_engine_read_step(self.raw.as_ptr(), &mut done) };
+        anyhow::ensure!(rc == 0, "Native clipboard response failed ({rc})");
+        Ok((done, self.events.replies.split_off(start)))
+    }
+    pub(crate) fn user_paste(
+        &mut self,
+        destination: gmux_client::clipboard::Destination,
+        mimes: &[String],
+    ) -> anyhow::Result<Vec<u8>> {
+        gmux_client::clipboard::validate_targets(mimes)?;
+        let names: Vec<_> = mimes
+            .iter()
+            .map(|s| GmuxText {
+                ptr: s.as_ptr(),
+                len: s.len(),
+            })
+            .collect();
+        let start = self.events.replies.len();
+        let rc = unsafe {
+            gmux_engine_user_paste(
+                self.raw.as_ptr(),
+                destination as u8,
+                names.as_ptr(),
+                names.len(),
+            )
+        };
+        anyhow::ensure!(rc == 0, "Native paste event failed ({rc})");
+        Ok(self.events.replies.split_off(start))
+    }
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> (bool, usize) {
+        let mut consumed = 0;
+        let changed = unsafe {
+            gmux_engine_feed(
+                self.raw.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut consumed,
+            )
+        };
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+            self.find.invalidate();
+        }
+        (changed, consumed)
+    }
     pub(crate) fn take_clipboard_writes(&mut self) -> Vec<gmux_client::clipboard::Write> {
         self.events.clipboard_bytes = 0;
         std::mem::take(&mut self.events.clipboard)
@@ -766,6 +934,9 @@ impl Engine {
             gmux_engine_new((&mut *events as *mut Events).cast(), Some(event))
         })
         .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
+        unsafe {
+            gmux_engine_read_callback(raw.as_ptr(), Some(clipboard_read));
+        }
         let mut engine = Self {
             revision: 1,
             history: GmuxHistory {
@@ -1146,10 +1317,9 @@ impl Engine {
     pub fn mode(&self, mode: i32) -> bool {
         unsafe { gmux_engine_mode(self.raw.as_ptr(), mode) != 0 }
     }
-    pub fn paste(&mut self, text: &str, clipboard: bool) -> anyhow::Result<Vec<u8>> {
+    pub fn paste(&mut self, text: &str) -> anyhow::Result<Vec<u8>> {
         let start = self.events.replies.len();
-        let result =
-            unsafe { gmux_engine_paste(self.raw.as_ptr(), text.as_ptr(), text.len(), clipboard) };
+        let result = unsafe { gmux_engine_paste(self.raw.as_ptr(), text.as_ptr(), text.len()) };
         anyhow::ensure!(result == 0, "Ghostty paste failed ({result})");
         // Return only this paste's bytes. Device replies already queued by
         // terminal output remain available to the PTY update loop.
@@ -2111,7 +2281,7 @@ mod tests {
                 fresh.key("Up", layout(0), 0, KeyAction::Press, ""),
                 b"\x1b[A"
             );
-            assert_eq!(fresh.paste("input", false).unwrap(), b"input");
+            assert_eq!(fresh.paste("input").unwrap(), b"input");
             assert_eq!(fresh.metadata(false), "");
             fresh.write(b"fresh shell\r\n");
             let text = fresh.text().unwrap();
@@ -2124,16 +2294,20 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_continuation_budget_recovers_after_the_parser_returns_to_ground() {
+    fn checkpoints_omit_large_unfinished_input_without_mutating_the_live_parser() {
         let mut old = Engine::new().unwrap();
-        old.write(b"primary history\r\n\x1b]2;");
+        old.write(b"primary history\r\n");
+        let before = old.checkpoint().unwrap();
+        old.write(b"\x1b]2;");
         old.write(&vec![b'a'; 64 * 1024 + 1]);
-        assert!(
-            old.checkpoint().is_err(),
-            "An untracked continuation must never become a partial snapshot"
-        );
-        old.write(b"\x07");
         let snapshot = old.checkpoint().unwrap();
+        assert_eq!(snapshot, before);
+        // The oversized title is discarded by the parser's own limits. A
+        // smaller continuation still completes normally after checkpointing.
+        old.write(b"\x07\x1b]2;live ");
+        old.checkpoint().unwrap();
+        old.write(b"parser\x07");
+        assert_eq!(old.metadata(false), "live parser");
         let mut fresh = Engine::new().unwrap();
         fresh.restore_history(&snapshot).unwrap();
         fresh.write(b"fresh shell");
@@ -2419,18 +2593,18 @@ mod tests {
     fn paste_uses_terminal_modes_and_preserves_queued_device_replies() {
         let mut engine = Engine::new().unwrap();
         engine.write(b"\x1b[6n");
-        assert_eq!(engine.paste("one\ntwo", false).unwrap(), b"one\rtwo");
+        assert_eq!(engine.paste("one\ntwo").unwrap(), b"one\rtwo");
         assert_eq!(engine.take_events().0, b"\x1b[1;1R");
         engine.write(b"\x1b[?2004h");
         assert_eq!(
-            engine.paste("one\ntwo 界", true).unwrap(),
+            engine.paste("one\ntwo 界").unwrap(),
             "\x1b[200~one\ntwo 界\x1b[201~".as_bytes()
         );
         assert_eq!(
-            engine.paste("\x1b[201~\0", true).unwrap(),
+            engine.paste("\x1b[201~\0").unwrap(),
             b"\x1b[200~ [201~ \x1b[201~"
         );
-        assert!(engine.paste("", true).unwrap().is_empty());
+        assert!(engine.paste("").unwrap().is_empty());
     }
     #[test]
     fn incremental_snapshots_keep_clean_rows_and_follow_resize_and_scrollback() {

@@ -41,8 +41,7 @@ to return JSON containing `text` and optional `html`. Socket clients can request
 
 Terminal applications can write through OSC 52, iTerm2 OSC 1337 `Copy`, and Kitty
 OSC 5522. The pinned libghostty normalizes these protocols into one atomic write
-callback. Gmux does not parse a second copy of these protocols. Clipboard reads
-remain disabled, including Kitty reads and OSC 52 `?`.
+callback. Gmux does not parse a second copy of these protocols. Clipboard reads use the permission and lifetime rules below.
 
 Kitty writes can offer these exact MIME names together:
 
@@ -119,6 +118,64 @@ sys.stdout.flush()
 For larger data, split each MIME's base64 stream across `wdata` packets rather
 than putting the whole file in one OSC sequence. The same transaction can include
 an `image/png` representation containing the file's exact bytes.
+
+## Application reads
+
+Terminal programs can request plain text through OSC 52 `?`, or MIME data and
+available targets through Kitty OSC 5522. Gmux routes each request to one attached
+clipboard-capable window viewing the pane, preferring the focused window. It
+never broadcasts a request or transfers an outstanding approval to another
+window. Headless observers have no clipboard capability by default.
+
+Data reads require Allow Once in a permission strip in that pane. Remote reads
+name the destination connection in the strip and access the viewing computer's
+clipboard, not the daemon host's clipboard. Program-supplied names are not trusted
+identities. Gmux does not remember approvals, prefetch clipboard content, or save
+requests, grants, or clipboard bytes. History checkpoints omit unfinished parser
+input as well, so partial clipboard control strings are never saved. Deny
+suppresses unsolicited data reads from the pane for 30 seconds. A genuine user
+paste still authorizes its one-use follow-up. Requests expire
+after 15 seconds without an answer; content transfer has a five-second deadline.
+
+A targets-only Kitty request is allowed without a content prompt. A request for
+both targets and data still requires permission. Target discovery reads format
+metadata only. Each request can read up to four MIME entries and 4 MiB of decoded
+data, counting repeated requested entries. Listings contain at most 16 valid
+names and 4096 bytes. MIME names are limited to 256 bytes. Unavailable formats
+are omitted. Plain text must be NUL-free UTF-8; other MIME data preserves exact
+bytes. Gmux does not render HTML, decode images, or open files named in clipboard
+data.
+
+The standard clipboard and primary selection are separate destinations. User
+paste preserves that destination. With terminal mode 5522 enabled, a genuine
+keyboard, menu, or middle-click paste sends a native targets event with a one-use
+password. The application's follow-up data read needs no additional prompt while
+its five-second paste authorization remains valid. A targets listing preserves
+that authorization. A clipboard change, a new paste, detach, recipient change,
+or pane exit revokes it. The authorization belongs to that pane, window,
+destination, connection, and clipboard generation. GTK independently checks its
+own recent paste gesture before honoring a daemon's grant. Scripted paste, CLI input, IME input,
+and program-supplied names or passwords do not create user-paste authorization.
+Ordinary text paste continues to use native terminal-mode handling. A deliberate
+paste supersedes unanswered clipboard work in its window, including consent
+pending in another split pane. A response already encoding finishes its ordered
+PTY-input transaction.
+
+A pending read pauses only its pane's output. The daemon continues polling other
+PTYs and serving windows. GTK obtains permission and reads clipboard streams
+asynchronously. Gmux owns a native deferred request instead of retaining the
+borrowed callback or reply pointer. After validation, the native encoder emits
+at most 64 KiB of raw data per daemon turn. Its response remains one ordered PTY
+input transaction, including when keyboard input arrives during encoding.
+
+Clipboard changes during content transfer abort the read. Detach, capability
+loss, pane exit, and timeouts cancel pending work. No completed result is replayed
+on reconnect. Kitty receives EPERM for denial, ENOSYS when no frontend or
+supported destination is available, EBUSY for admission limits or timeouts, and
+EIO for transfer failures. OSC 52 receives an empty response for each failure.
+Malformed native protocol requests can be ignored before admission. Per-pane
+and per-window rate limits, a maximum of 16 pending reads, bounded staging
+memory, and existing transport queues limit malicious bursts.
 
 The [pinned callback contract](https://github.com/ghostty-org/ghostty/blob/83fb95624b0439ee660c2679b43b38c8b63769cd/include/ghostty/vt/terminal.h)
 defines borrowing, atomicity, and protocol replies. GDK documents

@@ -47,6 +47,10 @@ impl Packet {
                 .as_ref()
                 .and_then(|write| write.content.as_ref())
                 .map_or(0, crate::clipboard::Offer::memory_size)
+            + header
+                .clipboard_read
+                .as_ref()
+                .map_or(0, crate::clipboard::ReadEvent::memory_size)
             + header.find.as_ref().map_or(0, |find| {
                 find.highlights.capacity() * size_of::<(usize, usize, u8)>()
             })

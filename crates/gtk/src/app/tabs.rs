@@ -30,7 +30,10 @@ impl Ui {
             focus,
             close,
             self.app.upcast_ref(),
-            self.keyboard.clone(),
+            crate::terminal::InputContext {
+                keyboard: self.keyboard.clone(),
+                clipboard: self.clipboard.clone(),
+            },
         ))
     }
     pub(super) fn new_tab(self: &Rc<Self>) {

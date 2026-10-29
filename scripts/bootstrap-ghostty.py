@@ -20,7 +20,9 @@ ZIG_SHA256 = {
     "x86_64": "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026",
     "aarch64": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
 }
-PATCHES = [ROOT / "scripts/patches/ghostty-media-keys.patch"]
+PATCHES = [ROOT / "scripts/patches/ghostty-media-keys.patch",
+           ROOT / "scripts/patches/ghostty-clipboard-reads.patch",
+           ROOT / "scripts/patches/ghostty-snapshot-state.patch"]
 
 
 def download(url, destination, checksum=None):

@@ -74,9 +74,10 @@ remote connections. Gmux sends each write to one window viewing the pane, prefer
 the last focused eligible window, then the earliest connected window. The `c`
 destination uses the system clipboard and `p` uses primary selection where the
 desktop supports it. An empty OSC 52 payload clears the destination. Secondary
-selection and clipboard reads are unsupported. Application writes are
-limited to 4 MiB of decoded data and discarded when no eligible window is
-connected. They are never replayed on attachment or session restore.
+selection is unsupported. Program clipboard reads ask for Allow Once in the
+viewing pane; target listings and one-use user-paste grants need no extra prompt.
+Application writes are limited to 4 MiB of decoded data and discarded when no
+eligible window is connected. They are never replayed on attachment or session restore.
 
 Settings and saved layouts live in `~/.config/gmux/`, or `$XDG_CONFIG_HOME/gmux/`.
 

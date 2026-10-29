@@ -187,6 +187,27 @@ typedef struct { GmuxText mime, data; } GmuxClipboardContent;
 typedef int (*GmuxClipboardFn)(void *userdata, uint8_t destination,
     const GmuxClipboardContent *contents, size_t count);
 void gmux_engine_clipboard_callback(GmuxEngine *engine, GmuxClipboardFn callback);
+// Read metadata is borrowed only for admission. An id of zero checks capacity
+// without copying; the second call publishes the native-owned deferred ID.
+typedef struct {
+    uint64_t id;
+    uint8_t destination;
+    bool list, granted;
+    const GmuxText *mimes;
+    size_t count;
+    GmuxText name;
+} GmuxClipboardRead;
+typedef int (*GmuxClipboardReadFn)(void *userdata, const GmuxClipboardRead *read);
+void gmux_engine_read_callback(GmuxEngine *engine, GmuxClipboardReadFn callback);
+uint64_t gmux_engine_read_pending(GmuxEngine *engine);
+int gmux_engine_read_complete(GmuxEngine *engine, uint64_t id, uint8_t result,
+    const GmuxClipboardContent *contents, size_t count, const GmuxText *available, size_t targets);
+int gmux_engine_read_step(GmuxEngine *engine, bool *done);
+void gmux_engine_read_discard(GmuxEngine *engine);
+void gmux_engine_grants_clear(GmuxEngine *engine);
+int gmux_engine_user_paste(GmuxEngine *engine, uint8_t destination, const GmuxText *mimes, size_t count);
+// Stops after a deferred callback. Only consumed bytes update the terminal.
+bool gmux_engine_feed(GmuxEngine *engine, const uint8_t *data, size_t len, size_t *consumed);
 // Called synchronously; true accepts all borrowed bytes, false aborts formatting.
 typedef bool (*GmuxWriterFn)(void *userdata, const uint8_t *data, size_t len);
 
@@ -246,7 +267,7 @@ bool gmux_engine_cursor_at_prompt(GmuxEngine *engine);
 bool gmux_engine_expire_render_hold(GmuxEngine *engine);
 size_t gmux_engine_string(GmuxEngine *engine, int pwd, uint8_t *out, size_t cap);
 int gmux_engine_mode(GmuxEngine *engine, int mode);
-int gmux_engine_paste(GmuxEngine *engine, const uint8_t *data, size_t len, bool clipboard);
+int gmux_engine_paste(GmuxEngine *engine, const uint8_t *data, size_t len);
 size_t gmux_engine_key(GmuxEngine *engine, const char *name, uint16_t physical,
     uint32_t unshifted, uint16_t consumed_mods, uint16_t mods,
     uint8_t action, const char *text, size_t len, uint8_t *out, size_t cap);

@@ -1,0 +1,569 @@
+--- a/include/ghostty/vt/terminal.h
++++ b/include/ghostty/vt/terminal.h
+@@ -1219,10 +1219,11 @@
+  * callback duration.
+  *
+  * The read is answered by calling `reply` with this request and a
+- * GhosttyClipboardReadReply. This must happen before the callback returns;
+- * the request is invalid afterwards. Calling `reply` more than once is
+- * ignored. Returning without replying answers the program with an empty
+- * clipboard (OSC 52) or EPERM (OSC 5522).
++ * GhosttyClipboardReadReply before the callback returns, or transferring the
++ * request through ghostty_terminal_clipboard_read_defer(). The borrowed request
++ * is invalid afterwards in both cases. Calling `reply` more than once is
++ * ignored. Returning without a reply or successful deferral answers the program
++ * with an empty clipboard (OSC 52) or EPERM (OSC 5522).
+  *
+  * @ingroup terminal
+  */
+@@ -1282,15 +1283,45 @@
+ };
+ 
+ /**
++ * Transfer the exact live callback request into terminal-owned state. Call only
++ * inside its callback. On success the original request is answered without
++ * output and out_id identifies one owned pending request. On failure it remains
++ * synchronously answerable. Never retain the request or its pointers.
++ *
++ * Use vt_write_until(OSC_END) and stop feeding this terminal until completion.
++ * Completion and step run on the terminal owner thread outside callbacks.
++ */
++GHOSTTY_API GhosttyResult ghostty_terminal_clipboard_read_defer(
++    GhosttyTerminal terminal, const GhosttyClipboardRead* request, uint64_t* out_id);
++/**
++ * Begin a deferred response exactly once. Non-success results emit the normal
++ * native failure response and release the ID. Success owns the supplied bytes
++ * before returning and emits nothing. At most four representations, 4 MiB of
++ * expanded requested data, 16 available names and 4096 listing bytes are accepted.
++ * Call step until done; all response bytes must remain one PTY-input transaction.
++ * Wrong/stale IDs and invalid replies emit nothing. A failed begin may be retried
++ * with a failure result. Terminal destruction discards either state.
++ */
++GHOSTTY_API GhosttyResult ghostty_terminal_clipboard_read_complete(
++    GhosttyTerminal terminal, uint64_t id, const GhosttyClipboardReadReply* reply);
++/** Emit at most 64 KiB raw data. Final step releases the ID. */
++GHOSTTY_API GhosttyResult ghostty_terminal_clipboard_read_step(
++    GhosttyTerminal terminal, uint64_t id, bool* out_done);
++/** Discard without output only when abandoning the PTY input stream. */
++GHOSTTY_API GhosttyResult ghostty_terminal_clipboard_read_discard(GhosttyTerminal terminal, uint64_t id);
++/** Revoke transient read/write and one-time paste grants. */
++GHOSTTY_API void ghostty_terminal_clipboard_grants_clear(GhosttyTerminal terminal);
++
++/**
+  * Callback function type for clipboard_read.
+  *
+  * Called synchronously when the running program requests clipboard contents
+  * via OSC 52 with a "?" payload or a Kitty clipboard (OSC 5522) read.
+  * Answering lets the program read the user's clipboard, so the embedder is
+- * expected to mediate consent. Because the read is synchronous, an embedder
+- * that needs to ask the user must block (for example by running a modal
+- * prompt) until it has an answer; the VT stream waits until the callback
+- * returns.
++ * expected to mediate consent. For asynchronous consent or clipboard access,
++ * transfer to owned state with ghostty_terminal_clipboard_read_defer(), stop the
++ * terminal at OSC_END, and complete/step later on its owner thread. Do not block
++ * unrelated terminals or retain this callback's borrowed request.
+  *
+  * Answer by calling `read->reply(read, &reply)` before returning. See
+  * GhosttyClipboardRead for the full contract.
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -329,6 +329,11 @@
+         @export(&c.terminal_reset, .{ .name = "ghostty_terminal_reset" });
+         @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
+         @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
++        @export(&c.terminal_clipboard_read_defer, .{ .name = "ghostty_terminal_clipboard_read_defer" });
++        @export(&c.terminal_clipboard_read_complete, .{ .name = "ghostty_terminal_clipboard_read_complete" });
++        @export(&c.terminal_clipboard_read_step, .{ .name = "ghostty_terminal_clipboard_read_step" });
++        @export(&c.terminal_clipboard_read_discard, .{ .name = "ghostty_terminal_clipboard_read_discard" });
++        @export(&c.terminal_clipboard_grants_clear, .{ .name = "ghostty_terminal_clipboard_grants_clear" });
+         @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
+         @export(&c.terminal_vt_write_until, .{ .name = "ghostty_terminal_vt_write_until" });
+         @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -192,6 +192,11 @@
+ pub const terminal_reset = terminal.reset;
+ pub const terminal_resize = terminal.resize;
+ pub const terminal_set = terminal.set;
++pub const terminal_clipboard_read_defer = terminal.clipboard_read_defer;
++pub const terminal_clipboard_read_complete = terminal.clipboard_read_complete;
++pub const terminal_clipboard_read_step = terminal.clipboard_read_step;
++pub const terminal_clipboard_read_discard = terminal.clipboard_read_discard;
++pub const terminal_clipboard_grants_clear = terminal.clipboard_grants_clear;
+ pub const terminal_vt_write = terminal.vt_write;
+ pub const terminal_vt_write_until = terminal.vt_write_until;
+ pub const terminal_scroll_viewport = terminal.scroll_viewport;
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -86,6 +86,7 @@
+     terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
+     stream: Stream,
+     effects: Effects = .{},
++    active_clipboard_read: ?*const ClipboardRead = null,
+     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+     searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
+ 
+@@ -575,6 +576,8 @@
+             .ctx = &ctx,
+             .reply = &clipboardReadReplyTrampoline,
+         };
++        wrapper.active_clipboard_read = &request;
++        defer wrapper.active_clipboard_read = null;
+         func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
+     }
+ 
+@@ -1052,6 +1055,74 @@
+         io,
+         default_continuation_max_bytes,
+     );
++}
++
++/// Only the original callback pointer can transfer a borrowed request.
++pub fn clipboard_read_defer(t: Terminal, request: ?*const ClipboardRead, out: ?*u64) callconv(lib.calling_conv) Result {
++    const wrapper = t orelse return .invalid_value;
++    const r = request orelse return .invalid_value;
++    const id = out orelse return .invalid_value;
++    if (wrapper.active_clipboard_read != r) return .invalid_value;
++    const ctx: *const Effects.ClipboardReadCtx = @ptrCast(@alignCast(r.ctx));
++    id.* = ctx.read.deferReply() orelse return .out_of_memory;
++    return .success;
++}
++
++pub fn clipboard_read_complete(t: Terminal, id: u64, reply_: ?*const ClipboardReadReply) callconv(lib.calling_conv) Result {
++    const wrapper = t orelse return .invalid_value;
++    if (wrapper.active_clipboard_read != null) return .invalid_value;
++    const reply = reply_ orelse return .invalid_value;
++    if (reply.size < @sizeOf(ClipboardReadReply)) return .invalid_value;
++    const result: clipboard.Read.Result = switch (reply.result) {
++        .denied => .denied,
++        .unsupported => .unsupported,
++        .busy => .busy,
++        .io_error => .io_error,
++        .success => success: {
++            if (reply.contents_len > 4 or reply.available_len > 16) return .invalid_value;
++            if ((reply.contents_len > 0 and reply.contents == null) or (reply.available_len > 0 and reply.available == null)) return .invalid_value;
++            var contents: [4]clipboard.Content = undefined;
++            var available: [16][]const u8 = undefined;
++            for (0..reply.contents_len) |i| {
++                const c = reply.contents.?[i];
++                contents[i] = .{ .mime = c.mime.ptr[0..c.mime.len], .data = c.data.ptr[0..c.data.len] };
++            }
++            for (0..reply.available_len) |i| {
++                const m = reply.available.?[i];
++                available[i] = m.ptr[0..m.len];
++            }
++            // Complete while conversion arrays still live.
++            wrapper.stream.handler.completeRead(id, .{ .success = .{ .contents = contents[0..reply.contents_len], .available = available[0..reply.available_len], .remember = reply.remember } }) catch |err| return switch (err) {
++                error.OutOfMemory => .out_of_memory,
++                else => .invalid_value,
++            };
++            break :success .{ .success = .{} };
++        },
++        _ => return .invalid_value,
++    };
++    if (reply.result != .success) wrapper.stream.handler.completeRead(id, result) catch return .invalid_value;
++    return .success;
++}
++
++pub fn clipboard_read_step(t: Terminal, id: u64, out: ?*bool) callconv(lib.calling_conv) Result {
++    const wrapper = t orelse return .invalid_value;
++    const done = out orelse return .invalid_value;
++    if (wrapper.active_clipboard_read != null) return .invalid_value;
++    done.* = wrapper.stream.handler.stepRead(id) catch return .invalid_value;
++    return .success;
++}
++
++/// Discard only when the host tears down the PTY or abandons its input stream.
++pub fn clipboard_read_discard(t: Terminal, id: u64) callconv(lib.calling_conv) Result {
++    const wrapper = t orelse return .invalid_value;
++    if (wrapper.active_clipboard_read != null) return .invalid_value;
++    return if (wrapper.stream.handler.discardRead(id)) .success else .invalid_value;
++}
++
++pub fn clipboard_grants_clear(t: Terminal) callconv(lib.calling_conv) void {
++    const wrapper = t orelse return;
++    wrapper.stream.handler.kitty_clipboard_grants.deinit(wrapper.terminal.gpa());
++    wrapper.stream.handler.kitty_clipboard_grants = .{};
+ }
+ 
+ pub fn vt_write(
+@@ -1849,6 +1920,9 @@
+ 
+ pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
+     const wrapper = terminal_ orelse return;
++    if (wrapper.active_clipboard_read != null) return;
++    if (wrapper.stream.handler.pending_read) |p| _ = wrapper.stream.handler.discardRead(p.id);
++    clipboard_grants_clear(terminal_);
+     const t: *ZigTerminal = wrapper.terminal;
+ 
+     // A reset always turns off synchronized output, ending its hold.
+--- a/src/terminal/clipboard.zig
++++ b/src/terminal/clipboard.zig
+@@ -151,9 +151,13 @@
+ ///
+ /// Reads are synchronous: the effect callback must answer through `reply`
+ /// before it returns, and the request (including its reply context) is
+-/// invalid afterwards. An embedder that needs user consent must block until
+-/// it has an answer; the VT stream waits with it.
++/// invalid afterwards. Alternatively deferReply transfers response state into
++/// the terminal. The caller stops at OSC_END and completes on the owner thread.
+ pub const Read = struct {
++    /// Transfer response state to the terminal. Only valid during the callback.
++    /// Failure leaves the synchronous request unanswered.
++    defer_fn: ?*const fn (*anyopaque) ?u64 = null,
++
+     location: Location,
+ 
+     /// The MIME types the program wants, in order of preference. The
+@@ -200,6 +204,10 @@
+         self.reply_fn(self.reply_ctx, result);
+     }
+ 
++    pub fn deferReply(self: Read) ?u64 {
++        return if (self.defer_fn) |f| f(self.reply_ctx) else null;
++    }
++
+     /// The status of a clipboard read reply.
+     pub const Status = enum(c_int) {
+         success = 0,
+--- a/src/terminal/kitty/clipboard_response.zig
++++ b/src/terminal/kitty/clipboard_response.zig
+@@ -149,7 +149,7 @@
+ 
+     /// Encode the targets ('.') listing packet. The listing gets a
+     /// trailing newline when non-empty.
+-    fn encodeListing(
++    pub fn encodeListing(
+         self: *const ReadSuccess,
+         writer: *std.Io.Writer,
+     ) std.Io.Writer.Error!void {
+--- a/src/terminal/osc.zig
++++ b/src/terminal/osc.zig
+@@ -413,6 +413,7 @@
+     /// Capture state. If this is set then we're actively capturing the
+     /// bytes coming into the parser.
+     capture: ?Capture,
++    clipboard_payload: bool = false,
+ 
+     /// The command that is the result of parsing.
+     command: Command,
+@@ -518,6 +519,7 @@
+ 
+     /// Reset the parser state.
+     pub fn reset(self: *Parser) void {
++        self.clipboard_payload = false;
+         // If we're capturing, then stop it.
+         if (self.capture) |*cap| cap.deinit();
+ 
+@@ -821,6 +823,17 @@
+ 
+         const rem = input[offset..];
+         if (rem.len == 0) return;
++        if (self.state == .@"5522" and !self.clipboard_payload) {
++            for (rem, 0..) |c, i| {
++                self.next(c);
++                if (self.state == .invalid) return;
++                if (self.clipboard_payload) {
++                    self.nextSlice(rem[i + 1 ..]);
++                    return;
++                }
++            }
++            return;
++        }
+         self.capture.?.writeSlice(rem) catch |err| switch (err) {
+             // We have overflowed our buffer or had some other error.
+             // Discard any further input.
+@@ -837,6 +850,19 @@
+         // If a writer has been initialized, we just accumulate the rest of the
+         // OSC sequence in the writer's buffer and skip the state machine.
+         if (self.capture) |*cap| {
++            if (self.state == .@"5522" and !self.clipboard_payload) {
++                if (cap.trailing().len >= 4096) {
++                    self.captureFailed();
++                    return;
++                }
++                if (c == ';') {
++                    self.clipboard_payload = true;
++                    // Protocol metadata parser decides the operation; no second grammar.
++                    if (@import("kitty/clipboard_command.zig").Metadata.operation(cap.trailing()) == .read) {
++                        cap.max_bytes = @min(cap.max_bytes, cap.trailing().len + 8193);
++                    }
++                }
++            }
+             cap.writeByte(c) catch |err| switch (err) {
+                 // We have overflowed our buffer or had some other error.
+                 // Discard any further input.
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -56,6 +56,7 @@
+     /// such as hitting Kitty image limits, failure to write a response,
+     /// do not flag this.
+     semantic_failure: bool = false,
++    pending_read: ?*PendingRead = null,
+ 
+     /// Callbacks for certain effects that handlers may have. These
+     /// may or may not fully replace internal handling of certain effects,
+@@ -507,7 +508,208 @@
+         };
+     }
+ 
++    const PendingRead = struct {
++        id: u64,
++        arena: std.heap.ArenaAllocator,
++        state: union(enum) { osc52: ClipboardReadState, kitty: KittyClipboardReadState },
++        response: ?Response = null,
++        index: usize = 0,
++        offset: usize = 0,
++        started: bool = false,
++        const Response = struct {
++            storage: []align(@alignOf(clipboard.Content)) u8,
++            value: clipboard.Read.Result.Success,
++        };
++    };
++    var next_read_id: std.atomic.Value(u64) = .init(1);
++
++    fn freePendingRead(self: *Handler, p: *PendingRead) void {
++        if (p.response) |r| self.terminal.gpa().free(r.storage);
++        p.arena.deinit();
++        self.terminal.gpa().destroy(p);
++    }
++
++    fn deferRead(self: *Handler, state: @FieldType(PendingRead, "state")) !u64 {
++        if (self.pending_read != null) return error.Busy;
++        const alloc = self.terminal.gpa();
++        const p = try alloc.create(PendingRead);
++        errdefer alloc.destroy(p);
++        p.* = .{ .id = next_read_id.fetchAdd(1, .monotonic), .arena = .init(alloc), .state = state };
++        errdefer p.arena.deinit();
++        if (p.state == .kitty) {
++            const s = &p.state.kitty;
++            if (s.id.len > 512 or s.pw.len > 128 or s.mimes.len > 4) return error.Invalid;
++            s.id = try p.arena.allocator().dupe(u8, s.id);
++            s.pw = try p.arena.allocator().dupe(u8, s.pw);
++            const mimes = try p.arena.allocator().alloc([]const u8, s.mimes.len);
++            for (mimes, s.mimes) |*dest, mime| {
++                if (mime.len > 256) return error.Invalid;
++                dest.* = try p.arena.allocator().dupe(u8, mime);
++            }
++            s.mimes = mimes;
++        }
++        self.pending_read = p;
++        return p.id;
++    }
++
++    pub fn discardRead(self: *Handler, id: u64) bool {
++        const p = self.pending_read orelse return false;
++        if (p.id != id) return false;
++        self.pending_read = null;
++        self.freePendingRead(p);
++        return true;
++    }
++
++    /// Own the response before any success bytes are emitted. Errors may be
++    /// retried or cancelled; no allocation from a failed begin is retained.
++    pub fn completeRead(self: *Handler, id: u64, result: clipboard.Read.Result) !void {
++        const p = self.pending_read orelse return error.Invalid;
++        if (p.id != id or p.response != null) return error.Invalid;
++        if (result != .success) {
++            switch (p.state) {
++                .osc52 => |*s| ClipboardReadState.reply(s, result),
++                .kitty => |*s| KittyClipboardReadState.reply(s, result),
++            }
++            self.pending_read = null;
++            self.freePendingRead(p);
++            return;
++        }
++        const success = result.success;
++        if (success.contents.len > 4 or success.available.len > 16) return error.Invalid;
++        var selected: [4]clipboard.Content = undefined;
++        var count: usize = 0;
++        var total: usize = 0;
++        var names_bytes: usize = 0;
++        const wanted: []const []const u8 = switch (p.state) {
++            .osc52 => &.{"text/plain"},
++            .kitty => |state| state.mimes,
++        };
++        for (wanted) |mime| {
++            for (success.contents) |c| {
++                const matches = if (p.state == .osc52) clipboard.isTextMime(c.mime) else std.mem.eql(u8, mime, c.mime);
++                if (!matches) continue;
++                if (c.mime.len > 256 or c.data.len > 4 * 1024 * 1024 - total) return error.Invalid;
++                total += c.data.len;
++                names_bytes += c.mime.len;
++                selected[count] = c;
++                count += 1;
++                break;
++            }
++        }
++        var listing_bytes: usize = 0;
++        for (success.available) |mime| {
++            if (mime.len == 0 or mime.len > 256) return error.Invalid;
++            listing_bytes += mime.len + 1;
++            if (listing_bytes > 4096) return error.Invalid;
++        }
++        // One allocation bounds storage independently of arena growth and MIME
++        // order. The host can reserve raw expanded bytes plus 8 KiB metadata.
++        const capacity = total + names_bytes + listing_bytes + count * @sizeOf(clipboard.Content) +
++            success.available.len * @sizeOf([]const u8) + 2 * @alignOf(clipboard.Content);
++        const storage = try self.terminal.gpa().alignedAlloc(u8, .of(clipboard.Content), capacity);
++        errdefer self.terminal.gpa().free(storage);
++        var fixed: std.heap.FixedBufferAllocator = .init(storage);
++        const a = fixed.allocator();
++        const served = try a.alloc(clipboard.Content, count);
++        const available = try a.alloc([]const u8, success.available.len);
++        for (served, selected[0..count]) |*dest, c|
++            dest.* = .{ .mime = try a.dupe(u8, c.mime), .data = try a.dupe(u8, c.data) };
++        for (available, success.available) |*dest, mime|
++            dest.* = try a.dupe(u8, mime);
++        const response: PendingRead.Response = .{ .storage = storage, .value = .{ .contents = served, .available = available } };
++        if (success.remember and p.state == .kitty and p.state.kitty.pw.len > 0)
++            try self.kitty_clipboard_grants.grant(self.terminal.gpa(), p.state.kitty.pw, .read, false);
++        p.response = response;
++    }
++
++    /// Emit at most 64 KiB raw bytes, using only a small packet scratch buffer.
++    /// The caller reserves the complete encoded transaction before beginning.
++    pub fn stepRead(self: *Handler, id: u64) !bool {
++        const p = self.pending_read orelse return error.Invalid;
++        if (p.id != id) return error.Invalid;
++        const r = p.response orelse return error.Invalid;
++        var buf: [8193]u8 = undefined;
++        var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
++        var remaining: usize = 64 * 1024;
++        switch (p.state) {
++            .osc52 => |s| {
++                const data = if (r.value.contents.len > 0) r.value.contents[0].data else "";
++                if (!p.started) {
++                    const kind: u8 = switch (s.location) {
++                        .primary => 'p',
++                        .selection => 's',
++                        else => 'c',
++                    };
++                    try w.print("\x1b]52;{c};", .{kind});
++                }
++                while (p.offset < data.len and remaining >= 4095) {
++                    const n = @min(@as(usize, 4095), data.len - p.offset);
++                    try std.base64.standard.Encoder.encodeWriter(&w, data[p.offset..][0..n]);
++                    p.offset += n;
++                    remaining -= n;
++                    buf[w.end] = 0;
++                    self.writePty(buf[0..w.end :0]);
++                    w.end = 0;
++                }
++                if (p.offset == data.len) try w.writeAll(s.terminator.string());
++            },
++            .kitty => |s| {
++                if (!p.started) {
++                    try (kitty_clipboard.Response{ .op = .read, .status = .OK, .primary = s.primary, .id = s.id, .terminator = s.terminator }).encode(&w);
++                    buf[w.end] = 0;
++                    self.writePty(buf[0..w.end :0]);
++                    w.end = 0;
++                    if (s.list) {
++                        // Reuse the native listing encoder without a second codec.
++                        var listing_buf: [8193]u8 = undefined;
++                        var listing: std.Io.Writer = .fixed(listing_buf[0 .. listing_buf.len - 1]);
++                        try (kitty_clipboard.ReadSuccess{ .id = s.id, .list = true, .available = r.value.available, .terminator = s.terminator }).encodeListing(&listing);
++                        listing_buf[listing.end] = 0;
++                        self.writePty(listing_buf[0..listing.end :0]);
++                    }
++                }
++                while (p.index < r.value.contents.len and remaining >= 4096) {
++                    const c = r.value.contents[p.index];
++                    if (p.offset == c.data.len) {
++                        p.index += 1;
++                        p.offset = 0;
++                        continue;
++                    }
++                    const n = @min(@as(usize, 4096), c.data.len - p.offset);
++                    try (kitty_clipboard.Response{ .op = .read, .status = .DATA, .id = s.id, .mime = c.mime, .payload = c.data[p.offset..][0..n], .terminator = s.terminator }).encode(&w);
++                    buf[w.end] = 0;
++                    self.writePty(buf[0..w.end :0]);
++                    w.end = 0;
++                    p.offset += n;
++                    remaining -= n;
++                    if (p.offset == c.data.len) {
++                        p.index += 1;
++                        p.offset = 0;
++                    }
++                }
++                if (p.index == r.value.contents.len)
++                    try (kitty_clipboard.Response{ .op = .read, .status = .DONE, .id = s.id, .terminator = s.terminator }).encode(&w);
++            },
++        }
++        p.started = true;
++        if (w.end > 0) {
++            buf[w.end] = 0;
++            self.writePty(buf[0..w.end :0]);
++        }
++        const done = switch (p.state) {
++            .osc52 => p.offset == (if (r.value.contents.len > 0) r.value.contents[0].data.len else 0),
++            .kitty => p.index == r.value.contents.len,
++        };
++        if (done) {
++            self.pending_read = null;
++            self.freePendingRead(p);
++        }
++        return done;
++    }
++
+     pub fn deinit(self: *Handler) void {
++        if (self.pending_read) |p| self.freePendingRead(p);
++
+         self.kittyClipboardAbort();
+         self.kitty_clipboard_grants.deinit(self.terminal.gpa());
+         self.apc_handler.deinit();
+@@ -1096,6 +1298,7 @@
+             .can_remember = false,
+             .reply_ctx = &state,
+             .reply_fn = &ClipboardReadState.reply,
++            .defer_fn = &ClipboardReadState.deferReply,
+         });
+ 
+         // The program is waiting on us, so a callback that returned
+@@ -1113,6 +1316,14 @@
+         location: clipboard.Location,
+         terminator: osc.Terminator,
+         replied: bool = false,
++
++        fn deferReply(ctx: *anyopaque) ?u64 {
++            const state: *ClipboardReadState = @ptrCast(@alignCast(ctx));
++            if (state.replied) return null;
++            const id = state.handler.deferRead(.{ .osc52 = state.* }) catch return null;
++            state.replied = true;
++            return id;
++        }
+ 
+         fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
+             const self: *ClipboardReadState = @ptrCast(@alignCast(ctx));
+@@ -1245,6 +1456,7 @@
+                     targets = true;
+                     continue;
+                 }
++                if (mime.len > 256) return;
+                 if (len == mimes_buf.len) continue;
+                 mimes_buf[len] = mime;
+                 len += 1;
+@@ -1280,6 +1492,7 @@
+             .can_remember = pw.len > 0,
+             .reply_ctx = &state,
+             .reply_fn = &KittyClipboardReadState.reply,
++            .defer_fn = &KittyClipboardReadState.deferReply,
+         });
+ 
+         // The program is waiting on us, so a callback that returned
+@@ -1303,6 +1516,14 @@
+         list: bool,
+         terminator: osc.Terminator,
+         replied: bool = false,
++
++        fn deferReply(ctx: *anyopaque) ?u64 {
++            const state: *KittyClipboardReadState = @ptrCast(@alignCast(ctx));
++            if (state.replied) return null;
++            const id = state.handler.deferRead(.{ .kitty = state.* }) catch return null;
++            state.replied = true;
++            return id;
++        }
+ 
+         fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
+             const self: *KittyClipboardReadState = @ptrCast(@alignCast(ctx));
