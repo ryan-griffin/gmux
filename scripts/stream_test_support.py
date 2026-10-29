@@ -14,6 +14,20 @@ PROTOCOL_VERSION = int(re.search(
 )[1])
 
 
+def decode_cells(data):
+    """Length-prefixed UTF-8 and native-width/rendition flags, never reparse VT."""
+    cells = []
+    data = memoryview(data)
+    while data:
+        assert len(data) >= 13
+        length, = struct.unpack_from("<H", data)
+        assert length <= 260 and len(data) >= 13 + length
+        cells.append((bytes(data[13:13 + length]).decode(), bytes(data[2:5]),
+                      bytes(data[5:8]), data[8], data[9], bytes(data[10:13])))
+        data = data[13 + length:]
+    return cells
+
+
 def decode_packet(body):
     """Decode a stream body into its header and cell bytes."""
     header_size, = struct.unpack("<I", body[:4])
@@ -77,8 +91,8 @@ class Client:
             self.socket.connect(fixture.env["GMUX_SOCKET"] + ".stream")
             hello = fixture.rpc("_hello")
         self.cells = {}
-        self.cell_bytes = {}
-        self.cached_cell_bytes = b""
+        self.cell_values = {}
+        self.cached_cells = []
         self.git = {}
         self.frame = None
         self.links = dict(targets=[], spans=[])
@@ -104,7 +118,7 @@ class Client:
             if size == 0:
                 self.heartbeats += 1
                 continue
-            assert 4 <= size <= 16 * 1024 * 1024
+            assert 4 <= size <= 64 * 1024 * 1024
             body = self.exact(size)
             header, cells = decode_packet(body)
             if value := header.get("git"):
@@ -113,23 +127,24 @@ class Client:
                 frame = header["frame"]
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells.clear()
-                    self.cell_bytes.clear()
+                    self.cell_values.clear()
                     self.links = dict(targets=[], spans=[])
                 shift = header.get("row_shift", 0)
                 if shift:
                     self.cells = {(row, col): self.cells.get((row + shift, col), " ")
                                   for row in range(frame["rows"]) for col in range(frame["cols"])}
-                    self.cell_bytes = {(row, col): self.cell_bytes.get((row + shift, col), bytes(75))
+                    self.cell_values = {(row, col): self.cell_values.get((row + shift, col), ("", bytes(3), bytes(3), 0, 0, bytes(3)))
                                        for row in range(frame["rows"]) for col in range(frame["cols"])}
                 self.frame = frame
                 if "hyperlinks" in header:
                     self.links = header["hyperlinks"]
+                cells = decode_cells(cells)
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):
-                        start = (index * frame["cols"] + col) * 75
-                        self.cells[row, col] = cells[start:start + 64].split(b"\0", 1)[0].decode()
-                        self.cell_bytes[row, col] = cells[start:start + 75]
-                self.cached_cell_bytes = cells[len(header["rows"]) * frame["cols"] * 75:]
+                        start = index * frame["cols"] + col
+                        self.cells[row, col] = cells[start][0]
+                        self.cell_values[row, col] = cells[start]
+                self.cached_cells = cells[len(header["rows"]) * frame["cols"]:]
             if predicate(header):
                 return header
         raise AssertionError("Client did not receive expected state")

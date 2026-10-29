@@ -176,7 +176,7 @@ impl Preview {
                 let end = ((last + 1) * cols - 1).min(screen.cells.len() - 1);
                 empty = !screen.cells[start..=end]
                     .iter()
-                    .any(|cell| cell.text[0] != 0);
+                    .any(|cell| !cell.text().is_empty());
                 Some(if empty {
                     (index / cols * cols, (index / cols + 1) * cols - 1)
                 } else {

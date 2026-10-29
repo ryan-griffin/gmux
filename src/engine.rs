@@ -13,9 +13,37 @@ use std::{
 mod ffi {
     include!(concat!(env!("OUT_DIR"), "/ghostty_bridge.rs"));
 }
+use ffi::Frame;
 pub(crate) use ffi::GmuxMemoryUsage as MemoryUsage;
 use ffi::*;
-use ffi::{Cell, Frame};
+use gmux_client::Cell;
+
+/// The native bridge lends one complete cell for this synchronous call.
+unsafe extern "C" fn capture_cell(ud: *mut c_void, index: usize, raw: *const GmuxCell) -> bool {
+    let cells = unsafe { &mut *ud.cast::<&mut [Cell]>() };
+    let Some(cell) = cells.get_mut(index) else {
+        return false;
+    };
+    let raw = unsafe { &*raw };
+    if raw.text_len > gmux_client::cells::MAX_GRAPHEME_BYTES || raw.text.is_null() {
+        return false;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(raw.text, raw.text_len) };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if cell.set_text(text).is_err() {
+        return false;
+    }
+    cell.fg = raw.fg;
+    cell.bg = raw.bg;
+    cell.flags = raw.flags;
+    cell.decoration = raw.decoration;
+    cell.underline_color = raw.underline_color;
+    true
+}
+const _: () = assert!(GMUX_GRAPHEME_MAX_CODEPOINTS == 65);
+const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_client::cells::MAX_GRAPHEME_BYTES);
 
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
@@ -838,7 +866,8 @@ impl Engine {
             gmux_engine_snapshot(
                 self.raw.as_ptr(),
                 &mut self.frame,
-                self.cells.as_mut_ptr(),
+                Some(capture_cell),
+                (&mut self.cells.as_mut_slice() as *mut &mut [Cell]).cast(),
                 self.cells.len(),
                 self.row_flags.as_mut_ptr(),
             )
@@ -925,7 +954,8 @@ impl Engine {
                 self.raw.as_ptr(),
                 start,
                 count,
-                cells.as_mut_ptr(),
+                Some(capture_cell),
+                (&mut cells.as_mut_slice() as *mut &mut [Cell]).cast(),
                 cols,
                 flags.as_mut_ptr(),
             )
@@ -965,7 +995,8 @@ impl Engine {
                 gmux_engine_history_row(
                     self.raw.as_ptr(),
                     self.find.next as u32,
-                    self.find_row.as_mut_ptr(),
+                    Some(capture_cell),
+                    (&mut self.find_row.as_mut_slice() as *mut &mut [Cell]).cast(),
                     self.find.cols,
                     &mut wrapped,
                 )
@@ -3548,3 +3579,7 @@ mod shell_tests;
 #[cfg(test)]
 #[path = "engine/program_status_tests.rs"]
 mod program_status_tests;
+
+#[cfg(test)]
+#[path = "engine/grapheme_tests.rs"]
+mod grapheme_tests;

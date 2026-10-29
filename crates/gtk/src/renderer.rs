@@ -637,7 +637,7 @@ impl Renderer {
                         let mut end = x + 1;
                         let text = if ascii_cell(cell) {
                             self.text.clear();
-                            self.text.push(cell.text[0] as char);
+                            self.text.push(cell.text().as_bytes()[0] as char);
                             // Keep selection and block cursors as shaping
                             // boundaries even when foreground colors match.
                             let mut limit = cells.len();
@@ -664,7 +664,7 @@ impl Renderer {
                                     == cell.flags & (1 | 2 | 4 | flags::BLINK)
                                 && colors.foreground(base + end, &cells[end]) == (rgb, alpha)
                             {
-                                self.text.push(cells[end].text[0] as char);
+                                self.text.push(cells[end].text().as_bytes()[0] as char);
                                 end += 1;
                             }
                             &self.text
@@ -766,7 +766,7 @@ impl Renderer {
 }
 
 fn ascii_cell(cell: &Cell) -> bool {
-    cell.flags & (32 | 64) == 0 && (b'!'..=b'~').contains(&cell.text[0]) && cell.text[1] == 0
+    cell.flags & (32 | 64) == 0 && matches!(cell.text().as_bytes(), [b'!'..=b'~'])
 }
 
 #[derive(Default)]

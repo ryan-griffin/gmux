@@ -268,11 +268,11 @@ fn scroll_clear_migrates_styled_hyperlinked_cursor_off_a_pruned_page() {
                     "Clear must prune the cursor page"
                 );
             }
-            assert_eq!(e.cells[0].text[0], b'Y');
+            assert_eq!(e.cells[0].text(), "Y");
             assert_eq!(e.cells[0].fg, [123, 45, 67]);
             assert_eq!(e.cells[0].flags & 1, 1, "Cursor bold style was lost");
             assert_eq!(e.hyperlinks.target_at(0), Some("test:cursor"));
-            assert_eq!(e.cells[1].text[0], b'Z');
+            assert_eq!(e.cells[1].text(), "Z");
             assert_eq!(e.cells[1].flags & 1, 0);
             assert_eq!(e.hyperlinks.target_at(1), None);
             // Reset and reuse the tables after releasing their cursor refs.
@@ -296,7 +296,7 @@ fn one_row_line_limit_preserves_cursor_style_and_link_after_reflow_and_pruning()
     e.write(&[b'\n'; 1000]);
     e.write(b"b\x1b]8;;\x07\x1b[0m");
     e.snapshot().unwrap();
-    let index = e.cells.iter().position(|c| c.text[0] == b'b').unwrap();
+    let index = e.cells.iter().position(|c| c.text() == "b").unwrap();
     assert_eq!(e.cells[index].flags & 1, 1);
     assert_eq!(e.hyperlinks.target_at(index), Some("test:one-row"));
 }

@@ -153,7 +153,7 @@ state from a different daemon.
 Viewport packets contain JSON metadata and fixed-width cell rows. A new
 subscription receives a complete viewport; later packets carry changed rows.
 Each client owns its subscriptions, search, selection, paste assembly, and copy
-replies. Stream packets are limited to 16 MiB; commands to 1 MiB. Pastes use
+replies. Stream packets are limited to 64 MiB; commands to 1 MiB. Pastes use
 UTF-8 chunks with a 4 MiB total limit.
 
 CLI execution operations such as `list`, `new`, `split`, `send`, `read`, and

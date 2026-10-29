@@ -19,7 +19,7 @@ fn fixture(cols: u16, rows: u16, unicode: bool) -> Vec<Cell> {
         } else {
             "X"
         };
-        cell.text[..glyph.len()].copy_from_slice(glyph.as_bytes());
+        cell.set_text(glyph).unwrap();
         if unicode && matches!(x % 8, 1 | 4) {
             cell.flags = 64;
         }

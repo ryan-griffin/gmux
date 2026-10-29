@@ -16,6 +16,9 @@ void *__real_realloc(void *,size_t);
 void *__wrap_malloc(size_t size) { calls++; return __real_malloc(size); }
 void *__wrap_calloc(size_t n,size_t size) { calls++; return __real_calloc(n,size); }
 void *__wrap_realloc(void *p,size_t size) { calls++; return __real_realloc(p,size); }
+static bool discard_cell(void *ud, size_t index, const GmuxCell *cell) {
+    (void)ud; (void)index; (void)cell; return true;
+}
 static void event(void *ud,int kind,const uint8_t *data,size_t len) {
     (void)ud; (void)kind; (void)data; (void)len;
 }
@@ -47,7 +50,7 @@ int main(int argc,char **argv) {
     bool output=strstr(workload,"output")!=NULL;
     GmuxEngine *e=gmux_engine_new(NULL,event);
     assert(e);
-    GmuxFrame frame={0}; GmuxCell cells[80*24]; uint8_t flags[24];
+    GmuxFrame frame={0};  uint8_t flags[24];
     char uri[1600]="test:target/";
     if (long_uri) { memset(uri+12,'x',1500); uri[1512]=0; }
     char initial[4096], rewrite[2048];
@@ -60,18 +63,18 @@ int main(int argc,char **argv) {
     if (linked) { memcpy(rewrite+n,"\x1b]8;;\x07",6); n+=6; }
     for (int i=0;i<5;i++) {
         if (output) gmux_engine_write(e,(uint8_t *)rewrite,n);
-        assert(gmux_engine_snapshot(e,&frame,cells,80*24,flags)>=0);
+        assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
     }
     calls=lookups=0;
     double start=cpu();
     for (int i=0;i<iterations;i++) {
         if (output) gmux_engine_write(e,(uint8_t *)rewrite,n);
-        assert(gmux_engine_snapshot(e,&frame,cells,80*24,flags)>=0);
+        assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
     }
     double duration=cpu()-start;
     size_t before_clear=retained(e), allocations=calls, uri_lookups=lookups;
     gmux_engine_write(e,(uint8_t *)"\x1b[H\x1b[2Jplain",12);
-    assert(gmux_engine_snapshot(e,&frame,cells,80*24,flags)>=0);
+    assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
     printf("{\"workload\":\"%s\",\"iterations\":%d,\"cpu_ns_per_snapshot\":%.1f,\"bridge_allocations\":%zu,\"uri_lookups\":%zu,\"link_retained_bytes\":%zu,\"post_clear_bytes\":%zu,\"engine_bytes\":%zu,\"view_bytes\":%zu,\"cell_bytes\":%zu,\"frame_bytes\":%zu}\n",
         workload,iterations,duration*1e9/iterations,allocations,uri_lookups,before_clear,retained(e),sizeof(*e),sizeof(GmuxView),sizeof(GmuxCell),sizeof(GmuxFrame));
     gmux_engine_free(e);

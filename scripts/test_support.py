@@ -216,7 +216,7 @@ class DelayedViewport:
                 self._reply_prefix.clear()
             elif len(self._reply_prefix) == 8:
                 header = int.from_bytes(self._reply_prefix[4:], "little")
-                assert 4 <= size <= 16 * 1024 * 1024 and header <= size - 4
+                assert 4 <= size <= 64 * 1024 * 1024 and header <= size - 4
                 self.reply_cell_bytes += size - 4 - header
                 self._reply_remaining = size - 4
                 self._reply_prefix.clear()

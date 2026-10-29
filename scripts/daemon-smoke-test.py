@@ -11,7 +11,7 @@ from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 from cargo_test_support import cargo_binary
-from stream_test_support import PROTOCOL_VERSION, decode_packet
+from stream_test_support import PROTOCOL_VERSION, decode_packet, decode_cells
 import select
 import shlex
 import socket
@@ -86,11 +86,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
 
     def packet():
         size, = struct.unpack("<I", exact(4))
-        assert size <= 16 * 1024 * 1024
+        assert size <= 64 * 1024 * 1024
         body = exact(size)
         header, cells = decode_packet(body)
         if header["frame"]:
-            assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header["frame"]["cols"] * 75
+            assert len(decode_cells(cells)) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header["frame"]["cols"]
         else:
             assert not cells
         return header, cells
@@ -204,7 +204,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert len(header["rows"]) == header["frame"]["rows"], "New subscription must resync every row"
         command("scroll", pane=hidden, delta=-10000, bottom=False)
         header, cells = screen(hidden, lambda header, cells: len(header["rows"]) > 0)
-        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 75))
+        text = "".join(cell[0] for cell in decode_cells(cells)).encode()
         assert b"hidden 1" in text, "Daemon must retain scrollback while hidden"
         assert header["frame"]["scrollback"]["offset"] == 0
         assert header["frame"]["scrollback"]["total"] > header["frame"]["rows"]
@@ -310,7 +310,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         screen(hidden)
         command("scroll-to", pane=hidden, row=0, serial=99)
         header, cells = screen(hidden, lambda header, cells: header["scroll_serial"] == 99)
-        text = b"".join(cells[i:i+64].split(b"\0", 1)[0] for i in range(0, len(cells), 75))
+        text = "".join(cell[0] for cell in decode_cells(cells)).encode()
         assert b"hidden 1" in text, "Daemon restart must restore primary-screen history"
         command("scroll", pane=hidden, delta=0, bottom=True)
         screen(hidden, lambda header, cells: header["frame"]["scrollback"]["offset"] > 0)

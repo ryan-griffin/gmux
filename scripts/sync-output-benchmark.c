@@ -52,11 +52,25 @@ static void event(void *ud, int kind, const uint8_t *data, size_t len) {
 static void write_text(GmuxEngine *engine, const char *text) {
     gmux_engine_write(engine, (const uint8_t *)text, strlen(text));
 }
-static void snapshot(GmuxEngine *engine, GmuxView *view, GmuxCell *cells, char expected) {
+// This fixture's longest glyph fits in 16 bytes; retain values, never pointers.
+typedef struct { uint8_t text[16], style[11]; } SavedCell;
+static bool save_cell(void *ud, size_t index, const GmuxCell *cell) {
+    SavedCell *saved = &((SavedCell *)ud)[index];
+    assert(cell->text_len <= sizeof(saved->text));
+    memset(saved, 0, sizeof(*saved));
+    memcpy(saved->text, cell->text, cell->text_len);
+    memcpy(saved->style, cell->fg, 3);
+    memcpy(saved->style + 3, cell->bg, 3);
+    saved->style[6] = cell->flags;
+    saved->style[7] = cell->decoration;
+    memcpy(saved->style + 8, cell->underline_color, 3);
+    return true;
+}
+static void snapshot(GmuxEngine *engine, GmuxView *view, SavedCell *cells, char expected) {
     GmuxFrame frame = {0};
     uint8_t row_flags[48] = {0};
     gmux_engine_view_enter(engine, view);
-    assert(gmux_engine_snapshot(engine, &frame, cells, 160 * 48, row_flags) >= 0);
+    assert(gmux_engine_snapshot(engine, &frame, save_cell, cells, 160 * 48, row_flags) >= 0);
     assert(frame.cols == 160 && frame.rows == 48);
     assert(cells[0].text[0] == expected);
     gmux_engine_view_leave(engine, view);
@@ -74,8 +88,8 @@ int main(int argc, char **argv) {
     GmuxEngine *engine = gmux_engine_new(NULL, event);
     assert(engine);
     assert(!gmux_engine_resize(engine, 160, 48, 8, 16));
-    GmuxCell *cells = calloc(160 * 48, sizeof(*cells));
-    GmuxCell *held_cells = calloc(160 * 48, sizeof(*held_cells));
+    SavedCell *cells = calloc(160 * 48, sizeof(*cells));
+    SavedCell *held_cells = calloc(160 * 48, sizeof(*held_cells));
     GmuxView **views = calloc(count, sizeof(*views));
     uint8_t bg[3] = {20, 20, 20}, fg[3] = {240, 240, 240}, palette[48] = {0};
     assert(!gmux_engine_theme(engine, bg, fg, fg, palette, true));

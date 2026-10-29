@@ -35,6 +35,30 @@ terminal. Text/SGR-only history reuses the formatted buffer. Content that needs
 normalization uses at most another 8 MiB of temporary output per pane. The 8 MiB
 formatted-input/replay and 64 MiB decoder limits remain in force.
 
+## Grapheme storage
+
+The pinned engine retains one base codepoint and at most 64 suffix codepoints
+per cell. Gmux preserves that complete value, up to 260 UTF-8 bytes, in live
+frames, history, search, copies, and saved scrollback. Additional suffixes follow
+Ghostty's own retention behavior. Column width and wide spacers always come
+from the engine.
+
+Rust cells hold up to 15 text bytes inline and share longer text through an
+`Arc<str>`. Ordinary cells allocate no text storage. The C bridge lends each
+changed cell synchronously using a single bounded stack buffer; native pointers
+never enter retained Rust cells or the wire format. Unchanged rows keep their
+owned text, including while synchronized output freezes a view.
+
+The stream uses explicit byte lengths and a 64 MiB record cap. Daemon output
+and client input queues each have a 64 MiB budget. These limits accommodate a
+maximum-sized grid of maximum-length native clusters plus history prefetch.
+The client history cache retains at most 2 MiB including overflow text and row
+storage, evicting complete rows when needed. Shared text is charged separately
+for every owning cell to keep admission conservative. Long-heavy history can
+therefore offer less local scroll prediction; daemon-provided views remain
+complete. Existing copy and checkpoint limits still apply to total output;
+remote control JSON replies retain their independent 16 MiB limit.
+
 ## Release security fixes
 
 The [1.4.0 release](https://ghostty.org/docs/install/release-notes/1-4-0) includes

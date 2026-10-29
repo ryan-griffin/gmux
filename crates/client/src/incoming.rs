@@ -2,7 +2,7 @@
 use crate::transport::Packet;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
-pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct State {

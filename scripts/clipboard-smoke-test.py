@@ -271,7 +271,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
             before = int(Path(f"/proc/{process.pid}/status").read_text().split("VmRSS:")[1].split()[0])
             chunk = kitty_write([("image/png", PNG + b"\0" * (1024 * 1024 - len(PNG)))])
             began = time.monotonic()
-            probe.burst([chunk] * 48, .005, wait=False)
+            probe.burst([chunk] * 80, .005, wait=False)
             input_began = time.monotonic()
             fixture.rpc("send", pane=responsive, text="printf '\\033]2;PTY_RESPONSIVE\\007'", enter=True)
             wait_for(lambda: fixture.rpc("_metadata", pane=responsive)["meta"]["title"] == "PTY_RESPONSIVE")
@@ -280,10 +280,10 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
             wait_for(lambda: fixture.rpc("status")["local_clients"] == 0)
             after = int(Path(f"/proc/{process.pid}/status").read_text().split("VmRSS:")[1].split()[0])
             peak = int(Path(f"/proc/{process.pid}/status").read_text().split("VmHWM:")[1].split()[0])
-            measurements.update(stopped_reader_48mib_seconds=time.monotonic() - began,
+            measurements.update(stopped_reader_80mib_seconds=time.monotonic() - began,
                                 rss_before_kib=before, rss_after_kib=after, rss_peak_kib=peak)
-            print(f"48 MiB rich writes to stopped reader: {measurements['stopped_reader_48mib_seconds']:.3f}s; RSS before={before} KiB, after={after} KiB, peak={peak} KiB; other PTY input={measurements['other_pty_input_seconds_during_flood']:.3f}s; idle ticks={measurements['idle_cpu_ticks_over_1_1_seconds']}", flush=True)
-            assert peak - before < 96 * 1024, (before, after, peak)
+            print(f"80 MiB rich writes to stopped reader: {measurements['stopped_reader_80mib_seconds']:.3f}s; RSS before={before} KiB, after={after} KiB, peak={peak} KiB; other PTY input={measurements['other_pty_input_seconds_during_flood']:.3f}s; idle ticks={measurements['idle_cpu_ticks_over_1_1_seconds']}", flush=True)
+            assert peak - before < 160 * 1024, (before, after, peak)
             slow.close()
             clients.remove(slow)
             replacement = client()

@@ -5,7 +5,7 @@ import fcntl
 import json
 from pathlib import Path
 from cargo_test_support import cargo_binary
-from stream_test_support import PROTOCOL_VERSION
+from stream_test_support import PROTOCOL_VERSION, decode_cells
 import runpy
 import socket
 import struct
@@ -47,14 +47,14 @@ class History:
     def packet(self, predicate):
         while True:
             size, = struct.unpack("<I", self.exact(4))
-            assert size <= 16 * 1024 * 1024
+            assert size <= 64 * 1024 * 1024
             body = self.exact(size)
             header_size, = struct.unpack("<I", body[:4])
             header = json.loads(body[4:4 + header_size])
             if header["meta"]["id"] == self.pane and header["frame"] is not None:
                 frame = header["frame"]
-                cells = body[4 + header_size:]
-                assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * frame["cols"] * 75
+                cells = decode_cells(body[4 + header_size:])
+                assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * frame["cols"]
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells = {}
                 shift = header.get("row_shift", 0)
@@ -64,14 +64,14 @@ class History:
                 self.frame = frame
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):
-                        start = (index * frame["cols"] + col) * 75
-                        cell = cells[start:start + 75]
-                        text = cell[:64].split(b"\0", 1)[0].decode()
-                        fg, bg, flags = bytes(cell[64:67]), bytes(cell[67:70]), cell[70]
+                        start = index * frame["cols"] + col
+                        cell = cells[start]
+                        text = cell[0]
+                        fg, bg, flags = cell[1:4]
                         # The formatter emits background-only blanks as spaces.
                         if not text and bg != bytes(frame["background"]) and flags & 64 == 0:
                             text = " "
-                        self.cells[row, col] = (text, fg, bg, flags, cell[71], bytes(cell[72:75]))
+                        self.cells[row, col] = (text, fg, bg, flags, cell[4], cell[5])
             if header["meta"]["id"] == self.pane and predicate(header):
                 return header
 

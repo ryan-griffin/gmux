@@ -2,7 +2,7 @@
 use crate::{Cell, Frame};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{BufRead, ErrorKind, Write},
+    io::{BufRead, ErrorKind, Read, Write},
     path::PathBuf,
 };
 
@@ -12,13 +12,14 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 36;
+pub const VERSION: u32 = 37;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
 pub const PASTE_CHUNK: usize = 16 * 1024;
-pub const MAX_PACKET: usize = 16 * 1024 * 1024;
-pub const CELL_BYTES: usize = 75;
+pub const MAX_PACKET: usize = 64 * 1024 * 1024;
+/// Per-cell prefix: UTF-8 length, colors and rendition. Text follows the prefix.
+pub const CELL_PREFIX_BYTES: usize = 13;
 pub const DEFAULT_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -165,19 +166,35 @@ impl Packet {
                     bytes.extend_from_slice(&representation.data);
                 }
             }
-            let size = bytes.len() - start - 4 + self.cells.len() * CELL_BYTES;
+            let cell_bytes: usize = self
+                .cells
+                .iter()
+                .map(|cell| CELL_PREFIX_BYTES + cell.text().len())
+                .sum();
+            let size = bytes.len() - start - 4 + cell_bytes;
             anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
             anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
             bytes[start..start + 4].copy_from_slice(&(size as u32).to_le_bytes());
             bytes[start + 4..start + 8].copy_from_slice(&(header_size as u32).to_le_bytes());
-            bytes.reserve(self.cells.len() * CELL_BYTES);
+            bytes.reserve(cell_bytes);
             for cell in &self.cells {
-                bytes.extend_from_slice(&cell.text);
-                bytes.extend_from_slice(&cell.fg);
-                bytes.extend_from_slice(&cell.bg);
-                bytes.push(cell.flags);
-                bytes.push(cell.decoration);
-                bytes.extend_from_slice(&cell.underline_color);
+                let len = (cell.text().len() as u16).to_le_bytes();
+                bytes.extend_from_slice(&[
+                    len[0],
+                    len[1],
+                    cell.fg[0],
+                    cell.fg[1],
+                    cell.fg[2],
+                    cell.bg[0],
+                    cell.bg[1],
+                    cell.bg[2],
+                    cell.flags,
+                    cell.decoration,
+                    cell.underline_color[0],
+                    cell.underline_color[1],
+                    cell.underline_color[2],
+                ]);
+                bytes.extend_from_slice(cell.text().as_bytes());
             }
             Ok(())
         })();
@@ -332,49 +349,62 @@ impl Packet {
             );
             0
         };
+        let payload = size - 4 - header_size;
         anyhow::ensure!(
-            size - 4 - header_size == expected * CELL_BYTES,
+            (expected * CELL_PREFIX_BYTES
+                ..=expected * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES))
+                .contains(&payload),
             "Invalid viewport cell data"
         );
+        // Bound reads to this record even when a length claims the next packet.
+        let mut reader = std::io::Read::take(reader, payload as u64);
         let mut cells = Vec::with_capacity(expected);
         while cells.len() < expected {
             let bytes = match reader.fill_buf() {
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 result => result?,
             };
-            let count = (bytes.len() / CELL_BYTES).min(expected - cells.len());
-            if count == 0 {
-                // A cell can straddle buffered reads. read_exact also handles
-                // short reads, interrupted reads, and EOF within this cell.
-                let mut bytes = [0; CELL_BYTES];
-                reader.read_exact(&mut bytes)?;
-                cells.push(decode_cell(&bytes));
-            } else {
-                // Decode from the caller's buffer without copying the payload
-                // into another allocation or consuming the following packet.
-                cells.extend(
-                    bytes[..count * CELL_BYTES]
-                        .as_chunks::<CELL_BYTES>()
-                        .0
-                        .iter()
-                        .map(decode_cell),
-                );
-                reader.consume(count * CELL_BYTES);
+            let mut consumed = 0;
+            while bytes.len() - consumed >= CELL_PREFIX_BYTES && cells.len() < expected {
+                let len = cell_length(&bytes[consumed..])?;
+                if bytes.len() - consumed < len {
+                    break;
+                }
+                cells.push(decode_cell(&bytes[consumed..consumed + len])?);
+                consumed += len;
             }
+            if consumed != 0 {
+                reader.consume(consumed);
+                continue;
+            }
+            let mut bytes = [0; CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES];
+            reader.read_exact(&mut bytes[..CELL_PREFIX_BYTES])?;
+            let len = cell_length(&bytes)?;
+            reader.read_exact(&mut bytes[CELL_PREFIX_BYTES..len])?;
+            cells.push(decode_cell(&bytes[..len])?);
         }
+        anyhow::ensure!(reader.limit() == 0, "Trailing viewport cell data");
         Ok(Some(Self { header, cells }))
     }
 }
 
-fn decode_cell(bytes: &[u8; CELL_BYTES]) -> Cell {
-    Cell {
-        text: bytes[..64].try_into().unwrap(),
-        fg: bytes[64..67].try_into().unwrap(),
-        bg: bytes[67..70].try_into().unwrap(),
-        flags: bytes[70],
-        decoration: bytes[71],
-        underline_color: bytes[72..75].try_into().unwrap(),
-    }
+fn cell_length(bytes: &[u8]) -> anyhow::Result<usize> {
+    let len = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as usize;
+    anyhow::ensure!(
+        len <= crate::cells::MAX_GRAPHEME_BYTES,
+        "Invalid grapheme length"
+    );
+    Ok(CELL_PREFIX_BYTES + len)
+}
+fn decode_cell(bytes: &[u8]) -> anyhow::Result<Cell> {
+    Ok(Cell {
+        text: crate::cells::Grapheme::new(std::str::from_utf8(&bytes[CELL_PREFIX_BYTES..])?)?,
+        fg: bytes[2..5].try_into().unwrap(),
+        bg: bytes[5..8].try_into().unwrap(),
+        flags: bytes[8],
+        decoration: bytes[9],
+        underline_color: bytes[10..13].try_into().unwrap(),
+    })
 }
 
 pub fn command_bytes(request: &impl Serialize) -> anyhow::Result<Vec<u8>> {
@@ -396,7 +426,7 @@ mod tests {
     use std::io::{self, BufReader, Read};
     fn packet() -> Packet {
         let mut cell = Cell::default();
-        cell.text[..5].copy_from_slice("界é".as_bytes());
+        cell.set_text("界é").unwrap();
         cell.fg = [1, 2, 3];
         cell.flags = 65 | crate::cells::flags::BLINK;
         cell.decoration = underline::CURLY | decoration::OVERLINE | decoration::UNDERLINE_COLOR;
@@ -450,7 +480,7 @@ mod tests {
             row_flags: vec![0, 1, 0],
         });
         packet.cells.resize(8, Cell::default());
-        packet.cells[2] = packet.cells[0];
+        packet.cells[2] = packet.cells[0].clone();
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         let decoded = Packet::read(&mut &bytes[..]).unwrap();
@@ -524,6 +554,54 @@ mod tests {
         sender.send(Ok(packet())).unwrap();
         assert!(matches!(receiver.try_recv(), Ok(Ok(packet)) if packet.header.scroll_serial == 42));
     }
+    #[test]
+    fn maximum_native_text_grid_and_prefetch_fit_packet_and_queue_bounds() {
+        let glyph = format!("🧑{}", "\u{1d185}".repeat(64));
+        let mut cell = Cell::default();
+        cell.set_text(&glyph).unwrap();
+        let cols = 512;
+        let rows = crate::viewport::MAX_CELLS / cols;
+        let cached = crate::scroll_cache::capacity(cols);
+        let packet = Packet {
+            header: Header {
+                frame: Some(Frame {
+                    cols: cols as u16,
+                    rows: rows as u16,
+                    scrollback: crate::Scrollback {
+                        total: 1000,
+                        offset: 0,
+                        len: rows as u64,
+                    },
+                    ..Frame::default()
+                }),
+                rows: (0..rows as u16).collect(),
+                cache: Some(CachedRows {
+                    start: 0,
+                    row_flags: vec![0; cached],
+                }),
+                ..Header::default()
+            },
+            cells: vec![cell; (rows + cached) * cols],
+        };
+        let (sender, receiver) = crate::incoming::channel(crate::incoming::MAX_BYTES, 1);
+        sender.send(Ok(packet)).unwrap();
+        let packet = receiver.try_recv().unwrap().unwrap();
+        let mut bytes = Vec::new();
+        packet.encode_into(&mut bytes).unwrap();
+        let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.cells.len(), packet.cells.len());
+        assert_eq!(decoded.cells.last().unwrap().text(), glyph);
+        // Heap text must consume admission budget even when Arc clones share it.
+        let (sender, _) = crate::incoming::channel(
+            decoded.cells.capacity() * size_of::<Cell>() + 1024 * 1024,
+            1,
+        );
+        assert_eq!(
+            sender.send(Ok(decoded)),
+            Err(crate::incoming::SendError::TooLarge)
+        );
+    }
+
     #[test]
     fn heartbeat_records_are_separate_from_viewports_and_do_not_consume_following_data() {
         let mut bytes = HEARTBEAT_REPLY.to_vec();
@@ -623,7 +701,7 @@ mod tests {
         encoded.clear();
         packet.encode_into(&mut encoded).unwrap();
         let size = u32::from_le_bytes(encoded[..4].try_into().unwrap());
-        for claimed_size in [size - 1, size + 1, size - CELL_BYTES as u32] {
+        for claimed_size in [size - 1, size + 1, size - CELL_PREFIX_BYTES as u32] {
             encoded[..4].copy_from_slice(&claimed_size.to_le_bytes());
             assert!(Packet::read(&mut encoded.as_slice()).is_err());
         }
@@ -714,6 +792,32 @@ mod tests {
         assert!(Packet::read(&mut bytes.as_slice()).is_err());
     }
 
+    #[test]
+    fn invalid_grapheme_lengths_utf8_and_trailing_data_are_rejected() {
+        let packet = packet();
+        let mut encoded = Vec::new();
+        packet.encode_into(&mut encoded).unwrap();
+        let start = 8 + u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+        for length in [261u16, u16::MAX] {
+            let mut bad = encoded.clone();
+            bad[start..start + 2].copy_from_slice(&length.to_le_bytes());
+            assert!(Packet::read(&mut bad.as_slice()).is_err());
+        }
+        for invalid in [0, 0xff] {
+            let mut bad = encoded.clone();
+            bad[start + CELL_PREFIX_BYTES] = invalid;
+            assert!(Packet::read(&mut bad.as_slice()).is_err());
+        }
+        // An inner length cannot consume the next record, even if it is valid UTF-8.
+        let mut bad = encoded.clone();
+        bad[start..start + 2].copy_from_slice(&260u16.to_le_bytes());
+        let boundary = bad.len();
+        bad.extend_from_slice(&encoded);
+        let mut reader = io::Cursor::new(bad);
+        assert!(Packet::read(&mut reader).is_err());
+        assert!(reader.position() <= boundary as u64);
+    }
+
     struct Fragmented<'a> {
         bytes: &'a [u8],
         chunk: usize,
@@ -740,7 +844,12 @@ mod tests {
         packet.cells = (0..146)
             .map(|i| {
                 let mut cell = Cell::default();
-                cell.text[..8].copy_from_slice("界ée\u{301}".as_bytes());
+                cell.set_text(&if i % 2 == 0 {
+                    "界ée\u{301}".into()
+                } else {
+                    format!("🧑{}", "\u{1d185}".repeat(64))
+                })
+                .unwrap();
                 cell.fg = [i, 2, 3];
                 cell.bg = [4, i, 6];
                 cell.flags = i;
@@ -760,9 +869,9 @@ mod tests {
         packet.encode_into(&mut encoded).unwrap();
         for (capacity, chunk) in [
             (1, 1),
-            (CELL_BYTES - 1, 13),
-            (CELL_BYTES, CELL_BYTES),
-            (CELL_BYTES + 1, 137),
+            (CELL_PREFIX_BYTES - 1, 13),
+            (CELL_PREFIX_BYTES, CELL_PREFIX_BYTES),
+            (CELL_PREFIX_BYTES + 1, 137),
             (8192, 8192),
         ] {
             let mut reader = BufReader::with_capacity(
@@ -797,7 +906,7 @@ mod tests {
         let mut encoded = Vec::new();
         packet().encode_into(&mut encoded).unwrap();
         for len in 0..encoded.len() {
-            let mut reader = BufReader::with_capacity(CELL_BYTES, &encoded[..len]);
+            let mut reader = BufReader::with_capacity(CELL_PREFIX_BYTES, &encoded[..len]);
             assert!(Packet::read(&mut reader).is_err(), "accepted {len} bytes");
         }
     }

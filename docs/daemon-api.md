@@ -287,14 +287,14 @@ Supported exact MIME names are `image/png`, `text/html`, `text/plain`, and
 preserve arbitrary bytes. Both plain aliases must agree when supplied together.
 Names are unique, and a packet carries at most four representations. Plain
 text is limited to 4 MiB per representation and HTML/PNG to 8 MiB each, with
-12 MiB total data and 16 KiB of clipboard metadata within the 16 MiB packet limit.
+12 MiB total data and 16 KiB of clipboard metadata within the 64 MiB stream packet limit.
 Application admission has a stricter 4 MiB total limit, including aliases.
 Explicit user copy still omits HTML if generation or normalization fails or its
 control-JSON budget would be exceeded. Clipboard stream data is always binary.
 See [clipboard behavior](clipboard.md) for formatter limitations.
-A stalled frontend's output is bounded by the 32 MiB transport queue and is
+A stalled frontend's output is bounded by the 64 MiB transport queue and is
 detached on overflow. The client reader separately bounds retained storage to
-32 MiB and 64 packets, including representation capacities.
+64 MiB and 64 packets, including representation capacities.
 
 `generation` identifies cached history for this pane and view. Clears, reflow,
 screen switches, and resolved palette or appearance changes advance it. Discard
@@ -394,11 +394,18 @@ number, or zero after acknowledgement. Send that sequence as `through` in
 the boolean `unread` field to indicate whether alerts remain.
 
 For each row listed in the header, there are `frame.cols` cells in column order.
-Each cell has 75 bytes: 64 bytes of zero-padded UTF-8 text, three RGB foreground
-bytes, three RGB background bytes, one flags byte, one decoration byte, and three
-RGB underline-color bytes. Flag bits 0, 1, 2, 4, and 5 mean bold, italic, faint,
-strike, and invisible. Bits 6 and 7 mark wide-character spacer tails and heads;
-bit 3 is reserved. Decoration bits 0-2 encode no underline, single, double, curly,
+Each cell starts with a 13-byte prefix: a little-endian `u16` UTF-8 byte length,
+three RGB foreground bytes, three RGB background bytes, one flags byte, one
+decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
+immediately follows, without zero padding or a terminator. Length zero represents
+an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
+cell data are rejected. This is stream protocol version 37; clients must match
+the daemon's version.
+
+Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.
+Bits 6 and 7 mark wide-character spacer tails and heads. These native layout
+flags determine occupied columns, independently of the text's byte or codepoint
+count. Decoration bits 0-2 encode no underline, single, double, curly,
 dotted, or dashed as 0-5. Bit 3 enables overline. Bit 4 selects the independent
 underline color; otherwise the underline follows the displayed text color.
 
@@ -413,7 +420,7 @@ The Rust `transport::Header` and `Packet::read` expose the complete header and
 validate packet dimensions and row indices before decoding cells.
 
 Handshakes are limited to 4 KiB; control and stream commands to 1 MiB; replies
-and viewport packets to 16 MiB. Pastes use UTF-8 chunks with a 4 MiB total limit.
+and viewport packets to 64 MiB. Pastes use UTF-8 chunks with a 4 MiB total limit.
 See [remote daemons](remote-daemons.md) for authentication, connection budgets,
 and saved destinations, and [background sessions](terminal-sessions.md) for
 persistence and scheduling.

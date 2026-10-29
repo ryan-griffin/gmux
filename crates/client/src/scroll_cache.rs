@@ -8,7 +8,12 @@ pub fn capacity(cols: usize) -> usize {
     if cols == 0 {
         return 0;
     }
-    (MAX_BYTES / (cols * std::mem::size_of::<Cell>() + std::mem::size_of::<Option<u64>>() + 1))
+    (MAX_BYTES
+        / (cols * std::mem::size_of::<Cell>()
+            + std::mem::size_of::<Option<u64>>()
+            + size_of::<Vec<Cell>>()
+            + size_of::<usize>()
+            + 1))
         .min(MAX_ROWS)
 }
 
@@ -31,13 +36,15 @@ pub fn window(frame: Frame) -> std::ops::Range<u64> {
 }
 
 /// Reuse overlapping rows before applying a packet's changed rows.
-pub fn shift<T: Copy>(data: &mut [T], cols: usize, rows: i16) {
+pub fn shift<T>(data: &mut [T], cols: usize, rows: i16) {
     let count = rows.unsigned_abs() as usize * cols;
+    // Exposed rows are overwritten by the packet. Move ownership instead of
+    // cloning overflow Arcs into cells that will immediately be replaced.
     if rows > 0 {
-        data.copy_within(count.., 0);
+        data.rotate_left(count);
     }
     if rows < 0 {
-        data.copy_within(..data.len() - count, count);
+        data.rotate_right(count);
     }
 }
 
@@ -47,16 +54,27 @@ pub struct RowCache {
     origin: u64,
     cols: usize,
     tags: Vec<Option<u64>>,
-    cells: Vec<Cell>,
+    cells: Vec<Vec<Cell>>,
+    row_bytes: Vec<usize>,
+    bytes: usize,
     flags: Vec<u8>,
 }
 
 impl RowCache {
     pub fn retained_bytes(&self) -> usize {
-        self.cells.capacity() * std::mem::size_of::<Cell>()
-            + self.tags.capacity() * std::mem::size_of::<Option<u64>>()
+        self.cells.capacity() * size_of::<Vec<Cell>>()
+            + self.tags.capacity() * size_of::<Option<u64>>()
+            + self.row_bytes.capacity() * size_of::<usize>()
             + self.flags.capacity()
+            + self.bytes
     }
+    fn discard(&mut self, slot: usize) {
+        self.tags[slot] = None;
+        self.bytes -= self.row_bytes[slot];
+        self.row_bytes[slot] = 0;
+        self.cells[slot] = Vec::new();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tags.is_empty()
     }
@@ -68,7 +86,9 @@ impl RowCache {
             return false;
         }
         self.generation = generation;
-        self.tags.fill(None);
+        for slot in 0..self.tags.len() {
+            self.discard(slot);
+        }
         true
     }
 
@@ -78,9 +98,9 @@ impl RowCache {
         }
         let removed = origin.saturating_sub(self.origin);
         self.origin = origin;
-        for tag in &mut self.tags {
-            if tag.is_some_and(|row| row < origin) {
-                *tag = None;
+        for slot in 0..self.tags.len() {
+            if self.tags[slot].is_some_and(|row| row < origin) {
+                self.discard(slot);
             }
         }
         removed
@@ -88,9 +108,9 @@ impl RowCache {
 
     pub fn truncate(&mut self, end: u64) {
         let end = self.origin.saturating_add(end);
-        for tag in &mut self.tags {
-            if tag.is_some_and(|row| row >= end) {
-                *tag = None;
+        for slot in 0..self.tags.len() {
+            if self.tags[slot].is_some_and(|row| row >= end) {
+                self.discard(slot);
             }
         }
     }
@@ -106,7 +126,9 @@ impl RowCache {
             self.cols = cols;
             self.generation = generation;
             self.tags = vec![None; count];
-            self.cells = vec![Cell::default(); count * cols];
+            self.cells = vec![Vec::new(); count];
+            self.row_bytes = vec![0; count];
+            self.bytes = 0;
             self.flags = vec![0; count];
         } else if self.generation != generation {
             self.invalidate(generation);
@@ -122,7 +144,17 @@ impl RowCache {
             let number = self.origin + start + index as u64;
             let slot = (number % self.tags.len() as u64) as usize;
             self.tags[slot] = Some(number);
-            self.cells[slot * self.cols..(slot + 1) * self.cols].copy_from_slice(row);
+            self.bytes -= self.row_bytes[slot];
+            self.cells[slot].resize(row.len(), Cell::default());
+            self.cells[slot].clone_from_slice(row);
+            self.row_bytes[slot] = self.cells[slot].capacity() * size_of::<Cell>()
+                + row.iter().map(Cell::heap_bytes).sum::<usize>();
+            self.bytes += self.row_bytes[slot];
+            let mut victim = (slot + 1) % self.tags.len();
+            while self.retained_bytes() > MAX_BYTES {
+                self.discard(victim);
+                victim = (victim + 1) % self.tags.len();
+            }
             self.flags[slot] = flags.get(index).copied().unwrap_or(0);
         }
     }
@@ -140,13 +172,11 @@ impl RowCache {
         let start = self.origin + start;
         cells.resize(rows * self.cols, Cell::default());
         flags.resize(rows, 0);
-        let slot = (start % self.tags.len() as u64) as usize;
-        let first = rows.min(self.tags.len() - slot);
-        cells[..first * self.cols]
-            .copy_from_slice(&self.cells[slot * self.cols..(slot + first) * self.cols]);
-        cells[first * self.cols..].copy_from_slice(&self.cells[..(rows - first) * self.cols]);
-        flags[..first].copy_from_slice(&self.flags[slot..slot + first]);
-        flags[first..].copy_from_slice(&self.flags[..rows - first]);
+        for index in 0..rows {
+            let slot = ((start + index as u64) % self.tags.len() as u64) as usize;
+            cells[index * self.cols..(index + 1) * self.cols].clone_from_slice(&self.cells[slot]);
+            flags[index] = self.flags[slot];
+        }
         true
     }
     fn contains(&self, start: u64, rows: usize) -> bool {
@@ -191,6 +221,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overflow_is_charged_evicted_and_released_with_its_row() {
+        let frame = Frame {
+            cols: 1000,
+            rows: 20,
+            scrollback: crate::Scrollback {
+                total: 1000,
+                offset: 0,
+                len: 20,
+            },
+            ..Frame::default()
+        };
+        let mut cache = RowCache::default();
+        cache.configure(1, frame);
+        let mut cell = Cell::default();
+        cell.set_text(&format!("🧑{}", "\u{1d185}".repeat(64)))
+            .unwrap();
+        cell.flags = crate::cells::flags::BLINK;
+        let row = vec![cell; 1000];
+        for index in 0..capacity(1000) {
+            cache.insert(index as u64, &row, &[0]);
+            assert!(cache.retained_bytes() <= MAX_BYTES);
+        }
+        let (mut cells, mut flags) = (Vec::new(), Vec::new());
+        assert!(!cache.copy_view(0, 1, &mut cells, &mut flags));
+        assert!(cache.copy_view(capacity(1000) as u64 - 1, 1, &mut cells, &mut flags));
+        assert!(cells == row);
+        cache.invalidate(2);
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.cells.iter().all(Vec::is_empty));
+    }
+
+    #[test]
     fn pruning_and_live_screen_edits_preserve_only_unchanged_history() {
         let mut cache = RowCache::default();
         let frame = Frame {
@@ -206,13 +268,14 @@ mod tests {
         cache.configure(1, frame);
         for row in 0..10 {
             let mut cell = Cell::default();
-            cell.text[0] = b'a' + row;
+            cell.set_text(std::str::from_utf8(&[b'a' + row]).unwrap())
+                .unwrap();
             cell.flags = if row % 2 == 1 {
                 crate::cells::flags::BLINK
             } else {
                 0
             };
-            cache.insert(row as u64, &[cell; 2], &[row % 2]);
+            cache.insert(row as u64, &[cell.clone(), cell], &[row % 2]);
         }
         cache.truncate(8);
         assert!(cache.has_margin(
@@ -262,17 +325,17 @@ mod tests {
         let count = capacity(1000);
         let mut row = vec![Cell::default(); 1000];
         for index in 0..count + 5 {
-            row[0].text[0] = index as u8;
+            row[0].set_text(&index.to_string()).unwrap();
             cache.insert(index as u64, &row, &[index as u8 % 2]);
         }
         let (mut cells, mut flags) = (Vec::new(), Vec::new());
         assert!(!cache.copy_view(0, 1, &mut cells, &mut flags));
         assert!(cache.copy_view(5, 20, &mut cells, &mut flags));
-        assert_eq!(cells[0].text[0], 5);
+        assert_eq!(cells[0].text(), "5");
         assert_eq!(flags[0], 1);
         assert!(cache.copy_view(count as u64 - 3, 6, &mut cells, &mut flags));
         for index in 0..6 {
-            assert_eq!(cells[index * 1000].text[0], (count - 3 + index) as u8);
+            assert_eq!(cells[index * 1000].text(), (count - 3 + index).to_string());
             assert_eq!(flags[index], ((count - 3 + index) % 2) as u8);
         }
         cache.configure(2, frame);

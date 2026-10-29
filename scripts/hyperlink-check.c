@@ -3,6 +3,9 @@
 #include <assert.h>
 #include <stdio.h>
 
+static bool discard_cell(void *ud, size_t index, const GmuxCell *cell) {
+    (void)ud; (void)index; (void)cell; return true;
+}
 static void event(void *ud, int kind, const uint8_t *data, size_t len) {
     (void)ud; (void)kind; (void)data; (void)len;
 }
@@ -11,9 +14,9 @@ static void write_text(GmuxEngine *e, const char *text) {
 }
 static void snapshot(GmuxEngine *e) {
     GmuxFrame frame={0};
-    GmuxCell cells[80*24];
+
     uint8_t flags[24];
-    assert(gmux_engine_snapshot(e,&frame,cells,80*24,flags)>=0);
+    assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
 }
 static size_t storage(const Links *links) {
     return links->spans_cap*sizeof(LinkSpan)+links->targets_cap*sizeof(LinkTarget)+links->bytes_cap;

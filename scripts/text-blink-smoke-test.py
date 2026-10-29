@@ -37,9 +37,9 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
             peer.until(lambda h: h["meta"]["title"] == title)
 
     def check_flags(peer, row=0):
-        flags = [peer.cell_bytes[row, x][70] for x in range(6)]
+        flags = [peer.cell_values[row, x][3] for x in range(6)]
         assert [bool(flag & 8) for flag in flags] == [True, False, True, True, True, False], flags
-        assert peer.cell_bytes[row, 4].split(b"\0", 1)[0] == "e\u0301".encode()
+        assert peer.cell_values[row, 4][0] == "e\u0301"
 
     try:
         for peer in peers:
@@ -55,7 +55,7 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
                 check_flags(peer)
             emit("\x1b[?2026l")
             for peer in peers:
-                assert not peer.cell_bytes[0, 0][70] & 8
+                assert not peer.cell_values[0, 0][3] & 8
         with scenario("styled history prefetch, scrolling and reconnect retain blink flags"):
             emit("\r\x1b[5mA\x1b[25m\r\n" + "".join(
                 f"\x1b[{'5' if row % 2 else '25'}mrow{row}\x1b[0m\r\n" for row in range(1, 20)))
@@ -63,12 +63,12 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
                 peer.send("scroll-to", row=0, serial=1)
                 peer.until(lambda h: h.get("scroll_serial") == 1 and h["frame"])
                 check_flags(peer)
-                assert peer.cached_cell_bytes, "Expected history prefetch"
-                assert any(peer.cached_cell_bytes[index] & 8 for index in range(70, len(peer.cached_cell_bytes), 75))
+                assert peer.cached_cells, "Expected history prefetch"
+                assert any(cell[3] & 8 for cell in peer.cached_cells)
                 peer.send("scroll-to", row=1, serial=2)
                 peer.until(lambda h: h.get("scroll_serial") == 2 and h["frame"])
-                assert peer.cell_bytes[0, 0][70] & 8
-                assert not peer.cell_bytes[1, 0][70] & 8
+                assert peer.cell_values[0, 0][3] & 8
+                assert not peer.cell_values[1, 0][3] & 8
             peers[1].close()
             peers[1] = Client(fixture, pane, address=address)
             peers[1].send("scroll-to", row=0, serial=3)
@@ -77,8 +77,8 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
         with scenario("screen switches and clear discard obsolete blinking rows"):
             emit("\x1b[?1049h\x1b[H\x1b[5mX\x1b[25mY")
             for peer in peers:
-                assert peer.cell_bytes[0, 0][70] & 8
-                assert not peer.cell_bytes[0, 1][70] & 8
+                assert peer.cell_values[0, 0][3] & 8
+                assert not peer.cell_values[0, 1][3] & 8
             emit("\x1b[?1049l")
             for index, peer in enumerate(peers):
                 peer.send("scroll-to", row=0, serial=4 + index)
@@ -87,7 +87,7 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
             peers[0].send("clear-screen")
             for peer in peers:
                 peer.barrier("clear")
-                assert all(not cell[70] & 8 for cell in peer.cell_bytes.values())
+                assert all(not cell[3] & 8 for cell in peer.cell_values.values())
     finally:
         for peer in peers:
             peer.close()

@@ -49,7 +49,7 @@ impl Content {
                     .sum::<usize>()
             };
             if html.len() > MAX_HTML
-                || json_bytes(&self.text) + json_bytes(html) > crate::transport::MAX_PACKET - 4096
+                || json_bytes(&self.text) + json_bytes(html) > crate::network::MAX_REPLY - 4096
             {
                 self.html = None;
             }

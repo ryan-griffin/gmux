@@ -80,7 +80,7 @@ fn cell(text: &str, fg: [u8; 3], bg: [u8; 3], flags: u8) -> Cell {
         flags,
         ..Cell::default()
     };
-    cell.text[..text.len()].copy_from_slice(text.as_bytes());
+    cell.set_text(text).unwrap();
     cell
 }
 
