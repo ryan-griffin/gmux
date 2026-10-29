@@ -14,6 +14,35 @@ PROTOCOL_VERSION = int(re.search(
 )[1])
 
 
+def decode_packet(body):
+    """Decode a stream body into its header and cell bytes."""
+    header_size, = struct.unpack("<I", body[:4])
+    header = json.loads(body[4:4 + header_size])
+    if (write := header.get("copy")) is not None:
+        assert header["frame"] is None and not header["rows"], header
+        offset = 4 + header_size
+        if write["content"] is not None:
+            representations = {}
+            for item in write["content"]:
+                end = offset + item["len"]
+                assert end <= len(body)
+                representations[item["mime"]] = bytes(body[offset:end])
+                offset = end
+            # Keep existing selected-text fixture assertions readable.
+            # Unrecognized formats retain their exact MIME key and bytes.
+            write["content"] = {}
+            for mime, data in representations.items():
+                if mime == "text/plain":
+                    write["content"]["text"] = data.decode()
+                elif mime == "text/html":
+                    write["content"]["html"] = data.decode()
+                else:
+                    write["content"][mime] = data
+        assert offset == len(body), (offset, len(body))
+        return header, b""
+    return header, body[4 + header_size:]
+
+
 class Client:
     def __init__(self, fixture, pane, *, connection=None, address=None, token=None):
         if connection:
@@ -77,28 +106,7 @@ class Client:
                 continue
             assert 4 <= size <= 16 * 1024 * 1024
             body = self.exact(size)
-            header_size, = struct.unpack("<I", body[:4])
-            header = json.loads(body[4:4 + header_size])
-            if (write := header.get("copy")) is not None:
-                offset = 4 + header_size
-                if write["content"] is not None:
-                    representations = {}
-                    for item in write["content"]:
-                        end = offset + item["len"]
-                        assert end <= len(body)
-                        representations[item["mime"]] = bytes(body[offset:end])
-                        offset = end
-                    # Keep existing selected-text fixture assertions readable.
-                    # Unrecognized formats retain their exact MIME key and bytes.
-                    write["content"] = {}
-                    for mime, data in representations.items():
-                        if mime == "text/plain":
-                            write["content"]["text"] = data.decode()
-                        elif mime == "text/html":
-                            write["content"]["html"] = data.decode()
-                        else:
-                            write["content"][mime] = data
-                assert offset == len(body), (offset, len(body))
+            header, cells = decode_packet(body)
             if value := header.get("git"):
                 self.git[value["id"]] = value
             if header["meta"]["id"] == self.pane and header["frame"]:
@@ -116,7 +124,6 @@ class Client:
                 self.frame = frame
                 if "hyperlinks" in header:
                     self.links = header["hyperlinks"]
-                cells = body[4 + header_size:]
                 for index, row in enumerate(header["rows"]):
                     for col in range(frame["cols"]):
                         start = (index * frame["cols"] + col) * 75
