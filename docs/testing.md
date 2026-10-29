@@ -27,8 +27,12 @@ Check execution and the client library without a toolkit:
 
 ```sh
 cargo test --locked -p gmux-core -p gmux-client --lib
-cargo clippy --locked -p gmux-core -p gmux-client --all-targets -- -D warnings
+cargo clippy --locked -p gmux-core -p gmux-client --all-targets
 ```
+
+All workspace packages inherit the lint policy in the root `Cargo.toml`.
+Compiler warnings fail normal checks, builds, and tests. Clippy warnings fail
+when running `cargo clippy`; normal builds do not run Clippy.
 
 ## Select checks
 

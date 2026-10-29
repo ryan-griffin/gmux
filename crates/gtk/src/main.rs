@@ -1,4 +1,3 @@
-#![deny(deprecated)]
 mod client;
 
 mod accessible_terminal;
