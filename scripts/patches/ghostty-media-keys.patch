@@ -1,5 +1,5 @@
 Add the standard Kitty functional codes for the existing media/audio identifiers.
-Upstream base: 8f0dd3709050b1026f6324368805033197d8b4a5
+Upstream base: 83fb95624b0439ee660c2679b43b38c8b63769cd (Ghostty 1.4.0)
 Reference: https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions
 No enum, public header, or ABI changes. Browser keys have no standard Kitty codes.
 

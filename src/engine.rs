@@ -78,6 +78,121 @@ fn validate_history_replay(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Convert the current formatter's OSC 8 and blank-cell operations to the
+// text/SGR-only replay format. No cursor, erase, or OSC operation reaches the
+// fresh shell. Both the formatted input and normalized output are bounded.
+fn normalize_history_replay(data: Vec<u8>, cols: u16) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        data.len() <= crate::scrollback::MAX_PANE_BYTES,
+        "History exceeds restore budget"
+    );
+    // Ordinary text and SGR already meet the replay contract. Keep their
+    // allocation instead of copying up to 8 MiB into a second buffer.
+    if validate_history_replay(&data).is_ok() {
+        return Ok(data);
+    }
+    let mut input = data.as_slice();
+    fn append(out: &mut Vec<u8>, data: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            data.len() <= crate::scrollback::MAX_PANE_BYTES - out.len(),
+            "History exceeds restore budget"
+        );
+        let required = out.len() + data.len();
+        if required > out.capacity() {
+            let capacity = required
+                .max(out.capacity().saturating_mul(2))
+                .clamp(4096, crate::scrollback::MAX_PANE_BYTES);
+            out.try_reserve_exact(capacity - out.len())?;
+        }
+        out.extend_from_slice(data);
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let mut pen = [0; 128];
+    let mut pen_len = 0;
+    while !input.is_empty() {
+        if input.starts_with(b"\x1b]8;") {
+            let end = input[4..]
+                .windows(2)
+                .position(|p| p == b"\x1b\\")
+                .ok_or_else(|| anyhow::anyhow!("Invalid history hyperlink"))?
+                + 4;
+            anyhow::ensure!(
+                input[4..end].contains(&b';')
+                    && !input[4..end].iter().any(|b| b.is_ascii_control()),
+                "Invalid history hyperlink"
+            );
+            input = &input[end + 2..];
+        } else if input.starts_with(b"\x1b[") {
+            let end = input[2..]
+                .iter()
+                .take(19)
+                .position(|b| (0x40..=0x7e).contains(b))
+                .ok_or_else(|| anyhow::anyhow!("Invalid history rendition"))?
+                + 2;
+            let sequence = &input[..end + 1];
+            let parameters = &input[2..end];
+            input = &input[end + 1..];
+            match sequence[end] {
+                b'm' => {
+                    validate_history_replay(sequence)?;
+                    append(&mut out, sequence)?;
+                    if parameters == b"0" {
+                        pen_len = 0;
+                    } else {
+                        anyhow::ensure!(
+                            pen_len + sequence.len() <= pen.len(),
+                            "Invalid history pen"
+                        );
+                        pen[pen_len..pen_len + sequence.len()].copy_from_slice(sequence);
+                        pen_len += sequence.len();
+                    }
+                }
+                b'C' | b'X' => {
+                    anyhow::ensure!(
+                        !parameters.is_empty() && parameters.iter().all(u8::is_ascii_digit),
+                        "Invalid history blank count"
+                    );
+                    let count: usize = std::str::from_utf8(parameters)?.parse()?;
+                    anyhow::ensure!(
+                        (1..=usize::from(cols)).contains(&count),
+                        "Invalid history blank count"
+                    );
+                    if sequence[end] == b'X' {
+                        // Background-only blanks use ECH followed by CUF with
+                        // the same count. Materialize them in the current pen.
+                        input = input
+                            .strip_prefix(b"\x1b[")
+                            .and_then(|rest| rest.strip_prefix(parameters))
+                            .and_then(|rest| rest.strip_prefix(b"C"))
+                            .ok_or_else(|| anyhow::anyhow!("Invalid history blank pair"))?;
+                    } else {
+                        // CUF alone skips unwritten cells. Their rendition is
+                        // default even when the surrounding text is styled.
+                        append(&mut out, b"\x1b[0m")?;
+                    }
+                    let spaces = [b' '; gmux_client::viewport::MAX_AXIS];
+                    append(&mut out, &spaces[..count])?;
+                    if sequence[end] == b'C' {
+                        append(&mut out, &pen[..pen_len])?;
+                    }
+                }
+                _ => anyhow::bail!("Invalid history operation"),
+            }
+        } else {
+            let len = input
+                .iter()
+                .position(|&b| b == 0x1b)
+                .unwrap_or(input.len())
+                .max(1);
+            append(&mut out, &input[..len])?;
+            input = &input[len..];
+        }
+    }
+    validate_history_replay(&out)?;
+    Ok(out)
+}
+
 #[derive(Default)]
 struct Events {
     replies: Vec<u8>,
@@ -603,7 +718,7 @@ impl Engine {
             gmux_client::viewport::valid(cols as u64, rows as u64),
             "Invalid snapshot dimensions"
         );
-        validate_history_replay(&text)?;
+        text = normalize_history_replay(text, cols)?;
         // Include the clean ending in the replay budget. Reset before CRLF so
         // a saved background cannot fill the new prompt's row during scrolling.
         if !text.is_empty() {
@@ -1770,6 +1885,36 @@ mod tests {
     }
 
     #[test]
+    fn current_formatter_controls_normalize_to_bounded_text_and_rendition() {
+        let mut formatted = b"\x1b[0m".to_vec();
+        formatted.extend_from_slice(b"\x1b[38;5;1mA\x1b[3CB\x1b]8;id=test;https://example/\x1b\\C\x1b]8;;\x1b\\\x1b[0m\x1b[48;5;4m\x1b[2X\x1b[2C");
+        let expected = b"\x1b[0m\x1b[38;5;1mA\x1b[0m   \x1b[38;5;1mBC\x1b[0m\x1b[48;5;4m  ";
+        assert_eq!(normalize_history_replay(formatted, 80).unwrap(), expected);
+        for invalid in [
+            b"\x1b]52;c;YQ==\x07".as_slice(),
+            b"\x1b[2J",
+            b"\x1b[H",
+            b"\x1b[0C",
+            b"\x1b[81C",
+            b"\x1b[+2C",
+            b"\x1b[2X",
+            b"\x1b[2X\x1b[3C",
+            b"\x1b]8;;unterminated",
+            b"\x1b]8;;bad\x07\x1b\\",
+        ] {
+            assert!(
+                normalize_history_replay(invalid.to_vec(), 80).is_err(),
+                "{invalid:?}"
+            );
+        }
+        // CUF expansion cannot bypass the replay budget with compact input.
+        let expansion = b"\x1b[1000C".repeat(crate::scrollback::MAX_PANE_BYTES / 1000 + 1);
+        assert!(normalize_history_replay(expansion, 1000).is_err());
+        let oversized = vec![b'a'; crate::scrollback::MAX_PANE_BYTES + 1];
+        assert!(normalize_history_replay(oversized, 80).is_err());
+    }
+
+    #[test]
     fn history_replay_accepts_only_complete_utf8_crlf_and_cell_rendition() {
         for valid in [
             "你好 e\u{301} 🦀\r\n",
@@ -1777,6 +1922,15 @@ mod tests {
             "\x1b[38;5;201m\x1b[48;2;1;2;3m",
         ] {
             validate_history_replay(valid.as_bytes()).unwrap();
+            let data = valid.as_bytes().to_vec();
+            let allocation = data.as_ptr();
+            let normalized = normalize_history_replay(data, 80).unwrap();
+            assert_eq!(normalized, valid.as_bytes());
+            assert_eq!(
+                normalized.as_ptr(),
+                allocation,
+                "Text/SGR replay must reuse its buffer"
+            );
         }
         for invalid in [
             b"\x1b]4;1;rgb:01/02/03\x1b\\".as_slice(),

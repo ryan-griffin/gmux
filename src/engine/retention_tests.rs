@@ -223,3 +223,80 @@ fn pruning_during_a_render_hold_refreshes_each_view_after_expiry_without_output(
         }
     }
 }
+
+#[test]
+fn scroll_clear_migrates_styled_hyperlinked_cursor_off_a_pruned_page() {
+    // GHSA-w9q4-5jvv-mcv4. Place the cursor on the last row of a page,
+    // with the other two active rows on the next page. Clearing must migrate
+    // its page-local style and hyperlink before the old page is freed.
+    for policy in [
+        limits(Some(0), None),
+        limits(Some(1), None),
+        limits(None, Some(0)),
+        limits(None, Some(1)),
+    ] {
+        for clear in [b"\x1b[22J".as_slice(), b"\x1b[2J".as_slice()] {
+            let mut e = Engine::new().unwrap();
+            e.resize(80, 3, 0, 0).unwrap();
+            e.set_scrollback_limits(policy).unwrap();
+            if policy.max_bytes != Limit::Count(0) {
+                let pages = e.memory_usage().unwrap().pages;
+                let mut crossed = false;
+                for _ in 0..10000 {
+                    e.write(b"x\r\n");
+                    if e.memory_usage().unwrap().pages > pages {
+                        crossed = true;
+                        break;
+                    }
+                }
+                assert!(crossed, "Fixture must span two native pages");
+            } else {
+                // Byte zero uses the separate no-scrollback path.
+                e.write(b"x\r\n");
+            }
+            // Mark the last row as a prompt, exercising CSI 2 J's scroll-clear
+            // heuristic as well as the explicit CSI 22 J operation.
+            e.write(b"x\r\n\x1b]133;A\x07x\x1b[H\x1b[1;38;2;123;45;67m\x1b]8;;test:cursor\x1b\\");
+            e.snapshot().unwrap();
+            let pages = e.memory_usage().unwrap().pages;
+            e.write(clear);
+            e.write(b"Y\x1b]8;;\x1b\\\x1b[0mZ");
+            e.snapshot().unwrap();
+            if matches!(policy.max_lines, Limit::Count(_)) {
+                assert!(
+                    e.memory_usage().unwrap().pages < pages,
+                    "Clear must prune the cursor page"
+                );
+            }
+            assert_eq!(e.cells[0].text[0], b'Y');
+            assert_eq!(e.cells[0].fg, [123, 45, 67]);
+            assert_eq!(e.cells[0].flags & 1, 1, "Cursor bold style was lost");
+            assert_eq!(e.hyperlinks.target_at(0), Some("test:cursor"));
+            assert_eq!(e.cells[1].text[0], b'Z');
+            assert_eq!(e.cells[1].flags & 1, 0);
+            assert_eq!(e.hyperlinks.target_at(1), None);
+            // Reset and reuse the tables after releasing their cursor refs.
+            e.write(b"\x1bc\x1b[3m\x1b]8;;test:after\x07ok\x1b]8;;\x07\x1b[0m");
+            e.snapshot().unwrap();
+            assert_eq!(e.hyperlinks.target_at(0), Some("test:after"));
+        }
+    }
+}
+
+#[test]
+fn one_row_line_limit_preserves_cursor_style_and_link_after_reflow_and_pruning() {
+    // GHSA-qjfx-r533-6vx3. Reflow creates a page whose capacity exceeds
+    // the line limit, then linefeeds eventually prune the cursor's page.
+    let mut e = Engine::new().unwrap();
+    e.resize(3, 1, 0, 0).unwrap();
+    e.set_scrollback_limits(limits(None, Some(0))).unwrap();
+    e.write(b"\x1b[1m\x1b]8;;test:one-row\x07");
+    e.write(&[b'a'; 103]);
+    e.resize(80, 1, 0, 0).unwrap();
+    e.write(&[b'\n'; 1000]);
+    e.write(b"b\x1b]8;;\x07\x1b[0m");
+    e.snapshot().unwrap();
+    let index = e.cells.iter().position(|c| c.text[0] == b'b').unwrap();
+    assert_eq!(e.cells[index].flags & 1, 1);
+    assert_eq!(e.hyperlinks.target_at(index), Some("test:one-row"));
+}

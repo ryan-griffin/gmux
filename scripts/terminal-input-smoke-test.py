@@ -162,7 +162,7 @@ done.touch()
             wait_for(lambda: appearance_events.exists() and b'a' in appearance_events.read_bytes())
             assert appearance()["cursor_phase_visible"], "IME commit must restore cursor without movement"
             # Shell actions use the native key dispatch and GDK clipboard.
-            shell_sequence = ("\x1b[3J\x1b[2J\x1b[H" + "".join(
+            shell_sequence = ("\x1b[2J\x1b[3J\x1b[H" + "".join(
                 f"\x1b]133;A\x07$ \x1b]133;B\x07cmd{i}\r\n\x1b]133;C\x07"
                 + ("\x1b[48;2;33;122;77m" if i == 98 else "")
                 + f"native-output-{i}\x1b[0m\r\n\x1b]133;D;0\x07"
@@ -199,7 +199,7 @@ done.touch()
             wait_for(lambda: appearance(lambda s: not s["scroll_pending"] and s["scrollback"]["offset"] == before_prompt))
             rich_text = "<>&\"'界🙂e\u0301"
             sequence = ("\x1b[?5h\x1b]10;#123456\x07\x1b]11;#654321\x07"
-                        + "\x1b[3J\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07"
+                        + "\x1b[2J\x1b[3J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07"
                         + "\x1b[1;3;4:3;9;38;2;17;34;51m" + rich_text
                         + "\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07").encode()
             appearance_control.write_bytes(sequence)
@@ -212,7 +212,7 @@ done.touch()
             for fragment in ["&lt;&gt;&amp;&quot;&#39;", "font-weight: bold", "font-style: italic", "rgb(17, 34, 51)"]:
                 assert fragment in html, html
             # Return to a neutral screen for the remaining input probes.
-            neutral = b'\x1b[?5l\x1b]110\x07\x1b]111\x07\x1b[3J\x1b[2J\x1b[H'
+            neutral = b'\x1b[?5l\x1b]110\x07\x1b]111\x07\x1b[2J\x1b[3J\x1b[H'
             appearance_control.write_bytes(neutral)
             wait_for(lambda: appearance_applied.read_bytes() == neutral)
             # Terminal clipboard writes use the daemon stream and real GDK
@@ -680,7 +680,13 @@ Path(done).touch()
                     native.drain_frames()
                     native.frame()
                     start = len(read_keys())
-                    tap(Gdk.KEY_a)
+                    # Reuse the held key's physical identity. Wait for its
+                    # press before releasing across the restored popup grab.
+                    native.keycode(30, True)
+                    try:
+                        wait_for(lambda: read_keys()[start:] == b"\x1b[97;;97u")
+                    finally:
+                        native.keycode(30, False)
                     wait_for(lambda: read_keys()[start:].endswith(b"\x1b[97;1:3u"))
                     assert read_keys()[start:] == b"\x1b[97;;97u\x1b[97;1:3u", (destination, read_keys()[start:])
 
@@ -726,7 +732,9 @@ Path(done).touch()
                 actual = read_keys()
                 assert actual == b"a" * (len(actual) - 1) + b"b", actual
 
-            command = r"printf '\033[2J\033[H\033[48;2;230;30;45mKEYBOARD_INPUT_OK\033[0m\n'"
+            # ED 2 may move a partial prompt screen into history in 1.4.
+            # Erase history afterwards so coordinate fixtures start at row 0.
+            command = r"printf '\033[2J\033[3J\033[H\033[48;2;230;30;45mKEYBOARD_INPUT_OK\033[0m\n'"
             for char in command + "\n":
                 symbol = Gdk.KEY_Return if char == "\n" else Gdk.unicode_to_keyval(ord(char))
                 native.key(symbol, True)
@@ -784,7 +792,7 @@ Path(done).touch()
             assert "\n" not in Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset)
 
             # No daemon reply is available while recognizing and reversing a drag.
-            rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[Hone café_界é two\\n  line two\\n'", paste=True, enter=True)
+            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[Hone café_界é two\\n  line two\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one café_界é two"))
             ch = rpc("renderer-info", pane=pane)["viewport"]["cell_height"]
 
@@ -846,7 +854,7 @@ Path(done).touch()
             copied("alphabetlong")
 
             wrapped_line = "wrapped_" + "x" * cols
-            rpc("send", pane=pane, text=f"printf '\\033[3J\\033[2J\\033[H{wrapped_line}\\n  line two\\n'", paste=True, enter=True)
+            rpc("send", pane=pane, text=f"printf '\\033[2J\\033[3J\\033[H{wrapped_line}\\n  line two\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("wrapped_"))
             proxy.pause()
             repeat_click(5, 1, 3, hold=True)
@@ -874,7 +882,7 @@ Path(done).touch()
 
             # Rectangles preview immediately while the stream is paused. Each
             # accessible range is one row, with complete wide/combining glyphs.
-            rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[Ha界éZ\\r\\n12界Q\\r\\n'", paste=True, enter=True)
+            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[Ha界éZ\\r\\n12界Q\\r\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("a界éZ"))
             for start, end in [((2, 0), (3, 1)), ((3, 1), (2, 0)),
                                ((3, 0), (2, 1)), ((2, 1), (3, 0))]:
@@ -899,7 +907,7 @@ Path(done).touch()
             copied("   \n   \n   ")
             # Soft wraps remain separate physical rows in a block copy.
             wrapped = "A" * cols + "B" * cols
-            rpc("send", pane=pane, text=f"printf '\\033[3J\\033[2J\\033[H{wrapped}'", paste=True, enter=True)
+            rpc("send", pane=pane, text=f"printf '\\033[2J\\033[3J\\033[H{wrapped}'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("A" * cols))
             native.key(Gdk.KEY_Control_L, True)
             repeat_click(2, 0, 1, hold=True)
@@ -917,7 +925,7 @@ Path(done).touch()
 old = termios.tcgetattr(0)
 try:
     tty.setraw(0)
-    os.write(1, b'\\x1b[3J\\x1b[2J\\x1b[Hone two\\r\\n\\x1b[?1000h\\x1b[?1006h\\x1b]2;SELECTION_MOUSE_READY\\x07')
+    os.write(1, b'\\x1b[2J\\x1b[3J\\x1b[Hone two\\r\\n\\x1b[?1000h\\x1b[?1006h\\x1b]2;SELECTION_MOUSE_READY\\x07')
     with open(sys.argv[1], 'wb', buffering=0) as events:
         while True:
             data = os.read(0, 128)
@@ -962,7 +970,7 @@ finally:
             rpc("send", pane=pane, text="q")
             wait_for(lambda: "GMUX_INPUT>" in Atspi.Text.get_text(text_iface, 0, -1))
 
-            rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[H界éX\\n'", paste=True, enter=True)
+            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[H界éX\\n'", paste=True, enter=True)
             wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("界éX"))
             for offset in (1, 2, 1):
                 cluster = Atspi.Text.get_string_at_offset(text_iface, offset, Atspi.TextGranularity.CHAR)
@@ -992,7 +1000,7 @@ finally:
 old = termios.tcgetattr(0)
 try:
     tty.setraw(0)
-    os.write(1, '\\x1b[3J\\x1b[2J\\x1b[H界éX\\r\\nUNCHANGED_ROW\\x1b[4;1H'.encode())
+    os.write(1, '\\x1b[2J\\x1b[3J\\x1b[H界éX\\r\\nUNCHANGED_ROW\\x1b[4;1H'.encode())
     while True:
         action = os.read(0, 1)
         if action == b'q':
@@ -1053,7 +1061,7 @@ finally:
                 rpc("send", pane=pane, text="q")
             wait_for(lambda: "GMUX_INPUT>" in Atspi.Text.get_text(text_iface, 0, -1))
             native.click_color((30, 90, 180))
-            rpc("send", pane=pane, text="printf '\\033[3J\\033[2J\\033[H\\033[48;2;230;30;45mHISTORY_START\\033[0m\\n'; seq 1 120; printf '\\033[48;2;30;200;80mHISTORY_END\\033[0m\\n'", paste=True, enter=True)
+            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[H\\033[48;2;230;30;45mHISTORY_START\\033[0m\\n'; seq 1 120; printf '\\033[48;2;30;200;80mHISTORY_END\\033[0m\\n'", paste=True, enter=True)
             wait_for(lambda: "HISTORY_END" in rpc("read", pane=pane)["text"])
 
             def page(symbol):

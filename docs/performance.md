@@ -161,8 +161,8 @@ Daemon RSS was 54,144 KiB before, 111,464 KiB at its process high-water mark, an
 daemon CPU ticks over 1.1 s in each case. These short idle samples do not measure
 sub-tick work. Clipboard delivery adds no polling timer.
 
-The native decoded-data limit does not bound repeated Kitty alias metadata
-before commit. Measure that separately against the pinned library:
+The native parser bounds Kitty MIME and alias counts separately from decoded
+data. Measure metadata retained before commit against the pinned library:
 
 ```sh
 cc -O2 -std=c11 '-DGMUX_VERSION="test"' -I.deps/ghostty/include \
@@ -172,11 +172,9 @@ cc -O2 -std=c11 '-DGMUX_VERSION="test"' -I.deps/ghostty/include \
 artifacts/clipboard-alias-benchmark 1000000
 ```
 
-One byte of data and a million repetitions of the same alias retained about
-9 MiB of extra native memory before commit, while the embedding callback had
-not yet run. Commit released that transaction storage. This is an upstream
-parser allocation limit, not a Gmux queue overflow. See the
-[current clipboard limits](clipboard.md#application-writes).
+Repeated aliases update their targets in place. The probe verifies that the
+embedding callback runs only at commit and reports RSS before and after the
+transaction. See the [current clipboard limits](clipboard.md#application-writes).
 
 ## Program status
 

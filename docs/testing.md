@@ -93,6 +93,19 @@ prompt/output anchors, independent viewports, alternate screens, pruning during
 synchronized-output holds, and byte/line zero semantics. Existing client tests exercise cache predictions and rebasing
 through delayed replies and pruning.
 
+Engine retention tests exercise scroll-clear cursor migration with zero and small
+byte/line limits, bold RGB text, OSC 8, and both explicit and shell-prompt clears.
+They also check one-row line-limit pruning after reflow. Saved-history tests
+check colors and gaps across reflow, current formatter normalization, buffer
+reuse, expansion budgets, and rejection of other terminal operations. Destructive-erasure shell
+fixtures put non-prompt text on the bottom row so ED 2 discards the active screen;
+prompt-preserving clears separately verify that captured output survives. Native
+coordinate fixtures erase history after ED 2 so its prompt-preserving behavior
+cannot shift their absolute row-zero assertions. The shell suite runs
+Bash/Zsh directory-reporting fixtures in new sessions without a controlling TTY.
+It captures all output and checks backslashes, raw controls, hostnames, and Unicode
+in both C and UTF-8 locales, alongside the existing startup and user-hook tests.
+
 The `compression` headless suite checks attached and detached multi-pane
 compression, input during incremental work, transparent history access, and
 deadline removal after completion and pane teardown. It observes idle periods

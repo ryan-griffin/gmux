@@ -78,6 +78,6 @@ rule used by CLI and socket status. Progress arrives through pane metadata;
 progress alone does not change client viewport or text revisions.
 
 The implementation uses the pinned
-[callback API](https://github.com/ghostty-org/ghostty/blob/8f0dd3709050b1026f6324368805033197d8b4a5/include/ghostty/vt/terminal.h),
-[reset effect](https://github.com/ghostty-org/ghostty/blob/8f0dd3709050b1026f6324368805033197d8b4a5/src/terminal/stream_terminal.zig),
-and [15-second timeout](https://github.com/ghostty-org/ghostty/blob/8f0dd3709050b1026f6324368805033197d8b4a5/src/apprt/gtk/class/surface.zig).
+[callback API](https://github.com/ghostty-org/ghostty/blob/83fb95624b0439ee660c2679b43b38c8b63769cd/include/ghostty/vt/terminal.h),
+[reset effect](https://github.com/ghostty-org/ghostty/blob/83fb95624b0439ee660c2679b43b38c8b63769cd/src/terminal/stream_terminal.zig),
+and [15-second timeout](https://github.com/ghostty-org/ghostty/blob/83fb95624b0439ee660c2679b43b38c8b63769cd/src/apprt/gtk/class/surface.zig).

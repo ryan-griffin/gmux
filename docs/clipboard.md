@@ -71,12 +71,10 @@ at most 16 KiB. Daemon output and client input queues are each limited to 32 MiB
 the client also limits its queue to 64 packets. A stalled recipient is detached
 when its daemon output queue fills, without blocking terminal output.
 
-The pinned native parser does not charge repeated Kitty alias metadata against
-its decoded-data budget. An unfinished transaction can therefore grow native
-memory through repeated aliases until commit or abort. The normalized callback
-only runs at commit, so Gmux's admission bounds cannot prevent that earlier
-allocation. A native dependency fix is required for a hard bound on all parser
-memory.
+The native parser separately limits each Kitty transaction to 64 MIME types and
+64 aliases. Repeated aliases update their targets in place, so they do not
+accumulate metadata before commit. Gmux's stricter four-representation and
+expanded-data limits apply when the normalized callback runs at commit.
 
 The standard clipboard and primary selection are supported. The separate
 `selection` destination is unsupported. Existing recipient policy applies to
@@ -122,7 +120,7 @@ For larger data, split each MIME's base64 stream across `wdata` packets rather
 than putting the whole file in one OSC sequence. The same transaction can include
 an `image/png` representation containing the file's exact bytes.
 
-The [pinned callback contract](https://github.com/ghostty-org/ghostty/blob/8f0dd3709050b1026f6324368805033197d8b4a5/include/ghostty/vt/terminal.h)
+The [pinned callback contract](https://github.com/ghostty-org/ghostty/blob/83fb95624b0439ee660c2679b43b38c8b63769cd/include/ghostty/vt/terminal.h)
 defines borrowing, atomicity, and protocol replies. GDK documents
 [byte providers](https://docs.gtk.org/gdk4/ctor.ContentProvider.new_for_bytes.html),
 [union ordering](https://docs.gtk.org/gdk4/ctor.ContentProvider.new_union.html), and

@@ -1,7 +1,7 @@
 # Shell integration resources
 
-The Bash and Zsh scripts come from Ghostty revision
-`8f0dd3709050b1026f6324368805033197d8b4a5`, matching
+The Bash and Zsh scripts come from Ghostty 1.4.0 revision
+`83fb95624b0439ee660c2679b43b38c8b63769cd`, matching
 `scripts/bootstrap-ghostty.py`:
 
 - `bash/ghostty.bash`, `zsh/.zshenv`, and `zsh/ghostty-integration` are

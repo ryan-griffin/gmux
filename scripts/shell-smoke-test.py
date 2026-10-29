@@ -17,6 +17,50 @@ root = Path(__file__).resolve().parent.parent
 binary = cargo_binary("gmux")
 
 
+def directory_reporting_security():
+    # Each shell has a new session, no controlling TTY, private startup files,
+    # and captured output. Even a regression cannot reach a desktop clipboard.
+    for shell in ("bash", "zsh"):
+        executable = shutil.which(shell)
+        assert executable, f"Install {shell} to run the shell integration suite"
+        for locale in ("C", "C.UTF-8"):
+            with AppFixture(prefix=f"gmux-{shell}-cwd-") as f:
+                home = f.path / "home"
+                home.mkdir()
+                for name in (r"back\a\e]52;c;SGVsbG8=\a",
+                             "raw\x07\x1b]52;c;SGVsbG8=\x07\r\n\t\x7f", "ordinary space 界"):
+                    directory = home / name
+                    directory.mkdir()
+                    host = "host\x07\x1b]52;c;SGVsbG8=\x07\r\n\t\x7f" + r"\a\e"
+                    script = root / "data/shell-integration" / (
+                        "bash/ghostty.bash" if shell == "bash" else "zsh/ghostty-integration")
+                    if shell == "bash":
+                        command = (f"source {shlex.quote(str(script))} >/dev/null; "
+                                   "_ghostty_executing=; BLE_VERSION=fixture; "
+                                   f"HOSTNAME={shlex.quote(host)}; __ghostty_precmd")
+                        flags = ["--noprofile", "--norc", "-ic"]
+                        prefix = b"\x1b]133;P;k=i\x07"
+                    else:
+                        command = (f"source {shlex.quote(str(script))} >/dev/null; "
+                                   "_ghostty_deferred_init >/dev/null 2>&1; _ghostty_fd=1; "
+                                   f"HOST={shlex.quote(host)}; _ghostty_report_pwd")
+                        flags = ["-fic"]
+                        prefix = b""
+                    env = dict(f.env, HOME=str(home), ZDOTDIR=str(home), ENV="",
+                               LC_ALL=locale, TERM="dumb", GHOSTTY_SHELL_FEATURES="")
+                    result = subprocess.run([executable, *flags, command], cwd=directory,
+                                            env=env, capture_output=True, start_new_session=True,
+                                            timeout=10, check=True)
+                    clean = lambda text: "".join(c for c in text if ord(c) >= 32 and ord(c) != 127)
+                    expected = prefix + b"\x1b]7;kitty-shell-cwd://" + (
+                        clean(host) + clean(str(directory))).encode() + b"\x07"
+                    assert result.stdout == expected, (shell, locale, repr(result.stdout))
+
+
+with scenario("Bash/Zsh directory reports preserve backslashes and remove controls"):
+    directory_reporting_security()
+
+
 def shell_fixture(shell, array=False, no_history=False, relative_resources=False):
     executable = shutil.which(shell)
     assert executable, f"Install {shell} to run the shell integration suite"
@@ -179,7 +223,7 @@ with AppFixture(prefix="gmux-semantic-") as f:
                         "\x1b]133;C\x07old output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
             first.send("anchor-output", point=[0, 1])
             first.barrier(3)
-            probe.write("\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07new\r\n"
+            probe.write("\x1b[10;1H.\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07new\r\n"
                         "\x1b]133;C\x07new output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
             first.send("select-output", point=None, anchored=True, copy="text", serial=2)
             h = first.until(lambda h: h.get("error") == "No command output available")
@@ -192,7 +236,7 @@ with AppFixture(prefix="gmux-semantic-") as f:
                         "\x1b]133;C\x07old output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
             first.send("anchor-output", point=[0, 1])
             first.barrier(4)
-            probe.write("new\r\n\x1b]133;C\x07\x1b[2J\x1b[Hnew first\r\nnew second\r\n"
+            probe.write("new\r\n\x1b]133;C\x07\x1b[10;1H.\x1b[2J\x1b[Hnew first\r\nnew second\r\n"
                         "\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
             first.send("select-output", point=None, anchored=True, copy="text", serial=3)
             h = first.until(lambda h: h.get("error") == "No command output available")
