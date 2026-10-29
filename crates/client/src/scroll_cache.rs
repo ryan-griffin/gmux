@@ -268,8 +268,7 @@ mod tests {
         cache.configure(1, frame);
         for row in 0..10 {
             let mut cell = Cell::default();
-            cell.set_text(std::str::from_utf8(&[b'a' + row]).unwrap())
-                .unwrap();
+            cell.set_text_bytes(&[b'a' + row]).unwrap();
             cell.flags = if row % 2 == 1 {
                 crate::cells::flags::BLINK
             } else {

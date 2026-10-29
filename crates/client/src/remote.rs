@@ -1927,8 +1927,7 @@ mod tests {
         };
         let row = |value| {
             let mut cell = Cell::default();
-            cell.set_text(std::str::from_utf8(&[value]).unwrap())
-                .unwrap();
+            cell.set_text_bytes(&[value]).unwrap();
             vec![cell.clone(), cell]
         };
         let links = |uri: &str| {
@@ -2529,8 +2528,7 @@ mod tests {
         let mut frame = session.borrow().frame;
         for (row, text) in [(0, b'a'), (1, b'b')] {
             let mut cell = Cell::default();
-            cell.set_text(std::str::from_utf8(&[text]).unwrap())
-                .unwrap();
+            cell.set_text_bytes(&[text]).unwrap();
             frame.cursor_y = row;
             sender
                 .send(Ok(Packet {
@@ -2745,8 +2743,7 @@ mod tests {
         };
         let row = |value| {
             let mut cell = Cell::default();
-            cell.set_text(std::str::from_utf8(&[value]).unwrap())
-                .unwrap();
+            cell.set_text_bytes(&[value]).unwrap();
             [cell.clone(), cell]
         };
         sender
@@ -2960,8 +2957,7 @@ mod tests {
         handle.borrow_mut().connection = connection;
         let row = |value: u8| {
             let mut cell = Cell::default();
-            cell.set_text(std::str::from_utf8(&[value]).unwrap())
-                .unwrap();
+            cell.set_text_bytes(&[value]).unwrap();
             cell.decoration = underline::CURLY;
             vec![cell.clone(), cell]
         };

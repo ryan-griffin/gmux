@@ -554,8 +554,7 @@ mod tests {
         frontend.attached = true;
         let packet = |text| {
             let mut cell = Cell::default();
-            cell.set_text(std::str::from_utf8(&[text]).unwrap())
-                .unwrap();
+            cell.set_text_bytes(&[text]).unwrap();
             Packet {
                 header: Header {
                     meta: Metadata {

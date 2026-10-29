@@ -76,17 +76,21 @@ pub mod mouse_shape {
 }
 /// Ghostty 1.4 stores one base and at most 64 suffix codepoints.
 pub const MAX_GRAPHEME_BYTES: usize = 65 * 4;
+const INLINE_TEXT_BYTES: usize = 15;
 
 /// Ordinary cells need no allocation. Clones share only the uncommon long text.
 #[derive(Clone, PartialEq, Eq)]
 enum Text {
-    Inline { bytes: [u8; 15], len: u8 },
+    Inline {
+        bytes: [u8; INLINE_TEXT_BYTES],
+        len: u8,
+    },
     Shared(std::sync::Arc<str>),
 }
 impl Default for Text {
     fn default() -> Self {
         Self::Inline {
-            bytes: [0; 15],
+            bytes: [0; INLINE_TEXT_BYTES],
             len: 0,
         }
     }
@@ -96,7 +100,7 @@ impl Text {
     fn as_str(&self) -> &str {
         match self {
             Self::Inline { bytes, len } => {
-                // Grapheme::new writes these private bytes only from a valid &str.
+                // Constructors store only valid UTF-8; bytes and length stay private.
                 unsafe { std::str::from_utf8_unchecked(&bytes[..*len as usize]) }
             }
             Self::Shared(text) => text,
@@ -109,14 +113,33 @@ impl Text {
 pub struct Grapheme(Text);
 
 impl Grapheme {
+    /// Decode borrowed engine or wire bytes, with no allocation for short text.
+    #[inline]
+    pub fn from_utf8(bytes: &[u8]) -> anyhow::Result<Self> {
+        match bytes {
+            [] => Ok(Self::default()),
+            [byte @ 1..=0x7f] => {
+                // The match establishes valid UTF-8 without NUL. This is the
+                // common native/wire cell, so avoid the general UTF-8 scan.
+                let mut bytes = [0; INLINE_TEXT_BYTES];
+                bytes[0] = *byte;
+                Ok(Self(Text::Inline { bytes, len: 1 }))
+            }
+            _ => {
+                anyhow::ensure!(bytes.len() <= MAX_GRAPHEME_BYTES, "Invalid grapheme text");
+                Self::new(std::str::from_utf8(bytes)?)
+            }
+        }
+    }
+
     #[inline]
     pub fn new(text: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             text.len() <= MAX_GRAPHEME_BYTES && !text.contains('\0'),
             "Invalid grapheme text"
         );
-        Ok(Self(if text.len() <= 15 {
-            let mut bytes = [0; 15];
+        Ok(Self(if text.len() <= INLINE_TEXT_BYTES {
+            let mut bytes = [0; INLINE_TEXT_BYTES];
             bytes[..text.len()].copy_from_slice(text.as_bytes());
             Text::Inline {
                 bytes,
@@ -185,10 +208,19 @@ impl Cell {
     #[inline]
     pub fn set_text(&mut self, text: &str) -> anyhow::Result<()> {
         // Avoid allocating an unchanged overflow value on dirty-row rewrites.
-        if text.len() > 15 && self.text() == text {
+        if text.len() > INLINE_TEXT_BYTES && self.text() == text {
             return Ok(());
         }
         self.text = Grapheme::new(text)?;
+        Ok(())
+    }
+    #[inline]
+    pub fn set_text_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        // Matching existing overflow is already valid and needs no new Arc.
+        if bytes.len() > INLINE_TEXT_BYTES && self.text().as_bytes() == bytes {
+            return Ok(());
+        }
+        self.text = Grapheme::from_utf8(bytes)?;
         Ok(())
     }
     /// Conservative retained allocation charge, including the Arc counters.

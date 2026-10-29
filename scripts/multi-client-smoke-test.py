@@ -290,7 +290,10 @@ with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-clien
             expect_size(512, 128)
             slow.barrier(10)
             # Reattachment requests full frames without changing the surviving views.
-            for serial in range(11, 41):
+            # Even empty protocol-37 cells have a 13-byte prefix. Queue twice
+            # the 64 MiB output cap to allow for the kernel's socket buffer.
+            resyncs = 2 * (64 * 1024 * 1024) // (512 * 128 * 13)
+            for serial in range(11, 11 + resyncs):
                 if fixture.rpc("status")["local_clients"] == 2:
                     break
                 slow.send("subscribe", panes=[])
