@@ -130,7 +130,7 @@ impl Packet {
         let clipboard_payload = if let Some(write) = &self.header.copy {
             let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
             // Reject backpressure before scanning text or growing the queue.
-            anyhow::ensure!(8 + payload <= limit, "Clipboard queue is full");
+            anyhow::ensure!(8 + payload <= limit, "Frontend is too slow");
             anyhow::ensure!(
                 self.clipboard_only() && self.cells.is_empty(),
                 "Clipboard offers require a dedicated packet"
@@ -166,7 +166,8 @@ impl Packet {
                 }
             }
             let size = bytes.len() - start - 4 + self.cells.len() * CELL_BYTES;
-            anyhow::ensure!(size + 4 <= limit, "Viewport packet or queue is too large");
+            anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
+            anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
             bytes[start..start + 4].copy_from_slice(&(size as u32).to_le_bytes());
             bytes[start + 4..start + 8].copy_from_slice(&(header_size as u32).to_le_bytes());
             bytes.reserve(self.cells.len() * CELL_BYTES);

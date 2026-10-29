@@ -11,7 +11,7 @@ from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 from cargo_test_support import cargo_binary
-from stream_test_support import PROTOCOL_VERSION
+from stream_test_support import PROTOCOL_VERSION, decode_packet
 import select
 import shlex
 import socket
@@ -88,9 +88,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         size, = struct.unpack("<I", exact(4))
         assert size <= 16 * 1024 * 1024
         body = exact(size)
-        header_size, = struct.unpack("<I", body[:4])
-        header = json.loads(body[4:4 + header_size])
-        cells = body[4 + header_size:]
+        header, cells = decode_packet(body)
         if header["frame"]:
             assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header["frame"]["cols"] * 75
         else:
