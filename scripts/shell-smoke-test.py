@@ -145,8 +145,10 @@ def shell_fixture(shell, array=False, no_history=False, relative_resources=False
                 f.rpc("send", pane=pane, text="for word in a b; do\n printf '%s\\n' \"$word\"\ndone", enter=True)
                 expect_exit(0)
                 assert f.rpc("command-output", pane=pane)["text"] == "a\nb"
-                f.rpc("send", pane=pane, text=":", enter=True)
-                expect_exit(0)
+                # Use a distinct status so the preceding successful command
+                # cannot satisfy this wait before the empty command finishes.
+                f.rpc("send", pane=pane, text=":; (exit 23)", enter=True)
+                expect_exit(23)
                 f.rpc("send", pane=pane, text="printf 'BUILTIN_VISIBLE\\n'; read -r answer", enter=True)
                 wait_for(lambda: (m := meta())["command"]["phase"] == "running" and m["busy"])
                 assert not meta()["command"]["at_prompt"]
@@ -154,7 +156,8 @@ def shell_fixture(shell, array=False, no_history=False, relative_resources=False
                 # writes it. Wait for the actual output row, not that echo.
                 client.until(lambda h: h["meta"]["id"] == pane and h["frame"]
                              and any(line.rstrip() == "BUILTIN_VISIBLE" for line in client.text().splitlines()))
-                assert f.rpc("command-output", pane=pane)["text"] == "BUILTIN_VISIBLE"
+                output = f.rpc("command-output", pane=pane)["text"]
+                assert output == "BUILTIN_VISIBLE", (output, meta(), client.text())
                 f.rpc("send", pane=pane, text="answer", enter=True)
                 expect_exit(0)
             with scenario(f"{shell} reconnect retains command status, restart starts a fresh shell"):
