@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the pinned libghostty-vt locally. Never changes system packages."""
 import hashlib
-import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -11,10 +11,15 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DEPS = ROOT / ".deps"
-REVISION = "8f0dd3709050b1026f6324368805033197d8b4a5"
-SOURCE_SHA256 = "f4869fc667ea0a1c93705e363ceca06d394b67ad1d3dde756a7fa5c15691f9cb"
+# Ghostty v1.4.0, peeled release tag. Never use the moving tag as a cache key.
+REVISION = "83fb95624b0439ee660c2679b43b38c8b63769cd"
+SOURCE_SHA256 = "7759929eadaddf602d6fd5ad6b3403d854b91b7083975cd984bb525bc8275187"
 # Must match the source's build.zig.zon and src/build/zig.zig requirement.
-ZIG_VERSION = "0.16.0"
+ZIG_VERSION = "0.17.0"
+ZIG_SHA256 = {
+    "x86_64": "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026",
+    "aarch64": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
+}
 PATCHES = [ROOT / "scripts/patches/ghostty-media-keys.patch"]
 
 
@@ -57,6 +62,18 @@ def extract(archive_path, destination, *, tree_name=None, patches=()):
         tree.replace(destination)
 
 
+def fetch_dependency(zig, source, archive, env):
+    # Fetch an extracted package root. Zig 0.17 can retain the archive's wrapper
+    # directory when repacking a local tarball into its global package cache.
+    # A directory fetch keeps the cached layout identical to the hashed source.
+    with tempfile.TemporaryDirectory(dir=DEPS, prefix=".fetch-") as directory:
+        with tarfile.open(archive) as package:
+            package.extractall(directory, filter="data")
+        entries = list(Path(directory).iterdir())
+        package_root = entries[0] if len(entries) == 1 and entries[0].is_dir() else Path(directory)
+        subprocess.run([str(zig), "fetch", str(package_root)], cwd=source, env=env, check=True)
+
+
 def main():
     arch = {"x86_64": "x86_64", "aarch64": "aarch64"}.get(platform.machine())
     if not arch or platform.system() != "Linux":
@@ -74,7 +91,7 @@ def main():
         return
     stamp.unlink(missing_ok=True)
 
-    source_archive = DEPS / "ghostty.tar.gz"
+    source_archive = DEPS / f"ghostty-{REVISION}.tar.gz"
     download(f"https://codeload.github.com/ghostty-org/ghostty/tar.gz/{REVISION}", source_archive, SOURCE_SHA256)
     source = DEPS / f"ghostty-{REVISION}-{patch_hash[:12]}"
     if not source.is_dir():
@@ -83,20 +100,23 @@ def main():
     zig_dir = DEPS / f"zig-{arch}-linux-{ZIG_VERSION}"
     zig = zig_dir / "zig"
     if not zig_dir.is_dir():
-        index = subprocess.check_output(["curl", "-fsSL", "https://ziglang.org/download/index.json"])
-        release = json.loads(index)[ZIG_VERSION][f"{arch}-linux"]
-        zig_archive = DEPS / "zig.tar.xz"
-        download(release["tarball"], zig_archive, release["shasum"])
+        zig_archive = DEPS / f"{zig_dir.name}.tar.xz"
+        download(f"https://ziglang.org/download/{ZIG_VERSION}/{zig_archive.name}",
+                 zig_archive, ZIG_SHA256[arch])
         extract(zig_archive, zig_dir)
 
     # curl honors HTTPS_PROXY in environments where Zig's downloader cannot
     # resolve external hosts. Zig still verifies each dependency's package hash.
+    # Keep compiler artifacts and downloaded packages in this worktree even
+    # when the caller exports cache paths for a different checkout.
+    env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(DEPS / "zig-cache"),
+               ZIG_LOCAL_CACHE_DIR=str(source / ".zig-cache"))
     # Cached installations must run on other CPUs of the same architecture.
-    command = [str(zig), "build", "-Demit-lib-vt=true", "-Doptimize=ReleaseFast", "-Dcpu=baseline", "--prefix", str(DEPS / "ghostty"), "-j4"]
+    command = [str(zig), "build", "-Demit-lib-vt=true", "-Dsimd=true", "-Doptimize=ReleaseFast", "-Dcpu=baseline", "--prefix", str(DEPS / "ghostty"), "-j4"]
     fetched = set()
     for _ in range(50):
         print("Building libghostty-vt...", flush=True)
-        result = subprocess.run(command, cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, cwd=source, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode == 0:
             stamp.write_text(build_id)
             print(f"libghostty-vt is ready in {DEPS / 'ghostty'}")
@@ -111,7 +131,7 @@ def main():
             print(f"Fetching {url}", flush=True)
             archive = DEPS / ("dep-" + hashlib.sha256(url.encode()).hexdigest()[:16] + ".tar.gz")
             download(url, archive)
-            subprocess.run([str(zig), "fetch", str(archive)], cwd=source, check=True)
+            fetch_dependency(zig, source, archive, env)
     else:
         raise SystemExit("Dependency fetch limit reached")
 

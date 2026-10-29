@@ -22,7 +22,9 @@ development compiler with rustup.
 ./scripts/run.sh --directory ~/Projects/my-app
 ```
 
-The first run downloads Zig and builds the pinned Ghostty library in `.deps/`.
+The first run downloads Zig 0.17.0 and builds the pinned Ghostty 1.4.0 library
+in `.deps/`. See [native library](docs/native-library.md) for the source pin,
+local build caches, and saved-history behavior on dependency updates.
 To install in `~/.local`, run `./scripts/install.sh`. Pass a different prefix as
 its first argument. Launch the installed app with `gmux-gtk`.
 

@@ -5,7 +5,6 @@ mkdir -p artifacts
 exec > >(tee artifacts/ci.log) 2>&1
 export CARGO_HOME="${CARGO_HOME:-$PWD/.ci-cache/cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$PWD/.ci-cache/rustup}"
-export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$PWD/.ci-cache/zig}"
 export PATH="$CARGO_HOME/bin:$PATH"
 # Fedora packages the installer; it creates Cargo's proxies without a curl pipe.
 if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
@@ -26,7 +25,17 @@ pins = runpy.run_path("scripts/bootstrap-ghostty.py")
 print(f"Ghostty {pins['REVISION']}; Zig {pins['ZIG_VERSION']}")
 PY
 ./scripts/bootstrap-ghostty.sh
-sha256sum .deps/ghostty.tar.gz
+python3 - <<'PY'
+import hashlib
+from pathlib import Path
+import runpy
+pins = runpy.run_path("scripts/bootstrap-ghostty.py")
+archive = Path(".deps") / f"ghostty-{pins['REVISION']}.tar.gz"
+with archive.open("rb") as source:
+    checksum = hashlib.file_digest(source, "sha256").hexdigest()
+assert checksum == pins["SOURCE_SHA256"]
+print(f"{checksum}  {archive}")
+PY
 python3 scripts/check.py --headless
 python3 - <<'PY'
 import hashlib

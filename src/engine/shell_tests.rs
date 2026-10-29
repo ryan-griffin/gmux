@@ -245,6 +245,8 @@ fn erasing_the_only_command_cannot_retarget_its_output_to_new_text() {
 
 #[test]
 fn captured_output_rejects_reused_active_cells_with_or_without_a_following_prompt() {
+    // A non-prompt on the bottom row forces destructive ED 2. Since Ghostty
+    // 1.4, trailing blank rows allow prompt-preserving scroll-clear instead.
     for following_prompt in [false, true] {
         let mut e = terminal();
         e.resize(40, 10, 0, 0).unwrap();
@@ -254,7 +256,7 @@ fn captured_output_rejects_reused_active_cells_with_or_without_a_following_promp
         }
         let mut view = e.new_view().unwrap();
         e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
-        e.write(b"\x1b[2J\x1b[H");
+        e.write(b"\x1b[10;1H.\x1b[2J\x1b[H");
         command(&mut e, "replacement");
         e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
         e.select_output(None).unwrap();
@@ -272,7 +274,7 @@ fn captured_output_rejects_cells_erased_inside_the_next_command() {
         let mut view = e.new_view().unwrap();
         let mut other = e.new_view().unwrap();
         e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
-        e.write(b"clear\r\n\x1b]133;C\x07\x1b[2J\x1b[H");
+        e.write(b"clear\r\n\x1b]133;C\x07\x1b[10;1H.\x1b[2J\x1b[H");
         e.write("replacement\r\n".repeat(lines).as_bytes());
         e.write(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         // The new prompt is on or below the former prompt's row. A retained
@@ -288,27 +290,31 @@ fn captured_output_rejects_cells_erased_inside_the_next_command() {
 
 #[test]
 fn screen_clear_preserves_captured_output_moved_into_native_history() {
-    let mut e = terminal();
-    for i in 0..8 {
-        command(&mut e, &format!("old{i}"));
+    // Filled screens and partially filled prompt screens both scroll-clear.
+    for (rows, commands) in [(3, 8), (10, 2)] {
+        let mut e = terminal();
+        e.resize(40, rows, 0, 0).unwrap();
+        for i in 0..commands {
+            command(&mut e, &format!("old{i}"));
+        }
+        e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let mut history = e.new_view().unwrap();
+        let mut active = e.new_view().unwrap();
+        e.with_view(&mut history, |e| e.anchor_output((0, 1)).unwrap());
+        e.with_view(&mut active, |e| {
+            e.anchor_output((0, commands * 2 - 1)).unwrap()
+        });
+        e.write(b"\x1b[2J\x1b[H");
+        command(&mut e, "replacement");
+        e.with_view(&mut active, |e| {
+            e.select_anchored_output().unwrap();
+            assert_eq!(e.copy().unwrap(), format!("old{}", commands - 1));
+        });
+        e.with_view(&mut history, |e| {
+            e.select_anchored_output().unwrap();
+            assert_eq!(e.copy().unwrap(), "old0");
+        });
     }
-    e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07");
-    let mut history = e.new_view().unwrap();
-    let mut active = e.new_view().unwrap();
-    e.with_view(&mut history, |e| e.anchor_output((0, 1)).unwrap());
-    e.with_view(&mut active, |e| e.anchor_output((0, 15)).unwrap());
-    e.write(b"\x1b[2J\x1b[H");
-    command(&mut e, "replacement");
-    // With a filled active screen, libghostty preserves these rows in history
-    // when ED 2 clears it. Their command identities and targets remain valid.
-    e.with_view(&mut active, |e| {
-        e.select_anchored_output().unwrap();
-        assert_eq!(e.copy().unwrap(), "old7");
-    });
-    e.with_view(&mut history, |e| {
-        e.select_anchored_output().unwrap();
-        assert_eq!(e.copy().unwrap(), "old0");
-    });
 }
 
 #[test]
@@ -329,9 +335,9 @@ fn captured_output_outlives_the_prompt_index_but_rejects_later_rewrites() {
             assert_eq!(e.copy().unwrap(), "keep");
         });
         if forward_prompt {
-            e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07\x1b[2J\x1b[Hnew\r\n\x1b]133;D;0\x07\x1b[4500H\x1b]133;A\x07$ \x1b]133;B\x07");
+            e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07\x1b[5000;1H.\x1b[2J\x1b[Hnew\r\n\x1b]133;D;0\x07\x1b[4500H\x1b]133;A\x07$ \x1b]133;B\x07");
         } else {
-            e.write(b"\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07new\r\n\x1b]133;D;0\x07");
+            e.write(b"\x1b[5000;1H.\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07new\r\n\x1b]133;D;0\x07");
         }
         e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
     }

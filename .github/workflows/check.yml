@@ -26,7 +26,6 @@ jobs:
       CARGO_HOME: ${{ github.workspace }}/.ci-cache/cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-cache/rustup
       CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cache/target
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.ci-cache/zig
       LANG: C.UTF-8
     timeout-minutes: 45
     steps:
@@ -69,9 +68,7 @@ jobs:
       - name: Cache Ghostty and Zig dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            .deps
-            .ci-cache/zig
+          path: .deps
           key: ghostty-fedora44-${{ runner.arch }}-${{ steps.environment.outputs.packages }}-${{ hashFiles('.github/workflows/check.yml', 'ci/install-deps.sh', 'scripts/bootstrap-ghostty.py', 'scripts/patches/**') }}
 
       - name: Bootstrap Ghostty and run the headless checks
