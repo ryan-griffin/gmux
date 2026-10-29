@@ -17,7 +17,8 @@ PTY parsing plus snapshot time, packet encode/decode time, retained packet
 storage including overflow charges, wire bytes, and exported glyph length.
 Encode and decode also run separately. This excludes sockets, shaping, GTK,
 and display presentation. Run without other builds or benchmarks competing
-for CPU. The long fixture is 193 UTF-8 bytes per occupied cell.
+for CPU. On hybrid CPUs, pin comparison runs to the same core with `taskset`.
+The long fixture is 193 UTF-8 bytes per occupied cell.
 
 On x86-64, cells occupy 40 bytes before overflow text. The probe's ASCII and
 short-combining packets each retain 193,032 bytes; wire sizes are 68,050 and
@@ -25,6 +26,8 @@ short-combining packets each retain 193,032 bytes; wire sizes are 68,050 and
 989,650 bytes. Retention includes each cell's overflow allocation even if
 other snapshots share it. The common case has no per-cell text allocation;
 unchanged overflow text reuses its allocation across dirty-row rewrites.
+Native extraction and wire decoding handle empty and single-byte ASCII values
+directly; other values pass through the UTF-8, NUL and byte-limit checks.
 
 Owned overflow values and validated variable-length decoding cost more CPU
 than fixed byte-buffer copies. Measure both packet CPU time and Unix/TCP

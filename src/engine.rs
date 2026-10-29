@@ -29,10 +29,7 @@ unsafe extern "C" fn capture_cell(ud: *mut c_void, index: usize, raw: *const Gmu
         return false;
     }
     let bytes = unsafe { std::slice::from_raw_parts(raw.text, raw.text_len) };
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    if cell.set_text(text).is_err() {
+    if cell.set_text_bytes(bytes).is_err() {
         return false;
     }
     cell.fg = raw.fg;

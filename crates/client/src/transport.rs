@@ -398,7 +398,7 @@ fn cell_length(bytes: &[u8]) -> anyhow::Result<usize> {
 }
 fn decode_cell(bytes: &[u8]) -> anyhow::Result<Cell> {
     Ok(Cell {
-        text: crate::cells::Grapheme::new(std::str::from_utf8(&bytes[CELL_PREFIX_BYTES..])?)?,
+        text: crate::cells::Grapheme::from_utf8(&bytes[CELL_PREFIX_BYTES..])?,
         fg: bytes[2..5].try_into().unwrap(),
         bg: bytes[5..8].try_into().unwrap(),
         flags: bytes[8],
@@ -794,7 +794,8 @@ mod tests {
 
     #[test]
     fn invalid_grapheme_lengths_utf8_and_trailing_data_are_rejected() {
-        let packet = packet();
+        let mut packet = packet();
+        packet.cells[0].set_text("X").unwrap();
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
         let start = 8 + u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
@@ -803,7 +804,7 @@ mod tests {
             bad[start..start + 2].copy_from_slice(&length.to_le_bytes());
             assert!(Packet::read(&mut bad.as_slice()).is_err());
         }
-        for invalid in [0, 0xff] {
+        for invalid in [0, 0x80, 0xff] {
             let mut bad = encoded.clone();
             bad[start + CELL_PREFIX_BYTES] = invalid;
             assert!(Packet::read(&mut bad.as_slice()).is_err());
