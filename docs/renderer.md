@@ -46,9 +46,8 @@ Link hit testing and styling add no socket requests and copy no URI strings.
 
 SGR 5 and 6 both blink text and its decorations at GTK's cursor blink cycle;
 libghostty exposes one boolean for both sequences. SGR 25 or 0 resets the attribute.
-The bridge and wire protocol use cell flag bit 3 without enlarging the 75-byte
-cell. Visible snapshots, styled history, scroll caches and restored history
-preserve this flag.
+The bridge and wire protocol use cell flag bit 3. Visible snapshots, styled
+history, scroll caches and restored history preserve this flag.
 
 Text blinking retains shown and hidden row nodes, sharing unchanged glyphs and
 backgrounds. Phase changes rebuild no rows, create no glyph nodes and do no

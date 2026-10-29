@@ -74,10 +74,63 @@ pub mod mouse_shape {
         ZOOM_OUT = 33 => "zoom-out",
     }
 }
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Ghostty 1.4 stores one base and at most 64 suffix codepoints.
+pub const MAX_GRAPHEME_BYTES: usize = 65 * 4;
+
+/// Ordinary cells need no allocation. Clones share only the uncommon long text.
+#[derive(Clone, PartialEq, Eq)]
+enum Text {
+    Inline { bytes: [u8; 15], len: u8 },
+    Shared(std::sync::Arc<str>),
+}
+impl Default for Text {
+    fn default() -> Self {
+        Self::Inline {
+            bytes: [0; 15],
+            len: 0,
+        }
+    }
+}
+impl Text {
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline { bytes, len } => {
+                // Grapheme::new writes these private bytes only from a valid &str.
+                unsafe { std::str::from_utf8_unchecked(&bytes[..*len as usize]) }
+            }
+            Self::Shared(text) => text,
+        }
+    }
+}
+
+/// Valid UTF-8 without NUL, bounded to the pinned native engine's cell limit.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Grapheme(Text);
+
+impl Grapheme {
+    #[inline]
+    pub fn new(text: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            text.len() <= MAX_GRAPHEME_BYTES && !text.contains('\0'),
+            "Invalid grapheme text"
+        );
+        Ok(Self(if text.len() <= 15 {
+            let mut bytes = [0; 15];
+            bytes[..text.len()].copy_from_slice(text.as_bytes());
+            Text::Inline {
+                bytes,
+                len: text.len() as u8,
+            }
+        } else {
+            Text::Shared(text.into())
+        }))
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Cell {
-    pub text: [u8; 64],
+    pub text: Grapheme,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub flags: u8,
@@ -108,18 +161,6 @@ pub struct Frame {
     pub cursor: [u8; 3],
     pub scrollback: Scrollback,
 }
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            text: [0; 64],
-            fg: [0; 3],
-            bg: [0; 3],
-            flags: 0,
-            decoration: 0,
-            underline_color: [0; 3],
-        }
-    }
-}
 impl Cell {
     pub fn blink(&self) -> bool {
         self.flags & flags::BLINK != 0
@@ -137,9 +178,27 @@ impl Cell {
     pub fn text_eq(&self, other: &Self) -> bool {
         self.text == other.text && (self.flags ^ other.flags) & (64 | 128) == 0
     }
+    #[inline]
     pub fn text(&self) -> &str {
-        let end = self.text.iter().position(|&x| x == 0).unwrap_or(64);
-        std::str::from_utf8(&self.text[..end]).unwrap_or("\u{fffd}")
+        self.text.0.as_str()
+    }
+    #[inline]
+    pub fn set_text(&mut self, text: &str) -> anyhow::Result<()> {
+        // Avoid allocating an unchanged overflow value on dirty-row rewrites.
+        if text.len() > 15 && self.text() == text {
+            return Ok(());
+        }
+        self.text = Grapheme::new(text)?;
+        Ok(())
+    }
+    /// Conservative retained allocation charge, including the Arc counters.
+    #[inline]
+    pub fn heap_bytes(&self) -> usize {
+        match &self.text.0 {
+            Text::Inline { .. } => 0,
+            Text::Shared(text) => (text.len() + 2 * size_of::<usize>())
+                .next_multiple_of(std::mem::align_of::<usize>()),
+        }
     }
 }
 /// Plain text for the displayed grid, with wide-cell continuations omitted.

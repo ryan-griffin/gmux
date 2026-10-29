@@ -4,6 +4,37 @@ Benchmarks write local reports under `artifacts/`, which Git ignores. Keep sourc
 revisions and matching frontend/daemon binaries with reports when comparing
 builds. Results depend on the compositor, driver, font, and machine.
 
+## Grapheme storage and transport
+
+```sh
+cargo test --locked --release -p gmux-core grapheme_measurements -- --ignored --nocapture
+cargo run --locked --release -p gmux-client --example scroll-benchmark -- 0
+```
+
+The grapheme probe rewrites a 120 × 40 grid 500 times for ASCII, `e` with one
+combining acute accent, and `a` with 64 three-byte combining marks. It reports
+PTY parsing plus snapshot time, packet encode/decode time, retained packet
+storage including overflow charges, wire bytes, and exported glyph length.
+Encode and decode also run separately. This excludes sockets, shaping, GTK,
+and display presentation. Run without other builds or benchmarks competing
+for CPU. The long fixture is 193 UTF-8 bytes per occupied cell.
+
+On x86-64, cells occupy 40 bytes before overflow text. The probe's ASCII and
+short-combining packets each retain 193,032 bytes; wire sizes are 68,050 and
+77,650 bytes. The long fixture retains a conservative 1,229,832 bytes and sends
+989,650 bytes. Retention includes each cell's overflow allocation even if
+other snapshots share it. The common case has no per-cell text allocation;
+unchanged overflow text reuses its allocation across dirty-row rewrites.
+
+Owned overflow values and validated variable-length decoding cost more CPU
+than fixed byte-buffer copies. Measure both packet CPU time and Unix/TCP
+scroll latency when changing this representation. The scroll benchmark's
+cached path includes cloning the requested viewport, and its uncached path
+includes socket delivery and packet decoding. The prediction cache includes
+row allocations and overflow text within its 2 MiB budget. See
+[native grapheme limits](native-library.md#grapheme-storage) and the
+[wire format](daemon-api.md) for admission bounds.
+
 ## Blinking text
 
 Measure retained text phases separately from output and cursor changes:
@@ -21,9 +52,8 @@ The renderer benchmark alternates visible and hidden phases over ASCII, Unicode,
 fallback, ligatures and decorated cells, with no, one-cell, full-screen and
 alternating-cell blink. Warmed phase changes assert zero rebuilt rows and zero
 new glyph nodes. The shape cache remains unchanged. Rust allocation counters
-measure scene preparation and exclude GTK/Pango/GSK allocations. The 75-byte
-shared/wire cell retains its size; phase nodes share glyphs and backgrounds
-instead of storing a second cell grid.
+measure scene preparation and exclude GTK/Pango/GSK allocations. Phase nodes
+share glyphs and backgrounds instead of storing a second cell grid.
 
 The process benchmark uses a private Wayland session, disables the terminal
 cursor and sets a 1200 ms desktop cycle. It measures ordinary, sparse, dense and

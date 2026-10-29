@@ -71,16 +71,23 @@
 
 #define GMUX_CELL_BLINK 8
 
+// Pinned Ghostty page.grapheme_max_len is 64 suffix codepoints.
+#define GMUX_GRAPHEME_MAX_CODEPOINTS 65u
+#define GMUX_GRAPHEME_MAX_BYTES (GMUX_GRAPHEME_MAX_CODEPOINTS * 4u)
+
 // Source of truth for the Gmux C/Rust ABI. Keep upstream Ghostty types in the
 // implementation; build.rs generates Rust declarations and layout checks here.
 typedef struct {
-    uint8_t text[64];
+    const uint8_t *text;
+    size_t text_len;
     uint8_t fg[3];
     uint8_t bg[3];
     uint8_t flags; // bold, italic, faint, blink, strike, invisible, wide tail/head
     uint8_t decoration; // underline style (bits 0-2), overline (3), underline color (4)
     uint8_t underline_color[3];
 } GmuxCell;
+// Borrowed only for this call. False aborts extraction without cleaning dirty rows.
+typedef bool (*GmuxCellFn)(void *userdata, size_t index, const GmuxCell *cell);
 
 typedef struct {
     uint64_t total;
@@ -192,7 +199,7 @@ int gmux_engine_checkpoint(GmuxEngine *engine, uint8_t *out, size_t cap, size_t 
 int gmux_checkpoint_history(const uint8_t *data, size_t len, GmuxWriterFn write,
     void *userdata, uint16_t *cols, uint16_t *rows);
 int gmux_engine_history_size(GmuxEngine *engine, uint16_t *cols, size_t *rows);
-int gmux_engine_history_row(GmuxEngine *engine, uint32_t row, GmuxCell *cells,
+int gmux_engine_history_row(GmuxEngine *engine, uint32_t row, GmuxCellFn write, void *userdata,
     size_t cols, bool *wrapped);
 // mode: 0 = cells, 1 = words, 2 = logical lines, 3 = rectangle.
 // Clear to begin a new gesture. Bounds are inclusive physical history cells.
@@ -218,9 +225,9 @@ int gmux_engine_theme(GmuxEngine *engine, const uint8_t *background,
 bool gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
 int gmux_engine_cursor_style(GmuxEngine *engine, uint8_t style);
 int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch);
-int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCell *cells, size_t cap, uint8_t *row_flags);
+int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags);
 GmuxHistory gmux_engine_history_state(GmuxEngine *engine);
-int gmux_engine_styled_rows(GmuxEngine *engine, uint32_t start, size_t rows, GmuxCell *cells, size_t cols, uint8_t *flags);
+int gmux_engine_styled_rows(GmuxEngine *engine, uint32_t start, size_t rows, GmuxCellFn write, void *userdata, size_t cols, uint8_t *flags);
 // Targets first (end == 0), then sorted spans, borrowed for each callback.
 typedef void (*GmuxLinkFn)(void *userdata, uint32_t start, uint32_t end,
     uint32_t target, const uint8_t *uri, size_t len);

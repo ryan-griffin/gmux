@@ -38,7 +38,7 @@ use commands::{ControlRequest, PendingControl};
 pub use event_loop::run;
 use frontend::Frontend;
 
-const MAX_PENDING: usize = 32 * 1024 * 1024;
+const MAX_PENDING: usize = 64 * 1024 * 1024;
 const MAX_NOTIFICATIONS: usize = 64;
 const MAX_NOTIFICATION_BYTES: usize = 512 * 1024;
 
@@ -554,7 +554,8 @@ mod tests {
         frontend.attached = true;
         let packet = |text| {
             let mut cell = Cell::default();
-            cell.text[0] = text;
+            cell.set_text(std::str::from_utf8(&[text]).unwrap())
+                .unwrap();
             Packet {
                 header: Header {
                     meta: Metadata {

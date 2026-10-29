@@ -14,7 +14,7 @@ import threading
 import time
 
 from cargo_test_support import cargo_binary
-from stream_test_support import PROTOCOL_VERSION
+from stream_test_support import PROTOCOL_VERSION, decode_cells
 from test_support import AppFixture, scenario, wait_for
 
 
@@ -48,7 +48,7 @@ class Client:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             size, = struct.unpack("<I", self.exact(4))
-            assert 4 <= size <= 16 * 1024 * 1024
+            assert 4 <= size <= 64 * 1024 * 1024
             body = self.exact(size)
             self.reply_bytes += size + 4
             header_size, = struct.unpack("<I", body[:4])
@@ -57,8 +57,7 @@ class Client:
                 self.viewport_rows += len(header["rows"])
                 self.cache_rows += len((header.get("cache") or {}).get("row_flags", []))
             cells = body[4 + header_size:]
-            text = b"".join(cells[i:i + 64].split(b"\0", 1)[0]
-                            for i in range(0, len(cells), 75)).decode()
+            text = "".join(cell[0] for cell in decode_cells(cells))
             if predicate(header, text):
                 return header
         raise AssertionError("Frontend did not receive the expected reply")
@@ -303,7 +302,7 @@ while True:
                           frame_interval_us=args.frame_interval_us,
                           elapsed_ms=(time.monotonic() - started) * 1000,
                           reply_bytes=client.reply_bytes - before[0], viewport_rows=viewport_rows,
-                          cache_rows=cache_rows, full_grid_cell_bytes=64 * frame["cols"] * frame["rows"] * 75,
+                          cache_rows=cache_rows, full_grid_cell_bytes=64 * frame["cols"] * frame["rows"] * 14,
                           daemon_rss_before_kib=rss["VmRSS"], daemon_rss_after_kib=memory(daemon.pid)["VmRSS"])
             assert viewport_rows == 64, report
             assert cache_rows <= 2 * frame["rows"] * 5, report

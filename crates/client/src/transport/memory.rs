@@ -15,6 +15,11 @@ impl Packet {
         size_of::<Self>()
             + header.state.as_ref().map_or(0, state_size)
             + self.cells.capacity() * size_of::<crate::Cell>()
+            + self
+                .cells
+                .iter()
+                .map(crate::Cell::heap_bytes)
+                .sum::<usize>()
             + metadata_size(&header.meta)
             + header
                 .git

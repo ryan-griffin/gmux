@@ -775,7 +775,7 @@ impl SessionManager {
                                 // layout, not rendition.
                                 text_changed = text_changed
                                     || previous.iter().zip(next).any(|(a, b)| !a.text_eq(b));
-                                previous.copy_from_slice(next);
+                                previous.clone_from_slice(next);
                             }
                             if packet.header.hyperlinks.is_some() || dimensions_changed {
                                 session.hyperlink_revision =
@@ -1927,8 +1927,9 @@ mod tests {
         };
         let row = |value| {
             let mut cell = Cell::default();
-            cell.text[0] = value;
-            vec![cell; 2]
+            cell.set_text(std::str::from_utf8(&[value]).unwrap())
+                .unwrap();
+            vec![cell.clone(), cell]
         };
         let links = |uri: &str| {
             Some(Hyperlinks {
@@ -2321,7 +2322,11 @@ mod tests {
             };
             let frame = session.frame;
             session.cache.configure(1, frame);
-            session.cache.insert(0, &[Cell::default(); 20], &[0; 10]);
+            session.cache.insert(
+                0,
+                &std::array::from_fn::<_, 20, _>(|_| Cell::default()),
+                &[0; 10],
+            );
             session.scroll_to(3);
         }
         let before = session.borrow();
@@ -2363,7 +2368,9 @@ mod tests {
             assert!(borrowed.snapshot().frame == frame);
             assert!(borrowed.prediction.is_some());
             assert_eq!(borrowed.cache.retained_bytes(), cache_bytes);
-            assert!(borrowed.snapshot().cells == [Cell::default(); 4]);
+            assert!(
+                borrowed.snapshot().cells == std::array::from_fn::<_, 4, _>(|_| Cell::default())
+            );
             assert!(!borrowed.unread());
             assert!(!borrowed.busy());
             drop(borrowed);
@@ -2406,7 +2413,7 @@ mod tests {
         assert_eq!(session.title(), "worker");
         assert_eq!(session.directory(), Path::new("/tmp/project"));
         assert_eq!(session.snapshot().revision, 0);
-        assert!(session.snapshot().cells == [Cell::default(); 4]);
+        assert!(session.snapshot().cells == std::array::from_fn::<_, 4, _>(|_| Cell::default()));
         assert!(manager.poll().is_empty());
     }
 
@@ -2522,7 +2529,8 @@ mod tests {
         let mut frame = session.borrow().frame;
         for (row, text) in [(0, b'a'), (1, b'b')] {
             let mut cell = Cell::default();
-            cell.text[0] = text;
+            cell.set_text(std::str::from_utf8(&[text]).unwrap())
+                .unwrap();
             frame.cursor_y = row;
             sender
                 .send(Ok(Packet {
@@ -2532,7 +2540,7 @@ mod tests {
                         rows: vec![row],
                         ..Header::default()
                     },
-                    cells: vec![cell; 2],
+                    cells: vec![cell.clone(), cell],
                 }))
                 .unwrap();
         }
@@ -2578,9 +2586,11 @@ mod tests {
         let (mut manager, sender, session) = manager();
         let frame = session.borrow().frame;
         let mut cells = session.borrow().cells.clone();
-        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[0].set_text("界").unwrap();
         cells[1].flags = 64;
-        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        cells[2]
+            .set_text(&format!("e{}", "\u{301}".repeat(64)))
+            .unwrap();
         send_frame(&sender, &session, frame, vec![0, 1], cells.clone(), None);
         assert!(manager.poll()[&1].changed);
         assert_eq!(session.borrow().snapshot().text_revision, 1);
@@ -2606,17 +2616,20 @@ mod tests {
         let (mut manager, sender, session) = manager();
         let frame = session.borrow().frame;
         let mut row = vec![Cell::default(); 2];
-        row[0].text[..3].copy_from_slice("e\u{301}".as_bytes());
-        row[1].text[0] = b'X';
+        row[0].set_text("e\u{301}").unwrap();
+        row[1].set_text("X").unwrap();
         send_frame(&sender, &session, frame, vec![1], row.clone(), None);
         assert!(manager.poll()[&1].changed);
         assert_eq!(session.borrow().snapshot().text_revision, 1);
-        assert!(session.borrow().snapshot().cells[..2] == [Cell::default(); 2]);
+        assert!(
+            session.borrow().snapshot().cells[..2]
+                == std::array::from_fn::<_, 2, _>(|_| Cell::default())
+        );
         // The same concatenated text can occupy different cells. Its caret and
         // geometry mappings must still be rebuilt.
-        row[0].text = [0; 64];
-        row[0].text[0] = b'e';
-        row[1].text[..3].copy_from_slice("\u{301}X".as_bytes());
+        row[0].set_text("").unwrap();
+        row[0].set_text("e").unwrap();
+        row[1].set_text("\u{301}X").unwrap();
         send_frame(&sender, &session, frame, vec![1], row.clone(), None);
         assert!(manager.poll()[&1].changed);
         assert_eq!(session.borrow().snapshot().text_revision, 2);
@@ -2732,8 +2745,9 @@ mod tests {
         };
         let row = |value| {
             let mut cell = Cell::default();
-            cell.text[0] = value;
-            [cell; 2]
+            cell.set_text(std::str::from_utf8(&[value]).unwrap())
+                .unwrap();
+            [cell.clone(), cell]
         };
         sender
             .send(Ok(Packet {
@@ -2845,7 +2859,11 @@ mod tests {
         };
         let frame = session.frame;
         session.cache.configure(1, frame);
-        session.cache.insert(4, &[Cell::default(); 6], &[0; 3]);
+        session.cache.insert(
+            4,
+            &std::array::from_fn::<_, 6, _>(|_| Cell::default()),
+            &[0; 3],
+        );
         session.scroll_to(4);
         assert_eq!(wire(outgoing.try_recv().unwrap())["row"], 4);
         session.scroll_to(5);
@@ -2882,7 +2900,11 @@ mod tests {
         session.frame.cursor_visible = 0;
         let frame = session.frame;
         session.cache.configure(1, frame);
-        session.cache.insert(10, &[Cell::default(); 20], &[0; 10]);
+        session.cache.insert(
+            10,
+            &std::array::from_fn::<_, 20, _>(|_| Cell::default()),
+            &[0; 10],
+        );
         session.scroll_to(16);
         assert_eq!(session.snapshot().frame.scrollback.offset, 16);
         assert!(session.scroll_defer_until.get().is_some());
@@ -2938,9 +2960,10 @@ mod tests {
         handle.borrow_mut().connection = connection;
         let row = |value: u8| {
             let mut cell = Cell::default();
-            cell.text[0] = value;
+            cell.set_text(std::str::from_utf8(&[value]).unwrap())
+                .unwrap();
             cell.decoration = underline::CURLY;
-            vec![cell; 2]
+            vec![cell.clone(), cell]
         };
         let frame = Frame {
             cols: 2,
@@ -3195,13 +3218,13 @@ mod tests {
         // Replays and older serials never acknowledge the latest target, and
         // acknowledgements must not re-send settled scrolls.
         let mut cell = Cell::default();
-        cell.text[0] = b'x';
+        cell.set_text("x").unwrap();
         send_frame(
             &sender,
             &session,
             session.borrow().frame,
             vec![0],
-            vec![cell; 2],
+            vec![cell.clone(), cell],
             None,
         );
         manager.poll();

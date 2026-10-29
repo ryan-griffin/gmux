@@ -87,10 +87,6 @@ static inline void cell_style(GmuxCell *cell, const GhosttyStyle *style,
         memcpy(cell->underline_color, underline, 3);
     }
 }
-static void replacement_text(GmuxCell *cell) {
-    memset(cell->text, 0, sizeof(cell->text));
-    memcpy(cell->text, "\xef\xbf\xbd", 3);
-}
 
 // Keep the moving libghostty ABI on this side of the Rust boundary.
 typedef struct {
@@ -1097,7 +1093,7 @@ static int update_history_cache(GmuxEngine *e, const GmuxFrame *frame,
 GmuxHistory gmux_engine_history_state(GmuxEngine *e) {
     return (e->view_history ? e->view_history : &e->history)->state;
 }
-int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t cap, uint8_t *row_flags) {
+int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags) {
     if (e->appearance_error) return -1;
     if (!e->view_held) gmux_engine_expire_render_hold(e);
     if (e->held) {
@@ -1144,8 +1140,9 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
         size_t x = 0;
         while (ghostty_render_state_row_cells_next(e->cells)) {
             if (x >= frame->cols || y >= frame->rows) return -1;
-            GmuxCell *cell = &out[y * frame->cols + x++];
-            memset(cell, 0, sizeof(*cell));
+            uint8_t text[GMUX_GRAPHEME_MAX_BYTES];
+            GmuxCell value = {.text = text};
+            GmuxCell *cell = &value;
             GhosttyColorRgb fg = colors.foreground, bg = colors.background;
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg);
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg);
@@ -1160,10 +1157,10 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCell *out, size_t 
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
             if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) cell->flags |= 64;
             if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) cell->flags |= 128;
-            GhosttyBuffer buffer = {.ptr = (uint8_t *)cell->text, .cap = sizeof(cell->text) - 1};
-            // A cluster too large for this cell is shown as a replacement character.
-            if (ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buffer))
-                replacement_text(cell);
+            GhosttyBuffer buffer = {.ptr = text, .cap = sizeof(text)};
+            if (ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buffer)) return -1;
+            cell->text_len = buffer.len;
+            if (!write(userdata, y * frame->cols + x++, cell)) return -1;
         }
     }
     if (!e->held && (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE || !e->links.valid))
@@ -1423,8 +1420,17 @@ static size_t utf8(uint32_t cp, uint8_t *out) {
     if (cp <= 0xffff) { out[0] = 0xe0 | (cp >> 12); out[1] = 0x80 | ((cp >> 6)&63); out[2] = 0x80 | (cp&63); return 3; }
     out[0] = 0xf0 | (cp >> 18); out[1] = 0x80 | ((cp >> 12)&63); out[2] = 0x80 | ((cp >> 6)&63); out[3] = 0x80 | (cp&63); return 4;
 }
+static int grid_text(GhosttyGridRef *ref, GmuxCell *cell, uint8_t *text) {
+    uint32_t cps[GMUX_GRAPHEME_MAX_CODEPOINTS];
+    size_t count = 0, len = 0;
+    if (ghostty_grid_ref_graphemes(ref, cps, GMUX_GRAPHEME_MAX_CODEPOINTS, &count)) return -1;
+    for (size_t i=0; i<count; i++) len += utf8(cps[i], text + len);
+    cell->text = text;
+    cell->text_len = len;
+    return 0;
+}
 int gmux_engine_styled_rows(GmuxEngine *e, uint32_t start, size_t rows,
-    GmuxCell *out, size_t cols, uint8_t *flags) {
+    GmuxCellFn write, void *userdata, size_t cols, uint8_t *flags) {
     // Read a bounded window without moving any client's viewport. Resolve the
     // palette once for the batch, using the same rendition as viewport cells.
     if (e->held || e->appearance_error) return -1;
@@ -1435,7 +1441,7 @@ int gmux_engine_styled_rows(GmuxEngine *e, uint32_t start, size_t rows,
         ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_TOTAL_ROWS, &total) ||
         cols != actual_cols || start > total || rows > total - start ||
         ghostty_render_state_get(e->render, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors)) return -1;
-    for (size_t index=0; index<rows; index++, out+=cols) {
+    for (size_t index=0; index<rows; index++) {
         GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
         GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN,
             .value.coordinate = {.x=0, .y=start + (uint32_t)index}};
@@ -1444,10 +1450,11 @@ int gmux_engine_styled_rows(GmuxEngine *e, uint32_t start, size_t rows,
         if (ghostty_terminal_grid_ref(e->terminal, point, &ref) ||
             ghostty_grid_ref_row(&ref, &row) || ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, &wrapped)) return -1;
         flags[index] = wrapped;
-        memset(out, 0, sizeof(*out) * cols);
         for (size_t x=0; x<cols; x++) {
             ref.x = x;
-            GmuxCell *cell = &out[x];
+            uint8_t text[GMUX_GRAPHEME_MAX_BYTES];
+            GmuxCell value = {0};
+            GmuxCell *cell = &value;
             GhosttyCell raw;
             GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
             GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
@@ -1469,45 +1476,28 @@ int gmux_engine_styled_rows(GmuxEngine *e, uint32_t start, size_t rows,
             cell_style(cell, &style, &colors);
             if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) cell->flags |= 64;
             if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) cell->flags |= 128;
-            uint32_t cps[64]; size_t count=0, len=0;
-            if (ghostty_grid_ref_graphemes(&ref, cps, 64, &count)) {
-                replacement_text(cell); continue;
-            }
-            for (size_t i=0; i<count; i++) {
-                uint8_t bytes[4]; size_t n=utf8(cps[i], bytes);
-                if (len+n >= sizeof(cell->text)) {
-                    replacement_text(cell); break;
-                }
-                memcpy(cell->text+len, bytes, n); len+=n;
-            }
+            if (grid_text(&ref, cell, text) || !write(userdata, index * cols + x, cell)) return -1;
         }
     }
     return 0;
 }
-int gmux_engine_history_row(GmuxEngine *e, uint32_t y, GmuxCell *out, size_t cols, bool *wrapped) {
+int gmux_engine_history_row(GmuxEngine *e, uint32_t y, GmuxCellFn write, void *userdata, size_t cols, bool *wrapped) {
     GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
     GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {.x=0, .y=y}};
     if (ghostty_terminal_grid_ref(e->terminal, point, &ref)) return -1;
     GhosttyRow row;
     if (ghostty_grid_ref_row(&ref, &row) || ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, wrapped)) return -1;
-    memset(out, 0, sizeof(GmuxCell)*cols);
     for (size_t x=0; x<cols; x++) {
         ref.x = x;
         GhosttyCell raw;
         GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
         if (ghostty_grid_ref_cell(&ref, &raw)) return -1;
         ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
-        if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) out[x].flags = 64;
-        if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) out[x].flags = 128;
-        uint32_t cps[64]; size_t count = 0, len = 0;
-        if (ghostty_grid_ref_graphemes(&ref, cps, 64, &count)) {
-            memcpy(out[x].text, "\xef\xbf\xbd", 3); continue;
-        }
-        for (size_t i=0; i<count; i++) {
-            uint8_t bytes[4]; size_t n = utf8(cps[i], bytes);
-            if (len+n >= sizeof(out[x].text)) { memcpy(out[x].text, "\xef\xbf\xbd", 3); out[x].text[3]=0; break; }
-            memcpy(out[x].text+len, bytes, n); len += n;
-        }
+        uint8_t text[GMUX_GRAPHEME_MAX_BYTES];
+        GmuxCell cell = {0};
+        if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) cell.flags = 64;
+        if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) cell.flags = 128;
+        if (grid_text(&ref, &cell, text) || !write(userdata, x, &cell)) return -1;
     }
     return 0;
 }

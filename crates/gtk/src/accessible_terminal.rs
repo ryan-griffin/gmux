@@ -205,6 +205,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_wide_cluster_maps_every_character_to_the_native_cell_span() {
+        let glyph = format!("🧑{}", "\u{1d185}".repeat(64));
+        let frame = Frame {
+            cols: 3,
+            rows: 1,
+            cursor_x: 2,
+            ..Frame::default()
+        };
+        let mut cells = vec![Cell::default(); 3];
+        cells[0].set_text(&glyph).unwrap();
+        cells[1].flags = 64;
+        cells[2].set_text("X").unwrap();
+        let text = Text::from_frame(
+            frame,
+            &cells,
+            Some(Selection {
+                start: 0,
+                end: 1,
+                shape: Shape::Linear,
+            }),
+        );
+        assert_eq!(text.value, format!("{glyph}X"));
+        assert_eq!(text.offsets, [0, 0, 65, 66]);
+        assert_eq!(text.caret, 65);
+        assert_eq!(text.selection, [(0, 65)]);
+        assert!(text.spans[..65].iter().all(|span| *span == (0..2)));
+    }
+
+    #[test]
     fn rectangle_ranges_exclude_unselected_columns_and_newlines_and_reuse_storage() {
         let frame = Frame {
             cols: 6,
@@ -212,9 +241,9 @@ mod tests {
             ..Frame::default()
         };
         let mut cells = vec![Cell::default(); 18];
-        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[0].set_text("界").unwrap();
         cells[1].flags = 64;
-        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        cells[2].set_text("e\u{301}").unwrap();
         let mut text = Text::from_frame(frame, &cells, Some(Selection::rectangle(1, 14, 6)));
         assert_eq!(text.selection, [(0, 3), (8, 10), (15, 17)]);
         let pointer = text.selection.as_ptr();
@@ -244,16 +273,16 @@ mod tests {
             ..Frame::default()
         };
         let mut cells = vec![Cell::default(); 2];
-        cells[0].text[..3].copy_from_slice("e\u{301}".as_bytes());
-        cells[1].text[0] = b'X';
+        cells[0].set_text("e\u{301}").unwrap();
+        cells[1].set_text("X").unwrap();
         let mut text = Text::from_frame(frame, &cells, Some(Selection::linear(0, 0)));
         assert_eq!(text.value, "e\u{301}X");
         assert_eq!(text.caret, 2);
         assert_eq!(text.selection, vec![(0, 2)]);
         assert_eq!(text.extents(1, 2, 8.0, 16.0), Some((0.0, 0.0, 8.0, 16.0)));
-        cells[0].text = [0; 64];
-        cells[0].text[0] = b'e';
-        cells[1].text[..3].copy_from_slice("\u{301}X".as_bytes());
+        cells[0].set_text("").unwrap();
+        cells[0].set_text("e").unwrap();
+        cells[1].set_text("\u{301}X").unwrap();
         text.rebuild(frame, &cells, Some(Selection::linear(0, 0)));
         assert_eq!(text.value, "e\u{301}X");
         assert_eq!(text.caret, 1);
@@ -274,7 +303,7 @@ mod tests {
             .iter_mut()
             .zip(["界", "", "e\u{301}", "X", "👩‍💻", "", "b", ""])
         {
-            cell.text[..glyph.len()].copy_from_slice(glyph.as_bytes());
+            cell.set_text(glyph).unwrap();
         }
         cells[1].flags = 64;
         cells[5].flags = 64;
@@ -282,7 +311,7 @@ mod tests {
         assert_eq!(text.value, "界e\u{301}X\n👩‍💻b ");
         let storage = allocations(&text);
         // A one-row update leaves the first row's offsets and geometry intact.
-        cells[6].text[0] = b'c';
+        cells[6].set_text("c").unwrap();
         text.rebuild(
             Frame {
                 cursor_x: 2,
@@ -343,9 +372,9 @@ mod tests {
             ..Frame::default()
         };
         let mut cells = vec![Cell::default(); 80 * 24];
-        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[0].set_text("界").unwrap();
         cells[1].flags = 64;
-        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        cells[2].set_text("e\u{301}").unwrap();
         let expected = Text::from_frame(frame, &cells, Some(Selection::linear(0, 2)));
         // The canvas must drop its old, large text instead of keeping it as a
         // spare, even if there are no further text changes after this resize.
@@ -368,9 +397,9 @@ mod tests {
     #[test]
     fn text_offsets_count_characters_and_preserve_wide_clusters() {
         let mut cells = vec![Cell::default(); 4];
-        cells[0].text[..3].copy_from_slice("界".as_bytes());
+        cells[0].set_text("界").unwrap();
         cells[1].flags = 64;
-        cells[2].text[..3].copy_from_slice("e\u{301}".as_bytes());
+        cells[2].set_text("e\u{301}").unwrap();
         let text = Text::from_frame(
             Frame {
                 cols: 4,
@@ -403,7 +432,7 @@ mod tests {
             .iter_mut()
             .zip(["a", "b", "界", "", "e\u{301}", "X", "", ""])
         {
-            cell.text[..value.len()].copy_from_slice(value.as_bytes());
+            cell.set_text(value).unwrap();
         }
         cells[3].flags = 64;
         let mut text = Text::from_frame(frame, &cells, None);

@@ -9,7 +9,6 @@ struct BridgeCallbacks;
 impl bindgen::callbacks::ParseCallbacks for BridgeCallbacks {
     fn item_name(&self, info: bindgen::callbacks::ItemInfo<'_>) -> Option<String> {
         match info.name {
-            "GmuxCell" => Some("Cell".into()),
             "GmuxFrame" => Some("Frame".into()),
             "GmuxScrollback" => Some("Scrollback".into()),
             _ => None,
@@ -46,7 +45,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
         .allowlist_var(
-            "GMUX_(CELL|UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION|KEY_ACTION|CLIPBOARD)_.*",
+            "GMUX_(CELL|UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION|KEY_ACTION|CLIPBOARD|GRAPHEME)_.*",
         )
         .allowlist_function("gmux_engine_.*")
         .allowlist_function("gmux_checkpoint_history")
@@ -66,7 +65,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
     // Keep bindgen's C-derived size, alignment, and field-offset assertions, but
     // use the client library's values at the FFI boundary. The client needs no C build.
     let mut declarations = generated.clone();
-    for name in ["Cell", "Frame", "Scrollback"] {
+    for name in ["Frame", "Scrollback"] {
         let marker = format!("pub struct {name} {{");
         let start = declarations
             .find(&marker)
@@ -98,7 +97,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
     }
     std::fs::write(
         out_dir.join("ghostty_bridge.rs"),
-        format!("pub use gmux_client::{{Cell,Frame,Scrollback}};\n{declarations}"),
+        format!("pub use gmux_client::{{Frame,Scrollback}};\n{declarations}"),
     )
     .expect("Could not write ABI bindings");
 }

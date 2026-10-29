@@ -83,7 +83,7 @@ fn cell(text: &str, theme: Theme, flags: u8) -> Cell {
         flags,
         ..Cell::default()
     };
-    cell.text[..text.len()].copy_from_slice(text.as_bytes());
+    cell.set_text(text).unwrap();
     cell
 }
 
@@ -115,7 +115,9 @@ fn scene(cells: &[Cell], theme: Theme) -> Scene<'_> {
 
 fn fixture(theme: Theme) -> Vec<Cell> {
     let mut cells = vec![cell(" ", theme, 0); 40 * 8];
+    let long = format!("a{}", "\u{301}".repeat(64));
     let clusters = [
+        long.as_str(),
         "A",
         "m",
         "e\u{301}",
@@ -615,9 +617,9 @@ fn validate_ligatures(
             for span in &spans {
                 let text: String = cells[span.clone()].iter().map(Cell::text).collect();
                 for expected in &mut expected_cells[span.clone()] {
-                    expected.text.fill(0);
+                    expected.set_text("").unwrap();
                 }
-                expected_cells[span.start].text[..text.len()].copy_from_slice(text.as_bytes());
+                expected_cells[span.start].set_text(&text).unwrap();
             }
             let (actual, _) = node(&mut renderer, &scene, &font, context);
             let expected = reference(
@@ -1379,7 +1381,7 @@ fn validate_decorations(gpu: &gsk::Renderer, context: &pango::Context, output: &
             let actual_pixels = pixels(&actual_texture);
             let mut blanks = decorated.clone();
             for c in &mut blanks {
-                c.text = [0; 64];
+                c.set_text("").unwrap();
             }
             let blank_scene = configured(&blanks, theme, scale);
             let mask = render(
@@ -1854,7 +1856,7 @@ fn validate_scroll_cache(
         node(&mut renderer, &scene(&cells, theme), font, context);
         let mut edited = cells.clone();
         edited[target * 40..(target + 1) * 40]
-            .copy_from_slice(&cells[source * 40..(source + 1) * 40]);
+            .clone_from_slice(&cells[source * 40..(source + 1) * 40]);
         let scene = scene(&edited, theme);
         let (cached, stats) = node(&mut renderer, &scene, font, context);
         assert_eq!(

@@ -18,7 +18,7 @@ fn cells(start: u64, rows: usize) -> Vec<Cell> {
         .flat_map(|row| {
             let mut cell = Cell::default();
             let text = format!("{row:04}");
-            cell.text[..text.len()].copy_from_slice(text.as_bytes());
+            cell.set_text(&text).unwrap();
             std::iter::repeat_n(cell, 80)
         })
         .collect()

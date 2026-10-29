@@ -963,7 +963,7 @@ impl Daemon {
                                 row_flags.push(flags);
                                 old.row_flags[row] = flags;
                                 cells.extend_from_slice(data);
-                                previous.copy_from_slice(data);
+                                previous.clone_from_slice(data);
                             }
                         }
                         self.sent_rows += rows.len() as u64;
@@ -1204,11 +1204,11 @@ mod tests {
                 content: Some(Content { text, html }.into()),
             }
         };
-        for character in ['a', 'b', 'c'] {
+        for character in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
             frontend.queue_clipboard(1, offer(character)).unwrap();
         }
         let previous = frontend.output.len();
-        assert!(frontend.queue_clipboard(1, offer('d')).is_err());
+        assert!(frontend.queue_clipboard(1, offer('h')).is_err());
         assert_eq!(frontend.output.len(), previous);
         assert!(previous <= MAX_PENDING);
         frontend
@@ -1221,7 +1221,7 @@ mod tests {
             )
             .unwrap();
         let mut reader = frontend.output.as_slice();
-        for character in ['a', 'b', 'c'] {
+        for character in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
             let packet = Packet::read(&mut reader).unwrap();
             let content = packet.header.copy.unwrap().content.unwrap();
             let text = content.plain_text().unwrap();
