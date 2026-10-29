@@ -83,7 +83,7 @@ if not args.skip_build:
         included = {line.split()[0] for line in dependencies.splitlines() if line.strip()}
         assert not included & forbidden, "Headless build includes frontend dependencies: " + str(included & forbidden)
     run(["cargo", "test", "--locked", *cargo_options], args.build_timeout)
-    run(["cargo", "clippy", "--locked", "--all-targets", *cargo_options, "--", "-D", "warnings"], args.build_timeout)
+    run(["cargo", "clippy", "--locked", "--all-targets", *cargo_options], args.build_timeout)
     artifacts = build_artifacts(examples=True, headless=args.headless, timeout=args.build_timeout,
                                 log_path=artifact_log)
     os.environ[ARTIFACT_ENV] = json.dumps(artifacts)

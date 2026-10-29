@@ -7,6 +7,9 @@ default-run = "gmux-gtk"
 description = "GTK client for the Gmux terminal daemon"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "gmux-gtk"
 path = "src/main.rs"

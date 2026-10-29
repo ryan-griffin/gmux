@@ -1,5 +1,3 @@
-#![deny(deprecated)]
-
 mod branch;
 mod compression;
 pub mod daemon;

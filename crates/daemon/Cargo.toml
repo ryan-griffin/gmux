@@ -6,6 +6,9 @@ rust-version = "1.99"
 description = "Persistent terminal daemon and management CLI"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 gmux-client = { path = "../client" }
 gmux-core = { path = "../.." }
