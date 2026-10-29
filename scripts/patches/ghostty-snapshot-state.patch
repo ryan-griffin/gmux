@@ -1,0 +1,104 @@
+--- a/src/terminal/c/snapshot.zig
++++ b/src/terminal/c/snapshot.zig
+@@ -626,11 +626,13 @@
+     };
+ }
+ 
+-/// Export the allocator-owned continuation required by snapshot encoding.
+-fn continuationOwned(terminal: terminal_c.Terminal) struct {
++const OwnedContinuation = struct {
+     result: Result,
+     bytes: []u8,
+-} {
++};
++
++/// Export the allocator-owned continuation required by snapshot encoding.
++fn continuationOwned(terminal: terminal_c.Terminal) OwnedContinuation {
+     // The terminal allocator also owns the temporary continuation copy.
+     const native = terminal_c.zigTerminal(terminal) orelse return .{
+         .result = .invalid_value,
+@@ -698,12 +700,37 @@
+     buf_len: usize,
+     out_written_: ?*usize,
+ ) callconv(lib.calling_conv) Result {
++    return encodeBuf(terminal, buf, buf_len, out_written_, true);
++}
++
++/// Encode committed terminal state without retaining unfinished parser input.
++/// Hosts that restore only history need no parser continuation, which may
++/// contain sensitive clipboard protocol metadata or data.
++pub fn encode_buf_state(
++    terminal: terminal_c.Terminal,
++    buf: ?[*]u8,
++    buf_len: usize,
++    out_written: ?*usize,
++) callconv(lib.calling_conv) Result {
++    return encodeBuf(terminal, buf, buf_len, out_written, false);
++}
++
++fn encodeBuf(
++    terminal: terminal_c.Terminal,
++    buf: ?[*]u8,
++    buf_len: usize,
++    out_written_: ?*usize,
++    include_continuation: bool,
++) Result {
+     // Validate output storage and preflight the terminal continuation.
+     const out_written = out_written_ orelse return .invalid_value;
+     out_written.* = 0;
+     if (buf == null and buf_len != 0) return .invalid_value;
+     const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+-    const continuation = continuationOwned(terminal);
++    const continuation: OwnedContinuation = if (include_continuation) continuationOwned(terminal) else .{
++        .result = Result.success,
++        .bytes = @as([]u8, &.{}),
++    };
+     if (continuation.result != .success) return continuation.result;
+     defer native.gpa().free(continuation.bytes);
+ 
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -242,6 +242,7 @@
+ 
+ pub const snapshot_encode = snapshot.encode;
+ pub const snapshot_encode_buf = snapshot.encode_buf;
++pub const snapshot_encode_buf_state = snapshot.encode_buf_state;
+ pub const snapshot_encode_alloc = snapshot.encode_alloc;
+ pub const snapshot_decoder_new = snapshot.decoder_new;
+ pub const snapshot_decoder_new_buf = snapshot.decoder_new_buf;
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -387,6 +387,7 @@
+         if (features.snapshot) {
+             @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
+             @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
++            @export(&c.snapshot_encode_buf_state, .{ .name = "ghostty_snapshot_encode_buf_state" });
+             @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
+             @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
+             @export(&c.snapshot_decoder_new_buf, .{ .name = "ghostty_snapshot_decoder_new_buf" });
+--- a/include/ghostty/vt/snapshot.h
++++ b/include/ghostty/vt/snapshot.h
+@@ -538,6 +538,23 @@
+     size_t* out_written);
+ 
+ /**
++ * Encode committed terminal state, omitting unfinished VT parser input.
++ *
++ * This has the same buffer, size-query and error contract as
++ * ghostty_snapshot_encode_buf(), but records an empty continuation without
++ * requiring continuation tracking. It does not change the live terminal or
++ * parser. Use this when only committed state or history will be restored, to
++ * avoid persisting clipboard protocol data from an unfinished control string.
++ *
++ * @ingroup snapshot
++ */
++GHOSTTY_API GhosttyResult ghostty_snapshot_encode_buf_state(
++    GhosttyTerminal terminal,
++    uint8_t* buf,
++    size_t buf_len,
++    size_t* out_written);
++
++/**
+  * Encode a complete terminal snapshot to an allocated buffer.
+  *
+  * The returned buffer is allocated with allocator, or the default allocator

@@ -89,7 +89,9 @@ pub struct Terminal {
     link_modifiers: ValueCell<bool>,
     link_hover: ValueCell<Option<(usize, usize)>>,
     paste_action: gio::SimpleAction,
-    session: SessionHandle,
+    pub(crate) session: SessionHandle,
+    pub(crate) clipboard_controls: crate::clipboard::Banner,
+    clipboard: Rc<crate::clipboard::Desktop>,
     selection: RefCell<Option<gmux_client::selection::Selection>>,
     selection_mode: ValueCell<SelectionMode>,
     selection_preview: RefCell<gmux_client::selection::Preview>,
@@ -128,6 +130,11 @@ mod text_blink;
 pub(crate) use input::KeyboardState;
 use keyboard::mods;
 
+pub(crate) struct InputContext {
+    pub keyboard: Rc<RefCell<KeyboardState>>,
+    pub clipboard: Rc<crate::clipboard::Desktop>,
+}
+
 impl Terminal {
     pub(crate) fn new(
         id: u64,
@@ -136,14 +143,25 @@ impl Terminal {
         on_focus: Rc<dyn Fn(u64)>,
         on_close: Rc<dyn Fn(u64)>,
         application: &gtk::Application,
-        keyboard: Rc<RefCell<KeyboardState>>,
+        input: InputContext,
     ) -> Rc<Self> {
+        let InputContext {
+            keyboard,
+            clipboard,
+        } = input;
+        clipboard.track(&session);
         let directory = session.borrow().directory().to_path_buf();
         let grid = session.borrow().size();
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("card");
         root.add_css_class("terminal-pane");
         root.set_widget_name(&format!("terminal-pane-{id}"));
+        let desktop = Rc::downgrade(&clipboard);
+        root.connect_unmap(move |_| {
+            if let Some(desktop) = desktop.upgrade() {
+                desktop.cancel_pane(id);
+            }
+        });
         root.set_hexpand(true);
         root.set_vexpand(true);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -183,6 +201,8 @@ impl Terminal {
         close.set_valign(gtk::Align::Center);
         toolbar.set_end_widget(Some(&close));
         content.append(&toolbar);
+        let clipboard_controls = crate::clipboard::Banner::new();
+        content.append(&clipboard_controls);
         let area = TerminalCanvas::new();
         area.add_css_class("terminal-canvas");
         area.set_has_tooltip(true);
@@ -284,6 +304,8 @@ impl Terminal {
             link_hover: ValueCell::new(None),
             paste_action,
             session,
+            clipboard_controls,
+            clipboard,
             selection: RefCell::new(None),
             selection_mode: ValueCell::new(SelectionMode::Cell),
             selection_preview: RefCell::new(gmux_client::selection::Preview::default()),
@@ -512,11 +534,9 @@ impl Terminal {
         self.copy_link_action.set_enabled(link.is_some());
         self.copy_action
             .set_enabled(self.selection.borrow().is_some());
+        let formats = self.area.clipboard().formats();
         self.paste_action.set_enabled(
-            self.area
-                .clipboard()
-                .formats()
-                .contains_type(String::static_type()),
+            formats.contains_type(String::static_type()) || !formats.mime_types().is_empty(),
         );
         self.context_menu.set_pointing_to(Some(&gdk::Rectangle::new(
             x.round().clamp(0.0, self.area.width().max(1) as f64 - 1.0) as i32,
@@ -648,7 +668,7 @@ impl Terminal {
             ));
         });
     }
-    fn show_status(&self, text: &str) {
+    pub(crate) fn show_status(&self, text: &str) {
         self.status.set_text(text);
         self.status.set_visible(true);
     }
@@ -812,19 +832,18 @@ impl Terminal {
         }
     }
     fn paste_from(self: &Rc<Self>, clipboard: &gdk::Clipboard) {
-        let weak = Rc::downgrade(self);
-        clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
-            if let (Some(t), Ok(Some(text))) = (weak.upgrade(), result) {
-                t.stop_selection_drag();
-                t.selection.borrow_mut().take();
-                let _ = t.session.borrow().clear_selection();
-                t.cursor.restart();
-                if let Err(error) = t.session.borrow().paste(&text) {
-                    t.show_status(&error.to_string());
-                }
-                t.area.queue_draw();
-            }
-        });
+        self.stop_selection_drag();
+        self.selection.borrow_mut().take();
+        let _ = self.session.borrow().clear_selection();
+        self.cursor.restart();
+        let destination = if *clipboard == self.area.primary_clipboard() {
+            gmux_client::clipboard::Destination::Primary
+        } else {
+            gmux_client::clipboard::Destination::Clipboard
+        };
+        if let Err(error) = self.clipboard.paste_intent(self, destination) {
+            self.show_status(&error.to_string());
+        }
     }
     pub fn scroll(&self, delta: isize) {
         let adjustment = self.scroller.vadjustment();
@@ -1023,6 +1042,7 @@ impl Terminal {
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.clipboard.cancel_pane(self.id);
         self.context_menu.unparent();
         if let Some(timer) = self.size_timer.get_mut().take() {
             timer.remove();

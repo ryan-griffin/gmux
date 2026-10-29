@@ -19,8 +19,12 @@ CI caches `.deps/` by the bootstrap and patch contents.
 
 The [media-key patch](../scripts/patches/ghostty-media-keys.patch) adds seven Kitty
 functional codes still absent in the release. It changes no public headers or
-ABI. There are no additional security backports on top of the release source.
-An external `GHOSTTY_PREFIX` must provide this exact revision with the patch.
+ABI. The [clipboard-read patch](../scripts/patches/ghostty-clipboard-reads.patch)
+adds owned deferred requests for asynchronous desktop access. The
+[snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) adds
+checkpoint encoding that omits unfinished parser input. There are no additional
+security backports on top of the release source. An external `GHOSTTY_PREFIX`
+must provide this exact revision with all three integration patches.
 Ghostty implementation types stay inside the C bridge; Rust and frontend clients
 use Gmux's declarations.
 

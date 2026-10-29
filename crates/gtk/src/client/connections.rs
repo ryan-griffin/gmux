@@ -649,6 +649,7 @@ impl Connections {
             .and_then(|o| o.link.manager_mut())
             .ok_or_else(|| anyhow::anyhow!("Connection is disconnected"))?;
         manager.set_clipboard_writes(true)?;
+        manager.set_clipboard_reads(true)?;
         let handle = manager.attach(reference.id, theme)?;
         self.attached.insert(id);
         Ok(handle)
@@ -787,9 +788,20 @@ impl Connections {
     pub fn poll(&mut self) -> HashMap<u64, SessionUpdate> {
         self.poll_with_clipboard(|_| {})
     }
+    #[cfg(test)]
     pub fn poll_with_clipboard(
         &mut self,
         mut clipboard: impl FnMut(gmux_client::clipboard::Write),
+    ) -> HashMap<u64, SessionUpdate> {
+        self.poll_with_clipboard_events(|event, _| {
+            if let gmux_client::clipboard::Event::Write(write) = event {
+                clipboard(write);
+            }
+        })
+    }
+    pub fn poll_with_clipboard_events(
+        &mut self,
+        mut clipboard: impl FnMut(gmux_client::clipboard::Event, Option<String>),
     ) -> HashMap<u64, SessionUpdate> {
         if self.watcher.changed()
             && let Err(error) = self.refresh_definitions()
@@ -802,7 +814,19 @@ impl Connections {
         let now = Instant::now();
         for (&daemon, origin) in &mut self.origins {
             let was_connected = origin.link.status() == ConnectionStatus::Connected;
-            let update = origin.link.poll_at_with_clipboard(now, &mut clipboard);
+            let label = (Some(daemon) != self.local).then(|| origin.machine.name.clone());
+            let update = origin.link.poll_at_with_clipboard_events(now, |event| {
+                let event = match event {
+                    gmux_client::clipboard::Event::Read { pane, event } => {
+                        gmux_client::clipboard::Event::Read {
+                            pane: self.handles.get(daemon, pane),
+                            event,
+                        }
+                    }
+                    other => other,
+                };
+                clipboard(event, label.clone());
+            });
             if update.status_changed {
                 self.status_changed = true;
                 if let Some(manager) = origin.link.manager() {

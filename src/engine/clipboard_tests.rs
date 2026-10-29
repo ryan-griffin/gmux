@@ -135,12 +135,13 @@ fn rich_application_requests_are_atomic_owned_and_reply_to_the_program() {
         b"\x1b]5522;type=write:status=EBUSY:id=busy\x1b\\"
     );
     assert_eq!(engine.take_clipboard_writes().len(), MAX_CLIPBOARD_EVENTS);
-    // Disabling writes never registers the separate clipboard-read callback.
+    // Read capability is independent of writes. An unavailable desktop replies
+    // empty for OSC 52 and ENOSYS for Kitty.
     engine.write(b"\x1b]52;c;?\x07\x1b]5522;type=read:id=read;dGV4dC9wbGFpbg==\x1b\\");
     assert!(engine.take_clipboard_writes().is_empty());
     assert_eq!(
         engine.take_events().0,
-        b"\x1b]5522;type=read:status=EPERM:id=read\x1b\\"
+        b"\x1b]52;c;\x07\x1b]5522;type=read:status=ENOSYS:id=read\x1b\\"
     );
 }
 
@@ -373,4 +374,105 @@ fn copy_measurements() {
         "{}",
         serde_json::json!({"case":case, "formats":formats, "cells":cells, "copy_us":copy_us, "text_bytes":text_bytes, "html_bytes":html_bytes, "before_rss_kib":before.0, "offer_rss_kib":during.0, "after_rss_kib":after.0, "peak_growth_kib":after.1.saturating_sub(before.1)})
     );
+}
+
+#[test]
+fn deferred_read_feed_preserves_tail_and_native_reply_order() {
+    use gmux_client::clipboard::{ReadDescriptor, ReadResult, ReadStatus};
+    let mut engine = Engine::new().unwrap();
+    engine.set_read_enabled(true);
+    let chunk = b"before\x1b]52;p;?\x1b\\\x1b[5nafter";
+    let (_, consumed) = engine.feed(chunk);
+    let request = engine.take_read_request().unwrap();
+    assert_eq!(request.destination, Destination::Primary);
+    assert_eq!(request.mimes, ["text/plain"]);
+    assert_eq!(chunk[consumed], b'\\');
+    assert!(engine.take_events().0.is_empty());
+    assert_eq!(engine.feed(&chunk[consumed..]).1, 0);
+    let result = ReadResult {
+        id: request.id,
+        status: ReadStatus::Success,
+        epoch: 1,
+        available: vec![],
+        contents: vec![ReadDescriptor {
+            mime: "text/plain".into(),
+            len: 5,
+        }],
+    };
+    engine.complete_read(&result, b"hello").unwrap();
+    let (done, bytes) = engine.step_read().unwrap();
+    assert!(done);
+    assert_eq!(bytes, b"\x1b]52;p;aGVsbG8=\x1b\\");
+    assert_eq!(engine.read_pending(), 0);
+    assert_eq!(engine.feed(&chunk[consumed..]).1, chunk.len() - consumed);
+    assert_eq!(engine.take_events().0, b"\x1b[0n");
+}
+
+#[test]
+fn checkpoints_exclude_partial_requests_pending_data_and_paste_grants() {
+    use gmux_client::clipboard::{ReadDescriptor, ReadResult, ReadStatus};
+    let mut engine = Engine::new().unwrap();
+    engine.set_read_enabled(true);
+    engine.write(b"saved history\r\n\x1b[?5522h");
+    let before = engine.checkpoint().unwrap();
+    let paste = engine
+        .user_paste(Destination::Clipboard, &["text/plain".into()])
+        .unwrap();
+    assert!(!paste.is_empty());
+    assert_eq!(engine.checkpoint().unwrap(), before);
+
+    engine.feed(b"\x1b]5522;type=read:name=cHJvZ3JhbQ==:pw=cHJpdmF0ZS1wYXNzd29yZA==");
+    assert_eq!(engine.checkpoint().unwrap(), before);
+    engine.feed(b";dGV4dC9wbGFpbg==\x1b\\");
+    let request = engine.take_read_request().unwrap();
+    assert_eq!(engine.checkpoint().unwrap(), before);
+    let data = b"private clipboard contents";
+    engine
+        .complete_read(
+            &ReadResult {
+                id: request.id,
+                status: ReadStatus::Success,
+                epoch: 1,
+                available: vec![],
+                contents: vec![ReadDescriptor {
+                    mime: "text/plain".into(),
+                    len: data.len(),
+                }],
+            },
+            data,
+        )
+        .unwrap();
+    let snapshot = engine.checkpoint().unwrap();
+    assert_eq!(snapshot, before);
+    // Checkpointing must leave the live owned reply and parser untouched.
+    assert!(!engine.step_read().unwrap().1.is_empty());
+    engine.feed(b"\\after");
+    assert!(engine.text().unwrap().contains("after"));
+
+    let mut fresh = Engine::new().unwrap();
+    fresh.restore_history(&snapshot).unwrap();
+    assert_eq!(fresh.read_pending(), 0);
+    assert!(fresh.take_read_request().is_none());
+    assert!(fresh.take_events().0.is_empty());
+    assert!(!fresh.mode(5522));
+    fresh.write(b"fresh shell");
+    let text = fresh.text().unwrap();
+    assert!(text.contains("saved history") && text.contains("fresh shell"));
+}
+
+#[test]
+fn clipboard_boundary_feeds_keep_fragmented_status_reports_metadata_only() {
+    let input = b"\x1b]9;4;1;42\x1b\\";
+    for split in 0..=input.len() {
+        let mut engine = Engine::new().unwrap();
+        for mut part in [&input[..split], &input[split..]] {
+            while !part.is_empty() {
+                let (changed, consumed) = engine.feed(part);
+                assert!(!changed, "split={split}, part={part:?}");
+                assert!(consumed > 0);
+                part = &part[consumed..];
+            }
+        }
+        assert!(engine.take_progress_changed());
+    }
 }

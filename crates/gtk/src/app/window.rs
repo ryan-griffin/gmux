@@ -214,7 +214,10 @@ impl Ui {
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
         let keyboard = Rc::new(RefCell::new(crate::terminal::KeyboardState::default()));
+        let clipboard =
+            crate::clipboard::Desktop::new(&window.clipboard(), &window.primary_clipboard());
         let ui = Rc::new(Self {
+            clipboard,
             app: app.clone(),
             window,
             split,
@@ -517,16 +520,27 @@ impl Ui {
                         ui.message(&error.to_string());
                     }
                 }
-                let updates = ui.sessions.borrow_mut().poll_with_clipboard(|write| {
-                    use gmux_client::clipboard::Destination;
-                    let clipboard = match write.destination {
-                        Destination::Clipboard => ui.window.clipboard(),
-                        Destination::Primary => ui.window.primary_clipboard(),
-                    };
-                    if let Err(error) = crate::clipboard::publish(&clipboard, write.content) {
-                        eprintln!("Could not publish clipboard offer: {error}");
-                    }
-                });
+                let updates = ui.sessions.borrow_mut().poll_with_clipboard_events(
+                    |event, remote| match event {
+                        gmux_client::clipboard::Event::Write(write) => {
+                            let clipboard = ui.clipboard.clipboard(write.destination);
+                            if let Err(error) = crate::clipboard::publish(&clipboard, write.content)
+                            {
+                                eprintln!("Could not publish clipboard offer: {error}");
+                            }
+                        }
+                        gmux_client::clipboard::Event::Read { pane, event } => {
+                            if let Ok(terminal) = ui.pane(Some(pane)) {
+                                ui.clipboard.handle(
+                                    &terminal,
+                                    event,
+                                    remote.as_deref(),
+                                    ui.window.is_active(),
+                                );
+                            }
+                        }
+                    },
+                );
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 let updates_git_changed = updates.values().any(|update| update.git_changed);
                 let mut status_tabs = HashSet::new();

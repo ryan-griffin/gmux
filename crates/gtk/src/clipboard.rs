@@ -31,3 +31,9 @@ pub(crate) fn publish(clipboard: &gdk::Clipboard, content: Option<Offer>) -> any
     clipboard.set_content(provider.as_ref())?;
     Ok(())
 }
+
+mod banner;
+mod prompt;
+pub(crate) use banner::Banner;
+mod read;
+pub(crate) use read::Desktop;

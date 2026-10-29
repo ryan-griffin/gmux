@@ -2,8 +2,13 @@
 
 Run commands from the repository root. The [README](../README.md#build-and-run)
 lists build prerequisites. Bootstrap the pinned Ghostty library before the first
-build, or set `GHOSTTY_PREFIX` to a build of the same source revision with the
-checked-in [integration patch](keyboard.md#native-library) applied.
+build, or set `GHOSTTY_PREFIX` to a build of the same source revision with all
+three bundled integration patches applied:
+
+- The [media-key patch](../scripts/patches/ghostty-media-keys.patch) supplies Kitty media/audio encoding.
+- The [clipboard-read patch](../scripts/patches/ghostty-clipboard-reads.patch) supplies the owned deferred-read APIs.
+- The [snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) omits unfinished parser input from history checkpoints.
+
 The bootstrap uses the architecture's baseline CPU target so cached libraries
 remain portable between machines. Ghostty's SIMD dispatch remains enabled.
 
@@ -134,6 +139,26 @@ The `clipboard-ui` suite uses the same native Wayland fixture to read exact PNG,
 HTML and plain bytes from local and remote GTK offers. It checks atomic rejection,
 no invented text, empty versus clear, and command-output copy. It does not render
 application clipboard data.
+
+The `clipboard-read` headless suite exercises real PTYs over local and remote
+frontend streams. It checks asynchronous ordering, 4 MiB binary results,
+continued service to another pane, one-use paste grants, metadata exemptions,
+destination and generation boundaries, detach, and partial-transfer deadlines.
+Engine tests also check that partial requests, deferred response bytes, and paste
+grants never enter history checkpoints. `scripts/clipboard-read-check.c` compares
+native synchronous and stepped encoding at base64 and packet boundaries, checks
+deferred request/reply ownership and stale IDs, and counts native allocations
+through teardown. It also bounds storage for skewed MIME sizes and repeated
+requested entries. The
+`clipboard-read-ui` suite uses native Wayland and AT-SPI to approve and deny real
+GTK requests. It observes clipboard transfer signals to verify no content is
+requested before consent, checks binary HTML without rendering it, and exercises
+local and remote genuine-paste authorization. Split-pane cases check that deliberate
+ordinary and Kitty pastes supersede unanswered consent in another pane without
+reading data for the cancelled request. Its `clipboard-banner-check`
+compares banner measurement and placement against the installed `AdwBanner`
+with one visible action, then checks the two-action adaptation, both text
+directions, larger fonts, keyboard focus, and cleanup after hiding.
 
 The `shell` headless suite requires Bash and Zsh. It checks real login startup,
 existing prompt/preexec hooks, scalar and array `PROMPT_COMMAND`, disabled Bash

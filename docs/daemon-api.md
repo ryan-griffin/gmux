@@ -296,6 +296,63 @@ A stalled frontend's output is bounded by the 64 MiB transport queue and is
 detached on overflow. The client reader separately bounds retained storage to
 64 MiB and 64 packets, including representation capacities.
 
+Clipboard reads use a separate capability,
+`{"method":"clipboard-reads","enabled":true}`. A desktop frontend advertises it
+only if it can mediate consent and serve asynchronous reads. After attachment it
+reports each destination's monotonically increasing clipboard `epoch` using
+`clipboard-changed` with `destination` and `epoch`. Equal epochs are idempotent;
+older epochs are invalid. Capabilities and epochs belong to this stream
+connection and must be advertised again after reconnect.
+
+Read events are dedicated metadata-only packets with `meta.id` identifying the
+pane and `clipboard_read` containing one of these objects:
+
+- `{"kind":"request","request":{"id":42,"destination":"clipboard","mimes":["text/plain"],"list":false,"name":"","granted":false,"epoch":null}}`.
+- `{"kind":"cancel","id":42}`.
+- `{"kind":"paste_text","serial":1,"destination":"primary","epoch":3}`.
+
+Request IDs identify a transient native request, independently of the program's
+Kitty `id`. A true `granted` is a hint, not desktop authority. The frontend must
+independently match it to a recent local user-paste gesture for the same pane,
+connection, destination, and clipboard epoch, and consume that authorization
+once. It must also validate `paste_text` against its own gesture serial. A server
+flag or program-supplied name cannot authorize reading the desktop. Targets-only requests do not read
+content and do not consume the one-use paste authorization. All other data reads
+require explicit consent. `SessionManager::poll_with_clipboard_events` delivers
+reads, cancellation, and writes in their shared wire order.
+
+The frontend answers with `clipboard-read-result`, containing a `result` object
+with `id`, `status`, `epoch`, `available` MIME names, and `contents` descriptors
+such as `[{"mime":"text/plain","len":5}]`. Status is `success`, `denied`,
+`unsupported`, `busy`, or `io_error`. Failures have no contents or targets.
+Success can contain no matching representations. Metadata is limited to 16 KiB,
+requested contents to four representations and 4 MiB total, and available targets
+to 16 names and 4096 joined bytes. Names are at most 256 bytes. Read MIME data is
+independent of the write-format allowlist.
+
+For each payload chunk, send a newline-terminated JSON command
+`{"method":"clipboard-read-data","pane":7,"id":42,"size":5}` followed
+immediately by exactly `size` raw bytes. Chunks contain at most 16 KiB. The next
+JSON command starts after those raw bytes, regardless of embedded NUL or newline.
+Bytes follow descriptor order and must total exactly the declared lengths.
+Finish with `clipboard-read-end` and the same pane and ID. This is the only raw
+binary extension to the frontend command stream; attach, authentication,
+heartbeats, and other commands retain their existing framing. Partial binary
+chunks and result assembly have five-second deadlines. Invalid transfers can
+detach the frontend. Late or foreign request IDs never complete another read.
+
+A genuine desktop paste uses `user-paste` with a new connection-wide `serial`,
+`destination`, `epoch`, and bounded `mimes`. It supersedes unanswered reads routed
+to this frontend, including a read in another pane. If native mode 5522 is active, the
+daemon emits a native paste event and records a short-lived authorization for
+one data read. Otherwise it returns `paste_text`. The frontend asynchronously
+reads bounded text and returns `user-paste-text` with `serial`, `epoch`, and
+`text`. The Rust client streams larger text using `user-paste-begin` with `size`,
+then ordinary `paste-data` chunks and `paste-end`. Scripted `paste` always inserts
+text and cannot create clipboard grants. A client claiming desktop capability
+is a trusted clipboard broker within the existing socket/authentication boundary;
+a JSON field cannot prove a physical gesture.
+
 `generation` identifies cached history for this pane and view. Clears, reflow,
 screen switches, and resolved palette or appearance changes advance it. Discard
 old cached rows when a nonzero generation changes, including on metadata-only
@@ -399,7 +456,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 37; clients must match
+cell data are rejected. This is stream protocol version 38; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.

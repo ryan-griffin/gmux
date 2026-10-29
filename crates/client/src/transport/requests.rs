@@ -58,8 +58,6 @@ impl StreamRequest {
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PasteOptions {
     #[serde(default)]
-    pub clipboard: bool,
-    #[serde(default)]
     pub enter: bool,
     #[serde(default)]
     pub bottom: bool,
@@ -114,6 +112,41 @@ pub enum StreamCommand {
     },
     Focused {
         active: bool,
+    },
+    ClipboardReads {
+        enabled: bool,
+    },
+    ClipboardChanged {
+        destination: crate::clipboard::Destination,
+        epoch: u64,
+    },
+    ClipboardReadResult {
+        result: crate::clipboard::ReadResult,
+    },
+    ClipboardReadData {
+        id: u64,
+        size: usize,
+        #[serde(skip)]
+        bytes: Vec<u8>,
+    },
+    ClipboardReadEnd {
+        id: u64,
+    },
+    UserPaste {
+        serial: u64,
+        destination: crate::clipboard::Destination,
+        epoch: u64,
+        mimes: Vec<String>,
+    },
+    UserPasteBegin {
+        serial: u64,
+        epoch: u64,
+        size: usize,
+    },
+    UserPasteText {
+        serial: u64,
+        epoch: u64,
+        text: String,
     },
     ClipboardWrites {
         enabled: bool,
