@@ -666,3 +666,18 @@ from 15.97 to 8.05 ms for 4,000,000. Alternating indexed colors took 16.28 ms
 before and 8.34 ms after at 4,000,000 characters. Streaming buffer growth raised
 peak copy scratch from about 4 to 6 MiB at that size. All buffers are temporary;
 plain-only requests allocate no HTML storage.
+
+## Client connections
+
+Measure idle client sockets without a daemon or GTK:
+
+```sh
+cargo run --locked --release -p gmux-client --example connection-benchmark -- 64
+```
+
+The example reports process thread count, resident and virtual memory, and setup
+and drop time. It keeps both ends of each Unix socket pair in the measured
+process, samples after 250 ms, and samples again 250 ms after dropping the
+managers. Peer sockets remain open until process exit. These totals include
+allocator retention and the shared I/O runtime; they do not represent the full
+GTK application or active terminal rendering. One I/O thread serves all streams.

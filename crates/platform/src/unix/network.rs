@@ -1,9 +1,9 @@
 //! Linux socket liveness settings and token-file loading.
 use anyhow::Context;
-use std::{io::Read, net::TcpStream, os::fd::AsRawFd};
+use std::{io::Read, os::fd::AsRawFd};
 /// Detect broken paths even on idle terminal streams, without userspace timers.
 /// TCP_USER_TIMEOUT also bounds unacknowledged writes and zero-window stalls.
-pub fn configure_liveness(stream: &TcpStream) -> std::io::Result<()> {
+pub fn configure_liveness(stream: &impl AsRawFd) -> std::io::Result<()> {
     for (level, option, value) in [
         (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1i32),
         (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15),

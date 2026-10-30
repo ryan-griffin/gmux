@@ -1,43 +1,27 @@
 //! Ordered stream backpressure bounded by retained bytes as well as packet count.
 use gmux_protocol::transport::Packet;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Default)]
-struct State {
-    bytes: usize,
-    closed: bool,
-}
 struct Budget {
     limit: usize,
-    state: Mutex<State>,
-    ready: Condvar,
-}
-struct Permit {
-    budget: Arc<Budget>,
-    bytes: usize,
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.budget.state.lock().unwrap().bytes -= self.bytes;
-        self.budget.ready.notify_all();
-    }
+    ready: Arc<tokio::sync::Semaphore>,
 }
 struct Message {
     item: Result<Packet, String>,
-    _permit: Permit,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 fn packet_size(packet: &Packet) -> usize {
     packet.memory_size() + std::mem::size_of::<Message>() - std::mem::size_of::<Packet>()
 }
 #[derive(Clone)]
 pub struct Sender {
-    sender: mpsc::SyncSender<Message>,
+    sender: tokio::sync::mpsc::Sender<Message>,
     budget: Arc<Budget>,
 }
 pub struct Receiver {
-    receiver: mpsc::Receiver<Message>,
+    receiver: std::cell::RefCell<tokio::sync::mpsc::Receiver<Message>>,
     budget: Arc<Budget>,
 }
 
@@ -57,22 +41,28 @@ impl std::fmt::Display for SendError {
 impl std::error::Error for SendError {}
 
 pub fn channel(bytes: usize, packets: usize) -> (Sender, Receiver) {
-    let (sender, receiver) = mpsc::sync_channel(packets);
+    let (sender, receiver) = tokio::sync::mpsc::channel(packets);
     let budget = Arc::new(Budget {
         limit: bytes,
-        state: Mutex::new(State::default()),
-        ready: Condvar::new(),
+        ready: Arc::new(tokio::sync::Semaphore::new(bytes)),
     });
     (
         Sender {
             sender,
             budget: budget.clone(),
         },
-        Receiver { receiver, budget },
+        Receiver {
+            receiver: std::cell::RefCell::new(receiver),
+            budget,
+        },
     )
 }
 impl Sender {
+    #[cfg(test)]
     pub fn send(&self, item: Result<Packet, String>) -> Result<(), SendError> {
+        crate::runtime::block_on(self.send_async(item))
+    }
+    pub async fn send_async(&self, item: Result<Packet, String>) -> Result<(), SendError> {
         let bytes = match &item {
             Ok(packet) => packet_size(packet),
             Err(error) => std::mem::size_of::<Message>() + error.capacity(),
@@ -80,36 +70,40 @@ impl Sender {
         if bytes > self.budget.limit {
             return Err(SendError::TooLarge);
         }
-        let mut state = self.budget.state.lock().unwrap();
-        while !state.closed && state.bytes + bytes > self.budget.limit {
-            state = self.budget.ready.wait(state).unwrap();
-        }
-        if state.closed {
-            return Err(SendError::Closed);
-        }
-        state.bytes += bytes;
-        drop(state);
+        let permit = self
+            .budget
+            .ready
+            .clone()
+            .acquire_many_owned(bytes.try_into().unwrap())
+            .await
+            .map_err(|_| SendError::Closed)?;
         self.sender
             .send(Message {
                 item,
-                _permit: Permit {
-                    budget: self.budget.clone(),
-                    bytes,
-                },
+                _permit: permit,
             })
+            .await
             .map_err(|_| SendError::Closed)
     }
 }
 impl Receiver {
     pub fn try_recv(&self) -> Result<Result<Packet, String>, mpsc::TryRecvError> {
         // Release the queue's reservation as ownership moves to the main thread.
-        self.receiver.try_recv().map(|message| message.item)
+        self.receiver
+            .borrow_mut()
+            .try_recv()
+            .map(|message| message.item)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TryRecvError::Empty => mpsc::TryRecvError::Empty,
+                tokio::sync::mpsc::error::TryRecvError::Disconnected => {
+                    mpsc::TryRecvError::Disconnected
+                }
+            })
     }
 }
 impl Drop for Receiver {
     fn drop(&mut self) {
-        self.budget.state.lock().unwrap().closed = true;
-        self.budget.ready.notify_all();
+        self.budget.ready.close();
     }
 }
 
@@ -126,20 +120,26 @@ mod tests {
         sender.send(Err("b".repeat(1024))).unwrap();
         let (started, ready) = mpsc::channel();
         let (finished, done) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::runtime::spawn(async move {
             started.send(()).unwrap();
-            sender.send(Err("c".repeat(1024))).unwrap();
+            sender.send_async(Err("c".repeat(1024))).await.unwrap();
             finished.send(()).unwrap();
         });
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(done.recv_timeout(Duration::from_millis(30)).is_err());
-        assert_eq!(receiver.budget.state.lock().unwrap().bytes, size * 2);
+        // A full byte budget must yield the shared executor to unrelated work.
+        let (progress, progressed) = mpsc::channel();
+        crate::runtime::spawn(async move {
+            progress.send(()).unwrap();
+        });
+        progressed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(receiver.budget.ready.available_permits(), 0);
         assert!(matches!(receiver.try_recv(), Ok(Err(text)) if text.starts_with('a')));
         done.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.join().unwrap();
+        crate::runtime::block_on(worker).unwrap();
         assert!(matches!(receiver.try_recv(), Ok(Err(text)) if text.starts_with('b')));
         assert!(matches!(receiver.try_recv(), Ok(Err(text)) if text.starts_with('c')));
-        assert_eq!(receiver.budget.state.lock().unwrap().bytes, 0);
+        assert_eq!(receiver.budget.ready.available_permits(), size * 2);
     }
 
     #[test]
@@ -147,9 +147,10 @@ mod tests {
         let size = std::mem::size_of::<Message>() + 1024;
         let (sender, receiver) = channel(size, 8);
         sender.send(Err("a".repeat(1024))).unwrap();
-        let worker = std::thread::spawn(move || sender.send(Err("b".repeat(1024))));
+        let worker =
+            crate::runtime::spawn(async move { sender.send_async(Err("b".repeat(1024))).await });
         drop(receiver);
-        assert!(worker.join().unwrap().is_err());
+        assert!(crate::runtime::block_on(worker).unwrap().is_err());
     }
 }
 

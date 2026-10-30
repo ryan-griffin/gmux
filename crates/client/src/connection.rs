@@ -198,19 +198,31 @@ impl Connection {
         let endpoint = self.endpoint.clone();
         let daemon = self.daemon;
         let wake = self.wake.clone();
-        std::thread::spawn(move || {
-            let result = (|| {
-                let mut socket = endpoint.connect_stream_cancellable(&cancellation)?;
-                // Attach within the stream's handshake deadline, independently
-                // of how long the separate control request takes to reply.
-                SessionManager::attach_stream(&mut socket, daemon)?;
-                let state = endpoint.state(Some(&cancellation))?;
+        crate::runtime::spawn(async move {
+            let result = crate::runtime::cancellable(Some(&cancellation), async {
+                let mut socket = endpoint.connect_stream_async().await?;
+                crate::runtime::deadline(
+                    Instant::now() + gmux_protocol::network::TIMEOUT,
+                    crate::io::write_json(
+                        &mut socket.split().1,
+                        &gmux_protocol::transport::StreamRequest::connection(
+                            gmux_protocol::transport::StreamCommand::Attach {
+                                version: gmux_protocol::transport::VERSION,
+                                daemon,
+                                remote: false,
+                            },
+                        ),
+                    ),
+                )
+                .await?;
+                let state = endpoint.state_async(None).await?;
                 anyhow::ensure!(
                     state.daemon == daemon,
                     crate::network::ConnectionRejected("Remote connection identity changed".into())
                 );
-                Ok((socket, state))
-            })();
+                Ok((socket.into_std()?, state))
+            })
+            .await;
             let _ = sender.send((generation, result));
             wake.notify();
         });

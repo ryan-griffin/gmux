@@ -1,7 +1,6 @@
 //! Execution endpoints and ordered request workers.
-use gmux_platform::unix::ipc::{
-    Cancellation, Wake, call_at_cancellable, companion_path, socket_path,
-};
+use crate::{io, runtime};
+use gmux_platform::unix::ipc::{Cancellation, Wake, companion_path, socket_path};
 use serde_json::Value;
 use std::{
     io::Write,
@@ -10,7 +9,7 @@ use std::{
         unix::net::UnixStream,
     },
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 /// An execution destination. Connecting never starts a daemon.
@@ -77,22 +76,32 @@ impl Endpoint {
         ))
     }
     pub fn call(&self, request: impl serde::Serialize) -> anyhow::Result<Value> {
-        self.call_inner(serde_json::to_value(request)?, None)
+        runtime::block_on(self.call_async(serde_json::to_value(request)?, None))
     }
     pub fn call_cancellable(
         &self,
         request: impl serde::Serialize,
         cancellation: &Cancellation,
     ) -> anyhow::Result<Value> {
-        self.call_inner(serde_json::to_value(request)?, Some(cancellation))
+        runtime::block_on(self.call_async(serde_json::to_value(request)?, Some(cancellation)))
     }
-    fn call_inner(
+    pub async fn call_async(
         &self,
         body: Value,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<Value> {
+        runtime::cancellable(cancellation, self.call_inner(body)).await
+    }
+    async fn resolve_async(
+        name: &str,
+        daemon: Option<gmux_protocol::model::DaemonId>,
+    ) -> anyhow::Result<Self> {
+        let name = name.to_owned();
+        runtime::blocking(move || Self::resolve(&name, daemon)).await
+    }
+    async fn call_inner(&self, body: Value) -> anyhow::Result<Value> {
         match self {
-            Self::Unix { control, .. } => call_at_cancellable(control, body, cancellation),
+            Self::Unix { control, .. } => Self::call_unix(control, body).await,
             Self::Tcp {
                 address,
                 credentials,
@@ -101,12 +110,13 @@ impl Endpoint {
                 use gmux_protocol::control::{InternalRequest, Request};
                 let request = Request::decode(body)?;
                 if matches!(request, Request::Internal(InternalRequest::Hello)) {
-                    let client = crate::network::Client::connect_cancellable(
+                    let client = crate::network::Client::connect_async(
                         address,
                         credentials,
                         *daemon,
-                        cancellation,
-                    )?;
+                        std::time::Instant::now() + gmux_protocol::network::TIMEOUT,
+                    )
+                    .await?;
                     return Ok(
                         serde_json::json!({"version":gmux_protocol::transport::VERSION,"daemon":client.daemon,
                         "hostname":client.hostname,"home_directory":client.home_directory,
@@ -118,14 +128,14 @@ impl Endpoint {
                         anyhow::anyhow!("Remote pane requests require an explicit pane field")
                     })
                 })?;
-                let reply = self.execute(&request, cancellation)?;
+                let reply = self.execute_inner(&request).await?;
                 if output_only {
                     return Ok(serde_json::to_value(command_outcome(reply)?)?);
                 }
                 Ok(reply)
             }
             Self::Saved { name, daemon } => {
-                Self::resolve(name, *daemon)?.call_inner(body, cancellation)
+                Box::pin(Self::resolve_async(name, *daemon).await?.call_inner(body)).await
             }
         }
     }
@@ -136,36 +146,87 @@ impl Endpoint {
         request: &gmux_protocol::control::ExecutionRequest,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<Value> {
+        runtime::block_on(self.execute_async(request, cancellation))
+    }
+    pub async fn execute_async(
+        &self,
+        request: &gmux_protocol::control::ExecutionRequest,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<Value> {
+        runtime::cancellable(cancellation, self.execute_inner(request)).await
+    }
+    async fn execute_inner(
+        &self,
+        request: &gmux_protocol::control::ExecutionRequest,
+    ) -> anyhow::Result<Value> {
         match self {
-            Self::Unix { control, .. } => call_at_cancellable(
-                control,
-                serde_json::json!({"method":"_execution","request":request}),
-                cancellation,
-            ),
+            Self::Unix { control, .. } => {
+                Self::call_unix(
+                    control,
+                    serde_json::json!({"method":"_execution","request":request}),
+                )
+                .await
+            }
             Self::Tcp {
                 address,
                 credentials,
                 daemon,
-            } => crate::network::call_cancellable(
-                address,
-                credentials,
-                *daemon,
-                request,
-                cancellation,
-            ),
+            } => crate::network::call_async(address, credentials, *daemon, request).await,
             Self::Saved { name, daemon } => {
-                Self::resolve(name, *daemon)?.execute(request, cancellation)
+                Box::pin(
+                    Self::resolve_async(name, *daemon)
+                        .await?
+                        .execute_inner(request),
+                )
+                .await
             }
         }
+    }
+    async fn call_unix(control: &std::path::Path, body: Value) -> anyhow::Result<Value> {
+        runtime::deadline(
+            std::time::Instant::now() + gmux_platform::unix::ipc::RESPONSE_TIMEOUT,
+            async {
+                let mut stream = tokio::net::UnixStream::connect(control)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Cannot connect to gmux at {}: {e}. Run gmux serve first.",
+                            control.display()
+                        )
+                    })?;
+                runtime::deadline(
+                    std::time::Instant::now() + gmux_platform::unix::ipc::REQUEST_TIMEOUT,
+                    io::write_json(&mut stream, &body),
+                )
+                .await?;
+                let value = io::read_json(
+                    &mut tokio::io::BufReader::new(stream),
+                    gmux_protocol::transport::MAX_PACKET,
+                )
+                .await?;
+                gmux_protocol::network::check_error(&value)?;
+                Ok(value)
+            },
+        )
+        .await
+    }
+    pub(crate) async fn state_async(
+        &self,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
+        Ok(serde_json::from_value(
+            self.execute_async(
+                &gmux_protocol::control::ExecutionRequest::State,
+                cancellation,
+            )
+            .await?,
+        )?)
     }
     pub fn state(
         &self,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
-        Ok(serde_json::from_value(self.execute(
-            &gmux_protocol::control::ExecutionRequest::State,
-            cancellation,
-        )?)?)
+        runtime::block_on(self.state_async(cancellation))
     }
     /// Apply a layout command and receive its typed result and execution state.
     pub fn command(
@@ -238,29 +299,40 @@ impl Endpoint {
         self.connect_stream_inner(Some(cancellation))
     }
     fn connect_stream_inner(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Stream> {
-        if let Some(c) = cancellation {
-            c.check()?;
-        }
+        runtime::block_on(runtime::cancellable(cancellation, async {
+            self.connect_stream_async()
+                .await?
+                .into_std()
+                .map_err(Into::into)
+        }))
+    }
+    pub(crate) async fn connect_stream_async(&self) -> anyhow::Result<io::Socket> {
         match self {
-            Self::Unix { stream, .. } => Ok(Stream::Unix(UnixStream::connect(stream)?)),
+            Self::Unix { stream, .. } => Ok(io::Socket::Unix(
+                tokio::net::UnixStream::connect(stream).await?,
+            )),
             Self::Tcp {
                 address,
                 credentials,
                 daemon,
             } => {
-                let (stream, _) = crate::network::connect_cancellable(
+                let (socket, _) = crate::network::connect_async(
                     address,
                     credentials,
                     gmux_protocol::network::Channel::Stream,
                     *daemon,
-                    cancellation,
-                )?;
-                stream.set_read_timeout(None)?;
-                stream.set_write_timeout(None)?;
-                Ok(Stream::Tcp(stream))
+                    std::time::Instant::now() + gmux_protocol::network::TIMEOUT,
+                )
+                .await?;
+                Ok(io::Socket::Tcp(socket))
             }
             Self::Saved { name, daemon } => {
-                Self::resolve(name, *daemon)?.connect_stream_inner(cancellation)
+                Box::pin(
+                    Self::resolve_async(name, *daemon)
+                        .await?
+                        .connect_stream_async(),
+                )
+                .await
             }
         }
     }
@@ -369,50 +441,55 @@ impl<R> Default for Jobs<R> {
     }
 }
 pub struct Client<R: Send + 'static = Value> {
-    jobs: Arc<(Mutex<Jobs<R>>, Condvar)>,
+    jobs: Arc<(Mutex<Jobs<R>>, tokio::sync::Notify)>,
     replies: mpsc::Receiver<(u64, anyhow::Result<R>)>,
     next: std::cell::Cell<u64>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Client<Value> {
     fn for_endpoint(endpoint: Endpoint, wake: Wake) -> Self {
-        Self::with_handler(wake, move |request| endpoint.call(request))
+        Self::with_async_handler(wake, move |request| {
+            let endpoint = endpoint.clone();
+            async move { endpoint.call_async(request, None).await }
+        })
     }
 }
 impl<R: Send + 'static> Client<R> {
-    pub fn with_handler(
-        wake: Wake,
-        handler: impl Fn(Value) -> anyhow::Result<R> + Send + 'static,
-    ) -> Self {
-        let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
+    pub fn with_async_handler<F, Fut>(wake: Wake, handler: F) -> Self
+    where
+        F: Fn(Value) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<R>> + Send + 'static,
+    {
+        let jobs = Arc::new((Mutex::new(Jobs::default()), tokio::sync::Notify::new()));
         let worker = jobs.clone();
         let (sender, replies) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
+        let task = runtime::spawn(async move {
             loop {
-                let (job, canceled) = {
-                    let (lock, ready) = &*worker;
-                    let mut jobs = lock.lock().unwrap();
-                    while jobs.queue.is_empty() && !jobs.closed {
-                        jobs = ready.wait(jobs).unwrap();
-                    }
-                    let Some(job) = jobs.queue.pop_front() else {
+                let job = {
+                    let jobs = &mut *worker.0.lock().unwrap();
+                    if jobs.queue.is_empty() && jobs.closed {
                         break;
-                    };
-                    let canceled = jobs.cancel_requests
-                        && job.coalesce.is_none()
-                        && matches!(job.operation, Operation::Request(_));
-                    (job, canceled)
+                    }
+                    jobs.queue.pop_front().map(|job| {
+                        let canceled = jobs.cancel_requests
+                            && job.coalesce.is_none()
+                            && matches!(job.operation, Operation::Request(_));
+                        (job, canceled)
+                    })
                 };
-                let id = job.id;
+                let Some((job, canceled)) = job else {
+                    worker.1.notified().await;
+                    continue;
+                };
                 let result = if canceled {
                     Err(anyhow::anyhow!("Request canceled"))
                 } else {
                     match job.operation {
-                        Operation::Request(body) => handler(body),
-                        Operation::Update(update) => update(),
+                        Operation::Request(body) => handler(body).await,
+                        Operation::Update(update) => runtime::blocking(update).await,
                     }
                 };
-                if sender.send((id, result)).is_err() {
+                if sender.send((job.id, result)).is_err() {
                     break;
                 }
                 wake.notify();
@@ -422,7 +499,7 @@ impl<R: Send + 'static> Client<R> {
             jobs,
             replies,
             next: std::cell::Cell::new(1),
-            thread: Some(thread),
+            task: Some(task),
         }
     }
     pub fn request(&self, request: impl serde::Serialize) -> anyhow::Result<u64> {
@@ -498,14 +575,12 @@ impl<R: Send + 'static> Client<R> {
         ready.notify_one();
     }
     pub fn is_finished(&self) -> bool {
-        self.thread
-            .as_ref()
-            .is_none_or(|thread| thread.is_finished())
+        self.task.as_ref().is_none_or(|task| task.is_finished())
     }
     pub fn join(&mut self) {
         self.close();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(task) = self.task.take() {
+            let _ = runtime::block_on(task);
         }
     }
 }

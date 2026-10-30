@@ -1,5 +1,7 @@
 //! Versioned packets: JSON metadata followed by cell rows or clipboard bytes.
 use crate::{Cell, Frame};
+#[cfg(feature = "async")]
+use futures_lite::io::{AsyncBufReadExt, AsyncReadExt};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{BufRead, ErrorKind, Read, Write},
@@ -121,6 +123,189 @@ impl Write for HeaderWriter<'_> {
     }
 }
 
+// Keep validation and allocation behavior identical for blocking and async I/O.
+macro_rules! packet_reader {
+    ($name:ident, [$($async:tt)*], $reader:ty, [$($wait:tt)*], $take:path) => {
+        /// Read a viewport packet or a heartbeat acknowledgement, represented by None.
+        pub $($async)* fn $name(reader: &mut $reader) -> anyhow::Result<Option<Self>> {
+            let mut size = [0; 4];
+            reader.read_exact(&mut size)$($wait)*?;
+            let size = u32::from_le_bytes(size) as usize;
+            if size == 0 {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                (4..=MAX_PACKET).contains(&size),
+                "Invalid viewport packet size"
+            );
+            let mut header_size = [0; 4];
+            reader.read_exact(&mut header_size)$($wait)*?;
+            let header_size = u32::from_le_bytes(header_size) as usize;
+            anyhow::ensure!(header_size <= size - 4, "Invalid viewport header size");
+            let header = {
+                let mut bytes = vec![0; header_size];
+                reader.read_exact(&mut bytes)$($wait)*?;
+                serde_json::from_slice::<Header>(&bytes)?
+            };
+            if let Some(event) = &header.clipboard_read {
+                event.validate()?;
+                anyhow::ensure!(
+                    header_size <= crate::clipboard::MAX_HEADER_BYTES
+                        && size == 4 + header_size
+                        && header.copy.is_none(),
+                    "Invalid clipboard read packet"
+                );
+                let packet = Self {
+                    header,
+                    cells: Vec::new(),
+                };
+                anyhow::ensure!(packet.clipboard_only(), "Mixed clipboard read packet");
+                return Ok(Some(packet));
+            }
+            if header.copy.is_some() {
+                let mut packet = Self {
+                    header,
+                    cells: Vec::new(),
+                };
+                anyhow::ensure!(
+                    header_size <= crate::clipboard::MAX_HEADER_BYTES && packet.clipboard_only(),
+                    "Invalid clipboard packet"
+                );
+                let write = packet.header.copy.as_mut().unwrap();
+                let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
+                anyhow::ensure!(
+                    size - 4 - header_size == payload,
+                    "Invalid clipboard payload length"
+                );
+                if let Some(content) = &mut write.content {
+                    for representation in &mut content.0 {
+                        reader.read_exact(&mut representation.data)$($wait)*?;
+                    }
+                }
+                write.validate()?;
+                return Ok(Some(packet));
+            }
+            if let Some(end) = header.cache_valid_before {
+                anyhow::ensure!(
+                    header.generation != 0
+                        && header.cache_origin.checked_add(end).is_some()
+                        && header
+                            .frame
+                            .is_none_or(|frame| end <= frame.scrollback.total),
+                    "Invalid history cache boundary"
+                );
+            }
+            anyhow::ensure!(
+                header.row_flags.is_empty()
+                    || (header.row_flags.len() == header.rows.len()
+                        && header.row_flags.iter().all(|flags| flags & !1 == 0)),
+                "Invalid viewport row flags"
+            );
+            anyhow::ensure!(
+                header.hyperlinks.is_none() || header.frame.is_some(),
+                "Hyperlinks require a frame"
+            );
+            let expected = if let Some(frame) = header.frame {
+                let cols = frame.cols as usize;
+                let rows = frame.rows as usize;
+                anyhow::ensure!(
+                    header
+                        .cache_origin
+                        .checked_add(frame.scrollback.total)
+                        .is_some(),
+                    "Invalid history origin"
+                );
+                anyhow::ensure!(
+                    crate::viewport::valid(cols as u64, rows as u64),
+                    "Invalid viewport dimensions"
+                );
+                anyhow::ensure!(
+                    header.rows.len() <= rows
+                        && header.rows.windows(2).all(|r| r[0] < r[1])
+                        && header.rows.iter().all(|r| (*r as usize) < rows),
+                    "Invalid viewport row indices"
+                );
+                anyhow::ensure!(
+                    (header.row_shift.unsigned_abs() as usize) < rows,
+                    "Invalid viewport row shift"
+                );
+                let exposed = if header.row_shift > 0 {
+                    rows - header.row_shift as usize..rows
+                } else {
+                    0..header.row_shift.unsigned_abs() as usize
+                };
+                anyhow::ensure!(
+                    exposed
+                        .into_iter()
+                        .all(|row| header.rows.binary_search(&(row as u16)).is_ok()),
+                    "Missing exposed viewport rows"
+                );
+                let cached = if let Some(cache) = &header.cache {
+                    anyhow::ensure!(
+                        cache.row_flags.len() <= crate::scroll_cache::capacity(cols)
+                            && cache.row_flags.iter().all(|flag| flag & !1 == 0)
+                            && cache.start <= frame.scrollback.total
+                            && cache.row_flags.len() as u64 <= frame.scrollback.total - cache.start,
+                        "Invalid cached rows"
+                    );
+                    cache.row_flags.len()
+                } else {
+                    0
+                };
+                if let Some(links) = &header.hyperlinks {
+                    links.validate(cols * rows)?;
+                }
+                (header.rows.len() + cached) * cols
+            } else {
+                anyhow::ensure!(
+                    header.rows.is_empty() && header.cache.is_none() && header.row_shift == 0,
+                    "Rows require a frame"
+                );
+                0
+            };
+            let payload = size - 4 - header_size;
+            anyhow::ensure!(
+                (expected * CELL_PREFIX_BYTES
+                    ..=expected * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES))
+                    .contains(&payload),
+                "Invalid viewport cell data"
+            );
+            // Bound reads to this record even when a length claims the next packet.
+            let mut reader = $take(reader, payload as u64);
+            let mut remaining = payload;
+            let mut cells = Vec::with_capacity(expected);
+            while cells.len() < expected {
+                let bytes = match reader.fill_buf()$($wait)* {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                let mut consumed = 0;
+                while bytes.len() - consumed >= CELL_PREFIX_BYTES && cells.len() < expected {
+                    let len = cell_length(&bytes[consumed..])?;
+                    if bytes.len() - consumed < len {
+                        break;
+                    }
+                    cells.push(decode_cell(&bytes[consumed..consumed + len])?);
+                    consumed += len;
+                }
+                if consumed != 0 {
+                    remaining -= consumed;
+                    reader.consume(consumed);
+                    continue;
+                }
+                let mut bytes = [0; CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES];
+                reader.read_exact(&mut bytes[..CELL_PREFIX_BYTES])$($wait)*?;
+                let len = cell_length(&bytes)?;
+                reader.read_exact(&mut bytes[CELL_PREFIX_BYTES..len])$($wait)*?;
+                remaining -= len;
+                cells.push(decode_cell(&bytes[..len])?);
+            }
+            anyhow::ensure!(remaining == 0, "Trailing viewport cell data");
+            Ok(Some(Self { header, cells }))
+        }
+    };
+}
+
 impl Packet {
     pub fn encode_into(&self, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
         self.encode_into_limit(bytes, MAX_PACKET + 4)
@@ -237,180 +422,9 @@ impl Packet {
         }
     }
 
-    /// Read a viewport packet or a heartbeat acknowledgement, represented by None.
-    pub fn read_message(reader: &mut impl BufRead) -> anyhow::Result<Option<Self>> {
-        let mut size = [0; 4];
-        reader.read_exact(&mut size)?;
-        let size = u32::from_le_bytes(size) as usize;
-        if size == 0 {
-            return Ok(None);
-        }
-        anyhow::ensure!(
-            (4..=MAX_PACKET).contains(&size),
-            "Invalid viewport packet size"
-        );
-        let mut header_size = [0; 4];
-        reader.read_exact(&mut header_size)?;
-        let header_size = u32::from_le_bytes(header_size) as usize;
-        anyhow::ensure!(header_size <= size - 4, "Invalid viewport header size");
-        let header = {
-            let mut bytes = vec![0; header_size];
-            reader.read_exact(&mut bytes)?;
-            serde_json::from_slice::<Header>(&bytes)?
-        };
-        if let Some(event) = &header.clipboard_read {
-            event.validate()?;
-            anyhow::ensure!(
-                header_size <= crate::clipboard::MAX_HEADER_BYTES
-                    && size == 4 + header_size
-                    && header.copy.is_none(),
-                "Invalid clipboard read packet"
-            );
-            let packet = Self {
-                header,
-                cells: Vec::new(),
-            };
-            anyhow::ensure!(packet.clipboard_only(), "Mixed clipboard read packet");
-            return Ok(Some(packet));
-        }
-        if header.copy.is_some() {
-            let mut packet = Self {
-                header,
-                cells: Vec::new(),
-            };
-            anyhow::ensure!(
-                header_size <= crate::clipboard::MAX_HEADER_BYTES && packet.clipboard_only(),
-                "Invalid clipboard packet"
-            );
-            let write = packet.header.copy.as_mut().unwrap();
-            let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
-            anyhow::ensure!(
-                size - 4 - header_size == payload,
-                "Invalid clipboard payload length"
-            );
-            if let Some(content) = &mut write.content {
-                for representation in &mut content.0 {
-                    reader.read_exact(&mut representation.data)?;
-                }
-            }
-            write.validate()?;
-            return Ok(Some(packet));
-        }
-        if let Some(end) = header.cache_valid_before {
-            anyhow::ensure!(
-                header.generation != 0
-                    && header.cache_origin.checked_add(end).is_some()
-                    && header
-                        .frame
-                        .is_none_or(|frame| end <= frame.scrollback.total),
-                "Invalid history cache boundary"
-            );
-        }
-        anyhow::ensure!(
-            header.row_flags.is_empty()
-                || (header.row_flags.len() == header.rows.len()
-                    && header.row_flags.iter().all(|flags| flags & !1 == 0)),
-            "Invalid viewport row flags"
-        );
-        anyhow::ensure!(
-            header.hyperlinks.is_none() || header.frame.is_some(),
-            "Hyperlinks require a frame"
-        );
-        let expected = if let Some(frame) = header.frame {
-            let cols = frame.cols as usize;
-            let rows = frame.rows as usize;
-            anyhow::ensure!(
-                header
-                    .cache_origin
-                    .checked_add(frame.scrollback.total)
-                    .is_some(),
-                "Invalid history origin"
-            );
-            anyhow::ensure!(
-                crate::viewport::valid(cols as u64, rows as u64),
-                "Invalid viewport dimensions"
-            );
-            anyhow::ensure!(
-                header.rows.len() <= rows
-                    && header.rows.windows(2).all(|r| r[0] < r[1])
-                    && header.rows.iter().all(|r| (*r as usize) < rows),
-                "Invalid viewport row indices"
-            );
-            anyhow::ensure!(
-                (header.row_shift.unsigned_abs() as usize) < rows,
-                "Invalid viewport row shift"
-            );
-            let exposed = if header.row_shift > 0 {
-                rows - header.row_shift as usize..rows
-            } else {
-                0..header.row_shift.unsigned_abs() as usize
-            };
-            anyhow::ensure!(
-                exposed
-                    .into_iter()
-                    .all(|row| header.rows.binary_search(&(row as u16)).is_ok()),
-                "Missing exposed viewport rows"
-            );
-            let cached = if let Some(cache) = &header.cache {
-                anyhow::ensure!(
-                    cache.row_flags.len() <= crate::scroll_cache::capacity(cols)
-                        && cache.row_flags.iter().all(|flag| flag & !1 == 0)
-                        && cache.start <= frame.scrollback.total
-                        && cache.row_flags.len() as u64 <= frame.scrollback.total - cache.start,
-                    "Invalid cached rows"
-                );
-                cache.row_flags.len()
-            } else {
-                0
-            };
-            if let Some(links) = &header.hyperlinks {
-                links.validate(cols * rows)?;
-            }
-            (header.rows.len() + cached) * cols
-        } else {
-            anyhow::ensure!(
-                header.rows.is_empty() && header.cache.is_none() && header.row_shift == 0,
-                "Rows require a frame"
-            );
-            0
-        };
-        let payload = size - 4 - header_size;
-        anyhow::ensure!(
-            (expected * CELL_PREFIX_BYTES
-                ..=expected * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES))
-                .contains(&payload),
-            "Invalid viewport cell data"
-        );
-        // Bound reads to this record even when a length claims the next packet.
-        let mut reader = std::io::Read::take(reader, payload as u64);
-        let mut cells = Vec::with_capacity(expected);
-        while cells.len() < expected {
-            let bytes = match reader.fill_buf() {
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                result => result?,
-            };
-            let mut consumed = 0;
-            while bytes.len() - consumed >= CELL_PREFIX_BYTES && cells.len() < expected {
-                let len = cell_length(&bytes[consumed..])?;
-                if bytes.len() - consumed < len {
-                    break;
-                }
-                cells.push(decode_cell(&bytes[consumed..consumed + len])?);
-                consumed += len;
-            }
-            if consumed != 0 {
-                reader.consume(consumed);
-                continue;
-            }
-            let mut bytes = [0; CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES];
-            reader.read_exact(&mut bytes[..CELL_PREFIX_BYTES])?;
-            let len = cell_length(&bytes)?;
-            reader.read_exact(&mut bytes[CELL_PREFIX_BYTES..len])?;
-            cells.push(decode_cell(&bytes[..len])?);
-        }
-        anyhow::ensure!(reader.limit() == 0, "Trailing viewport cell data");
-        Ok(Some(Self { header, cells }))
-    }
+    packet_reader!(read_message, [], impl BufRead, [], std::io::Read::take);
+    #[cfg(feature = "async")]
+    packet_reader!(read_message_async, [async], (impl futures_lite::io::AsyncBufRead + Unpin), [.await], futures_lite::io::AsyncReadExt::take);
 }
 
 fn cell_length(bytes: &[u8]) -> anyhow::Result<usize> {
@@ -785,7 +799,31 @@ mod tests {
                 return Err(io::ErrorKind::Interrupted.into());
             }
             let len = out.len().min(self.chunk);
-            self.bytes.read(&mut out[..len])
+            std::io::Read::read(&mut self.bytes, &mut out[..len])
+        }
+    }
+
+    #[cfg(feature = "async")]
+    impl futures_lite::io::AsyncRead for Fragmented<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            out: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            // Exercise suspension as well as fragmentation and Interrupted reads.
+            if self.reads.is_multiple_of(7) {
+                self.reads += 1;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            match Read::read(&mut *self, out) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    // AsyncRead handles EINTR below the codec.
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                result => std::task::Poll::Ready(result),
+            }
         }
     }
 
@@ -853,6 +891,28 @@ mod tests {
             let mut trailing = Vec::new();
             reader.read_to_end(&mut trailing).unwrap();
             assert!(trailing.is_empty());
+            #[cfg(feature = "async")]
+            futures_lite::future::block_on(async {
+                let mut reader = futures_lite::io::BufReader::with_capacity(
+                    capacity,
+                    Fragmented {
+                        bytes: &encoded,
+                        chunk,
+                        reads: 0,
+                    },
+                );
+                for expected in [&packet, &unchanged, &packet] {
+                    let decoded = Packet::read_message_async(&mut reader)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(decoded.cells == expected.cells);
+                    assert_eq!(
+                        serde_json::to_value(decoded.header).unwrap(),
+                        serde_json::to_value(&expected.header).unwrap()
+                    );
+                }
+            });
         }
     }
 

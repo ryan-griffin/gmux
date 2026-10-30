@@ -1,5 +1,5 @@
 //! Frontend handles contain cached viewports; terminal engines live in the daemon.
-use crate::{incoming, ipc};
+use crate::{incoming, ipc, runtime};
 use gmux_protocol::{
     Cell, Frame,
     control::InternalRequest,
@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 use std::{
     cell::{Cell as ValueCell, RefCell},
     collections::{HashMap, HashSet},
-    io::BufReader,
     path::Path,
     rc::Rc,
     sync::{
@@ -26,6 +25,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -54,10 +55,10 @@ impl Heartbeat {
     fn remaining(&self) -> Duration {
         self.next.saturating_duration_since(Instant::now())
     }
-    fn check(&mut self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+    async fn check(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> anyhow::Result<()> {
         let now = Instant::now();
         if now >= self.next {
-            writer.write_all(PING)?;
+            writer.write_all(PING).await?;
             self.next = now + self.interval;
         }
         Ok(())
@@ -80,13 +81,27 @@ fn stream_error(error: anyhow::Error) -> String {
 pub type SessionHandle = Rc<RefCell<RemoteSession>>;
 
 struct Connection {
-    commands: mpsc::SyncSender<Outgoing>,
+    commands: tokio::sync::mpsc::Sender<Queued>,
+    task: Option<tokio::task::AbortHandle>,
     pending_bytes: Arc<AtomicUsize>,
     socket: ipc::Stream,
     clipboard_epochs: [ValueCell<u64>; 2],
 }
+struct Queued {
+    outgoing: Outgoing,
+    reservation: Reservation,
+}
+struct Reservation {
+    bytes: usize,
+    pending: Arc<AtomicUsize>,
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 enum Outgoing {
-    Close,
     ClipboardReply {
         pane: u64,
         result: gmux_protocol::clipboard::ReadResult,
@@ -144,7 +159,6 @@ impl Outgoing {
 
     fn bytes(&self) -> usize {
         match self {
-            Self::Close => 0,
             Self::ClipboardReply { contents, .. } => {
                 contents
                     .iter()
@@ -157,27 +171,31 @@ impl Outgoing {
         }
     }
 
-    fn write(
+    #[cfg(test)]
+    fn write(self, writer: &mut Vec<u8>, heartbeat: &mut Heartbeat) -> anyhow::Result<()> {
+        runtime::block_on(self.write_async(writer, heartbeat))
+    }
+    async fn write_async(
         self,
-        writer: &mut impl std::io::Write,
+        writer: &mut (impl AsyncWrite + Unpin),
         heartbeat: &mut Heartbeat,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Close => return Ok(()),
-            Self::Command(bytes) => writer.write_all(&bytes)?,
+            Self::Command(bytes) => writer.write_all(&bytes).await?,
             Self::ClipboardReply {
                 pane,
                 result,
                 contents,
             } => {
                 let id = result.id;
-                transport::command(
+                write_command(
                     writer,
                     &StreamRequest::pane(pane, StreamCommand::ClipboardReadResult { result }),
-                )?;
+                )
+                .await?;
                 for c in contents {
                     for bytes in c.data.chunks(gmux_protocol::clipboard::READ_CHUNK) {
-                        transport::command(
+                        write_command(
                             writer,
                             &StreamRequest::pane(
                                 pane,
@@ -187,24 +205,26 @@ impl Outgoing {
                                     bytes: vec![],
                                 },
                             ),
-                        )?;
-                        writer.write_all(bytes)?;
-                        heartbeat.check(writer)?;
+                        )
+                        .await?;
+                        writer.write_all(bytes).await?;
+                        heartbeat.check(writer).await?;
                     }
                 }
-                transport::command(
+                write_command(
                     writer,
                     &StreamRequest::pane(pane, StreamCommand::ClipboardReadEnd { id }),
-                )?;
+                )
+                .await?;
             }
             Self::Paste {
                 pane,
                 text,
                 options,
                 user,
-            } => write_paste(writer, pane, &text, options, user, heartbeat)?,
+            } => write_paste(writer, pane, &text, options, user, heartbeat).await?,
         }
-        heartbeat.check(writer)
+        heartbeat.check(writer).await
     }
 }
 
@@ -228,9 +248,10 @@ impl Connection {
         Ok(())
     }
     fn close(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
-        // Cached viewports may retain this sender after their manager is gone.
-        let _ = self.commands.try_send(Outgoing::Close);
     }
     fn send(&self, request: StreamRequest) -> anyhow::Result<()> {
         self.enqueue(Outgoing::prepare(request)?)
@@ -242,23 +263,39 @@ impl Connection {
                 (pending + bytes <= 2 * transport::MAX_PASTE).then_some(pending + bytes)
             })
             .map_err(|_| anyhow::anyhow!("Terminal input queue is full"))?;
-        if let Err(error) = self.commands.try_send(outgoing) {
-            self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            anyhow::bail!("Could not queue daemon command: {error}");
-        }
+        let queued = Queued {
+            outgoing,
+            reservation: Reservation {
+                bytes,
+                pending: self.pending_bytes.clone(),
+            },
+        };
+        self.commands
+            .try_send(queued)
+            .map_err(|error| anyhow::anyhow!("Could not queue daemon command: {error}"))?;
         Ok(())
     }
 }
 
-fn write_paste(
-    writer: &mut impl std::io::Write,
+async fn write_command(
+    writer: &mut (impl AsyncWrite + Unpin),
+    request: &StreamRequest,
+) -> anyhow::Result<()> {
+    writer
+        .write_all(&transport::command_bytes(request)?)
+        .await?;
+    Ok(())
+}
+
+async fn write_paste(
+    writer: &mut (impl AsyncWrite + Unpin),
     pane: Option<u64>,
     text: &str,
     options: PasteOptions,
     user: Option<(u64, u64)>,
     heartbeat: &mut Heartbeat,
 ) -> anyhow::Result<()> {
-    transport::command(
+    write_command(
         writer,
         &StreamRequest {
             pane,
@@ -275,11 +312,12 @@ fn write_paste(
                 }
             },
         },
-    )?;
+    )
+    .await?;
     let mut start = 0;
     while start < text.len() {
         let end = text.floor_char_boundary((start + transport::PASTE_CHUNK).min(text.len()));
-        transport::command(
+        write_command(
             writer,
             &StreamRequest {
                 pane,
@@ -287,17 +325,19 @@ fn write_paste(
                     text: text[start..end].to_owned(),
                 },
             },
-        )?;
+        )
+        .await?;
         start = end;
-        heartbeat.check(writer)?;
+        heartbeat.check(writer).await?;
     }
-    transport::command(
+    write_command(
         writer,
         &StreamRequest {
             pane,
             command: StreamCommand::PasteEnd,
         },
     )
+    .await
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -326,6 +366,56 @@ pub struct SessionManager {
     disconnected: bool,
     disconnect_error: Option<anyhow::Error>,
     state: Option<gmux_protocol::control::CommandReply>,
+}
+
+async fn read_packets(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    sender: &incoming::Sender,
+    wake: &gmux_platform::unix::ipc::Wake,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut reader = tokio::io::BufReader::new(reader).compat();
+    loop {
+        let packet = runtime::deadline(
+            Instant::now() + timeout,
+            Packet::read_message_async(&mut reader),
+        )
+        .await?;
+        if let Some(packet) = packet {
+            sender.send_async(Ok(packet)).await?;
+            wake.notify();
+        }
+    }
+}
+
+async fn write_commands(
+    mut writer: impl AsyncWrite + Unpin,
+    queue: &mut tokio::sync::mpsc::Receiver<Queued>,
+    wake: &gmux_platform::unix::ipc::Wake,
+    interval: Duration,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut heartbeat = Heartbeat::new(interval);
+    loop {
+        match tokio::time::timeout(heartbeat.remaining(), queue.recv()).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(Queued {
+                outgoing,
+                reservation,
+            })) => {
+                runtime::deadline(
+                    Instant::now() + timeout,
+                    outgoing.write_async(&mut writer, &mut heartbeat),
+                )
+                .await?;
+                drop(reservation);
+                wake.notify();
+            }
+            Err(_) => {
+                runtime::deadline(Instant::now() + timeout, heartbeat.check(&mut writer)).await?
+            }
+        }
+    }
 }
 
 impl SessionManager {
@@ -362,15 +452,25 @@ impl SessionManager {
         socket: &mut ipc::Stream,
         daemon: gmux_protocol::model::DaemonId,
     ) -> anyhow::Result<()> {
-        transport::command(
-            socket,
-            &StreamRequest::connection(StreamCommand::Attach {
-                version: transport::VERSION,
-                daemon,
-                remote: false,
-            }),
-        )
+        runtime::block_on(async {
+            let mut socket = crate::io::Socket::from_std(socket.try_clone()?)?;
+            let result = runtime::deadline(
+                Instant::now() + gmux_protocol::network::TIMEOUT,
+                write_command(
+                    &mut socket.split().1,
+                    &StreamRequest::connection(StreamCommand::Attach {
+                        version: transport::VERSION,
+                        daemon,
+                        remote: false,
+                    }),
+                ),
+            )
+            .await;
+            socket.into_std()?;
+            result
+        })
     }
+
     pub(crate) fn from_attached_stream(
         endpoint: ipc::Endpoint,
         wake: gmux_platform::unix::ipc::Wake,
@@ -394,76 +494,37 @@ impl SessionManager {
         interval: Duration,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
-        socket.set_read_timeout(Some(timeout))?;
-        socket.set_write_timeout(Some(timeout))?;
-        let mut writer = socket.try_clone()?;
-        let reader = socket.try_clone()?;
-        let (commands, queue) = mpsc::sync_channel::<Outgoing>(128);
+        let socket_copy = socket.try_clone()?;
+        let (commands, mut queue) = tokio::sync::mpsc::channel::<Queued>(128);
         let pending_bytes = Arc::new(AtomicUsize::new(0));
-        let writer_bytes = pending_bytes.clone();
         let (sender, receiver) = incoming::channel(incoming::MAX_BYTES, 64);
-        let errors = sender.clone();
-        let writer_wake = wake.clone();
-        std::thread::spawn(move || {
-            let mut heartbeat = Heartbeat::new(interval);
-            loop {
-                let (result, commands_changed) = match queue.recv_timeout(heartbeat.remaining()) {
-                    Ok(Outgoing::Close) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Ok(outgoing) => {
-                        let bytes = outgoing.bytes();
-                        let result = outgoing.write(&mut writer, &mut heartbeat);
-                        writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                        (result, true)
+        let task_wake = wake.clone();
+        let task = runtime::spawn(async move {
+            let result = async {
+                let mut socket = crate::io::Socket::from_std(socket_copy)?;
+                let result = {
+                    let (reader, writer) = socket.split();
+                    tokio::select! {
+                        result = read_packets(reader, &sender, &task_wake, timeout) => result,
+                        result = write_commands(writer, &mut queue, &task_wake, interval, timeout) => result,
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => (heartbeat.check(&mut writer), false),
                 };
-                if let Err(error) = result {
-                    let _ = errors.send(Err(stream_error(error)));
-                    writer_wake.notify();
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
-                    break;
-                }
-                // Retry state commands after queue backpressure without a timer.
-                if commands_changed {
-                    writer_wake.notify();
-                }
-            }
-        });
-        let reader_wake = wake.clone();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(reader);
-            loop {
-                let packet = match Packet::read_message(&mut reader) {
-                    Ok(None) => continue,
-                    Ok(Some(packet)) => Ok(packet),
-                    Err(error) => Err(error),
-                }
-                .map_err(stream_error);
-                let failed = packet.is_err();
-                match sender.send(packet) {
-                    Ok(()) => (),
-                    Err(incoming::SendError::TooLarge) => {
-                        // Admission accounts retained storage once. Keep its
-                        // rejection ordered after packets already in the queue.
-                        if sender
-                            .send(Err("Lost connection to the terminal daemon: Viewport packet exceeds the frontend memory budget".into()))
-                            .is_ok()
-                        {
-                            let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
-                            reader_wake.notify();
-                        }
-                        break;
-                    }
-                    Err(incoming::SendError::Closed) => break,
-                }
-                if failed {
-                    // Queue the cause before shutdown can make the writer fail too.
-                    let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
-                }
-                reader_wake.notify();
-                if failed {
-                    break;
-                }
+                // Cached views can retain the UI's descriptor after a failure.
+                socket.shutdown();
+                result
+            }.await;
+            // Release queued data before waiting to report an error to the UI.
+            drop(queue);
+            if let Err(error) = result {
+                let message = if error.downcast_ref::<incoming::SendError>()
+                    == Some(&incoming::SendError::TooLarge)
+                {
+                    "Lost connection to the terminal daemon: Viewport packet exceeds the frontend memory budget".into()
+                } else {
+                    stream_error(error)
+                };
+                let _ = sender.send_async(Err(message)).await;
+                task_wake.notify();
             }
         });
         Ok(Self {
@@ -472,6 +533,7 @@ impl SessionManager {
             connection: Rc::new(Connection {
                 clipboard_epochs: Default::default(),
                 commands,
+                task: Some(task.abort_handle()),
                 pending_bytes,
                 socket,
             }),
@@ -1563,6 +1625,7 @@ mod tests {
     }
     use super::*;
     use gmux_protocol::cells::{decoration, underline};
+    use std::io::BufReader;
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -1610,10 +1673,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         // The old viewport can retain its connection without retaining a worker.
         loop {
-            if matches!(
-                cached.commands.try_send(Outgoing::Close),
-                Err(mpsc::TrySendError::Disconnected(_))
-            ) {
+            if cached.commands.is_closed() {
                 break;
             }
             assert!(
@@ -1687,7 +1747,11 @@ mod tests {
     fn request(value: Value) -> StreamRequest {
         serde_json::from_value(value).unwrap()
     }
-    fn wire(outgoing: Outgoing) -> Value {
+    fn wire(queued: Queued) -> Value {
+        let Queued {
+            outgoing,
+            reservation: _reservation,
+        } = queued;
         let mut bytes = Vec::new();
         outgoing
             .write(&mut bytes, &mut Heartbeat::new(HEARTBEAT_INTERVAL))
@@ -1724,10 +1788,11 @@ mod tests {
     #[test]
     fn paste_queue_limits_count_bytes_and_failed_enqueues_release_the_reservation() {
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(2);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(2);
         let connection = Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         };
@@ -1756,15 +1821,71 @@ mod tests {
             2 * transport::MAX_PASTE
         );
         assert!(receiver.try_recv().is_ok());
+        assert_eq!(
+            connection.pending_bytes.load(Ordering::Relaxed),
+            transport::MAX_PASTE
+        );
+        drop(receiver);
+        assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn aborting_a_blocked_write_releases_in_flight_and_queued_byte_reservations() {
+        use tokio::io::AsyncReadExt;
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, mut queue) = tokio::sync::mpsc::channel(2);
+        let connection = Connection {
+            clipboard_epochs: Default::default(),
+            commands,
+            task: None,
+            socket: socket.into(),
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        for _ in 0..2 {
+            connection
+                .send(request(
+                    json!({"method":"paste","text":"x".repeat(transport::MAX_PASTE)}),
+                ))
+                .unwrap();
+        }
+        let (writer, mut reader) = tokio::io::duplex(32);
+        let task = runtime::spawn(async move {
+            write_commands(
+                writer,
+                &mut queue,
+                &gmux_platform::unix::ipc::Wake::new().unwrap(),
+                HEARTBEAT_INTERVAL,
+                RESPONSE_TIMEOUT,
+            )
+            .await
+        });
+        // Receiving a byte proves the writer has taken the first operation and
+        // is blocked on this tiny socket, with another operation still queued.
+        runtime::block_on(async {
+            runtime::deadline(Instant::now() + Duration::from_secs(2), async {
+                reader.read_exact(&mut [0]).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            connection.pending_bytes.load(Ordering::Relaxed),
+            2 * transport::MAX_PASTE
+        );
+        task.abort();
+        assert!(runtime::block_on(task).unwrap_err().is_cancelled());
+        assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn oversized_commands_fail_before_enqueue_and_leave_later_input_usable() {
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(2);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(2);
         let connection = Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         };
@@ -1782,7 +1903,7 @@ mod tests {
             assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), 0);
             assert!(matches!(
                 receiver.try_recv(),
-                Err(mpsc::TryRecvError::Empty)
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ));
         }
         connection
@@ -1797,10 +1918,11 @@ mod tests {
     #[test]
     fn ordinary_commands_share_the_outgoing_byte_budget_with_pastes() {
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(16);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(16);
         let connection = Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         };
@@ -1817,17 +1939,18 @@ mod tests {
         assert!(before <= 2 * transport::MAX_PASTE);
         assert!(connection.send(input()).is_err());
         assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), before);
-        assert_eq!(receiver.try_iter().count(), 5);
+        assert_eq!(std::iter::from_fn(|| receiver.try_recv().ok()).count(), 5);
     }
     use gmux_protocol::transport::Header;
     use std::path::PathBuf;
 
     fn manager() -> (SessionManager, incoming::Sender, SessionHandle) {
         let (socket, _) = UnixStream::pair().unwrap();
-        let (commands, _) = mpsc::sync_channel(1);
+        let (commands, _) = tokio::sync::mpsc::channel(1);
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -1919,11 +2042,12 @@ mod tests {
             },
         );
         let second = manager.attach(2, &Theme::adwaita(true)).unwrap();
-        let (commands, receiver) = mpsc::sync_channel(1);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -1950,11 +2074,12 @@ mod tests {
         assert!(receiver.try_recv().is_err());
 
         // A replacement connection must advertise its own initial generation.
-        let (commands, receiver) = mpsc::sync_channel(1);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         second.borrow_mut().connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -1965,11 +2090,12 @@ mod tests {
     #[test]
     fn clipboard_capability_changes_coalesce_and_failed_advertisements_can_retry() {
         let (mut manager, _, _) = manager();
-        let (commands, receiver) = mpsc::sync_channel(1);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         manager.connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -2164,11 +2290,12 @@ mod tests {
         use gmux_protocol::hyperlinks::Hyperlinks;
         let (mut manager, sender, handle) = manager();
         manager.visible.insert(1);
-        let (commands, _receiver) = mpsc::sync_channel(32);
+        let (commands, mut _receiver) = tokio::sync::mpsc::channel(32);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -2538,11 +2665,12 @@ mod tests {
     #[test]
     fn git_subscriptions_retry_after_command_backpressure() {
         let (mut manager, _, _) = manager();
-        let (commands, receiver) = mpsc::sync_channel(1);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         manager.connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -2561,6 +2689,7 @@ mod tests {
         receiver
             .try_recv()
             .unwrap()
+            .outgoing
             .write(&mut bytes, &mut Heartbeat::new(HEARTBEAT_INTERVAL))
             .unwrap();
         assert_eq!(
@@ -2575,11 +2704,12 @@ mod tests {
         // Metadata must also leave a populated history cache and its active
         // prediction alone, rather than only preserving an empty live viewport.
         manager.visible.insert(1);
-        let (commands, _outgoing) = mpsc::sync_channel(8);
+        let (commands, mut _outgoing) = tokio::sync::mpsc::channel(8);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -2918,11 +3048,12 @@ mod tests {
     fn selection_replies_wait_for_the_latest_range_or_clear() {
         use gmux_protocol::transport::SelectionMode;
         let (mut manager, sender, session) = manager();
-        let (commands, _outgoing) = mpsc::sync_channel(16);
+        let (commands, mut _outgoing) = tokio::sync::mpsc::channel(16);
         let (socket, _peer) = UnixStream::pair().unwrap();
         session.borrow_mut().connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3000,11 +3131,12 @@ mod tests {
     fn output_and_pruning_preserve_predictions_until_their_rows_change() {
         let (mut manager, sender, handle) = manager();
         manager.visible.insert(1);
-        let (commands, _outgoing) = mpsc::sync_channel(32);
+        let (commands, mut _outgoing) = tokio::sync::mpsc::channel(32);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3120,12 +3252,13 @@ mod tests {
     #[test]
     fn cached_edge_requests_coalesce_during_refill_but_misses_keep_pipelining() {
         let (mut manager, _sender, handle) = manager();
-        let (commands, outgoing) = mpsc::sync_channel(8);
+        let (commands, mut outgoing) = tokio::sync::mpsc::channel(8);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let mut session = handle.borrow_mut();
         session.connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3161,12 +3294,13 @@ mod tests {
     #[test]
     fn returning_to_the_live_bottom_does_not_debounce_cursor_synchronization() {
         let (_manager, _sender, handle) = manager();
-        let (commands, outgoing) = mpsc::sync_channel(8);
+        let (commands, mut outgoing) = tokio::sync::mpsc::channel(8);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let mut session = handle.borrow_mut();
         session.connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3202,11 +3336,12 @@ mod tests {
     #[test]
     fn display_interval_changes_update_scroll_pacing_and_retry_after_backpressure() {
         let (mut manager, _sender, handle) = manager();
-        let (commands, outgoing) = mpsc::sync_channel(1);
+        let (commands, mut outgoing) = tokio::sync::mpsc::channel(1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3228,11 +3363,12 @@ mod tests {
     fn cached_scrolling_is_immediate_and_reconciles_ordered_deltas_and_invalidations() {
         let (mut manager, sender, handle) = manager();
         manager.visible.insert(1);
-        let (commands, receiver) = mpsc::sync_channel(32);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(32);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3388,10 +3524,11 @@ mod tests {
     fn key_actions_survive_the_frontend_command_queue() {
         let (_, _, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(8);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(8);
         session.borrow_mut().connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -3430,10 +3567,11 @@ mod tests {
     fn rapid_scroll_events_pipeline_before_viewport_replies_arrive() {
         let (mut manager, sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(128);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(128);
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -3482,7 +3620,9 @@ mod tests {
                 .key("a", layout(b'a' as u32), 0, KeyAction::Release, "")
                 .unwrap();
             manager.poll();
-            let commands: Vec<_> = receiver.try_iter().map(wire).collect();
+            let commands: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(wire)
+                .collect();
             assert_eq!(commands.len(), 4);
             assert_eq!(
                 commands[0],
@@ -3526,10 +3666,11 @@ mod tests {
     fn a_coalesced_scroll_target_releases_at_the_cadence_without_responses() {
         let (mut manager, _sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(8);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(8);
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -3584,10 +3725,11 @@ mod tests {
     fn queue_backpressure_suspends_expired_scroll_deadlines_until_progress() {
         let (mut manager, _sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(1);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
@@ -3617,10 +3759,11 @@ mod tests {
     fn commands_follow_the_latest_scroll_target_under_backpressure() {
         let (mut manager, _sender, session) = manager();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(2);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(2);
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
@@ -3652,7 +3795,10 @@ mod tests {
             .borrow()
             .key("b", layout(b'b' as u32), 0, KeyAction::Press, "b")
             .unwrap();
-        let commands: Vec<_> = receiver.try_iter().take(2).map(wire).collect();
+        let commands: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .take(2)
+            .map(wire)
+            .collect();
         assert_eq!(commands.len(), 2);
         assert_eq!(
             commands[0],
@@ -3666,16 +3812,18 @@ mod tests {
     fn scroll_requests_coalesce_under_backpressure_and_ignore_stale_acknowledgements() {
         let (mut manager, sender, session) = manager();
         let (socket, _) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(1);
-        commands
-            .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
-            .unwrap();
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+
         let connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
+        connection
+            .send(request(json!({"method":"input","bytes":[]})))
+            .unwrap();
         manager.connection = connection.clone();
         session.borrow_mut().connection = connection;
         session.borrow_mut().scroll_to(10);
@@ -3721,16 +3869,19 @@ mod tests {
     fn viewport_subscription_retries_after_command_backpressure() {
         let (mut manager, _sender, _session) = manager();
         let (socket, _) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(1);
-        commands
-            .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
-            .unwrap();
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+
         manager.connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
+        manager
+            .connection
+            .send(request(json!({"method":"input","bytes":[]})))
+            .unwrap();
         assert!(manager.set_visible(HashSet::from([1])).is_err());
         assert_eq!(wire(receiver.try_recv().unwrap())["method"], "input");
         assert!(manager.poll().is_empty());
@@ -3770,16 +3921,19 @@ mod tests {
     fn read_acknowledgements_retry_after_command_backpressure() {
         let (mut manager, _sender, session) = manager();
         let (socket, _) = UnixStream::pair().unwrap();
-        let (commands, receiver) = mpsc::sync_channel(1);
-        commands
-            .send(Outgoing::prepare(request(json!({"method":"input","bytes":[]}))).unwrap())
-            .unwrap();
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+
         manager.connection = Rc::new(Connection {
             clipboard_epochs: Default::default(),
             commands,
+            task: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             socket: socket.into(),
         });
+        manager
+            .connection
+            .send(request(json!({"method":"input","bytes":[]})))
+            .unwrap();
         session.borrow_mut().meta.unread_sequence = 7;
         manager.mark_read(1);
         assert!(!session.borrow().unread());
