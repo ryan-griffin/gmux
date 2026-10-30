@@ -1,5 +1,11 @@
-//! Execution requests independent of client organization and toolkit.
-use crate::{model::ExecutionSnapshot, transport::Metadata};
+//! Execution requests and replies independent of client organization and toolkit.
+use crate::{
+    model::{DaemonId, ExecutionSnapshot, PaneRef, PaneTree, TabRef},
+    transport::Metadata,
+};
+
+mod replies;
+pub use replies::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -240,6 +246,8 @@ pub enum PaneRequest {
     },
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
 pub enum Request {
     Layout(Command),
     Execution(ExecutionRequest),
@@ -247,15 +255,6 @@ pub enum Request {
     Public(PublicRequest),
 }
 impl Request {
-    pub fn returns_snapshot(&self) -> bool {
-        match self {
-            Self::Internal(InternalRequest::Command { .. } | InternalRequest::State) => true,
-            Self::Execution(request) | Self::Internal(InternalRequest::Execution { request }) => {
-                matches!(request, ExecutionRequest::State) || request.changes_layout()
-            }
-            _ => false,
-        }
-    }
     /// Normalize control requests, resolving and validating pane targets through
     /// the destination's policy. The boolean selects a public command result
     /// rather than a full execution snapshot.

@@ -68,7 +68,7 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneProgress {
     pub pane: u64,
     pub progress: Progress,

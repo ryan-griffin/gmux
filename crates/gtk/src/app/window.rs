@@ -726,7 +726,8 @@ impl Ui {
                     .is_some_and(|id| sessions.connected(id))
             };
             if local_connected {
-                ui.request(json!({"method":"local-daemon-stop"}), move |ui, result| {
+                ui.request_stop(move |ui, result| {
+                    let result = result.and_then(|value| Ok(serde_json::to_value(value)?));
                     let success = result.is_ok();
                     let _ = reply.try_send(
                         result.unwrap_or_else(|error| json!({"error":error.to_string()})),
@@ -786,11 +787,16 @@ impl Ui {
             ui.save_session();
             ui.request_reply(body, move |ui, result| {
                 let result = result.and_then(|raw| {
-                    if let BackendReply::Value(value) = raw {
-                        return Ok(value);
+                    if !matches!(
+                        raw,
+                        BackendReply::Execution(gmux_protocol::control::ExecutionReply::Snapshot(
+                            _
+                        )) | BackendReply::Organization { .. }
+                    ) {
+                        return raw.into_value();
                     }
                     let response = match &raw {
-                        BackendReply::Execution { reply } => serde_json::to_value(reply)?,
+                        BackendReply::Execution(reply) => serde_json::to_value(reply)?,
                         BackendReply::Organization { result } => json!({"result":result}),
                         BackendReply::Value(_) => unreachable!(),
                     };
@@ -838,9 +844,10 @@ impl Ui {
                     return;
                 }
             };
-            ui.request(
+            ui.request_reply(
                 json!({"method":"notify","pane":pane.id,"message":message}),
                 move |_, result| {
+                    let result = result.and_then(BackendReply::into_value);
                     let _ = reply.try_send(
                         result.unwrap_or_else(|error| json!({"error":error.to_string()})),
                     );
@@ -867,7 +874,8 @@ impl Ui {
             let body = InternalRequest::Read {
                 pane: Some(pane.id),
             };
-            ui.request(body, move |_, result| {
+            ui.request_reply(body, move |_, result| {
+                let result = result.and_then(BackendReply::into_value);
                 let _ = reply.try_send(result.unwrap_or_else(|e| json!({"error":e.to_string()})));
             });
             return;

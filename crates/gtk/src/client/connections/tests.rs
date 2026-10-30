@@ -840,9 +840,9 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
         let mut f = Fixture::new(2);
         for origin in 0..2 {
             f.hub
-                .project(BackendReply::Execution {
-                    reply: f.execution(origin, 1, 1),
-                })
+                .project(BackendReply::Execution(
+                    execution::ExecutionReply::Snapshot(Box::new(f.execution(origin, 1, 1))),
+                ))
                 .unwrap();
         }
         let daemon = f.ids[host];

@@ -1,6 +1,7 @@
 //! Execution endpoints and ordered request workers.
 use crate::{io, runtime};
 use gmux_platform::unix::ipc::{Cancellation, Wake, companion_path, socket_path};
+use gmux_protocol::control::{ExecutionReply, ExecutionRequest, StopReply};
 use serde_json::Value;
 use std::{
     io::Write,
@@ -75,6 +76,8 @@ impl Endpoint {
             Some(remote.daemon),
         ))
     }
+    /// JSON control API for CLI/RPC boundaries and dynamic configuration.
+    /// Application execution uses `execute`, `state`, or `command`.
     pub fn call(&self, request: impl serde::Serialize) -> anyhow::Result<Value> {
         runtime::block_on(self.call_async(serde_json::to_value(request)?, None))
     }
@@ -123,16 +126,9 @@ impl Endpoint {
                         "machine_kind":client.machine_kind,"quitting":false}),
                     );
                 }
-                let (request, output_only) = request.into_execution(|pane| {
-                    pane.ok_or_else(|| {
-                        anyhow::anyhow!("Remote pane requests require an explicit pane field")
-                    })
-                })?;
-                let reply = self.execute_inner(&request).await?;
-                if output_only {
-                    return Ok(serde_json::to_value(command_outcome(reply)?)?);
-                }
-                Ok(reply)
+                Ok(serde_json::to_value(
+                    self.execute_control_request_inner(request).await?,
+                )?)
             }
             Self::Saved { name, daemon } => {
                 Box::pin(Self::resolve_async(name, *daemon).await?.call_inner(body)).await
@@ -145,27 +141,31 @@ impl Endpoint {
         &self,
         request: &gmux_protocol::control::ExecutionRequest,
         cancellation: Option<&Cancellation>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<ExecutionReply> {
         runtime::block_on(self.execute_async(request, cancellation))
     }
     pub async fn execute_async(
         &self,
         request: &gmux_protocol::control::ExecutionRequest,
         cancellation: Option<&Cancellation>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<ExecutionReply> {
         runtime::cancellable(cancellation, self.execute_inner(request)).await
     }
     async fn execute_inner(
         &self,
         request: &gmux_protocol::control::ExecutionRequest,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<ExecutionReply> {
         match self {
             Self::Unix { control, .. } => {
-                Self::call_unix(
+                let bytes = Self::call_unix_bytes(
                     control,
-                    serde_json::json!({"method":"_execution","request":request}),
+                    &ExecutionCall {
+                        method: "_execution",
+                        request,
+                    },
                 )
-                .await
+                .await?;
+                request.decode_reply(&bytes)
             }
             Self::Tcp {
                 address,
@@ -183,6 +183,15 @@ impl Endpoint {
         }
     }
     async fn call_unix(control: &std::path::Path, body: Value) -> anyhow::Result<Value> {
+        let bytes = Self::call_unix_bytes(control, &body).await?;
+        let value = serde_json::from_slice(&bytes)?;
+        gmux_protocol::network::check_error(&value)?;
+        Ok(value)
+    }
+    async fn call_unix_bytes(
+        control: &std::path::Path,
+        body: &impl serde::Serialize,
+    ) -> anyhow::Result<Vec<u8>> {
         runtime::deadline(
             std::time::Instant::now() + gmux_platform::unix::ipc::RESPONSE_TIMEOUT,
             async {
@@ -194,10 +203,49 @@ impl Endpoint {
                             control.display()
                         )
                     })?;
-                Self::call_on_unix(&mut stream, body).await
+                runtime::deadline(
+                    std::time::Instant::now() + gmux_platform::unix::ipc::REQUEST_TIMEOUT,
+                    io::write_json(&mut stream, body),
+                )
+                .await?;
+                io::read_json_bytes(
+                    &mut tokio::io::BufReader::new(stream),
+                    gmux_protocol::transport::MAX_PACKET,
+                )
+                .await
             },
         )
         .await
+    }
+    /// Decode a control request at an RPC boundary and carry its typed execution
+    /// reply back to the caller. Unix requests retain daemon-side implicit targets.
+    pub(crate) async fn execute_control_async(
+        &self,
+        body: Value,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<ExecutionReply> {
+        let request = gmux_protocol::control::Request::decode(body)?;
+        runtime::cancellable(cancellation, self.execute_control_request_inner(request)).await
+    }
+    async fn execute_control_request_inner(
+        &self,
+        request: gmux_protocol::control::Request,
+    ) -> anyhow::Result<ExecutionReply> {
+        if let Self::Unix { control, .. } = self {
+            let bytes = Self::call_unix_bytes(control, &request).await?;
+            return request.decode_reply(&bytes);
+        }
+        let (request, output_only) = request.into_execution(|pane| {
+            pane.ok_or_else(|| {
+                anyhow::anyhow!("Remote pane requests require an explicit pane field")
+            })
+        })?;
+        let reply = self.execute_inner(&request).await?;
+        Ok(if output_only {
+            ExecutionReply::Outcome(command_outcome(reply.into_snapshot()?))
+        } else {
+            reply
+        })
     }
     /// Return None only when the Unix socket is absent or refuses the connection.
     /// Once connected, every request or reply failure remains an error.
@@ -247,18 +295,15 @@ impl Endpoint {
         gmux_protocol::network::check_error(&value)?;
         Ok(value)
     }
-    pub(crate) async fn state_async(
+    pub async fn state_async(
         &self,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
-        Ok(serde_json::from_value(
-            self.execute_async(
-                &gmux_protocol::control::ExecutionRequest::State,
-                cancellation,
-            )
-            .await?,
-        )?)
+        self.execute_async(&ExecutionRequest::State, cancellation)
+            .await?
+            .into_snapshot()
     }
+
     pub fn state(
         &self,
         cancellation: Option<&Cancellation>,
@@ -271,12 +316,24 @@ impl Endpoint {
         command: gmux_protocol::control::Command,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
-        let request = gmux_protocol::control::InternalRequest::Command { command };
-        let value = match cancellation {
-            Some(c) => self.call_cancellable(request, c)?,
-            None => self.call(request)?,
-        };
-        Ok(serde_json::from_value(value)?)
+        runtime::block_on(self.command_async(command, cancellation))
+    }
+    pub async fn command_async(
+        &self,
+        command: gmux_protocol::control::Command,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
+        runtime::cancellable(cancellation, self.command_inner(command)).await
+    }
+    async fn command_inner(
+        &self,
+        command: gmux_protocol::control::Command,
+    ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
+        self.execute_control_request_inner(gmux_protocol::control::Request::Internal(
+            gmux_protocol::control::InternalRequest::Command { command },
+        ))
+        .await?
+        .into_snapshot()
     }
     /// Return only the typed command result. Local commands avoid transferring
     /// an execution snapshot; TCP replies are reduced at the control API boundary.
@@ -285,26 +342,44 @@ impl Endpoint {
         command: gmux_protocol::control::Command,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<gmux_protocol::control::CommandOutcome> {
-        let value = match cancellation {
-            Some(c) => self.call_cancellable(command, c)?,
-            None => self.call(command)?,
-        };
-        Ok(serde_json::from_value(value)?)
+        runtime::block_on(self.command_result_async(command, cancellation))
+    }
+    pub async fn command_result_async(
+        &self,
+        command: gmux_protocol::control::Command,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<gmux_protocol::control::CommandOutcome> {
+        runtime::cancellable(cancellation, self.command_result_inner(command)).await
+    }
+    async fn command_result_inner(
+        &self,
+        command: gmux_protocol::control::Command,
+    ) -> anyhow::Result<gmux_protocol::control::CommandOutcome> {
+        match self
+            .execute_control_request_inner(gmux_protocol::control::Request::Layout(command))
+            .await?
+        {
+            ExecutionReply::Outcome(outcome) => Ok(outcome),
+            _ => anyhow::bail!("Expected a command outcome reply"),
+        }
     }
     /// Stop execution and return after this daemon has shut down.
-    pub fn stop(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Value> {
+    pub fn stop(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<StopReply> {
         runtime::block_on(self.stop_async(cancellation))
     }
-    pub async fn stop_async(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Value> {
+    pub async fn stop_async(
+        &self,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<StopReply> {
         match self {
             Self::Unix { .. } => crate::local::stop(self, cancellation).await,
-            Self::Tcp { .. } => {
-                self.execute_async(
+            Self::Tcp { .. } => self
+                .execute_async(
                     &gmux_protocol::control::ExecutionRequest::Stop,
                     cancellation,
                 )
-                .await
-            }
+                .await?
+                .into_stopped(),
             Self::Saved { name, daemon } => {
                 Box::pin(
                     Self::resolve_async(name, *daemon)
@@ -367,11 +442,19 @@ impl Endpoint {
     }
 }
 /// Reduce an execution snapshot to the public command result at the client boundary.
-fn command_outcome(mut reply: Value) -> anyhow::Result<gmux_protocol::control::CommandOutcome> {
-    Ok(gmux_protocol::control::CommandOutcome {
-        daemon: serde_json::from_value(reply["daemon"].take())?,
-        result: serde_json::from_value(reply["result"].take())?,
-    })
+fn command_outcome(
+    reply: gmux_protocol::control::CommandReply,
+) -> gmux_protocol::control::CommandOutcome {
+    gmux_protocol::control::CommandOutcome {
+        daemon: reply.daemon,
+        result: reply.result,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ExecutionCall<'a> {
+    method: &'static str,
+    request: &'a ExecutionRequest,
 }
 
 /// A direct daemon stream over a Unix socket or TCP.
@@ -469,17 +552,17 @@ impl<R> Default for Jobs<R> {
         }
     }
 }
-pub struct Client<R: Send + 'static = Value> {
+pub struct Client<R: Send + 'static = ExecutionReply> {
     jobs: Arc<(Mutex<Jobs<R>>, tokio::sync::Notify)>,
     replies: mpsc::Receiver<(u64, anyhow::Result<R>)>,
     next: std::cell::Cell<u64>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
-impl Client<Value> {
+impl Client<ExecutionReply> {
     fn for_endpoint(endpoint: Endpoint, wake: Wake) -> Self {
         Self::with_async_handler(wake, move |request| {
             let endpoint = endpoint.clone();
-            async move { endpoint.call_async(request, None).await }
+            async move { endpoint.execute_control_async(request, None).await }
         })
     }
 }
@@ -650,8 +733,11 @@ mod tests {
             }
             seen
         });
-        let client = Endpoint::unix(path.clone(), companion_at(&path, ".stream"))
-            .client(Wake::new().unwrap());
+        let endpoint = Endpoint::unix(path.clone(), companion_at(&path, ".stream"));
+        let client = Client::<Value>::with_async_handler(Wake::new().unwrap(), move |request| {
+            let endpoint = endpoint.clone();
+            async move { endpoint.call_async(request, None).await }
+        });
         client
             .request(serde_json::json!({"method":"slow"}))
             .unwrap();
@@ -708,3 +794,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(test)]
+mod reply_tests;

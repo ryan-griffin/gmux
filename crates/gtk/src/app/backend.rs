@@ -29,13 +29,35 @@ impl Selection {
 }
 
 impl Ui {
-    pub(super) fn request(
+    pub(super) fn request_busy(
+        self: &Rc<Self>,
+        body: impl serde::Serialize,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<bool>) + 'static,
+    ) {
+        self.request_reply(body, move |ui, result| {
+            callback(
+                ui,
+                result.and_then(|reply| match reply {
+                    BackendReply::Execution(reply) => reply.into_busy(),
+                    _ => anyhow::bail!("Expected a busy reply"),
+                }),
+            );
+        });
+    }
+    /// Configuration requests retain their dynamic JSON result contract.
+    pub(super) fn request_configuration(
         self: &Rc<Self>,
         body: impl serde::Serialize,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<Value>) + 'static,
     ) {
         self.request_reply(body, move |ui, result| {
-            callback(ui, result.and_then(BackendReply::into_value));
+            callback(
+                ui,
+                result.and_then(|reply| match reply {
+                    BackendReply::Value(value) => Ok(value),
+                    _ => anyhow::bail!("Expected a configuration reply"),
+                }),
+            );
         });
     }
     pub(super) fn request_reply(

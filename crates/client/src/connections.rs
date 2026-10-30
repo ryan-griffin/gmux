@@ -162,12 +162,25 @@ fn validate_address(address: &str) -> anyhow::Result<()> {
 pub fn call(body: impl Serialize) -> anyhow::Result<Value> {
     call_at(&ipc::Endpoint::local(), serde_json::to_value(body)?, None)
 }
+/// A routed reply retains execution types until an external JSON boundary.
+pub enum Reply {
+    Execution(gmux_protocol::control::ExecutionReply),
+    Configuration(Value),
+}
+impl Reply {
+    pub fn into_value(self) -> anyhow::Result<Value> {
+        Ok(match self {
+            Self::Execution(reply) => serde_json::to_value(reply)?,
+            Self::Configuration(value) => value,
+        })
+    }
+}
 /// Async routing keeps execution I/O off the bounded filesystem workers.
-pub async fn call_at_async(
+pub async fn request_at_async(
     mut endpoint: ipc::Endpoint,
     mut body: Value,
     cancellation: Option<gmux_platform::unix::ipc::Cancellation>,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<Reply> {
     loop {
         let method = body["method"].as_str().unwrap_or("");
         if method == "_connection-call" {
@@ -193,24 +206,50 @@ pub async fn call_at_async(
             if let Some(cancellation) = &cancellation {
                 cancellation.check()?;
             }
-            return Ok(state);
+            return Ok(Reply::Configuration(state));
         } else if method == "local-daemon-stop" {
             serde_json::from_value::<Request>(body)?;
-            return crate::local::stop_if_running(
+            let stopped = crate::local::stop_if_running(
                 &gmux_platform::unix::ipc::socket_path(),
                 cancellation.as_ref(),
             )
-            .await;
+            .await?;
+            return Ok(Reply::Execution(match stopped {
+                Some(reply) => gmux_protocol::control::ExecutionReply::Stopped(reply),
+                None => gmux_protocol::control::ExecutionReply::Done(
+                    gmux_protocol::control::Acknowledgement { ok: true },
+                ),
+            }));
         } else if handles(method) {
             return crate::runtime::blocking(move || {
                 call_configuration(&endpoint, body, cancellation.as_ref())
             })
-            .await;
+            .await
+            .map(Reply::Configuration);
         } else {
-            return endpoint.call_async(body, cancellation.as_ref()).await;
+            if method == "_hello" {
+                return endpoint
+                    .call_async(body, cancellation.as_ref())
+                    .await
+                    .map(Reply::Configuration);
+            }
+            return endpoint
+                .execute_control_async(body, cancellation.as_ref())
+                .await
+                .map(Reply::Execution);
         }
     }
 }
+pub async fn call_at_async(
+    endpoint: ipc::Endpoint,
+    body: Value,
+    cancellation: Option<gmux_platform::unix::ipc::Cancellation>,
+) -> anyhow::Result<Value> {
+    request_at_async(endpoint, body, cancellation)
+        .await?
+        .into_value()
+}
+
 pub fn call_at(
     endpoint: &ipc::Endpoint,
     body: Value,

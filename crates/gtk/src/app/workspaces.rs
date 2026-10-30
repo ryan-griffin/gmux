@@ -711,10 +711,10 @@ impl Ui {
         if panes.is_empty() {
             return;
         }
-        self.request(
+        self.request_busy(
             InternalRequest::Busy { panes },
             move |ui, result| match result {
-                Ok(value) => ui.confirm_close_tab(id, value["busy"].as_bool().unwrap_or(true)),
+                Ok(busy) => ui.confirm_close_tab(id, busy),
                 Err(e) => ui.message(&e.to_string()),
             },
         );

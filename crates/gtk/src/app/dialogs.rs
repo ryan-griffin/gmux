@@ -3,10 +3,10 @@ use super::*;
 
 impl Ui {
     pub(super) fn request_close(self: &Rc<Self>, id: u64) {
-        self.request(
+        self.request_busy(
             InternalRequest::Busy { panes: vec![id] },
             move |ui, result| match result {
-                Ok(value) => ui.confirm_close(id, value["busy"].as_bool().unwrap_or(true)),
+                Ok(busy) => ui.confirm_close(id, busy),
                 Err(e) => ui.message(&e.to_string()),
             },
         );
@@ -70,10 +70,10 @@ impl Ui {
             self.confirm_quit(false);
             return;
         }
-        self.request(
+        self.request_busy(
             json!({"method":"_busy","panes":panes}),
             |ui, result| match result {
-                Ok(value) => ui.confirm_quit(value["busy"].as_bool().unwrap_or(true)),
+                Ok(busy) => ui.confirm_quit(busy),
                 Err(e) => ui.message(&e.to_string()),
             },
         );
@@ -99,19 +99,17 @@ impl Ui {
     }
     pub(super) fn stop_daemon(self: &Rc<Self>) {
         self.save_session();
-        self.request(
-            json!({"method":"local-daemon-stop"}),
-            |ui, result| match result {
-                Ok(value) => {
-                    if let Some(warning) = value["warning"].as_str() {
-                        eprintln!("{warning}");
-                    }
-                    ui.app.quit();
+        self.request_stop(|ui, result| match result {
+            Ok(reply) => {
+                if let Some(warning) = reply.warning {
+                    eprintln!("{warning}");
                 }
-                Err(error) => ui.message(&error.to_string()),
-            },
-        );
+                ui.app.quit();
+            }
+            Err(error) => ui.message(&error.to_string()),
+        });
     }
+
     pub(super) fn detach_frontend(self: &Rc<Self>) {
         if self.detaching.replace(true) {
             return;

@@ -118,11 +118,65 @@ pub fn check_error(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check the error envelope without allocating JSON trees for successful payloads.
+pub fn check_response(bytes: &[u8]) -> anyhow::Result<()> {
+    check_response_from(bytes, None)
+}
+
+/// Validate any supplied identity, including on otherwise payload-free replies.
+pub fn check_response_from(bytes: &[u8], expected: Option<DaemonId>) -> anyhow::Result<()> {
+    use serde_json::value::RawValue;
+    fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<&'de RawValue>, D::Error> {
+        <&RawValue>::deserialize(d).map(Some)
+    }
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(default, borrow, deserialize_with = "present")]
+        error: Option<&'a RawValue>,
+        #[serde(default, borrow, deserialize_with = "present")]
+        daemon: Option<&'a RawValue>,
+    }
+    let envelope: Envelope<'_> = serde_json::from_slice(bytes)?;
+    if let Some(error) = envelope.error {
+        let error: Value = serde_json::from_str(error.get())?;
+        anyhow::bail!("{}", error.as_str().unwrap_or("Connection request failed"));
+    }
+    if let (Some(expected), Some(daemon)) = (expected, envelope.daemon) {
+        anyhow::ensure!(
+            serde_json::from_str::<DaemonId>(daemon.get())? == expected,
+            "Remote connection identity changed"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
+    #[test]
+    fn error_envelopes_take_precedence_over_otherwise_valid_payloads() {
+        for error in [
+            json!("Pane has closed"),
+            Value::Null,
+            json!(false),
+            json!({}),
+        ] {
+            let value = json!({"error":error,"busy":false});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                check_response(&bytes).unwrap_err().to_string(),
+                check_error(&value).unwrap_err().to_string(),
+            );
+            assert!(
+                crate::control::ExecutionRequest::Busy { panes: vec![] }
+                    .decode_reply(&bytes)
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn listener_settings_accept_optional_ports_and_save_the_resolved_port() {
         for (input, expected) in [

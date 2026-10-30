@@ -213,7 +213,7 @@ impl Drop for StartedChild {
 pub(crate) async fn stop(
     endpoint: &Endpoint,
     cancellation: Option<&Cancellation>,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<gmux_protocol::control::StopReply> {
     let hello = endpoint
         .call_async(serde_json::to_value(InternalRequest::Hello)?, cancellation)
         .await?;
@@ -224,7 +224,7 @@ pub(crate) async fn stop(
 pub(crate) async fn stop_if_running(
     control: &Path,
     cancellation: Option<&Cancellation>,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<Option<gmux_protocol::control::StopReply>> {
     let Some(hello) = Endpoint::call_unix_if_running(
         control,
         serde_json::to_value(InternalRequest::Hello)?,
@@ -232,20 +232,22 @@ pub(crate) async fn stop_if_running(
     )
     .await?
     else {
-        return Ok(serde_json::json!({"ok":true}));
+        return Ok(None);
     };
     let endpoint = Endpoint::unix(
         control.to_owned(),
         gmux_platform::unix::ipc::companion_at(control, ".stream"),
     );
-    stop_after_hello(&endpoint, hello, cancellation).await
+    stop_after_hello(&endpoint, hello, cancellation)
+        .await
+        .map(Some)
 }
 
 async fn stop_after_hello(
     endpoint: &Endpoint,
     hello: serde_json::Value,
     cancellation: Option<&Cancellation>,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<gmux_protocol::control::StopReply> {
     use gmux_protocol::control::ExecutionRequest;
     let pid = hello["pid"]
         .as_u64()
@@ -263,7 +265,8 @@ async fn stop_after_hello(
     let process = unsafe { tokio::io::unix::AsyncFd::register(OwnedFd::from_raw_fd(fd)) }?;
     let reply = endpoint
         .execute_async(&ExecutionRequest::Stop, cancellation)
-        .await?;
+        .await?
+        .into_stopped()?;
     runtime::cancellable(cancellation, async {
         let _ready =
             tokio::time::timeout(gmux_protocol::network::CONTROL_TIMEOUT, process.readable())
@@ -469,7 +472,9 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            assert_eq!(reply, serde_json::json!({"ok":true}));
+            let reply = reply.unwrap();
+            assert!(reply.ok);
+            assert!(reply.warning.is_none());
             server.await.unwrap();
             assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
         });
@@ -480,10 +485,7 @@ mod tests {
         let fixture = Fixture::new();
         runtime::block_on(async {
             let control = fixture.0.join("control");
-            assert_eq!(
-                stop_if_running(&control, None).await.unwrap(),
-                serde_json::json!({"ok":true})
-            );
+            assert!(stop_if_running(&control, None).await.unwrap().is_none());
             // A stale socket is also offline, but a failed or canceled handshake
             // after connecting must not be reported as a successful stop.
             let listener = UnixListener::bind(&control).unwrap();
@@ -493,11 +495,7 @@ mod tests {
                 0
             );
             drop(listener);
-            assert!(
-                stop_if_running(&control, None).await.unwrap()["ok"]
-                    .as_bool()
-                    .unwrap()
-            );
+            assert!(stop_if_running(&control, None).await.unwrap().is_none());
             std::fs::remove_file(&control).unwrap();
             for cancel in [false, true] {
                 let listener = tokio::net::UnixListener::bind(&control).unwrap();

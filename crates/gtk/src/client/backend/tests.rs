@@ -72,7 +72,7 @@ impl Drop for Fixture {
     }
 }
 fn remote(name: &str) -> Value {
-    json!({"method":"_state", "test_destination":name})
+    json!({"method":"_command", "command":{"method":"rename", "tab":1, "name":name}})
 }
 fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<BackendReply>)> {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -101,7 +101,7 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
         .unwrap();
     let replies = collect(&backend, 1);
     assert!(
-        matches!(&replies[0].1, Ok(BackendReply::Value(value)) if value["execution"] == "diagnostic")
+        matches!(&replies[0].1, Ok(BackendReply::Execution(control::ExecutionReply::Status(value))) if value["execution"] == "diagnostic")
     );
 
     backend
@@ -119,7 +119,32 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
     f.answer(f.incoming(), f.local);
     let replies = collect(&backend, 1);
     assert!(
-        matches!(&replies[0].1, Ok(BackendReply::Execution { reply }) if reply.daemon == f.local)
+        matches!(&replies[0].1, Ok(BackendReply::Execution(control::ExecutionReply::Snapshot(reply))) if reply.daemon == f.local)
+    );
+
+    backend
+        .request(f.local, json!({"method":"_busy","panes":[7]}))
+        .unwrap();
+    f.incoming().reply.send(json!({"busy":false})).unwrap();
+    let replies = collect(&backend, 1);
+    assert!(matches!(&replies[0].1,
+        Ok(BackendReply::Execution(control::ExecutionReply::Busy(reply))) if !reply.busy));
+
+    backend
+        .request(f.local, json!({"method":"_busy","panes":[7]}))
+        .unwrap();
+    f.incoming()
+        .reply
+        .send(json!({"error":"Daemon is shutting down","busy":false}))
+        .unwrap();
+    assert_eq!(
+        collect(&backend, 1)[0]
+            .1
+            .as_ref()
+            .err()
+            .unwrap()
+            .to_string(),
+        "Daemon is shutting down"
     );
 }
 
@@ -183,7 +208,7 @@ fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves
     let b = gmux_platform::unix::identity::daemon_id().unwrap();
     let first = backend.request(a, remote("a")).unwrap();
     let held = f.incoming();
-    assert_eq!(held.body["test_destination"], "a");
+    assert_eq!(held.body["command"]["name"], "a");
     let second = backend.request(a, remote("renamed-a")).unwrap();
     let local = backend
         .request(f.local, json!({"method":"_state"}))
@@ -193,7 +218,7 @@ fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves
     f.answer(local_request, f.local);
     let other = backend.request(b, remote("b")).unwrap();
     let other_request = f.incoming();
-    assert_eq!(other_request.body["test_destination"], "b");
+    assert_eq!(other_request.body["command"]["name"], "b");
     f.answer(other_request, b);
     let workspace = backend
         .request(
@@ -225,7 +250,7 @@ fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves
     }
     f.answer(held, a);
     let next = f.incoming();
-    assert_eq!(next.body["test_destination"], "renamed-a");
+    assert_eq!(next.body["command"]["name"], "renamed-a");
     f.answer(next, a);
     let replies = collect(&backend, 2);
     assert_eq!(
