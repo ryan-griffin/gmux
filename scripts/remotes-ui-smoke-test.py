@@ -937,18 +937,21 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         widget("server", "list item")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
 
-    with scenario("disconnection shows automatic recovery and the retry button retries immediately"):
+    with scenario("disconnection offers manual retry and reconnects when the server returns"):
         stop_daemon(server.env["GMUX_SOCKET"])
         remote.wait(timeout=8)
         retry = widget("Retry connection to server now", "button")
         widget("Reconnecting…", "label")
         wait_accessible(lambda: retry.get_state_set().contains(Atspi.StateType.SENSITIVE))
         screenshot("connections-reconnecting.png")
+        # Retry while the server is still offline. After restarting it, automatic
+        # recovery can connect first and correctly disable the retry button.
+        wait_accessible(lambda: retry.get_state_set().contains(Atspi.StateType.SENSITIVE))
+        activate(retry)
         server.rpc("connection-edit", connection="local", remote_access=dict(
             enabled=True, listen_address=address, authentication=dict(mode="none")))
         server.start(daemon, "serve", stdout=log, stderr=log)
         wait_for(lambda: server.rpc("status")["bound_address"] == address)
-        click("Retry connection to server now", "button")
         wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
         wait_accessible(lambda: not retry.get_state_set().contains(Atspi.StateType.SENSITIVE))
 
