@@ -8,13 +8,14 @@ The Cargo workspace separates shared protocol, client behavior, and execution:
   requests and snapshots, network handshakes, and codecs. It uses ordinary Rust
   serialization dependencies and has no platform I/O or native build dependencies.
   Wire cache limits reserve encoded bytes without depending on Rust cell layout.
-- `gmux-client`, in `crates/client`, owns outgoing connections, retries, terminal
-  caches, and bounded queues. Its `unix` module contains client platform adapters.
+- `gmux-client`, in `crates/client`, owns outgoing connections, local daemon
+  acquisition and shutdown, retries, terminal caches, and bounded queues.
+  Its `unix` module contains client platform adapters.
 - `gmux-platform`, in `crates/platform`, provides shared platform services.
   `paths` formats paths against an explicit home directory, and `tcp` applies
   deadlines through standard-library sockets. `unix` contains the current Linux
   integration: control sockets, fd wakeups, cancellation, file locking, atomic
-  writes, machine detection, identity generation, and local daemon lifecycle.
+  writes, machine detection, and identity generation.
 - `gmux-daemon`, at the repository root, owns PTYs, Ghostty and its native bridge,
   server listeners, execution, history prefetch policy, and daemon persistence.
   It exposes the daemon entry points and has no runtime dependency on the client
@@ -155,19 +156,35 @@ its existing retry and scroll deadlines, and never waits for socket I/O.
 Blocking application work uses at most four pooled workers. System DNS uses at
 most two workers and 32 waiting lookups; active lookups keep their permits until
 the system resolver returns, even if the caller cancels. Configuration changes,
-local process lifecycle operations, and durable organization saves run outside
-the I/O thread. Execution requests use async I/O directly. Shutdown cancels
-execution while ordered organization updates and saves finish.
+process creation, log setup, and durable organization saves run outside the I/O
+thread. Lifecycle waits and execution requests use async I/O directly. Shutdown
+cancels execution while ordered organization updates and saves finish.
 
 The protocol's optional `async` feature adds a runtime-independent reader using
 `futures-lite` I/O traits. Blocking and async readers share their validation and
 decode incrementally into final packet storage, without a full-record buffer.
 `unix/watch.rs` watches saved connections using inotify on the shared executor. Direct TCP endpoints
 accept in-memory credentials; saved connections load credentials from token files.
-`gmux-platform::unix::local` provides explicit daemon startup and completed shutdown,
-separate from connecting. GTK and `gmux serve --background` share its detached
-launcher and readiness check. Daemon checkpoint formats and restoration stay in
-`gmux-daemon`; GTK organization and saved connections stay with their owners.
+`local.rs` owns explicit daemon acquisition and completed shutdown, separate from
+control and viewport connections. GTK starts the sibling `gmux` executable;
+`gmux serve --background` starts its own executable. Both launch `serve` in a
+detached session with errors appended to `daemon.log`, and wait up to eight
+seconds for a compatible, non-quitting control handshake. Explicit starts reject
+competitors; GTK acquisition waits for the winner of the daemon's execution lock.
+The shared duplicate-start error and process exit status live in
+`gmux-protocol::control`, so the daemon does not depend on client code.
+
+Launched children are reaped by tasks on the shared runtime. Canceling queued
+acquisition returns without waiting for a blocking worker. If process creation
+has already started, its child guard leaves shared execution alive and reaps it
+after exit, even if the caller has gone away. Other startup errors kill and reap
+only the process that caller launched. Local stop uses one async Hello handshake
+and watches the daemon with a pidfd
+before requesting shutdown, then waits asynchronously for process exit and lock
+release. Remote stop returns the remote control reply without a local process
+watch. The daemon owns its execution lock, listener creation, stale socket
+replacement, socket cleanup, checkpoint formats, and restoration. GTK organization
+and saved connections stay with their owners.
 
 ## GTK organization
 

@@ -194,21 +194,58 @@ impl Endpoint {
                             control.display()
                         )
                     })?;
-                runtime::deadline(
-                    std::time::Instant::now() + gmux_platform::unix::ipc::REQUEST_TIMEOUT,
-                    io::write_json(&mut stream, &body),
-                )
-                .await?;
-                let value = io::read_json(
-                    &mut tokio::io::BufReader::new(stream),
-                    gmux_protocol::transport::MAX_PACKET,
-                )
-                .await?;
-                gmux_protocol::network::check_error(&value)?;
-                Ok(value)
+                Self::call_on_unix(&mut stream, body).await
             },
         )
         .await
+    }
+    /// Return None only when the Unix socket is absent or refuses the connection.
+    /// Once connected, every request or reply failure remains an error.
+    pub(crate) async fn call_unix_if_running(
+        control: &std::path::Path,
+        body: Value,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<Option<Value>> {
+        runtime::cancellable(
+            cancellation,
+            runtime::deadline(
+                std::time::Instant::now() + gmux_platform::unix::ipc::RESPONSE_TIMEOUT,
+                async {
+                    let mut stream = match tokio::net::UnixStream::connect(control).await {
+                        Ok(stream) => stream,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound
+                                    | std::io::ErrorKind::ConnectionRefused
+                            ) =>
+                        {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    Self::call_on_unix(&mut stream, body).await.map(Some)
+                },
+            ),
+        )
+        .await
+    }
+    async fn call_on_unix(
+        stream: &mut tokio::net::UnixStream,
+        body: Value,
+    ) -> anyhow::Result<Value> {
+        runtime::deadline(
+            std::time::Instant::now() + gmux_platform::unix::ipc::REQUEST_TIMEOUT,
+            io::write_json(stream, &body),
+        )
+        .await?;
+        let value = io::read_json(
+            &mut tokio::io::BufReader::new(stream),
+            gmux_protocol::transport::MAX_PACKET,
+        )
+        .await?;
+        gmux_protocol::network::check_error(&value)?;
+        Ok(value)
     }
     pub(crate) async fn state_async(
         &self,
@@ -256,34 +293,26 @@ impl Endpoint {
     }
     /// Stop execution and return after this daemon has shut down.
     pub fn stop(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Value> {
+        runtime::block_on(self.stop_async(cancellation))
+    }
+    pub async fn stop_async(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Value> {
         match self {
-            Self::Unix { .. } => {
-                let hello = match cancellation {
-                    Some(c) => {
-                        self.call_cancellable(gmux_protocol::control::InternalRequest::Hello, c)?
-                    }
-                    None => self.call(gmux_protocol::control::InternalRequest::Hello)?,
-                };
-                let pid = hello["pid"]
-                    .as_u64()
-                    .and_then(|pid| i32::try_from(pid).ok())
-                    .ok_or_else(|| anyhow::anyhow!("Daemon handshake requires a process ID"))?;
-                gmux_platform::unix::local::stop(
-                    pid,
-                    || {
-                        self.execute(
-                            &gmux_protocol::control::ExecutionRequest::Stop,
-                            cancellation,
-                        )
-                    },
+            Self::Unix { .. } => crate::local::stop(self, cancellation).await,
+            Self::Tcp { .. } => {
+                self.execute_async(
+                    &gmux_protocol::control::ExecutionRequest::Stop,
                     cancellation,
                 )
+                .await
             }
-            Self::Tcp { .. } => self.execute(
-                &gmux_protocol::control::ExecutionRequest::Stop,
-                cancellation,
-            ),
-            Self::Saved { name, daemon } => Self::resolve(name, *daemon)?.stop(cancellation),
+            Self::Saved { name, daemon } => {
+                Box::pin(
+                    Self::resolve_async(name, *daemon)
+                        .await?
+                        .stop_async(cancellation),
+                )
+                .await
+            }
         }
     }
     pub fn client(&self, wake: Wake) -> Client {

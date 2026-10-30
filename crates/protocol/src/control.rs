@@ -3,6 +3,24 @@ use crate::{model::ExecutionSnapshot, transport::Metadata};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The daemon's execution lock is already held by another process.
+#[derive(Debug)]
+pub struct DaemonAlreadyRunning;
+
+impl DaemonAlreadyRunning {
+    /// Process exit status for a competing launcher, distinct from startup failure.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl std::fmt::Display for DaemonAlreadyRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "The local daemon is already running or starting. Use gmux connection edit local to change its settings, or gmux stop before starting it again.",
+        )
+    }
+}
+impl std::error::Error for DaemonAlreadyRunning {}
+
 /// Public commands whose CLI pane selector can be inherited from GMUX_PANE.
 pub fn pane_method(method: &str) -> bool {
     matches!(

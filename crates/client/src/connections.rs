@@ -181,9 +181,29 @@ pub async fn call_at_async(
             };
             endpoint = ipc::Endpoint::remote(connection, daemon);
             body = request;
+        } else if method == "local-daemon-start" {
+            // Readiness and process waits use the I/O runtime, not a blocking slot.
+            serde_json::from_value::<Request>(body)?;
+            crate::local::ensure_daemon(cancellation.as_ref()).await?;
+            let mut state = ipc::Endpoint::local()
+                .call_async(json!({"method":"remote-access-get"}), cancellation.as_ref())
+                .await?;
+            let catalog = crate::runtime::blocking(Catalog::load).await?;
+            state["local"]["name"] = json!(catalog.local_name());
+            if let Some(cancellation) = &cancellation {
+                cancellation.check()?;
+            }
+            return Ok(state);
+        } else if method == "local-daemon-stop" {
+            serde_json::from_value::<Request>(body)?;
+            return crate::local::stop_if_running(
+                &gmux_platform::unix::ipc::socket_path(),
+                cancellation.as_ref(),
+            )
+            .await;
         } else if handles(method) {
             return crate::runtime::blocking(move || {
-                call_at(&endpoint, body, cancellation.as_ref())
+                call_configuration(&endpoint, body, cancellation.as_ref())
             })
             .await;
         } else {
@@ -192,6 +212,21 @@ pub async fn call_at_async(
     }
 }
 pub fn call_at(
+    endpoint: &ipc::Endpoint,
+    body: Value,
+    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
+) -> anyhow::Result<Value> {
+    if matches!(
+        body["method"].as_str(),
+        Some("local-daemon-start" | "local-daemon-stop")
+    ) {
+        crate::runtime::block_on(call_at_async(endpoint.clone(), body, cancellation.cloned()))
+    } else {
+        call_configuration(endpoint, body, cancellation)
+    }
+}
+
+fn call_configuration(
     endpoint: &ipc::Endpoint,
     body: Value,
     cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
@@ -220,29 +255,8 @@ pub fn call_at(
             set_remote_access(&remote_access, cancellation)?;
             json!({"remote_access":remote_access})
         }
-        Request::LocalDaemonStart => {
-            gmux_platform::unix::local::ensure_daemon(cancellation)?;
-            let mut state = call(
-                &ipc::Endpoint::local(),
-                json!({"method":"remote-access-get"}),
-            )?;
-            state["local"]["name"] = json!(Catalog::load()?.local_name());
-            state
-        }
-        Request::LocalDaemonStop => {
-            // Disabling local execution must also work during startup backoff,
-            // when there is no daemon to stop. Do not start one to disable it.
-            if gmux_platform::unix::ipc::call_if_running(
-                &gmux_platform::unix::ipc::socket_path(),
-                gmux_protocol::control::InternalRequest::Hello,
-                cancellation,
-            )?
-            .is_some()
-            {
-                ipc::Endpoint::local().stop(cancellation)?
-            } else {
-                json!({"ok":true})
-            }
+        Request::LocalDaemonStart | Request::LocalDaemonStop => {
+            unreachable!("Local lifecycle requests are routed asynchronously")
         }
         Request::ConnectionAdd {
             name,
