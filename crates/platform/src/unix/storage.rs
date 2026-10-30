@@ -169,8 +169,15 @@ pub fn atomic_write_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gmux_protocol::model::ExecutionState;
     use serde::Deserialize;
+
+    #[derive(Default, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Record {
+        sequence: u64,
+        values: std::collections::HashMap<u64, String>,
+    }
+
     fn test_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "gmux-state-test-{}-{}",
@@ -187,21 +194,24 @@ mod tests {
     fn missing_state_uses_defaults_but_invalid_and_unreadable_state_is_preserved() {
         let path = test_directory();
         let file = path.join("execution.json");
-        assert!(load_at::<ExecutionState>(&file).unwrap().tabs.is_empty());
-        assert!(load_at::<ExecutionState>(&path).is_err());
-        for bytes in [b"{broken".as_slice(), b"{\"tabs\":\"invalid\"}".as_slice()] {
+        assert!(load_at::<Record>(&file).unwrap().values.is_empty());
+        assert!(load_at::<Record>(&path).is_err());
+        for bytes in [
+            b"{broken".as_slice(),
+            b"{\"values\":\"invalid\"}".as_slice(),
+        ] {
             std::fs::write(&file, bytes).unwrap();
-            assert!(load_at::<ExecutionState>(&file).is_err());
-            assert!(save_at(&file, &ExecutionState::default()).is_err());
+            assert!(load_at::<Record>(&file).is_err());
+            assert!(save_at(&file, &Record::default()).is_err());
             assert_eq!(std::fs::read(&file).unwrap(), bytes);
             assert!(!file.with_extension("tmp").exists());
         }
-        let mut outdated = serde_json::to_value(ExecutionState::default()).unwrap();
-        outdated.as_object_mut().unwrap().remove("tabs");
+        let mut outdated = serde_json::to_value(Record::default()).unwrap();
+        outdated.as_object_mut().unwrap().remove("values");
         let bytes = serde_json::to_vec(&outdated).unwrap();
         std::fs::write(&file, &bytes).unwrap();
-        assert!(load_at::<ExecutionState>(&file).is_err());
-        assert!(save_at(&file, &ExecutionState::default()).is_err());
+        assert!(load_at::<Record>(&file).is_err());
+        assert!(save_at(&file, &Record::default()).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), bytes);
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -215,36 +225,31 @@ mod tests {
         let file = path.join("execution.json");
         let stale = path.join("execution.tmp");
         std::fs::write(&stale, b"previous temporary file").unwrap();
-        save_at(&file, &ExecutionState::default()).unwrap();
+        save_at(&file, &Record::default()).unwrap();
         let done = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 while !done.load(Ordering::Relaxed) {
-                    let value = load_at::<ExecutionState>(&file).unwrap();
+                    let value = load_at::<Record>(&file).unwrap();
                     assert_eq!(
-                        value.last_id.to_string(),
-                        value
-                            .scrollback
-                            .get(&0)
-                            .cloned()
-                            .unwrap_or_else(|| "0".into())
+                        value.sequence.to_string(),
+                        value.values.get(&0).cloned().unwrap_or_else(|| "0".into())
                     );
                 }
             });
             let writers = (1..=8)
-                .map(|last_id| {
+                .map(|sequence| {
                     let file = &file;
                     scope.spawn(move || {
                         for _ in 0..16 {
                             save_at(
                                 file,
-                                &ExecutionState {
-                                    last_id,
-                                    scrollback: std::collections::HashMap::from([(
+                                &Record {
+                                    sequence,
+                                    values: std::collections::HashMap::from([(
                                         0,
-                                        last_id.to_string(),
+                                        sequence.to_string(),
                                     )]),
-                                    ..ExecutionState::default()
                                 },
                             )
                             .unwrap();
@@ -261,7 +266,7 @@ mod tests {
                 result.unwrap();
             }
         });
-        assert!((1..=8).contains(&load_at::<ExecutionState>(&file).unwrap().last_id));
+        assert!((1..=8).contains(&load_at::<Record>(&file).unwrap().sequence));
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600

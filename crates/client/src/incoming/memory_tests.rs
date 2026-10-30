@@ -1,7 +1,7 @@
 use crate::incoming;
 use gmux_protocol::{
     control::{CommandOutput, CommandReply},
-    model::{ExecutionState, ExecutionTab, MachineKind, PaneTree},
+    model::{ExecutionSnapshot, ExecutionTab, MachineKind, PaneTree},
     transport::{Header, Metadata, Packet},
 };
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ fn state() -> CommandReply {
         hostname: "host".into(),
         revision: 1,
         result: CommandOutput::Done { ok: true }.into(),
-        execution: ExecutionState {
+        execution: ExecutionSnapshot {
             tabs: vec![ExecutionTab {
                 id: 1,
                 created_at: 1,
@@ -23,8 +23,6 @@ fn state() -> CommandReply {
                 layout: PaneTree::Pane(2),
                 directories: HashMap::from([(2, "/home/test".into())]),
             }],
-            scrollback: HashMap::from([(2, String::new())]),
-            ..ExecutionState::default()
         },
         metadata: vec![Metadata::default()],
     }
@@ -61,16 +59,6 @@ fn state_capacity_consumes_queue_budget_even_when_json_is_unchanged() {
         ("pane path", |s| {
             s.execution.tabs[0]
                 .directories
-                .get_mut(&2)
-                .unwrap()
-                .reserve(LIMIT * 2);
-        }),
-        ("scrollback table", |s| {
-            s.execution.scrollback.reserve(LIMIT)
-        }),
-        ("scrollback string", |s| {
-            s.execution
-                .scrollback
                 .get_mut(&2)
                 .unwrap()
                 .reserve(LIMIT * 2);

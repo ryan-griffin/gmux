@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 mod state;
-pub use state::{DaemonId, ExecutionState, ExecutionTab, PaneRef, PaneTree, TabRef};
+pub use state::{DaemonId, ExecutionSnapshot, ExecutionTab, PaneRef, PaneTree, TabRef};
 pub fn is_machine_directory(path: &Path) -> bool {
     path.is_absolute() || path.starts_with("~")
 }

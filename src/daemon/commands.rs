@@ -158,7 +158,7 @@ impl ControlReply {
         if self.kind == ReplyKind::Snapshot && self.value.get("error").is_none() {
             self.value = (|| -> anyhow::Result<Value> {
                 let result = serde_json::from_value(self.value["result"].take())?;
-                let mut reply = daemon.execution_state();
+                let mut reply = daemon.execution_reply();
                 reply.result = result;
                 Ok(serde_json::to_value(reply)?)
             })()
@@ -394,7 +394,7 @@ impl Daemon {
             }
             ExecutionRequest::State => {
                 self.refresh_state();
-                Ok(serde_json::to_value(self.execution_state())?)
+                Ok(serde_json::to_value(self.execution_reply())?)
             }
             ExecutionRequest::Metadata { pane: id } => {
                 let session = self.sessions.get_mut(&id).unwrap();

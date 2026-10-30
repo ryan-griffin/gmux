@@ -1,13 +1,13 @@
 //! Headless owner of PTYs, terminal engines, and the reconnectable live layout.
 use crate::{
-    persistence::{Save, Worker},
+    persistence::{Save, SavedExecution, Worker},
     session::TerminalSession,
 };
 use gmux_platform::unix::storage;
 use gmux_protocol::{
     Cell, Frame,
     control::{CommandOutput, CommandResult},
-    model::{CursorStyle, DaemonId, ExecutionState, ExecutionTab, PaneRef, PaneTree, TabRef},
+    model::{CursorStyle, DaemonId, ExecutionTab, PaneRef, PaneTree, TabRef},
     theme::Theme,
     transport::{self, Header, Metadata, Packet},
 };
@@ -94,7 +94,7 @@ struct Daemon {
     sessions: HashMap<u64, TerminalSession>,
     id: DaemonId,
     remote_access: remote_access::RemoteAccess,
-    state: ExecutionState,
+    state: SavedExecution,
     limits: gmux_protocol::retention::ScrollbackLimits,
     frontends: HashMap<u64, Frontend>,
     clipboard: clipboard::Broker,
@@ -143,7 +143,7 @@ impl Daemon {
         let limits =
             storage::load::<gmux_protocol::retention::ScrollbackLimits>("daemon-settings.json")?
                 .resolve()?;
-        let mut execution = storage::load::<ExecutionState>("execution.json")?;
+        let mut execution = storage::load::<SavedExecution>("execution.json")?;
         let id = crate::persistence::daemon_id()?;
         let scrollback = std::mem::take(&mut execution.scrollback);
         let last_id = execution
@@ -160,7 +160,7 @@ impl Daemon {
             limits,
             id,
             remote_access: Default::default(),
-            state: ExecutionState {
+            state: SavedExecution {
                 last_id,
                 ..Default::default()
             },
@@ -359,13 +359,11 @@ impl Daemon {
             }
         }
     }
-    fn execution_snapshot(&mut self) -> ExecutionState {
+    fn saved_execution(&mut self) -> SavedExecution {
         self.refresh_state();
         self.state.clone()
     }
-    fn execution_state(&self) -> gmux_protocol::control::CommandReply {
-        let mut execution = self.state.clone();
-        execution.scrollback.clear();
+    fn execution_reply(&self) -> gmux_protocol::control::CommandReply {
         gmux_protocol::control::CommandReply {
             daemon: self.id,
             home_directory: gmux_platform::unix::paths::home(),
@@ -373,7 +371,7 @@ impl Daemon {
             hostname: gmux_platform::unix::machine::hostname().into(),
             revision: self.revision,
             result: CommandOutput::Done { ok: true }.into(),
-            execution,
+            execution: self.state.snapshot(),
             metadata: self
                 .sessions
                 .iter()
@@ -384,7 +382,7 @@ impl Daemon {
         }
     }
     fn state_save(&mut self) -> Save {
-        Save::Execution(self.execution_snapshot())
+        Save::Execution(self.saved_execution())
     }
     fn prepare_state_save(&mut self) {
         self.pending_write = Some(self.state_save());
@@ -419,7 +417,7 @@ impl Daemon {
                 Err(error) => warnings.push(format!("Pane {id}: {error}")),
             }
         }
-        crate::scrollback::Checkpoint::new(self.execution_snapshot(), panes, warnings)
+        crate::scrollback::Checkpoint::new(self.saved_execution(), panes, warnings)
     }
 }
 

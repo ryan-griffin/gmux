@@ -3,7 +3,7 @@ use crate::{incoming, ipc, runtime};
 use gmux_protocol::{
     Cell, Frame,
     control::InternalRequest,
-    model::{CursorStyle, ExecutionState},
+    model::{CursorStyle, ExecutionSnapshot},
     selection::Selection,
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
@@ -559,7 +559,7 @@ impl SessionManager {
     pub fn set_endpoint(&mut self, endpoint: ipc::Endpoint) {
         self.endpoint = endpoint;
     }
-    pub fn execution_state(&mut self) -> anyhow::Result<ExecutionState> {
+    pub fn execution_state(&mut self) -> anyhow::Result<ExecutionSnapshot> {
         let reply: gmux_protocol::control::CommandReply =
             serde_json::from_value(self.endpoint.call(InternalRequest::State)?)?;
         self.validate_state(&reply)?;
@@ -2583,7 +2583,7 @@ mod tests {
         manager.install_metadata(&[current.clone()], 1);
         let state = serde_json::from_value(serde_json::json!({
             "daemon":manager.daemon,"home_directory":"/tmp","machine_kind":"unknown","hostname":"host", "revision":1,
-            "result":{"ok":true},"execution":{"last_id":1,"tabs":[],"scrollback":{}},"metadata":[current]
+            "result":{"ok":true},"execution":{"tabs":[]},"metadata":[current]
         })).unwrap();
         sender
             .send(Ok(Packet {
@@ -2831,7 +2831,7 @@ mod tests {
                     daemon,
                     revision: 1,
                     result: gmux_protocol::control::CommandOutput::Done { ok: true }.into(),
-                    execution: ExecutionState::default(),
+                    execution: ExecutionSnapshot::default(),
                     metadata: vec![],
                 }),
                 meta: session.borrow().meta.clone(),

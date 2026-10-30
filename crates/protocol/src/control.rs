@@ -1,5 +1,5 @@
 //! Execution requests independent of client organization and toolkit.
-use crate::{model::ExecutionState, transport::Metadata};
+use crate::{model::ExecutionSnapshot, transport::Metadata};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -371,7 +371,7 @@ pub struct CommandReply {
     pub hostname: String,
     pub revision: u64,
     pub result: CommandResult,
-    pub execution: ExecutionState,
+    pub execution: ExecutionSnapshot,
     pub metadata: Vec<Metadata>,
 }
 

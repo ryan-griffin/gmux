@@ -65,7 +65,6 @@ impl Fixture {
     }
     fn execution(&self, host: usize, tabs: usize, revision: u64) -> execution::CommandReply {
         let machine = &self.hub.origins[&self.ids[host]].machine;
-        let last_id = tabs as u64 * 3;
         let tabs = (0..tabs)
             .map(|index| {
                 let id = 1 + index as u64 * 3;
@@ -93,11 +92,7 @@ impl Fixture {
             machine_kind: machine.machine_kind,
             revision,
             result: execution::CommandOutput::Done { ok: true }.into(),
-            execution: crate::model::ExecutionState {
-                tabs,
-                last_id,
-                ..Default::default()
-            },
+            execution: crate::model::ExecutionSnapshot { tabs },
             metadata: Vec::new(),
         }
     }
@@ -911,9 +906,19 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
             .unwrap();
         assert_eq!(assignment(&f.hub.store), Some(Some(workspace)));
 
-        // Even a stale reply with a higher ID cannot confirm that the tab closed.
+        // Even a stale reply with higher topology IDs cannot confirm closure.
         let mut stale = f.execution(host, 0, 0);
-        stale.execution.last_id = 100;
+        stale
+            .execution
+            .tabs
+            .push(gmux_protocol::model::ExecutionTab {
+                id: 100,
+                created_at: 100,
+                name: "Stale".into(),
+                custom_name: false,
+                layout: crate::model::PaneTree::Pane(101),
+                directories: HashMap::new(),
+            });
         let delayed = f.hub.project_execution(stale).unwrap();
         let desktop = f.hub.desktop(&delayed.session);
         f.hub
@@ -942,8 +947,7 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
             .unwrap();
         assert_eq!(assignment(&f.hub.store), Some(Some(workspace)));
 
-        let mut closed = f.execution(host, 1, 3);
-        closed.execution.last_id = 6;
+        let closed = f.execution(host, 1, 3);
         let closed = f.hub.project_execution(closed).unwrap();
         let desktop = f.hub.desktop(&closed.session);
         f.hub

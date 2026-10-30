@@ -1,7 +1,7 @@
 //! Ordered disk writes outside the daemon's PTY owner thread.
 use crate::scrollback::Checkpoint;
 use gmux_platform::unix::storage;
-use gmux_protocol::model::{DaemonId, ExecutionState};
+use gmux_protocol::model::DaemonId;
 use std::{
     cell::Cell,
     collections::VecDeque,
@@ -9,6 +9,9 @@ use std::{
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::JoinHandle,
 };
+
+mod execution;
+pub(crate) use execution::SavedExecution;
 
 pub(crate) fn daemon_id() -> anyhow::Result<DaemonId> {
     storage::with_state_lock("daemon-id.json", identity_at)
@@ -28,7 +31,7 @@ fn identity_at(path: &Path) -> anyhow::Result<DaemonId> {
     Ok(id)
 }
 pub(crate) enum Save {
-    Execution(ExecutionState),
+    Execution(SavedExecution),
     Settings(gmux_protocol::retention::ScrollbackLimits),
     Checkpoint(Checkpoint),
     Prune,
@@ -147,6 +150,33 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn saved_execution_preserves_disk_fields_and_projects_only_client_topology() {
+        use gmux_protocol::model::ExecutionSnapshot;
+        use serde_json::json;
+
+        // A disk record with deleted IDs above every live ID and a committed checkpoint.
+        let disk = json!({
+            "last_id": 900,
+            "scrollback": {"2": "2-0123456789abcdef0123456789abcdef.snapshot"},
+            "tabs": [{
+                "id": 1, "created_at": 10, "name": "Build", "custom_name": true,
+                "layout": {"Split": {"vertical": true, "first": {"Pane": 2}, "second": {"Pane": 3}}},
+                "directories": {"2": "/srv/project", "3": "/tmp"}
+            }]
+        });
+        let saved: SavedExecution = serde_json::from_value(disk.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&saved).unwrap(), disk);
+        let snapshot = serde_json::to_value(saved.snapshot()).unwrap();
+        assert_eq!(snapshot, json!({"tabs": disk["tabs"]}));
+        assert!(serde_json::from_value::<ExecutionSnapshot>(disk.clone()).is_err());
+        assert!(serde_json::from_value::<SavedExecution>(snapshot.clone()).is_err());
+        let decoded: ExecutionSnapshot = serde_json::from_value(snapshot.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), snapshot);
+        // Projection cannot mutate checkpoint ownership or the durable ID reservation.
+        assert_eq!(serde_json::to_value(saved).unwrap(), disk);
+    }
+
+    #[test]
     fn daemon_identity_is_durable_and_concurrent_initialization_keeps_one_id() {
         let directory = std::env::temp_dir().join(format!(
             "gmux-identity-{}-{}",
@@ -200,7 +230,7 @@ mod tests {
             },
         );
         let session = |last_id| {
-            Save::Execution(ExecutionState {
+            Save::Execution(SavedExecution {
                 last_id,
                 ..Default::default()
             })

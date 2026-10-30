@@ -92,8 +92,13 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 - `commands.rs`: layout and control commands, including ordered saves.
 
 `crates/protocol/src/model.rs` and `model/state.rs` define daemon identities, qualified references,
-execution state, and pane topology. `crates/platform/src/unix/storage.rs`
-loads JSON and writes files atomically. `src/persistence.rs` creates the daemon identity and runs the disk worker.
+`ExecutionSnapshot`, and pane topology. A snapshot contains only live tabs;
+`ExecutionTab` and `PaneTree` also describe the saved topology.
+`src/persistence/execution.rs` owns `SavedExecution`, the daemon runtime and
+`execution.json` record with checkpoint filenames and the durable ID counter.
+It constructs client snapshots by cloning only the shared tabs.
+`crates/platform/src/unix/storage.rs` loads JSON and writes files atomically.
+`src/persistence.rs` creates the daemon identity and runs the disk worker.
 The detached launcher only starts a process and waits for its control handshake;
 the daemon validates and restores its own saved execution.
 `src/scrollback.rs` handles history checkpoints.
@@ -171,7 +176,12 @@ and window defaults. Its store shares immutable snapshots between GTK windows
 and saves organization atomically. Its connection adapter combines execution
 snapshots with GTK organization, maps qualified daemon IDs to window handles,
 and chooses tab order. It uses the client library for connections and execution.
-Workspace operations never cross the execution protocol.
+Workspace operations never cross the execution protocol. For each daemon, GTK
+retains the greatest ID observed in accepted topology. An absent tab at or below
+that ID can be pruned from saved organization, including when the highest live
+tab closes or the connection restarts. Assignments ahead of observed topology
+remain saved until execution catches up. A tab created and closed before this
+client observes it can leave an assignment until the client sees a later ID.
 
 Request workers return daemon execution replies or GTK organization results.
 Worker channels carry typed replies; execution snapshots are deserialized before
