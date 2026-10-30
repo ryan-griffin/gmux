@@ -81,7 +81,7 @@ if not args.skip_build:
     check_dependencies("gmux-client", execution_and_gui)
     check_dependencies("gmux-platform", execution_and_gui | {"gmux-client"})
     check_dependencies("gmux-protocol", execution_and_gui | {"gmux-client", "gmux-platform", "libc", "directories"})
-    check_dependencies("gmux-daemon", {"gmux-client", "gtk4", "libadwaita", "glib"})
+    check_dependencies("gmux-daemon", {"gmux-client", "tokio", "tokio-util", "gtk4", "libadwaita", "glib"})
     if args.headless:
         dependencies = subprocess.check_output(
             ["cargo", "tree", "--locked", *cargo_options, "--edges", "normal,build", "--prefix", "none"],

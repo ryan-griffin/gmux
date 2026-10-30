@@ -5,6 +5,7 @@ pub mod connections;
 mod incoming;
 mod io;
 pub mod ipc;
+pub mod local;
 pub mod network;
 pub mod remote;
 pub mod runtime;

@@ -211,9 +211,7 @@ struct ServeOptions {
 impl ServeOptions {
     fn run(self) -> anyhow::Result<()> {
         if self.background {
-            let mut command = std::process::Command::new(std::env::current_exe()?);
-            command.arg("serve");
-            gmux_platform::unix::local::start_daemon(command)
+            gmux_client::local::start_daemon()
         } else {
             gmux_daemon::daemon::run()
         }
@@ -255,9 +253,9 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error:#}");
-            if error.is::<gmux_platform::unix::local::DaemonAlreadyRunning>() {
+            if error.is::<gmux_protocol::control::DaemonAlreadyRunning>() {
                 std::process::ExitCode::from(
-                    gmux_platform::unix::local::DaemonAlreadyRunning::EXIT_CODE,
+                    gmux_protocol::control::DaemonAlreadyRunning::EXIT_CODE,
                 )
             } else {
                 std::process::ExitCode::FAILURE

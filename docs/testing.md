@@ -40,6 +40,13 @@ All workspace packages inherit the lint policy in the root `Cargo.toml`.
 Compiler warnings fail normal checks, builds, and tests. Clippy warnings fail
 when running `cargo clippy`; normal builds do not run Clippy.
 
+Client lifecycle unit tests cover silent readiness timeouts, failed child exits,
+cancellation with all blocking workers occupied, dropped acquisition futures,
+child reaping, and completed async stop with one handshake. Offline stop succeeds
+only before connecting; failed and canceled replies remain errors. The `serve` suite
+checks simultaneous explicit starts and GTK acquisition races through the CLI,
+detachment, log permissions, immediate stop/restart, and daemon-owned socket cleanup.
+
 ## Select checks
 
 ```sh

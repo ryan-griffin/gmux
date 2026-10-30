@@ -52,7 +52,9 @@ directory. Startup failures return a nonzero exit status. Both forms reject an
 already running or starting local daemon. `serve` accepts no listener or
 authentication overrides; use `gmux connection edit local` to change incoming
 access settings. These edits persist and apply immediately to a running daemon.
-GTK starts or attaches to a daemon when local execution is requested. Reading
+GTK starts or attaches to a daemon when local execution is requested. Detached
+starts and GTK acquisition wait up to eight seconds for readiness. Canceling a
+GTK acquisition leaves the daemon running. Reading
 client configuration, adding a remote, or connecting to one never starts a local
 daemon.
 
