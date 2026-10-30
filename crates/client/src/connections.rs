@@ -1,10 +1,8 @@
 //! Saved destinations and direct execution calls. Opening this catalog starts no daemon.
-use crate::{
-    ipc,
-    model::{DaemonId, Machine, MachineKind},
-    network::{self, Authentication},
-    storage,
-};
+use crate::{ipc, network};
+use gmux_platform::unix::storage;
+use gmux_protocol::model::{DaemonId, Machine, MachineKind};
+use gmux_protocol::network::Authentication;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -25,7 +23,7 @@ fn deserialize_address<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
     let address = String::deserialize(deserializer)?;
-    Ok(network::with_default_port(&address).into_owned())
+    Ok(gmux_protocol::network::with_default_port(&address).into_owned())
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -42,7 +40,7 @@ impl Catalog {
     pub fn local_name(&self) -> &str {
         self.local_name
             .as_deref()
-            .unwrap_or(crate::model::hostname())
+            .unwrap_or(gmux_platform::unix::machine::hostname())
     }
     pub fn is_local(&self, name: &str) -> bool {
         name == "local" || name == self.local_name()
@@ -93,7 +91,7 @@ enum Request {
     ConnectionList,
     RemoteAccessGet,
     RemoteAccessSet {
-        remote_access: network::RemoteAccess,
+        remote_access: gmux_protocol::network::RemoteAccess,
     },
     ConnectionAdd {
         name: Option<String>,
@@ -107,7 +105,7 @@ enum Request {
         name: Option<Option<String>>,
         address: Option<String>,
         authentication: Option<Authentication>,
-        remote_access: Option<network::RemoteAccess>,
+        remote_access: Option<gmux_protocol::network::RemoteAccess>,
     },
     ConnectionRemove {
         connection: String,
@@ -167,7 +165,7 @@ pub fn call(body: impl Serialize) -> anyhow::Result<Value> {
 pub fn call_at(
     endpoint: &ipc::Endpoint,
     body: Value,
-    cancellation: Option<&ipc::Cancellation>,
+    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
 ) -> anyhow::Result<Value> {
     let call = |endpoint: &ipc::Endpoint, request: Value| match cancellation {
         Some(c) => endpoint.call_cancellable(request, c),
@@ -184,7 +182,7 @@ pub fn call_at(
             let catalog = Catalog::load()?;
             let mut result = remote_access_status(cancellation)?;
             result["local"]["name"] = json!(catalog.local_name());
-            result["hostname"] = json!(crate::model::hostname());
+            result["hostname"] = json!(gmux_platform::unix::machine::hostname());
             result["remotes"] = json!(catalog.remotes);
             result
         }
@@ -194,7 +192,7 @@ pub fn call_at(
             json!({"remote_access":remote_access})
         }
         Request::LocalDaemonStart => {
-            crate::local::ensure_daemon(cancellation)?;
+            gmux_platform::unix::local::ensure_daemon(cancellation)?;
             let mut state = call(
                 &ipc::Endpoint::local(),
                 json!({"method":"remote-access-get"}),
@@ -205,9 +203,9 @@ pub fn call_at(
         Request::LocalDaemonStop => {
             // Disabling local execution must also work during startup backoff,
             // when there is no daemon to stop. Do not start one to disable it.
-            if ipc::call_if_running(
-                &ipc::socket_path(),
-                crate::control::InternalRequest::Hello,
+            if gmux_platform::unix::ipc::call_if_running(
+                &gmux_platform::unix::ipc::socket_path(),
+                gmux_protocol::control::InternalRequest::Hello,
                 cancellation,
             )?
             .is_some()
@@ -222,14 +220,14 @@ pub fn call_at(
             address,
             authentication,
         } => {
-            let address = network::with_default_port(&address).into_owned();
+            let address = gmux_protocol::network::with_default_port(&address).into_owned();
             validate_address(&address)?;
             if let Some(name) = &name {
                 validate_name(name)?;
             }
             let client = network::Client::connect_cancellable(
                 &address,
-                &authentication.credentials()?,
+                &network::credentials(&authentication)?,
                 None,
                 cancellation,
             )?;
@@ -316,15 +314,16 @@ pub fn call_at(
                             if let Some(n) = &name {
                                 validate_name(n)?;
                             }
-                            let effective_name =
-                                name.as_deref().unwrap_or(crate::model::hostname());
+                            let effective_name = name
+                                .as_deref()
+                                .unwrap_or(gmux_platform::unix::machine::hostname());
                             anyhow::ensure!(
                                 name.as_deref() != Some("local")
                                     && !catalog.remotes.iter().any(|r| r.name == effective_name),
                                 "Connection name is already in use"
                             );
-                            catalog.local_name =
-                                name.filter(|name| name != crate::model::hostname());
+                            catalog.local_name = name
+                                .filter(|name| name != gmux_platform::unix::machine::hostname());
                             Ok(catalog.local_name().to_owned())
                         },
                         || {
@@ -359,7 +358,7 @@ pub fn call_at(
                     })?;
                 }
                 if let Some(a) = address {
-                    remote.address = network::with_default_port(&a).into_owned();
+                    remote.address = gmux_protocol::network::with_default_port(&a).into_owned();
                 }
                 if let Some(a) = authentication {
                     remote.authentication = a;
@@ -371,7 +370,7 @@ pub fn call_at(
                 {
                     let client = network::Client::connect_cancellable(
                         &remote.address,
-                        &remote.authentication.credentials()?,
+                        &crate::network::credentials(&remote.authentication)?,
                         Some(remote.daemon),
                         cancellation,
                     )?;
@@ -426,9 +425,11 @@ pub fn call_at(
     Ok(result)
 }
 
-fn remote_access_status(cancellation: Option<&ipc::Cancellation>) -> anyhow::Result<Value> {
-    let current = ipc::call_if_running(
-        &ipc::socket_path(),
+fn remote_access_status(
+    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
+) -> anyhow::Result<Value> {
+    let current = gmux_platform::unix::ipc::call_if_running(
+        &gmux_platform::unix::ipc::socket_path(),
         json!({"method":"remote-access-get"}),
         cancellation,
     )?;
@@ -436,9 +437,9 @@ fn remote_access_status(cancellation: Option<&ipc::Cancellation>) -> anyhow::Res
     let mut result = match current {
         Some(value) => value,
         None => json!({
-            "remote_access":storage::load::<network::RemoteAccess>("remote-access.json")?,
+            "remote_access":storage::load::<gmux_protocol::network::RemoteAccess>("remote-access.json")?,
             "bound_address":null,"remote_access_error":null,
-            "local":{"name":crate::model::hostname(),"machine_kind":MachineKind::local(),"daemon":null}
+            "local":{"name":gmux_platform::unix::machine::hostname(),"machine_kind":gmux_platform::unix::machine::machine_kind(),"daemon":null}
         }),
     };
     result["running"] = json!(running);
@@ -446,14 +447,14 @@ fn remote_access_status(cancellation: Option<&ipc::Cancellation>) -> anyhow::Res
 }
 
 fn set_remote_access(
-    remote_access: &network::RemoteAccess,
-    cancellation: Option<&ipc::Cancellation>,
+    remote_access: &gmux_protocol::network::RemoteAccess,
+    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
 ) -> anyhow::Result<()> {
     if remote_access.enabled {
-        remote_access.authentication.token()?;
+        gmux_platform::unix::network::token(&remote_access.authentication)?;
     }
-    if ipc::call_if_running(
-        &ipc::socket_path(),
+    if gmux_platform::unix::ipc::call_if_running(
+        &gmux_platform::unix::ipc::socket_path(),
         json!({"method":"remote-access-set","remote_access":remote_access}),
         cancellation,
     )?
@@ -465,119 +466,13 @@ fn set_remote_access(
 }
 
 /// Watch atomic catalog changes across CLI and graphical clients without polling the disk.
-pub struct Watch {
-    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop: ipc::Wake,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl Watch {
-    pub fn new(wake: ipc::Wake) -> anyhow::Result<Self> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let directory = storage::config_dir();
-        std::fs::create_dir_all(&directory)?;
-        let directory = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes())?;
-        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        anyhow::ensure!(
-            raw >= 0,
-            "Could not watch connection settings: {}",
-            std::io::Error::last_os_error()
-        );
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        anyhow::ensure!(
-            unsafe {
-                libc::inotify_add_watch(
-                    raw,
-                    directory.as_ptr(),
-                    libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_DELETE,
-                )
-            } >= 0,
-            "Could not watch connection settings"
-        );
-        let stop = ipc::Wake::new()?;
-        let stopping = stop.clone();
-        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pending = changed.clone();
-        let thread = std::thread::spawn(move || {
-            let mut fds = [
-                libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stopping.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            let mut buffer = [0u8; 8192];
-            loop {
-                let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                if fds[1].revents != 0 {
-                    break;
-                }
-                if n < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                let n =
-                    unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-                if n <= 0 {
-                    continue;
-                }
-                let mut offset = 0;
-                let mut notify = false;
-                while offset + std::mem::size_of::<libc::inotify_event>() <= n as usize {
-                    let event = unsafe {
-                        std::ptr::read_unaligned(
-                            buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
-                        )
-                    };
-                    let start = offset + std::mem::size_of::<libc::inotify_event>();
-                    let end = start + event.len as usize;
-                    if end > n as usize {
-                        break;
-                    }
-                    let name = &buffer[start..end];
-                    let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
-                    notify |= name == b"connections.json" || event.mask & libc::IN_Q_OVERFLOW != 0;
-                    offset = end;
-                }
-                if notify {
-                    pending.store(true, std::sync::atomic::Ordering::Release);
-                    wake.notify();
-                }
-            }
-        });
-        Ok(Self {
-            changed,
-            stop,
-            thread: Some(thread),
-        })
-    }
-    pub fn changed(&self) -> bool {
-        self.changed
-            .swap(false, std::sync::atomic::Ordering::Acquire)
-    }
-}
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.stop.notify();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn saved_remote_addresses_include_ports_and_preserve_hostnames() {
-        let daemon = DaemonId::generate().unwrap();
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
         for (input, expected) in [
             ("server.example", "server.example:7331"),
             ("127.0.0.1", "127.0.0.1:7331"),

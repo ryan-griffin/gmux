@@ -89,7 +89,7 @@ pub fn save_locked_at<T: Serialize + serde::de::DeserializeOwned + Default>(
 
 /// Stage and sync the file before applying dependent configuration. A rejected
 /// preparation leaves the old file intact. The caller must hold its writer lock.
-pub(crate) fn save_prepared_locked_at<T: Serialize + serde::de::DeserializeOwned + Default>(
+pub fn save_prepared_locked_at<T: Serialize + serde::de::DeserializeOwned + Default>(
     path: &Path,
     value: &T,
     before_publish: impl FnOnce() -> anyhow::Result<()>,
@@ -169,7 +169,7 @@ pub fn atomic_write_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ExecutionState;
+    use gmux_protocol::model::ExecutionState;
     use serde::Deserialize;
     fn test_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(

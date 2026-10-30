@@ -63,7 +63,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .expect("Could not generate the Gmux C/Rust ABI declarations");
     let generated = bindings.to_string();
     // Keep bindgen's C-derived size, alignment, and field-offset assertions, but
-    // use the client library's values at the FFI boundary. The client needs no C build.
+    // use the protocol crate's values at the FFI boundary without giving it a C build.
     let mut declarations = generated.clone();
     for name in ["Frame", "Scrollback"] {
         let marker = format!("pub struct {name} {{");
@@ -74,7 +74,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         let attributes = declarations[..start].rfind("#[repr(C)]").unwrap();
         declarations.replace_range(attributes..end, "");
     }
-    // Check every named protocol code against the toolkit-free client values.
+    // Check every named protocol code against the platform-independent protocol values.
     // The C implementation maps pinned Ghostty enum names explicitly.
     for (prefix, module) in [
         ("GMUX_CELL_", "cells::flags"),
@@ -88,7 +88,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
             if let Some(rest) = line.strip_prefix(&format!("pub const {prefix}")) {
                 let (name, _) = rest.split_once(':').unwrap();
                 declarations.push_str(&format!(
-                    "const _: () = assert!({prefix}{name} == gmux_client::{module}::{name} as u32);\n"
+                    "const _: () = assert!({prefix}{name} == gmux_protocol::{module}::{name} as u32);\n"
                 ));
                 checked += 1;
             }
@@ -97,7 +97,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
     }
     std::fs::write(
         out_dir.join("ghostty_bridge.rs"),
-        format!("pub use gmux_client::{{Frame,Scrollback}};\n{declarations}"),
+        format!("pub use gmux_protocol::{{Frame,Scrollback}};\n{declarations}"),
     )
     .expect("Could not write ABI bindings");
 }

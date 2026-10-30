@@ -67,14 +67,21 @@ if args.native:
 artifact_log = root / "artifacts" / ("cargo-build-headless.jsonl" if args.headless else "cargo-build.jsonl")
 
 if not args.skip_build:
-    cargo_options = ["-p", "gmux-core", "-p", "gmux-client", "-p", "gmux"] if args.headless else ["--workspace"]
+    cargo_options = ["-p", "gmux-protocol", "-p", "gmux-platform", "-p", "gmux-daemon", "-p", "gmux-client", "-p", "gmux"] if args.headless else ["--workspace"]
     run(["cargo", "fmt", "--all", "--check"], args.build_timeout)
-    client_dependencies = subprocess.check_output(
-        ["cargo", "tree", "--locked", "-p", "gmux-client", "--edges", "normal,build", "--prefix", "none"],
-        cwd=root, text=True, timeout=args.build_timeout)
-    included = {line.split()[0] for line in client_dependencies.splitlines() if line.strip()}
-    forbidden = {"gmux-core", "gtk4", "libadwaita", "portable-pty", "bindgen", "cc", "glib"}
-    assert not included & forbidden, "Client library includes execution or GUI dependencies: " + str(included & forbidden)
+
+    def check_dependencies(package, forbidden):
+        dependencies = subprocess.check_output(
+            ["cargo", "tree", "--locked", "-p", package, "--edges", "normal,build", "--prefix", "none"],
+            cwd=root, text=True, timeout=args.build_timeout)
+        included = {line.split()[0] for line in dependencies.splitlines() if line.strip()}
+        assert not included & forbidden, f"{package} includes forbidden dependencies: " + str(included & forbidden)
+
+    execution_and_gui = {"gmux-daemon", "gtk4", "libadwaita", "portable-pty", "bindgen", "cc", "glib"}
+    check_dependencies("gmux-client", execution_and_gui)
+    check_dependencies("gmux-platform", execution_and_gui | {"gmux-client"})
+    check_dependencies("gmux-protocol", execution_and_gui | {"gmux-client", "gmux-platform", "libc", "directories"})
+    check_dependencies("gmux-daemon", {"gmux-client", "gtk4", "libadwaita", "glib"})
     if args.headless:
         dependencies = subprocess.check_output(
             ["cargo", "tree", "--locked", *cargo_options, "--edges", "normal,build", "--prefix", "none"],

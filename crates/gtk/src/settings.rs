@@ -1,5 +1,5 @@
 //! Preferences for the GTK frontend, independent of client organization.
-use gmux_client::model::CursorStyle;
+use gmux_protocol::model::CursorStyle;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]

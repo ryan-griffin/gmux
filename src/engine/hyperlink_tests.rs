@@ -214,7 +214,7 @@ fn invalid_utf8_targets_discard_the_complete_map_before_transport() {
 
 #[test]
 fn span_limit_discards_the_whole_map_and_recovers_after_a_partial_erase() {
-    use gmux_client::hyperlinks::MAX_SPANS;
+    use gmux_protocol::hyperlinks::MAX_SPANS;
     let mut e = Engine::new().unwrap();
     e.resize(1000, 33, 0, 0).unwrap();
     // Keep one Ghostty link open; repeated OSC starts have their own upstream

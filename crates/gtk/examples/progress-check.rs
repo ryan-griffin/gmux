@@ -1,10 +1,10 @@
 //! Native size/role checks for the production progress widget at interface fonts.
 #[path = "../src/progress.rs"]
 mod progress;
-use gmux_client::progress::{Progress, ProgressState};
-use gmux_client::{
+use gmux_protocol::{
     activity::Activity,
     program_status::{Record, State, Summary},
+    progress::{Progress, ProgressState},
 };
 use gtk::{gio, prelude::*};
 use std::time::{Duration, Instant};
@@ -71,7 +71,7 @@ fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
         ] {
             for percentage in [0, 9, 42, 99, 100] {
                 value.apply(state, Some(percentage));
-                progress.update(gmux_client::activity::Activity::select(None, value));
+                progress.update(gmux_protocol::activity::Activity::select(None, value));
                 settle();
                 assert_eq!((area.width(), area.height()), size, "{titles}, {state:?}");
                 assert_eq!(progress.bar.is_mapped(), value.active());
@@ -102,7 +102,7 @@ fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
             }
         }
         value.apply(ProgressState::Indeterminate, None);
-        progress.update(gmux_client::activity::Activity::select(None, value));
+        progress.update(gmux_protocol::activity::Activity::select(None, value));
         window.set_visible(false);
         settle();
         assert!(
@@ -121,7 +121,7 @@ fn check_pane(direction: gtk::TextDirection) -> serde_json::Value {
             "Mapping must resume unknown progress"
         );
         value.apply(ProgressState::Inactive, None);
-        progress.update(gmux_client::activity::Activity::select(None, value));
+        progress.update(gmux_protocol::activity::Activity::select(None, value));
         settle();
         assert!(!fill.has_css_class("pulse"));
         assert!(!progress.bar.is_mapped());

@@ -1,6 +1,6 @@
 //! Organization and navigation requests served by execution clients.
 use crate::client::model::{DaemonId, Session, WorkspaceCatalog};
-pub use gmux_client::control::{PaneRequest, TabCommand};
+pub use gmux_protocol::control::{PaneRequest, TabCommand};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -59,7 +59,7 @@ pub enum InternalRequest {
     Hello,
     #[serde(rename = "_execution")]
     Execution {
-        request: gmux_client::control::ExecutionRequest,
+        request: gmux_protocol::control::ExecutionRequest,
     },
     #[serde(rename = "_busy")]
     Busy { panes: Vec<u64> },
@@ -225,7 +225,7 @@ impl From<CommandOutput> for CommandResult {
 /// Worker results keep execution separate from GTK organization until the window combines them.
 pub enum BackendReply {
     Execution {
-        reply: gmux_client::control::CommandReply,
+        reply: gmux_protocol::control::CommandReply,
     },
     Organization {
         result: CommandResult,
@@ -262,7 +262,7 @@ impl Command {
         } = self
         {
             if local && let Some(path) = directory {
-                let expanded = gmux_client::model::expand_home(path);
+                let expanded = gmux_platform::unix::paths::expand_home(path);
                 *path = if let Some(base) = directory_base.as_ref() {
                     std::path::absolute(base.join(expanded))?
                 } else {
@@ -274,8 +274,8 @@ impl Command {
         Ok(())
     }
     /// Convert after the client resolves workspace membership and its destination directory.
-    pub fn into_execution(self) -> Result<gmux_client::control::Command, Self> {
-        use gmux_client::control::Command as Execution;
+    pub fn into_execution(self) -> Result<gmux_protocol::control::Command, Self> {
+        use gmux_protocol::control::Command as Execution;
         Ok(match self {
             Self::New {
                 directory, name, ..
@@ -285,7 +285,7 @@ impl Command {
         })
     }
     pub fn supports(method: &str) -> bool {
-        gmux_client::control::Command::supports(method)
+        gmux_protocol::control::Command::supports(method)
             || Self::workspace_method(method)
             || method == "move"
     }
@@ -335,7 +335,7 @@ mod tests {
         use std::collections::HashMap;
         let session = Session {
             tabs: vec![TabState {
-                daemon: DaemonId::generate().unwrap(),
+                daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
                 id: 1,
                 created_at: 1,
                 name: "Terminal".into(),

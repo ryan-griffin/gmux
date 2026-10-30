@@ -1,5 +1,5 @@
 //! One sidebar slot for activity and unread alerts. No animation or polling.
-use gmux_client::activity::{Activity, State};
+use gmux_protocol::activity::{Activity, State};
 use gtk::prelude::*;
 
 pub(crate) fn icon_name(state: State) -> &'static str {

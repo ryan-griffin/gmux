@@ -1,5 +1,5 @@
 use super::*;
-use gmux_client::{control, model::MachineKind};
+use gmux_protocol::{control, model::MachineKind};
 use serde_json::json;
 use std::{
     collections::HashSet,
@@ -12,16 +12,20 @@ struct Fixture {
     local: DaemonId,
     store: Arc<Store>,
     endpoint: ipc::Endpoint,
-    server: ipc::Server,
+    server: gmux_platform::unix::ipc::Server,
 }
 impl Fixture {
     fn new() -> Self {
-        let local = DaemonId::generate().unwrap();
+        let local = gmux_platform::unix::identity::daemon_id().unwrap();
         let path = std::env::temp_dir().join(format!("gmux-backend-{local}"));
         std::fs::create_dir_all(&path).unwrap();
         let control = path.join("control.sock");
         let endpoint = ipc::Endpoint::unix(control.clone(), path.join("stream.sock"));
-        let server = ipc::Server::start_at(control, ipc::Wake::new().unwrap()).unwrap();
+        let server = gmux_platform::unix::ipc::Server::start_at(
+            control,
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+        )
+        .unwrap();
         let store = Store::at(path.join("state.json")).unwrap();
         Self {
             path,
@@ -34,18 +38,18 @@ impl Fixture {
     fn backend(&self) -> Backend {
         Backend::new(
             self.endpoint.clone(),
-            ipc::Wake::new().unwrap(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
             self.store.clone(),
             self.local,
         )
     }
-    fn incoming(&self) -> ipc::Request {
+    fn incoming(&self) -> gmux_platform::unix::ipc::Request {
         self.server
             .receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
     }
-    fn answer(&self, request: ipc::Request, daemon: DaemonId) {
+    fn answer(&self, request: gmux_platform::unix::ipc::Request, daemon: DaemonId) {
         let reply = control::CommandReply {
             daemon,
             home_directory: "/home/test".into(),
@@ -142,7 +146,10 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
     );
 
     let daemons: Vec<_> = std::iter::once(f.local)
-        .chain((0..gmux_client::connections::MAX_REMOTES).map(|_| DaemonId::generate().unwrap()))
+        .chain(
+            (0..gmux_client::connections::MAX_REMOTES)
+                .map(|_| gmux_platform::unix::identity::daemon_id().unwrap()),
+        )
         .collect();
     for &daemon in &daemons {
         let id = backend.request(daemon, remote("execution")).unwrap();
@@ -154,7 +161,7 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
                 .any(|(reply, result)| *reply == id && result.is_ok())
         );
     }
-    let replacement = DaemonId::generate().unwrap();
+    let replacement = gmux_platform::unix::identity::daemon_id().unwrap();
     assert!(backend.request(replacement, remote("overflow")).is_err());
     let removed = daemons[1];
     backend.retain_connections(|daemon| daemon != removed);
@@ -172,8 +179,8 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
 fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves_its_order() {
     let f = Fixture::new();
     let backend = f.backend();
-    let a = DaemonId::generate().unwrap();
-    let b = DaemonId::generate().unwrap();
+    let a = gmux_platform::unix::identity::daemon_id().unwrap();
+    let b = gmux_platform::unix::identity::daemon_id().unwrap();
     let first = backend.request(a, remote("a")).unwrap();
     let held = f.incoming();
     assert_eq!(held.body["test_destination"], "a");
@@ -239,7 +246,7 @@ fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves
 fn removing_a_connection_cancels_its_requests_and_shutdown_flushes_the_latest_save() {
     let f = Fixture::new();
     let backend = f.backend();
-    let a = DaemonId::generate().unwrap();
+    let a = gmux_platform::unix::identity::daemon_id().unwrap();
     let first = backend.request(a, remote("a")).unwrap();
     let held = f.incoming();
     let second = backend.request(a, remote("a")).unwrap();

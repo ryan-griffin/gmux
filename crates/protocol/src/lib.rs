@@ -1,0 +1,20 @@
+//! Shared execution protocol and terminal values. No platform I/O or native build.
+pub mod activity;
+pub mod cells;
+pub mod clipboard;
+pub mod control;
+pub mod hyperlinks;
+pub mod model;
+pub mod network;
+pub mod program_status;
+pub mod progress;
+pub mod retention;
+pub mod scroll_cache;
+pub mod search;
+pub mod selection;
+pub mod session;
+pub mod shell;
+pub mod theme;
+pub mod transport;
+pub mod viewport;
+pub use cells::{Cell, Frame, Scrollback};

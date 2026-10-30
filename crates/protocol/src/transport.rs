@@ -557,77 +557,6 @@ mod tests {
         assert!(reader.is_empty());
     }
     #[test]
-    fn incoming_budget_counts_retained_capacity_and_rejects_oversized_packets() {
-        let mut oversized = packet();
-        oversized.cells.reserve_exact(4096);
-        let mut encoded = Vec::new();
-        oversized.encode_into(&mut encoded).unwrap();
-        let size = oversized.memory_size();
-        assert!(size > encoded.len());
-        let (sender, receiver) = crate::incoming::channel(size - 1, 8);
-        assert!(
-            sender
-                .send(Ok(oversized))
-                .unwrap_err()
-                .to_string()
-                .contains("memory budget")
-        );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        sender.send(Ok(packet())).unwrap();
-        assert!(matches!(receiver.try_recv(), Ok(Ok(packet)) if packet.header.scroll_serial == 42));
-    }
-    #[test]
-    fn maximum_native_text_grid_and_prefetch_fit_packet_and_queue_bounds() {
-        let glyph = format!("🧑{}", "\u{1d185}".repeat(64));
-        let mut cell = Cell::default();
-        cell.set_text(&glyph).unwrap();
-        let cols = 512;
-        let rows = crate::viewport::MAX_CELLS / cols;
-        let cached = crate::scroll_cache::capacity(cols);
-        let packet = Packet {
-            header: Header {
-                frame: Some(Frame {
-                    cols: cols as u16,
-                    rows: rows as u16,
-                    scrollback: crate::Scrollback {
-                        total: 1000,
-                        offset: 0,
-                        len: rows as u64,
-                    },
-                    ..Frame::default()
-                }),
-                rows: (0..rows as u16).collect(),
-                cache: Some(CachedRows {
-                    start: 0,
-                    row_flags: vec![0; cached],
-                }),
-                ..Header::default()
-            },
-            cells: vec![cell; (rows + cached) * cols],
-        };
-        let (sender, receiver) = crate::incoming::channel(crate::incoming::MAX_BYTES, 1);
-        sender.send(Ok(packet)).unwrap();
-        let packet = receiver.try_recv().unwrap().unwrap();
-        let mut bytes = Vec::new();
-        packet.encode_into(&mut bytes).unwrap();
-        let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded.cells.len(), packet.cells.len());
-        assert_eq!(decoded.cells.last().unwrap().text(), glyph);
-        // Heap text must consume admission budget even when Arc clones share it.
-        let (sender, _) = crate::incoming::channel(
-            decoded.cells.capacity() * size_of::<Cell>() + 1024 * 1024,
-            1,
-        );
-        assert_eq!(
-            sender.send(Ok(decoded)),
-            Err(crate::incoming::SendError::TooLarge)
-        );
-    }
-
-    #[test]
     fn heartbeat_records_are_separate_from_viewports_and_do_not_consume_following_data() {
         let mut bytes = HEARTBEAT_REPLY.to_vec();
         packet().encode_into(&mut bytes).unwrap();
@@ -938,14 +867,17 @@ mod tests {
     }
     #[test]
     fn failed_encoding_preserves_previously_queued_packets() {
-        use std::os::unix::ffi::OsStringExt;
         let mut packet = packet();
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
         let original = encoded.clone();
-        packet.header.meta.directory = std::ffi::OsString::from_vec(vec![0xff]).into();
-        assert!(packet.encode_into(&mut encoded).is_err());
-        assert_eq!(encoded, original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            packet.header.meta.directory = std::ffi::OsString::from_vec(vec![0xff]).into();
+            assert!(packet.encode_into(&mut encoded).is_err());
+            assert_eq!(encoded, original);
+        }
 
         packet.header.meta.directory = "/tmp".into();
         packet.header.copy = Some(crate::clipboard::Write {

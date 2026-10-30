@@ -1,5 +1,5 @@
 //! Desktop clipboard publication, independent of terminal rendering.
-use gmux_client::clipboard::Offer;
+use gmux_protocol::clipboard::Offer;
 use gtk::{gdk, glib, prelude::*};
 
 pub(crate) fn publish(clipboard: &gdk::Clipboard, content: Option<Offer>) -> anyhow::Result<()> {

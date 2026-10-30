@@ -1,5 +1,5 @@
 //! Hostname and hardware detection, independent of whether a daemon serves or receives.
-use serde::{Deserialize, Serialize};
+use gmux_protocol::model::MachineKind;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read},
@@ -28,28 +28,9 @@ pub fn hostname() -> &'static str {
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MachineKind {
-    #[default]
-    Unknown,
-    Desktop,
-    Laptop,
-    Convertible,
-    Server,
-    Tablet,
-    Phone,
-    Watch,
-    Embedded,
-    VirtualMachine,
-    Container,
-}
-
-impl MachineKind {
-    pub fn local() -> Self {
-        static KIND: OnceLock<MachineKind> = OnceLock::new();
-        *KIND.get_or_init(|| detect(Path::new("/")))
-    }
+pub fn machine_kind() -> MachineKind {
+    static KIND: OnceLock<MachineKind> = OnceLock::new();
+    *KIND.get_or_init(|| detect(Path::new("/")))
 }
 
 fn chassis(value: &str) -> Option<MachineKind> {
@@ -267,7 +248,7 @@ mod tests {
         fn new() -> Self {
             Self(std::env::temp_dir().join(format!(
                 "gmux-machine-{}",
-                crate::model::DaemonId::generate().unwrap()
+                crate::unix::identity::daemon_id().unwrap()
             )))
         }
 

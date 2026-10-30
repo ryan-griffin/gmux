@@ -1,7 +1,7 @@
 //! Check sidebar status tooltips, accessibility and stable title allocation.
 #[path = "../src/activity.rs"]
 mod activity;
-use gmux_client::program_status::{Record, State, Summary};
+use gmux_protocol::program_status::{Record, State, Summary};
 use gtk::prelude::*;
 use std::time::{Duration, Instant};
 
@@ -26,9 +26,12 @@ fn check_sidebar(direction: gtk::TextDirection) -> serde_json::Value {
         .default_width(300)
         .build();
     window.present();
-    let mut legacy = gmux_client::progress::Progress::default();
-    legacy.apply(gmux_client::progress::ProgressState::Determinate, Some(42));
-    let report = gmux_client::activity::Activity::select(None, legacy).unwrap();
+    let mut legacy = gmux_protocol::progress::Progress::default();
+    legacy.apply(
+        gmux_protocol::progress::ProgressState::Determinate,
+        Some(42),
+    );
+    let report = gmux_protocol::activity::Activity::select(None, legacy).unwrap();
     let icon = indicator
         .widget
         .child()
@@ -84,7 +87,7 @@ fn check_sidebar(direction: gtk::TextDirection) -> serde_json::Value {
             },
         };
         indicator.update(
-            Some(gmux_client::activity::Activity::Program(&status)),
+            Some(gmux_protocol::activity::Activity::Program(&status)),
             true,
         );
         settle();
@@ -96,7 +99,7 @@ fn check_sidebar(direction: gtk::TextDirection) -> serde_json::Value {
         assert_eq!(
             icon.icon_name().as_deref(),
             Some(activity::icon_name(
-                gmux_client::activity::Activity::Program(&status).state()
+                gmux_protocol::activity::Activity::Program(&status).state()
             ))
         );
         assert!(gtk::test_accessible_has_property(

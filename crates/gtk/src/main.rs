@@ -18,9 +18,8 @@ mod terminal_canvas;
 use crate::client::control::{Command as LayoutCommand, PaneRequest, PublicRequest, TabCommand};
 use crate::client::model;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use gmux_client::control::pane_method;
 use gmux_client::ipc;
-use gmux_client::theme;
+use gmux_protocol::{control::pane_method, theme};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -190,7 +189,7 @@ enum WorkspaceCommand {
 }
 fn workspace_directories(
     values: &[String],
-) -> anyhow::Result<std::collections::BTreeMap<gmux_client::model::DaemonId, PathBuf>> {
+) -> anyhow::Result<std::collections::BTreeMap<gmux_protocol::model::DaemonId, PathBuf>> {
     let mut directories = std::collections::BTreeMap::new();
     if values.is_empty() {
         return Ok(directories);
@@ -222,7 +221,9 @@ fn workspace_directories(
         directories.insert(
             serde_json::from_value(connection["daemon"].clone())?,
             if connection["local"] == true {
-                std::path::absolute(gmux_client::model::expand_home(std::path::Path::new(path)))?
+                std::path::absolute(gmux_platform::unix::paths::expand_home(
+                    std::path::Path::new(path),
+                ))?
             } else {
                 PathBuf::from(path)
             },
@@ -244,8 +245,8 @@ fn launch_in_running_app(cli: &Cli) -> anyhow::Result<bool> {
     if !cli.new_window && cli.connection.is_none() && cli.directory.is_none() {
         return Ok(false);
     }
-    Ok(ipc::call_if_running(
-        &ipc::companion_path(".ui"),
+    Ok(gmux_platform::unix::ipc::call_if_running(
+        &gmux_platform::unix::ipc::companion_path(".ui"),
         PublicRequest::Launch {
             connection: cli.connection.clone(),
             directory: cli.directory.clone(),
@@ -325,7 +326,9 @@ fn main() -> anyhow::Result<()> {
                 } => serde_json::to_value(LayoutCommand::WorkspaceAdd {
                     name,
                     directory: directory
-                        .map(|path| std::path::absolute(gmux_client::model::expand_home(&path)))
+                        .map(|path| {
+                            std::path::absolute(gmux_platform::unix::paths::expand_home(&path))
+                        })
                         .transpose()?,
                     directories: workspace_directories(&connection_directory)?,
                     tab: None,
@@ -344,7 +347,7 @@ fn main() -> anyhow::Result<()> {
                         })
                         .ok_or_else(|| anyhow::anyhow!("Workspace {id} does not exist"))?;
                     let mut directories: std::collections::BTreeMap<
-                        gmux_client::model::DaemonId,
+                        gmux_protocol::model::DaemonId,
                         PathBuf,
                     > = serde_json::from_value(definition["directories"].clone())?;
                     directories.extend(workspace_directories(&connection_directory)?);
@@ -353,7 +356,9 @@ fn main() -> anyhow::Result<()> {
                         name: name
                             .unwrap_or_else(|| definition["name"].as_str().unwrap().to_owned()),
                         directory: directory
-                            .map(|path| std::path::absolute(gmux_client::model::expand_home(&path)))
+                            .map(|path| {
+                                std::path::absolute(gmux_platform::unix::paths::expand_home(&path))
+                            })
                             .transpose()?,
                         directories: Some(directories),
                     })?

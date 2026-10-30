@@ -603,8 +603,8 @@ impl Ui {
         drop(tabs);
         self.refresh_sidebar();
     }
-    pub(super) fn tab_progress(&self, tab: &Tab) -> Option<gmux_client::progress::PaneProgress> {
-        gmux_client::progress::representative(
+    pub(super) fn tab_progress(&self, tab: &Tab) -> Option<gmux_protocol::progress::PaneProgress> {
+        gmux_protocol::progress::representative(
             tab.panes
                 .iter()
                 .map(|(&id, pane)| (self.sessions.borrow().pane_ref(id).id, pane.progress())),
@@ -613,8 +613,8 @@ impl Ui {
     pub(super) fn tab_program_status(
         &self,
         tab: &Tab,
-    ) -> Option<gmux_client::program_status::PaneStatus> {
-        gmux_client::program_status::representative(tab.panes.iter().map(|(&id, pane)| {
+    ) -> Option<gmux_protocol::program_status::PaneStatus> {
+        gmux_protocol::program_status::representative(tab.panes.iter().map(|(&id, pane)| {
             (
                 self.sessions.borrow().pane_ref(id).id,
                 pane.program_status(),
@@ -624,7 +624,7 @@ impl Ui {
     pub(super) fn refresh_tab_activity(&self, tab: &Tab) {
         let sessions = self.sessions.borrow();
         let selected =
-            gmux_client::activity::representative(tab.panes.iter().map(|(&id, pane)| {
+            gmux_protocol::activity::representative(tab.panes.iter().map(|(&id, pane)| {
                 (
                     sessions.pane_ref(id).id,
                     pane.program_status(),

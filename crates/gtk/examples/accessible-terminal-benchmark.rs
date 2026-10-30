@@ -6,7 +6,7 @@
 mod accessible_terminal;
 
 use accessible_terminal::Text;
-use gmux_client::{Cell, Frame};
+use gmux_protocol::{Cell, Frame};
 use serde_json::{Value, json};
 use std::{hint::black_box, time::Instant};
 
@@ -132,7 +132,7 @@ fn main() {
                 assert!(!text_changed);
                 text.update_positions(
                     black_box(frame),
-                    black_box(Some(gmux_client::selection::Selection::linear(
+                    black_box(Some(gmux_protocol::selection::Selection::linear(
                         0,
                         cells.len() as u64 - 1,
                     ))),
@@ -144,7 +144,7 @@ fn main() {
                 column = 1 + column % (u64::from(cols) - 2);
                 text.update_positions(
                     black_box(frame),
-                    black_box(Some(gmux_client::selection::Selection::rectangle(
+                    black_box(Some(gmux_protocol::selection::Selection::rectangle(
                         1,
                         u64::from(rows - 1) * u64::from(cols) + column,
                         cols,

@@ -10,9 +10,8 @@ use super::{
         Session, TabRef, TabState,
     },
 };
-use gmux_client::{
-    control as execution, ipc, remote::SessionHandle, session::SessionUpdate, theme::Theme,
-};
+use gmux_client::{ipc, remote::SessionHandle};
+use gmux_protocol::{control as execution, session::SessionUpdate, theme::Theme};
 use serde_json::{Value, json};
 use std::{
     cell::Cell,
@@ -33,7 +32,7 @@ struct Origin {
     revision: u64,
 }
 impl Origin {
-    fn new(machine: Machine, wake: ipc::Wake) -> Self {
+    fn new(machine: Machine, wake: gmux_platform::unix::ipc::Wake) -> Self {
         let mut link = Connection::new(
             machine.daemon,
             ipc::Endpoint::remote(machine.name.clone(), Some(machine.daemon)),
@@ -55,7 +54,7 @@ pub struct Connections {
     local_enabled: bool,
     preferred: Option<String>,
     definitions: Vec<gmux_client::connections::Remote>,
-    watcher: gmux_client::connections::Watch,
+    watcher: gmux_client::unix::Watch,
     store: Arc<Store>,
     client_revision: u64,
     _subscription: Subscription,
@@ -64,7 +63,7 @@ pub struct Connections {
     revision: u64,
     desktop: DesktopState,
     organization: Arc<Snapshot>,
-    wake: ipc::Wake,
+    wake: gmux_platform::unix::ipc::Wake,
     snapshot: Option<CommandReply>,
     attached: HashSet<u64>,
     focused: Cell<bool>,
@@ -125,13 +124,13 @@ fn layout_ids(layout: &mut Layout, map: &mut impl FnMut(u64) -> u64) {
 }
 impl Connections {
     pub fn new(
-        wake: ipc::Wake,
+        wake: gmux_platform::unix::ipc::Wake,
         store: Arc<Store>,
         local_enabled: bool,
         preferred: Option<String>,
     ) -> anyhow::Result<(Self, CommandReply)> {
         // Observe edits made while loading the initial catalog, too.
-        let watcher = gmux_client::connections::Watch::new(wake.clone())?;
+        let watcher = gmux_client::unix::Watch::new(wake.clone())?;
         let catalog = gmux_client::connections::Catalog::load()?;
         let subscription = store.subscribe(wake.clone());
         let (organization, client_revision) = store.snapshot();
@@ -165,7 +164,7 @@ impl Connections {
             snapshot: None,
             attached: HashSet::new(),
             focused: Cell::new(false),
-            frame_interval: gmux_client::transport::DEFAULT_FRAME_INTERVAL,
+            frame_interval: gmux_protocol::transport::DEFAULT_FRAME_INTERVAL,
             status_changed: false,
         };
         let initial = hub.combined(CommandOutput::Done { ok: true }.into());
@@ -321,7 +320,7 @@ impl Connections {
             .and_then(|origin| origin.home_directory.as_ref())
             .map_or_else(
                 || path.display().to_string(),
-                |home| gmux_client::model::display_path_with_home(path, home),
+                |home| gmux_platform::paths::display_path(path, home),
             )
     }
     pub fn kind(&self, daemon: DaemonId) -> MachineKind {
@@ -791,17 +790,17 @@ impl Connections {
     #[cfg(test)]
     pub fn poll_with_clipboard(
         &mut self,
-        mut clipboard: impl FnMut(gmux_client::clipboard::Write),
+        mut clipboard: impl FnMut(gmux_protocol::clipboard::Write),
     ) -> HashMap<u64, SessionUpdate> {
         self.poll_with_clipboard_events(|event, _| {
-            if let gmux_client::clipboard::Event::Write(write) = event {
+            if let gmux_protocol::clipboard::Event::Write(write) = event {
                 clipboard(write);
             }
         })
     }
     pub fn poll_with_clipboard_events(
         &mut self,
-        mut clipboard: impl FnMut(gmux_client::clipboard::Event, Option<String>),
+        mut clipboard: impl FnMut(gmux_protocol::clipboard::Event, Option<String>),
     ) -> HashMap<u64, SessionUpdate> {
         if self.watcher.changed()
             && let Err(error) = self.refresh_definitions()
@@ -817,8 +816,8 @@ impl Connections {
             let label = (Some(daemon) != self.local).then(|| origin.machine.name.clone());
             let update = origin.link.poll_at_with_clipboard_events(now, |event| {
                 let event = match event {
-                    gmux_client::clipboard::Event::Read { pane, event } => {
-                        gmux_client::clipboard::Event::Read {
+                    gmux_protocol::clipboard::Event::Read { pane, event } => {
+                        gmux_protocol::clipboard::Event::Read {
                             pane: self.handles.get(daemon, pane),
                             event,
                         }

@@ -11,7 +11,7 @@ impl Ui {
         id: u64,
         preferred: Option<String>,
     ) -> anyhow::Result<Rc<Self>> {
-        let wake = ipc::Wake::new()?;
+        let wake = gmux_platform::unix::ipc::Wake::new()?;
         let store = owner
             .upgrade()
             .unwrap()
@@ -522,14 +522,14 @@ impl Ui {
                 }
                 let updates = ui.sessions.borrow_mut().poll_with_clipboard_events(
                     |event, remote| match event {
-                        gmux_client::clipboard::Event::Write(write) => {
+                        gmux_protocol::clipboard::Event::Write(write) => {
                             let clipboard = ui.clipboard.clipboard(write.destination);
                             if let Err(error) = crate::clipboard::publish(&clipboard, write.content)
                             {
                                 eprintln!("Could not publish clipboard offer: {error}");
                             }
                         }
-                        gmux_client::clipboard::Event::Read { pane, event } => {
+                        gmux_protocol::clipboard::Event::Read { pane, event } => {
                             if let Ok(terminal) = ui.pane(Some(pane)) {
                                 ui.clipboard.handle(
                                     &terminal,
@@ -651,7 +651,7 @@ impl Ui {
     }
     /// Wake for connection retries and coalesced scroll releases. Waiting
     /// creates no permanent worker; deadlines are rescheduled on every poll.
-    fn schedule_deadlines(self: &Rc<Self>, wake: &ipc::Wake) {
+    fn schedule_deadlines(self: &Rc<Self>, wake: &gmux_platform::unix::ipc::Wake) {
         let next = {
             let sessions = self.sessions.borrow();
             sessions

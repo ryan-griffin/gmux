@@ -1,9 +1,9 @@
 use clap::{
     Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
 };
-use gmux_client::{
-    control::{Command as TerminalCommand, PaneRequest, PublicRequest, TabCommand, pane_method},
-    ipc, network,
+use gmux_client::ipc;
+use gmux_protocol::control::{
+    Command as TerminalCommand, PaneRequest, PublicRequest, TabCommand, pane_method,
 };
 use serde_json::{Value, json};
 use std::{net::SocketAddr, path::PathBuf};
@@ -32,10 +32,10 @@ enum Command {
     Scrollback {
         /// Maximum retained allocation in bytes: integer, default, or unlimited. Zero disables history.
         #[arg(long)]
-        max_bytes: Option<gmux_client::retention::Limit>,
+        max_bytes: Option<gmux_protocol::retention::Limit>,
         /// Maximum physical history lines: integer, default, or unlimited. Zero still permits a native page.
         #[arg(long)]
-        max_lines: Option<gmux_client::retention::Limit>,
+        max_lines: Option<gmux_protocol::retention::Limit>,
     },
     /// List tabs, panes, working directories, program status, progress, and unread indicators.
     List,
@@ -176,7 +176,7 @@ enum ConnectionCommand {
         #[arg(long, value_name = "BOOL")]
         remote_access: Option<bool>,
         /// Incoming listening IP address. The port defaults to 7331.
-        #[arg(long, value_parser = network::parse_listen_address)]
+        #[arg(long, value_parser = gmux_protocol::network::parse_listen_address)]
         listen_address: Option<SocketAddr>,
         /// Authentication for the remote daemon, or incoming clients when editing local.
         #[arg(long, value_enum, required_if_eq("remote_access", "true"))]
@@ -213,9 +213,9 @@ impl ServeOptions {
         if self.background {
             let mut command = std::process::Command::new(std::env::current_exe()?);
             command.arg("serve");
-            gmux_client::local::start_daemon(command)
+            gmux_platform::unix::local::start_daemon(command)
         } else {
-            gmux_core::daemon::run()
+            gmux_daemon::daemon::run()
         }
     }
 }
@@ -231,14 +231,17 @@ struct ServeCli {
     options: ServeOptions,
 }
 impl Auth {
-    fn authentication(self, file: Option<PathBuf>) -> anyhow::Result<network::Authentication> {
+    fn authentication(
+        self,
+        file: Option<PathBuf>,
+    ) -> anyhow::Result<gmux_protocol::network::Authentication> {
         anyhow::ensure!(
             self == Self::Token || file.is_none(),
             "--token-file requires --auth token"
         );
         Ok(match self {
-            Self::None => network::Authentication::None,
-            Self::Token => network::Authentication::Token {
+            Self::None => gmux_protocol::network::Authentication::None,
+            Self::Token => gmux_protocol::network::Authentication::Token {
                 file: std::path::absolute(
                     file.ok_or_else(|| anyhow::anyhow!("Token file is required"))?,
                 )?,
@@ -252,8 +255,10 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error:#}");
-            if error.is::<gmux_client::local::DaemonAlreadyRunning>() {
-                std::process::ExitCode::from(gmux_client::local::DaemonAlreadyRunning::EXIT_CODE)
+            if error.is::<gmux_platform::unix::local::DaemonAlreadyRunning>() {
+                std::process::ExitCode::from(
+                    gmux_platform::unix::local::DaemonAlreadyRunning::EXIT_CODE,
+                )
             } else {
                 std::process::ExitCode::FAILURE
             }
@@ -318,7 +323,7 @@ fn run() -> anyhow::Result<()> {
         Command::Scrollback {
             max_bytes,
             max_lines,
-        } => serde_json::to_value(gmux_client::control::ExecutionRequest::Scrollback {
+        } => serde_json::to_value(gmux_protocol::control::ExecutionRequest::Scrollback {
             max_bytes,
             max_lines,
         })?,
@@ -330,7 +335,7 @@ fn run() -> anyhow::Result<()> {
                 directory
             } else {
                 directory
-                    .map(|path| std::path::absolute(gmux_client::model::expand_home(&path)))
+                    .map(|path| std::path::absolute(gmux_platform::unix::paths::expand_home(&path)))
                     .transpose()?
             },
         })?,
@@ -356,9 +361,9 @@ fn run() -> anyhow::Result<()> {
             pane,
             point: column.zip(row),
             formats: if html {
-                gmux_client::clipboard::Formats::TextHtml
+                gmux_protocol::clipboard::Formats::TextHtml
             } else {
-                gmux_client::clipboard::Formats::Text
+                gmux_protocol::clipboard::Formats::Text
             },
         })?,
         Command::Read { pane } => serde_json::to_value(PaneRequest::Read { pane })?,
@@ -409,7 +414,7 @@ fn run() -> anyhow::Result<()> {
                     {
                         let current =
                             gmux_client::connections::call(json!({"method":"remote-access-get"}))?;
-                        let mut config: network::RemoteAccess =
+                        let mut config: gmux_protocol::network::RemoteAccess =
                             serde_json::from_value(current["remote_access"].clone())?;
                         if let Some(enabled) = remote_access {
                             config.enabled = enabled;

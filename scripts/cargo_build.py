@@ -43,7 +43,7 @@ def build_artifacts(profile="debug", *, target=None, examples=False, headless=Fa
     # Build the daemon independently in both installation modes. GTK enables
     # additional features on shared dependencies; building it alongside the
     # daemon would otherwise produce a different daemon artifact.
-    selections = [["-p", "gmux-core", "-p", "gmux"]]
+    selections = [["-p", "gmux-daemon", "-p", "gmux"]]
     if not headless:
         selections.append(["-p", "gmux-gtk"])
     output = ""

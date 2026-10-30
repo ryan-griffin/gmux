@@ -9,7 +9,7 @@ mod render;
 mod renderer;
 
 use clap::Parser;
-use gmux_client::{
+use gmux_protocol::{
     Cell, Frame,
     cells::{decoration, underline},
     theme::Theme,
@@ -253,7 +253,7 @@ fn main() -> anyhow::Result<()> {
                     "alternating-blink" => index % 2 == 0,
                     _ => false,
                 } {
-                    cell.flags |= gmux_client::cells::flags::BLINK;
+                    cell.flags |= gmux_protocol::cells::flags::BLINK;
                 }
             }
             let highlights = vec![0; cells.len()];
@@ -345,9 +345,9 @@ fn main() -> anyhow::Result<()> {
                         let end = u64::from(options.rows - 1) * u64::from(options.cols)
                             + selection_column as u64;
                         Some(if workload == "rectangle-selection" {
-                            gmux_client::selection::Selection::rectangle(1, end, options.cols)
+                            gmux_protocol::selection::Selection::rectangle(1, end, options.cols)
                         } else {
-                            gmux_client::selection::Selection::linear(1, end)
+                            gmux_protocol::selection::Selection::linear(1, end)
                         })
                     } else {
                         None

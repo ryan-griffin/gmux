@@ -1,10 +1,7 @@
 //! Ordered disk writes outside the daemon's PTY owner thread.
 use crate::scrollback::Checkpoint;
-use gmux_client::{
-    ipc,
-    model::{DaemonId, ExecutionState},
-    storage,
-};
+use gmux_platform::unix::storage;
+use gmux_protocol::model::{DaemonId, ExecutionState};
 use std::{
     cell::Cell,
     collections::VecDeque,
@@ -26,13 +23,13 @@ fn identity_at(path: &Path) -> anyhow::Result<DaemonId> {
         "Invalid daemon identity in {}",
         path.display()
     );
-    let id = DaemonId::generate()?;
+    let id = gmux_platform::unix::identity::daemon_id()?;
     storage::save_locked_at(path, &Some(id))?;
     Ok(id)
 }
 pub(crate) enum Save {
     Execution(ExecutionState),
-    Settings(gmux_client::retention::ScrollbackLimits),
+    Settings(gmux_protocol::retention::ScrollbackLimits),
     Checkpoint(Checkpoint),
     Prune,
 }
@@ -63,11 +60,11 @@ pub(crate) struct Worker {
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
-    pub(crate) fn new(wake: ipc::Wake) -> Self {
+    pub(crate) fn new(wake: gmux_platform::unix::ipc::Wake) -> Self {
         Self::with_save(wake, Save::write)
     }
     fn with_save(
-        wake: ipc::Wake,
+        wake: gmux_platform::unix::ipc::Wake,
         save: impl Fn(Save) -> anyhow::Result<()> + Send + 'static,
     ) -> Self {
         let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
@@ -154,7 +151,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "gmux-identity-{}-{}",
             std::process::id(),
-            DaemonId::generate().unwrap()
+            gmux_platform::unix::identity::daemon_id().unwrap()
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("daemon-id.json");
@@ -185,20 +182,23 @@ mod tests {
         let (started, began) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let (seen, writes) = mpsc::channel();
-        let mut worker = Worker::with_save(ipc::Wake::new().unwrap(), move |save| {
-            match save {
-                Save::Execution(value) => {
-                    if value.last_id == 1 {
-                        started.send(()).unwrap();
-                        gate.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut worker = Worker::with_save(
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+            move |save| {
+                match save {
+                    Save::Execution(value) => {
+                        if value.last_id == 1 {
+                            started.send(()).unwrap();
+                            gate.recv_timeout(Duration::from_secs(3)).unwrap();
+                        }
+                        seen.send(value.last_id).unwrap();
                     }
-                    seen.send(value.last_id).unwrap();
+                    Save::Prune => seen.send(6).unwrap(),
+                    _ => panic!("Expected execution"),
                 }
-                Save::Prune => seen.send(6).unwrap(),
-                _ => panic!("Expected execution"),
-            }
-            Ok(())
-        });
+                Ok(())
+            },
+        );
         let session = |last_id| {
             Save::Execution(ExecutionState {
                 last_id,

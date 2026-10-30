@@ -18,16 +18,22 @@ python3 scripts/check.py
 ```
 
 The runner checks formatting, Rust tests, Clippy, builds, linkage, and headless
-smoke suites. Add `--headless` to build and test only `gmux-core`, `gmux-client`,
-and `gmux`, without GTK, libadwaita, GLib, or `glib-compile-resources`.
+smoke suites. Add `--headless` to build and test the protocol, platform support,
+daemon, client library, and CLI packages, without GTK, libadwaita, GLib, or `glib-compile-resources`.
 Add `--native` to include desktop suites in a private Wayland session.
 `--headless` and `--native` cannot be combined.
 
 Check execution and the client library without a toolkit:
 
 ```sh
-cargo test --locked -p gmux-core -p gmux-client --lib
-cargo clippy --locked -p gmux-core -p gmux-client --all-targets
+cargo test --locked -p gmux-protocol -p gmux-platform -p gmux-daemon -p gmux-client --lib
+cargo clippy --locked -p gmux-protocol -p gmux-platform -p gmux-daemon -p gmux-client --all-targets
+```
+
+Test the protocol and client without Ghostty or a C compiler:
+
+```sh
+cargo test --locked -p gmux-protocol -p gmux-platform -p gmux-client
 ```
 
 All workspace packages inherit the lint policy in the root `Cargo.toml`.

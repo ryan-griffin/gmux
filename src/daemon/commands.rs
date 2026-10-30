@@ -1,13 +1,13 @@
 //! Control commands and their ordered persistence.
 use super::*;
-use gmux_client::control::{ExecutionRequest, InternalRequest, Request};
+use gmux_protocol::control::{ExecutionRequest, InternalRequest, Request};
 
 pub(super) struct ControlRequest {
     pub(super) body: Request,
     reply: std::sync::mpsc::SyncSender<Value>,
 }
 impl ControlRequest {
-    pub(super) fn decode(request: ipc::Request) -> Option<Self> {
+    pub(super) fn decode(request: gmux_platform::unix::ipc::Request) -> Option<Self> {
         match Request::decode(request.body) {
             Ok(body) => Some(Self {
                 body,
@@ -34,7 +34,7 @@ struct ControlReply {
 pub(super) struct PendingControl {
     reply: ControlReply,
     pub(super) id: u64,
-    limits: Option<gmux_client::retention::ScrollbackLimits>,
+    limits: Option<gmux_protocol::retention::ScrollbackLimits>,
 }
 impl PendingControl {
     pub(super) fn start(
@@ -131,7 +131,7 @@ impl ControlReply {
     fn settings_failed(
         mut self,
         error: String,
-        current: gmux_client::retention::ScrollbackLimits,
+        current: gmux_protocol::retention::ScrollbackLimits,
     ) -> Self {
         self.value["limits"] = json!(current);
         self.value["error"] = json!(format!(
@@ -170,7 +170,7 @@ impl ControlReply {
 impl Daemon {
     fn apply_scrollback_limits(
         &mut self,
-        limits: gmux_client::retention::ScrollbackLimits,
+        limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> Value {
         // Publication precedes irreversible pruning. Never roll back a policy
         // after applying it to only part of the history.
@@ -223,9 +223,9 @@ impl Daemon {
                     "reference": TabRef { daemon: self.id, id: tab.id },
                     "name": tab.name,
                     "unread": ids.iter().any(|id| self.unread.contains_key(id)),
-                    "progress": gmux_client::progress::representative(ids.iter().filter_map(|id|
+                    "progress": gmux_protocol::progress::representative(ids.iter().filter_map(|id|
                         self.sessions.get(id).map(|s| (*id, s.progress())))),
-                    "program_status": gmux_client::program_status::representative(ids.iter().filter_map(|id|
+                    "program_status": gmux_protocol::program_status::representative(ids.iter().filter_map(|id|
                         self.sessions.get(id).map(|s| (*id, s.program_status())))),
                     "layout": tab.layout,
                     "panes": panes,
@@ -244,8 +244,8 @@ impl Daemon {
     fn control(&mut self, request: ExecutionRequest) -> anyhow::Result<Value> {
         match request {
             ExecutionRequest::New { directory, name } => {
-                let directory = directory.unwrap_or_else(model::home);
-                let directory = model::expand_home(&directory);
+                let directory = directory.unwrap_or_else(gmux_platform::unix::paths::home);
+                let directory = gmux_platform::unix::paths::expand_home(&directory);
                 anyhow::ensure!(
                     directory.is_dir(),
                     "{} is not a directory",
@@ -278,9 +278,9 @@ impl Daemon {
                     ExecutionTab {
                         id: tab,
                         created_at,
-                        name: name
-                            .clone()
-                            .unwrap_or_else(|| model::directory_name(&directory)),
+                        name: name.clone().unwrap_or_else(|| {
+                            gmux_platform::unix::paths::directory_name(&directory)
+                        }),
                         custom_name: name.is_some(),
                         layout: PaneTree::Pane(pane),
                         directories: HashMap::from([(pane, directory)]),
@@ -369,9 +369,9 @@ impl Daemon {
             ExecutionRequest::Status => Ok(json!({
                 "version": transport::VERSION,
                 "daemon": self.id,
-                "hostname": model::hostname(),
-                "home_directory": model::home(),
-                "machine_kind": model::MachineKind::local(),
+                "hostname": gmux_platform::unix::machine::hostname(),
+                "home_directory": gmux_platform::unix::paths::home(),
+                "machine_kind": gmux_platform::unix::machine::machine_kind(),
                 "bound_address": self.remote_access.bound_address(),
                 "pid": std::process::id(),
                 "local_clients": self.frontends.values().filter(|f| f.attached && !f.remote).count(),
@@ -482,6 +482,6 @@ impl Daemon {
         }
     }
     fn hello(&self) -> Value {
-        json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_client::model::MachineKind::local(),"hostname":model::hostname(),"home_directory":model::home(),"quitting":self.quitting})
+        json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_platform::unix::machine::machine_kind(),"hostname":gmux_platform::unix::machine::hostname(),"home_directory":gmux_platform::unix::paths::home(),"quitting":self.quitting})
     }
 }

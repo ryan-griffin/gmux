@@ -1,10 +1,10 @@
 //! Permission and asynchronous desktop reads for one frontend window.
-use gmux_client::{
+use gmux_client::remote::{RemoteSession, SessionHandle};
+use gmux_protocol::{
+    clipboard as protocol,
     clipboard::{
-        self as protocol, Destination, ReadDescriptor, ReadEvent, ReadRequest, ReadResult,
-        ReadStatus, Representation,
+        Destination, ReadDescriptor, ReadEvent, ReadRequest, ReadResult, ReadStatus, Representation,
     },
-    remote::{RemoteSession, SessionHandle},
     transport::StreamCommand,
 };
 use gtk::gio;

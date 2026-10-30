@@ -1,4 +1,4 @@
-use gmux_client::{Frame, cells::mouse_shape};
+use gmux_protocol::{Frame, cells::mouse_shape};
 use gtk::{gdk, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},

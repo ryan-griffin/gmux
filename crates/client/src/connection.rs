@@ -1,7 +1,6 @@
 //! One daemon's connection lifecycle, independent of client organization.
-use crate::{
-    control::CommandReply, ipc, model::DaemonId, remote::SessionManager, session::SessionUpdate,
-};
+use crate::{ipc, remote::SessionManager};
+use gmux_protocol::{control::CommandReply, model::DaemonId, session::SessionUpdate};
 use std::{
     collections::{HashMap, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
@@ -65,7 +64,7 @@ enum State {
         retry_at: Option<Instant>,
     },
     Connecting {
-        cancellation: ipc::Cancellation,
+        cancellation: gmux_platform::unix::ipc::Cancellation,
         error: Option<String>,
     },
     Connected(Box<SessionManager>),
@@ -87,14 +86,18 @@ pub struct Connection {
     generation: u64,
     sender: mpsc::Sender<Completion>,
     receiver: mpsc::Receiver<Completion>,
-    wake: ipc::Wake,
+    wake: gmux_platform::unix::ipc::Wake,
     changed: bool,
     auto_reconnect: bool,
     backoff: Backoff,
 }
 
 impl Connection {
-    pub fn new(daemon: DaemonId, mut endpoint: ipc::Endpoint, wake: ipc::Wake) -> Self {
+    pub fn new(
+        daemon: DaemonId,
+        mut endpoint: ipc::Endpoint,
+        wake: gmux_platform::unix::ipc::Wake,
+    ) -> Self {
         endpoint.pin(daemon);
         let (sender, receiver) = mpsc::channel();
         Self {
@@ -113,7 +116,7 @@ impl Connection {
             backoff: Backoff::default(),
         }
     }
-    pub fn from_session(manager: SessionManager, wake: ipc::Wake) -> Self {
+    pub fn from_session(manager: SessionManager, wake: gmux_platform::unix::ipc::Wake) -> Self {
         let mut connection = Self::new(manager.daemon_id(), manager.endpoint().clone(), wake);
         connection.state = State::Connected(Box::new(manager));
         connection.backoff.connected(Instant::now());
@@ -213,13 +216,13 @@ impl Connection {
         });
         true
     }
-    fn start_attempt(&mut self) -> Option<(u64, ipc::Cancellation)> {
+    fn start_attempt(&mut self) -> Option<(u64, gmux_platform::unix::ipc::Cancellation)> {
         let State::Disconnected { error, .. } = &mut self.state else {
             return None;
         };
         let error = error.take();
         self.generation += 1;
-        let cancellation = ipc::Cancellation::default();
+        let cancellation = gmux_platform::unix::ipc::Cancellation::default();
         self.state = State::Connecting {
             cancellation: cancellation.clone(),
             error,
@@ -271,10 +274,10 @@ impl Connection {
     pub fn poll_at_with_clipboard(
         &mut self,
         now: Instant,
-        mut clipboard: impl FnMut(crate::clipboard::Write),
+        mut clipboard: impl FnMut(gmux_protocol::clipboard::Write),
     ) -> Update {
         self.poll_at_with_clipboard_events(now, |event| {
-            if let crate::clipboard::Event::Write(write) = event {
+            if let gmux_protocol::clipboard::Event::Write(write) = event {
                 clipboard(write);
             }
         })
@@ -282,7 +285,7 @@ impl Connection {
     pub fn poll_at_with_clipboard_events(
         &mut self,
         now: Instant,
-        clipboard: impl FnMut(crate::clipboard::Event),
+        clipboard: impl FnMut(gmux_protocol::clipboard::Event),
     ) -> Update {
         let mut update = Update::default();
         if self.next_retry().is_some_and(|at| at <= now) {
@@ -361,12 +364,12 @@ mod tests {
 
     #[test]
     fn retries_wait_for_their_deadline_allow_manual_retry_and_stop_on_rejection_or_cancel() {
-        let daemon = DaemonId::generate().unwrap();
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
         let directory = std::env::temp_dir().join(format!("gmux-retry-{daemon}"));
         let mut connection = Connection::new(
             daemon,
             ipc::Endpoint::unix(directory.join("control"), directory.join("stream")),
-            ipc::Wake::new().unwrap(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
         );
         connection.set_auto_reconnect(true);
         let (generation, _) = connection.start_attempt().unwrap();
@@ -435,9 +438,12 @@ mod tests {
     #[test]
     fn disabling_retries_wakes_observers_and_cancels_the_deadline() {
         use std::os::fd::AsRawFd;
-        let daemon = DaemonId::generate().unwrap();
-        let mut connection =
-            Connection::new(daemon, ipc::Endpoint::local(), ipc::Wake::new().unwrap());
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
+        let mut connection = Connection::new(
+            daemon,
+            ipc::Endpoint::local(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+        );
         let now = Instant::now();
         connection.set_auto_reconnect(true);
         connection.failed("offline".into(), true, now);
@@ -473,11 +479,15 @@ mod tests {
             os::unix::net::UnixListener,
             time::Duration,
         };
-        let daemon = DaemonId::generate().unwrap();
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
         let directory = std::env::temp_dir().join(format!("gmux-connect-order-{daemon}"));
         let control = directory.join("control");
         let stream = directory.join("stream");
-        let server = ipc::Server::start_at(control.clone(), ipc::Wake::new().unwrap()).unwrap();
+        let server = gmux_platform::unix::ipc::Server::start_at(
+            control.clone(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+        )
+        .unwrap();
         let listener = UnixListener::bind(&stream).unwrap();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -503,7 +513,7 @@ mod tests {
         let mut connection = Connection::new(
             daemon,
             ipc::Endpoint::unix(control, stream),
-            ipc::Wake::new().unwrap(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
         );
         connection.connect();
         let attached = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -518,9 +528,12 @@ mod tests {
 
     #[test]
     fn retries_ignore_late_completions_and_release_their_streams() {
-        let daemon = DaemonId::generate().unwrap();
-        let mut connection =
-            Connection::new(daemon, ipc::Endpoint::local(), ipc::Wake::new().unwrap());
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
+        let mut connection = Connection::new(
+            daemon,
+            ipc::Endpoint::local(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+        );
         let (first, _) = connection.start_attempt().unwrap();
         assert!(connection.start_attempt().is_none());
         connection.cancel();

@@ -1,5 +1,5 @@
 //! Ordered stream backpressure bounded by retained bytes as well as packet count.
-use crate::transport::Packet;
+use gmux_protocol::transport::Packet;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -152,3 +152,8 @@ mod tests {
         assert!(worker.join().unwrap().is_err());
     }
 }
+
+#[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
+mod packet_tests;

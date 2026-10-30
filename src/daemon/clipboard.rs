@@ -1,6 +1,6 @@
 //! Clipboard authority is tied to one attached desktop connection and one pane.
 use super::*;
-use gmux_client::{
+use gmux_protocol::{
     clipboard::{self, Destination, ReadEvent, ReadRequest, ReadResult, ReadStatus},
     transport::StreamCommand,
 };

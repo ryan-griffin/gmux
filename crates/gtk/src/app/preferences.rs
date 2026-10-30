@@ -29,7 +29,7 @@ impl AppPreferences {
             settings.system_font = desktop.string(font::KEY).to_string();
         }
         apply_appearance(&settings);
-        let wake = ipc::Wake::new()?;
+        let wake = gmux_platform::unix::ipc::Wake::new()?;
         let preferences = Rc::new(Self {
             settings: Rc::new(RefCell::new(settings)),
             writer: SettingsWriter::new(wake.clone()),
@@ -170,7 +170,7 @@ struct SettingsWriter {
 }
 
 impl SettingsWriter {
-    fn new(wake: ipc::Wake) -> Self {
+    fn new(wake: gmux_platform::unix::ipc::Wake) -> Self {
         let pending = Arc::new((Mutex::new(PendingSettings::default()), Condvar::new()));
         let writing = pending.clone();
         let (results, receiver) = mpsc::channel();

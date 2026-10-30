@@ -13,7 +13,7 @@ fn client_request(body: &Value) -> anyhow::Result<Option<Request>> {
             if let Some(fields) = execution.as_object_mut() {
                 fields.remove("connection");
             }
-            if gmux_client::control::Request::decode(execution).is_ok() {
+            if gmux_protocol::control::Request::decode(execution).is_ok() {
                 Ok(None)
             } else {
                 Err(error)
@@ -32,8 +32,8 @@ pub fn call(body: impl serde::Serialize) -> anyhow::Result<Value> {
     }
     let decoded = client_request(&body)?;
     let client = decoded.as_ref().is_some_and(Request::uses_ui);
-    let path = ipc::companion_path(".ui");
-    if client && let Some(reply) = ipc::call_if_running(&path, &body, None)? {
+    let path = gmux_platform::unix::ipc::companion_path(".ui");
+    if client && let Some(reply) = gmux_platform::unix::ipc::call_if_running(&path, &body, None)? {
         return Ok(reply);
     }
     if let Some(message) = decoded.as_ref().and_then(Request::ui_requirement) {

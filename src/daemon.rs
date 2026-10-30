@@ -3,12 +3,11 @@ use crate::{
     persistence::{Save, Worker},
     session::TerminalSession,
 };
-use gmux_client::{
+use gmux_platform::unix::storage;
+use gmux_protocol::{
     Cell, Frame,
     control::{CommandOutput, CommandResult},
-    ipc,
-    model::{self, CursorStyle, DaemonId, ExecutionState, ExecutionTab, PaneRef, PaneTree, TabRef},
-    storage,
+    model::{CursorStyle, DaemonId, ExecutionState, ExecutionTab, PaneRef, PaneTree, TabRef},
     theme::Theme,
     transport::{self, Header, Metadata, Packet},
 };
@@ -95,7 +94,7 @@ struct Daemon {
     id: DaemonId,
     remote_access: remote_access::RemoteAccess,
     state: ExecutionState,
-    limits: gmux_client::retention::ScrollbackLimits,
+    limits: gmux_protocol::retention::ScrollbackLimits,
     frontends: HashMap<u64, Frontend>,
     clipboard: clipboard::Broker,
     next_frontend: u64,
@@ -116,7 +115,7 @@ struct Daemon {
     git_dirty: bool,
 }
 impl Daemon {
-    fn sync_git(&mut self, wake: &ipc::Wake) {
+    fn sync_git(&mut self, wake: &gmux_platform::unix::ipc::Wake) {
         if !std::mem::take(&mut self.git_dirty) {
             return;
         }
@@ -141,7 +140,7 @@ impl Daemon {
     }
     fn new() -> anyhow::Result<Self> {
         let limits =
-            storage::load::<gmux_client::retention::ScrollbackLimits>("daemon-settings.json")?
+            storage::load::<gmux_protocol::retention::ScrollbackLimits>("daemon-settings.json")?
                 .resolve()?;
         let mut execution = storage::load::<ExecutionState>("execution.json")?;
         let id = crate::persistence::daemon_id()?;
@@ -204,7 +203,7 @@ impl Daemon {
                         .get(id)
                         .filter(|p| p.is_dir())
                         .cloned()
-                        .unwrap_or_else(model::home);
+                        .unwrap_or_else(gmux_platform::unix::paths::home);
                     let history = scrollback.get(id).and_then(|name| {
                         if history_panes >= crate::scrollback::MAX_PANES {
                             eprintln!(
@@ -363,14 +362,14 @@ impl Daemon {
         self.refresh_state();
         self.state.clone()
     }
-    fn execution_state(&self) -> gmux_client::control::CommandReply {
+    fn execution_state(&self) -> gmux_protocol::control::CommandReply {
         let mut execution = self.state.clone();
         execution.scrollback.clear();
-        gmux_client::control::CommandReply {
+        gmux_protocol::control::CommandReply {
             daemon: self.id,
-            home_directory: model::home(),
-            machine_kind: model::MachineKind::local(),
-            hostname: model::hostname().into(),
+            home_directory: gmux_platform::unix::paths::home(),
+            machine_kind: gmux_platform::unix::machine::machine_kind(),
+            hostname: gmux_platform::unix::machine::hostname().into(),
             revision: self.revision,
             result: CommandOutput::Done { ok: true }.into(),
             execution,
@@ -504,17 +503,17 @@ mod tests {
                 }),
                 rows: (0..256).collect(),
                 notifications: queue.messages.into_iter().collect(),
-                find: Some(gmux_client::search::FindState {
+                find: Some(gmux_protocol::search::FindState {
                     current: 1,
-                    total: gmux_client::viewport::MAX_CELLS,
+                    total: gmux_protocol::viewport::MAX_CELLS,
                     pending: false,
-                    highlights: (0..gmux_client::viewport::MAX_CELLS)
+                    highlights: (0..gmux_protocol::viewport::MAX_CELLS)
                         .map(|i| (i, i + 1, 1))
                         .collect(),
                 }),
                 ..Header::default()
             },
-            cells: vec![Cell::default(); gmux_client::viewport::MAX_CELLS],
+            cells: vec![Cell::default(); gmux_protocol::viewport::MAX_CELLS],
         };
         packet.encode_into(&mut Vec::new()).unwrap();
     }

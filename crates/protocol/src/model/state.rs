@@ -1,15 +1,13 @@
 //! Daemon identity and persistent execution topology.
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::Read, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
 /// Persistent identity of one daemon's state directory, independent of address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DaemonId([u8; 16]);
 impl DaemonId {
-    pub fn generate() -> anyhow::Result<Self> {
-        let mut bytes = [0; 16];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        Ok(Self(bytes))
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
     }
 }
 

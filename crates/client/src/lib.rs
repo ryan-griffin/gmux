@@ -1,27 +1,9 @@
-//! Direct daemon connections, execution commands, and terminal viewport streams.
-pub mod activity;
-pub mod cells;
-pub mod clipboard;
-pub use cells::{Cell, Frame, Scrollback};
+//! Daemon connections, retries, terminal caches, and bounded input/output queues.
+//! Linux is currently supported; Platform helpers live in `unix` and `gmux-platform`.
 pub mod connection;
 pub mod connections;
-pub mod control;
-pub mod hyperlinks;
 mod incoming;
 pub mod ipc;
-pub mod local;
-pub mod model;
 pub mod network;
-pub mod program_status;
-pub mod progress;
 pub mod remote;
-pub mod retention;
-pub mod scroll_cache;
-pub mod search;
-pub mod selection;
-pub mod session;
-pub mod shell;
-pub mod storage;
-pub mod theme;
-pub mod transport;
-pub mod viewport;
+pub mod unix;

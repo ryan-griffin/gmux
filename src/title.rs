@@ -1,4 +1,3 @@
-use gmux_client::model;
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +57,7 @@ impl PaneTitle {
         {
             return process.command.clone();
         }
-        model::directory_name(directory)
+        gmux_platform::unix::paths::directory_name(directory)
     }
 }
 

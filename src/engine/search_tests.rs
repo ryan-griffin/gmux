@@ -1,6 +1,5 @@
 use crate::engine::Engine;
-use gmux_client::search::*;
-use gmux_client::theme::Theme;
+use gmux_protocol::{search::*, theme::Theme};
 
 fn screen(text: &str, cols: u16, rows: u16) -> Engine {
     let mut engine = Engine::new().unwrap();

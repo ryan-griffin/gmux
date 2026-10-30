@@ -510,7 +510,9 @@ dependencies = [
  "anyhow",
  "clap",
  "gmux-client",
- "gmux-core",
+ "gmux-daemon",
+ "gmux-platform",
+ "gmux-protocol",
  "serde_json",
 ]
 
@@ -519,20 +521,23 @@ name = "gmux-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "directories",
+ "gmux-platform",
+ "gmux-protocol",
  "libc",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "gmux-core"
+name = "gmux-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bindgen",
  "cc",
  "gmux-client",
+ "gmux-platform",
+ "gmux-protocol",
  "libc",
  "portable-pty",
  "serde",
@@ -549,10 +554,33 @@ dependencies = [
  "glib",
  "glib-unix",
  "gmux-client",
+ "gmux-platform",
+ "gmux-protocol",
  "gtk4",
  "libadwaita",
  "libc",
  "pango",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gmux-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "gmux-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gmux-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
 ]
