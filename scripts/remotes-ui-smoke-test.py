@@ -1055,7 +1055,10 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         key(Gdk.KEY_Escape)
         server.start(daemon, "serve", stdout=log, stderr=log)
         wait_for(lambda: server.rpc("status")["bound_address"] == address)
-        wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]))
+        # Inspecting the disconnected menus can exhaust the retry backoff.
+        # Allow its documented 30-second maximum plus connection setup time.
+        wait_for(lambda: any(t["connection"] == "server" and t["connected"] for t in local.rpc("list")["tabs"]),
+                 timeout=40)
         activate(empty_options)
         creation_menu(disconnected=("secured",))
         click(hostname, "menu item")
