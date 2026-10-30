@@ -1,6 +1,6 @@
 //! Frontend socket buffering, terminal input, and viewport updates.
 use super::*;
-use gmux_client::transport::{KeyAction, PasteOptions, StreamCommand, StreamRequest};
+use gmux_protocol::transport::{KeyAction, PasteOptions, StreamCommand, StreamRequest};
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
 const READ_CHUNK: usize = 16 * 1024;
@@ -20,10 +20,10 @@ pub(super) struct SentScreen {
     cached: std::ops::Range<u64>,
     cache_active: bool,
     prefetch_at: Option<Instant>,
-    pub(super) hyperlinks: gmux_client::hyperlinks::Hyperlinks,
+    pub(super) hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
 }
 pub(super) struct SentSelection {
-    range: Option<gmux_client::selection::Selection>,
+    range: Option<gmux_protocol::selection::Selection>,
     serial: u64,
 }
 pub(super) struct Frontend {
@@ -43,7 +43,7 @@ pub(super) struct Frontend {
     pub(super) metadata: HashMap<u64, Metadata>,
     pub(super) scroll_serials: HashMap<u64, u64>,
     pub(super) sent_scroll_serials: HashMap<u64, u64>,
-    pub(super) find: HashMap<u64, gmux_client::search::FindState>,
+    pub(super) find: HashMap<u64, gmux_protocol::search::FindState>,
     pub(super) selections: HashMap<u64, SentSelection>,
     pub(super) selection_serials: HashMap<u64, u64>,
     pub(super) discarding: bool,
@@ -76,7 +76,7 @@ impl Frontend {
     fn queue_clipboard(
         &mut self,
         pane: u64,
-        write: gmux_client::clipboard::Write,
+        write: gmux_protocol::clipboard::Write,
     ) -> anyhow::Result<()> {
         self.queue(Packet {
             header: Header {
@@ -240,7 +240,7 @@ impl Frontend {
                 }
                 self.input.extend_from_slice(part);
                 if complete {
-                    if self.input.len() > gmux_client::clipboard::MAX_HEADER_BYTES {
+                    if self.input.len() > gmux_protocol::clipboard::MAX_HEADER_BYTES {
                         #[derive(serde::Deserialize)]
                         struct Method {
                             method: Option<String>,
@@ -262,12 +262,12 @@ impl Frontend {
                     self.input.clear();
                     if let StreamCommand::ClipboardReadData { size, .. } = &request.command {
                         anyhow::ensure!(
-                            (1..=gmux_client::clipboard::READ_CHUNK).contains(size),
+                            (1..=gmux_protocol::clipboard::READ_CHUNK).contains(size),
                             "Invalid clipboard chunk length"
                         );
                         self.binary = Some(request);
                         self.binary_deadline =
-                            Some(Instant::now() + gmux_client::clipboard::TRANSFER_TIMEOUT);
+                            Some(Instant::now() + gmux_protocol::clipboard::TRANSFER_TIMEOUT);
                         break;
                     }
                     requests.push(request);
@@ -314,7 +314,7 @@ impl Daemon {
         &mut self,
         recipient: u64,
         pane: u64,
-        writes: Vec<gmux_client::clipboard::Write>,
+        writes: Vec<gmux_protocol::clipboard::Write>,
     ) {
         let Some(frontend) = self.frontends.get_mut(&recipient) else {
             return;
@@ -503,7 +503,7 @@ impl Daemon {
         } = command
         {
             anyhow::ensure!(
-                gmux_client::viewport::valid(cols.into(), rows.into()),
+                gmux_protocol::viewport::valid(cols.into(), rows.into()),
                 "Invalid terminal size"
             );
             frontend
@@ -767,8 +767,8 @@ impl Daemon {
         if let Some(content) = copy {
             frontend.queue_clipboard(
                 id,
-                gmux_client::clipboard::Write {
-                    destination: gmux_client::clipboard::Destination::Clipboard,
+                gmux_protocol::clipboard::Write {
+                    destination: gmux_protocol::clipboard::Destination::Clipboard,
                     content: Some(content.into()),
                 },
             )?;
@@ -1040,7 +1040,7 @@ impl Daemon {
                         }
                         if !same_content {
                             old.prefetch_at = (!engine.mode(2026)
-                                && !gmux_client::scroll_cache::window(frame).is_empty())
+                                && !gmux_protocol::scroll_cache::window(frame).is_empty())
                             .then(|| Instant::now() + Duration::from_millis(100));
                         }
                         old.source_revision = Some(engine.revision);
@@ -1056,8 +1056,8 @@ impl Daemon {
                             - old.frame.scrollback.offset.saturating_sub(removed) as i128;
                         if !reset && delta != 0 && delta.unsigned_abs() < frame.rows as u128 {
                             row_shift = delta as i16;
-                            gmux_client::scroll_cache::shift(&mut old.cells, cols, row_shift);
-                            gmux_client::scroll_cache::shift(&mut old.row_flags, 1, row_shift);
+                            gmux_protocol::scroll_cache::shift(&mut old.cells, cols, row_shift);
+                            gmux_protocol::scroll_cache::shift(&mut old.row_flags, 1, row_shift);
                         }
                         for (row, data) in cells_snapshot.chunks_exact(cols).enumerate() {
                             let previous = &mut old.cells[row * cols..(row + 1) * cols];
@@ -1081,7 +1081,7 @@ impl Daemon {
                         // prefetch live screen rows after output has settled.
                         if !engine.mode(2026) {
                             let quiet = old.prefetch_at.is_none_or(|at| at <= Instant::now());
-                            let mut wanted = gmux_client::scroll_cache::window(frame);
+                            let mut wanted = gmux_protocol::scroll_cache::window(frame);
                             let history_end =
                                 frame.scrollback.total.saturating_sub(frame.rows as u64);
                             if !quiet {
@@ -1153,7 +1153,12 @@ impl Daemon {
                     ))
                 })?
             } else {
-                (None, gmux_client::search::FindState::default(), None, None)
+                (
+                    None,
+                    gmux_protocol::search::FindState::default(),
+                    None,
+                    None,
+                )
             };
             let find_changed = frontend.find.get(&id) != Some(&find);
             let selection_serial = frontend.selection_serials.get(&id).copied().unwrap_or(0);
@@ -1266,7 +1271,7 @@ mod tests {
             clipboard: Default::default(),
             sessions: HashMap::new(),
             limits: Default::default(),
-            id: DaemonId::generate().unwrap(),
+            id: gmux_platform::unix::identity::daemon_id().unwrap(),
             remote_access: Default::default(),
             state: Default::default(),
             frontends: HashMap::new(),
@@ -1330,7 +1335,7 @@ mod tests {
 
     #[test]
     fn rich_clipboard_queue_rejects_overflow_without_losing_prior_offers_or_clear() {
-        use gmux_client::clipboard::{Content, Destination, Write};
+        use gmux_protocol::clipboard::{Content, Destination, Write};
         let (mut frontend, _peer) = client((80, 24, 8, 16, 640, 384));
         let offer = |character: char| {
             let text = character.to_string().repeat(transport::MAX_PASTE);

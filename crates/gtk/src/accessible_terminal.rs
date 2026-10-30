@@ -1,5 +1,5 @@
 //! Character offsets for GTK's accessible text interface, including wide cells.
-use gmux_client::{
+use gmux_protocol::{
     Cell, Frame,
     selection::{Selection, Shape},
 };

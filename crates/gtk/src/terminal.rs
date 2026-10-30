@@ -1,15 +1,15 @@
 use crate::{
-    model,
     renderer::{Renderer, Scene},
     settings::Settings,
     terminal_canvas::TerminalCanvas,
     theme::Theme,
 };
-use gmux_client::{
+use gmux_client::remote::SessionHandle;
+use gmux_protocol::{
     Frame,
+    session::SessionUpdate,
     transport::{KeyAction, KeyLayout, SelectionMode},
 };
-use gmux_client::{remote::SessionHandle, session::SessionUpdate};
 use gtk::{gdk, gio, glib, graphene, pango, prelude::*};
 use std::{
     cell::{Cell as ValueCell, Ref, RefCell},
@@ -92,9 +92,9 @@ pub struct Terminal {
     pub(crate) session: SessionHandle,
     pub(crate) clipboard_controls: crate::clipboard::Banner,
     clipboard: Rc<crate::clipboard::Desktop>,
-    selection: RefCell<Option<gmux_client::selection::Selection>>,
+    selection: RefCell<Option<gmux_protocol::selection::Selection>>,
     selection_mode: ValueCell<SelectionMode>,
-    selection_preview: RefCell<gmux_client::selection::Preview>,
+    selection_preview: RefCell<gmux_protocol::selection::Preview>,
     drag_origin: ValueCell<(f64, f64)>,
     drag_position: ValueCell<Option<(f64, f64)>>,
     drag_request: ValueCell<Option<DragSelectionRequest>>,
@@ -175,7 +175,7 @@ impl Terminal {
         toolbar.add_css_class("pane-toolbar");
         toolbar.set_visible(settings.borrow().show_pane_titles);
         let title = gtk::Label::builder()
-            .label(model::directory_name(&directory))
+            .label(gmux_platform::unix::paths::directory_name(&directory))
             .xalign(0.5)
             .ellipsize(pango::EllipsizeMode::End)
             .hexpand(true)
@@ -186,7 +186,7 @@ impl Terminal {
         let progress = crate::progress::PaneProgress::new();
         {
             let session = session.borrow();
-            progress.update(gmux_client::activity::Activity::select(
+            progress.update(gmux_protocol::activity::Activity::select(
                 session.program_status(),
                 session.progress(),
             ));
@@ -308,7 +308,7 @@ impl Terminal {
             clipboard,
             selection: RefCell::new(None),
             selection_mode: ValueCell::new(SelectionMode::Cell),
-            selection_preview: RefCell::new(gmux_client::selection::Preview::default()),
+            selection_preview: RefCell::new(gmux_protocol::selection::Preview::default()),
             drag_origin: ValueCell::new((0.0, 0.0)),
             drag_position: ValueCell::new(None),
             drag_request: ValueCell::new(None),
@@ -584,17 +584,17 @@ impl Terminal {
     pub fn text(&self) -> String {
         self.session.borrow().text()
     }
-    pub fn progress(&self) -> gmux_client::progress::Progress {
+    pub fn progress(&self) -> gmux_protocol::progress::Progress {
         self.session.borrow().progress()
     }
-    pub fn program_status(&self) -> Option<Ref<'_, gmux_client::program_status::Summary>> {
+    pub fn program_status(&self) -> Option<Ref<'_, gmux_protocol::program_status::Summary>> {
         Ref::filter_map(self.session.borrow(), |session| session.program_status()).ok()
     }
     pub fn tick(self: &Rc<Self>, update: &SessionUpdate) {
         if update.progress_changed || update.program_status_changed {
             let session = self.session.borrow();
             self.progress
-                .update(gmux_client::activity::Activity::select(
+                .update(gmux_protocol::activity::Activity::select(
                     session.program_status(),
                     session.progress(),
                 ));
@@ -789,7 +789,7 @@ impl Terminal {
         if let Err(error) = self
             .session
             .borrow()
-            .copy(gmux_client::clipboard::Formats::TextHtml)
+            .copy(gmux_protocol::clipboard::Formats::TextHtml)
         {
             self.show_status(&error.to_string());
             return false;
@@ -816,7 +816,7 @@ impl Terminal {
         self.stop_selection_drag();
         if let Err(error) = self.session.borrow().select_output(
             point,
-            copy.then_some(gmux_client::clipboard::Formats::TextHtml),
+            copy.then_some(gmux_protocol::clipboard::Formats::TextHtml),
         ) {
             self.show_status(&error.to_string());
         }
@@ -826,7 +826,7 @@ impl Terminal {
         if let Err(error) = self
             .session
             .borrow()
-            .select_anchored_output(copy.then_some(gmux_client::clipboard::Formats::TextHtml))
+            .select_anchored_output(copy.then_some(gmux_protocol::clipboard::Formats::TextHtml))
         {
             self.show_status(&error.to_string());
         }
@@ -837,9 +837,9 @@ impl Terminal {
         let _ = self.session.borrow().clear_selection();
         self.cursor.restart();
         let destination = if *clipboard == self.area.primary_clipboard() {
-            gmux_client::clipboard::Destination::Primary
+            gmux_protocol::clipboard::Destination::Primary
         } else {
-            gmux_client::clipboard::Destination::Clipboard
+            gmux_protocol::clipboard::Destination::Clipboard
         };
         if let Err(error) = self.clipboard.paste_intent(self, destination) {
             self.show_status(&error.to_string());
@@ -926,7 +926,7 @@ impl Terminal {
         self.area.set_text_metrics(cw as f32, ch as f32);
         // GTK supplies the small canvas margins. Use its full allocation so
         // the grid, selections, and pointer coordinates share the same origin.
-        let (cols, rows) = gmux_client::viewport::constrain(
+        let (cols, rows) = gmux_protocol::viewport::constrain(
             (width as f64 / cw).floor().max(0.0) as usize,
             (height as f64 / ch).floor().max(0.0) as usize,
         );

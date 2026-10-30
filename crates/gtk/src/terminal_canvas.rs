@@ -1,4 +1,4 @@
-use gmux_client::Scrollback;
+use gmux_protocol::Scrollback;
 use gtk::{glib, prelude::*, subclass::prelude::*};
 use std::{
     cell::{Cell, RefCell},
@@ -283,8 +283,8 @@ glib::wrapper! {
 impl TerminalCanvas {
     pub fn update_text(
         &self,
-        screen: &gmux_client::session::ScreenSnapshot<'_>,
-        selection: Option<gmux_client::selection::Selection>,
+        screen: &gmux_protocol::session::ScreenSnapshot<'_>,
+        selection: Option<gmux_protocol::selection::Selection>,
     ) {
         let imp = self.imp();
         let key = (

@@ -1,5 +1,6 @@
 use super::*;
-use gmux_client::{control as execution, model::MachineKind, remote::SessionManager};
+use gmux_client::remote::SessionManager;
+use gmux_protocol::{control as execution, model::MachineKind};
 use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -13,11 +14,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new(hosts: usize) -> Self {
-        let ids: Vec<_> = (0..hosts).map(|_| DaemonId::generate().unwrap()).collect();
+        let ids: Vec<_> = (0..hosts)
+            .map(|_| gmux_platform::unix::identity::daemon_id().unwrap())
+            .collect();
         let local = ids[0];
         let path = std::env::temp_dir().join(format!("gmux-connections-{local}"));
         let store = Store::at(path.join("state.json")).unwrap();
-        let wake = ipc::Wake::new().unwrap();
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
         let mut origins: HashMap<_, _> = ids
             .iter()
             .enumerate()
@@ -42,7 +45,7 @@ impl Fixture {
             local_enabled: true,
             preferred: None,
             definitions: Vec::new(),
-            watcher: gmux_client::connections::Watch::new(wake.clone()).unwrap(),
+            watcher: gmux_client::unix::Watch::new(wake.clone()).unwrap(),
             _subscription: store.subscribe(wake.clone()),
             store: Arc::clone(&store),
             client_revision: 0,
@@ -55,7 +58,7 @@ impl Fixture {
             snapshot: None,
             attached: HashSet::new(),
             focused: Cell::new(false),
-            frame_interval: gmux_client::transport::DEFAULT_FRAME_INTERVAL,
+            frame_interval: gmux_protocol::transport::DEFAULT_FRAME_INTERVAL,
             status_changed: false,
         };
         Self { hub, path, ids }
@@ -66,7 +69,7 @@ impl Fixture {
         let tabs = (0..tabs)
             .map(|index| {
                 let id = 1 + index as u64 * 3;
-                gmux_client::model::ExecutionTab {
+                gmux_protocol::model::ExecutionTab {
                     id,
                     created_at: id,
                     name: format!("tab-{index}"),
@@ -182,7 +185,7 @@ fn connection_names_remain_routable_independently_of_live_status() {
 
 #[test]
 fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_stale_metadata() {
-    use gmux_client::transport::{Header, Metadata, Packet};
+    use gmux_protocol::transport::{Header, Metadata, Packet};
     use std::{
         io::Write,
         time::{Duration, Instant},
@@ -294,7 +297,7 @@ fn stream_loss_updates_local_and_remote_status_without_discarding_cached_executi
 
 #[test]
 fn rejected_stream_state_preserves_cached_views_and_the_disconnect_reason() {
-    use gmux_client::transport::{Header, Metadata, Packet};
+    use gmux_protocol::transport::{Header, Metadata, Packet};
     use std::{
         io::Write,
         time::{Duration, Instant},
@@ -375,7 +378,7 @@ fn abandoned_connection_setup_releases_sockets_in_both_phases_and_retries_cleanl
         let (started, ready) = mpsc::channel();
         let (finished, closed) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            let hello = json!({"version":gmux_client::transport::VERSION,"daemon":daemon,"hostname":"test","home_directory":"/home/test","machine_kind":"server"});
+            let hello = json!({"version":gmux_protocol::transport::VERSION,"daemon":daemon,"hostname":"test","home_directory":"/home/test","machine_kind":"server"});
             for retry in [false, true] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream

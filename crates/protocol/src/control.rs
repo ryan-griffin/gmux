@@ -383,15 +383,6 @@ pub struct CommandOutcome {
     pub result: CommandResult,
 }
 
-impl CommandOutcome {
-    pub(crate) fn from_execution(mut reply: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(Self {
-            daemon: serde_json::from_value(reply["daemon"].take())?,
-            result: serde_json::from_value(reply["result"].take())?,
-        })
-    }
-}
-
 impl Command {
     pub fn supports(method: &str) -> bool {
         method == "new" || TabCommand::supports(method)

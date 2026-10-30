@@ -1,5 +1,5 @@
 //! A bounded session-owned set. Callbacks apply directly; there is no event queue.
-use gmux_client::program_status::{Kind, MAX_RECORDS, Record, State, Summary};
+use gmux_protocol::program_status::{Kind, MAX_RECORDS, Record, State, Summary};
 
 pub(crate) struct Report<'a> {
     pub id: &'a str,

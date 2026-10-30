@@ -14,7 +14,7 @@ use std::{
 
 struct Worker {
     client: ipc::Client<BackendReply>,
-    cancellation: ipc::Cancellation,
+    cancellation: gmux_platform::unix::ipc::Cancellation,
     execution: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,12 +26,12 @@ enum Lane {
 impl Worker {
     fn new(
         endpoint: ipc::Endpoint,
-        wake: ipc::Wake,
+        wake: gmux_platform::unix::ipc::Wake,
         store: Arc<Store>,
         local: Arc<Mutex<Option<DaemonId>>>,
         execution: bool,
     ) -> Self {
-        let cancellation = ipc::Cancellation::default();
+        let cancellation = gmux_platform::unix::ipc::Cancellation::default();
         let calls = cancellation.clone();
         let client = ipc::Client::with_handler(wake, move |body| {
             let local = *local.lock().unwrap();
@@ -64,7 +64,7 @@ pub struct Backend {
     workers: RefCell<HashMap<Lane, Worker>>,
     endpoint: ipc::Endpoint,
     local: Arc<Mutex<Option<DaemonId>>>,
-    wake: ipc::Wake,
+    wake: gmux_platform::unix::ipc::Wake,
     store: Arc<Store>,
     next: Cell<u64>,
     outstanding: Cell<usize>,
@@ -74,7 +74,7 @@ pub struct Backend {
 impl Backend {
     pub fn new(
         endpoint: ipc::Endpoint,
-        wake: ipc::Wake,
+        wake: gmux_platform::unix::ipc::Wake,
         store: Arc<Store>,
         local: impl Into<Option<DaemonId>>,
     ) -> Self {

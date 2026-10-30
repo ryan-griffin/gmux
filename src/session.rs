@@ -4,8 +4,12 @@ use crate::{
     engine::Engine,
     title::{ForegroundProcess, PaneTitle},
 };
-use gmux_client::transport::{KeyAction, KeyLayout};
-use gmux_client::{ipc, model::CursorStyle, session::SessionUpdate, theme::Theme};
+use gmux_protocol::{
+    model::CursorStyle,
+    session::SessionUpdate,
+    theme::Theme,
+    transport::{KeyAction, KeyLayout},
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     cell::{Cell, RefCell},
@@ -70,7 +74,7 @@ pub(crate) struct TerminalSession {
 impl TerminalSession {
     pub(crate) fn set_scrollback_limits(
         &mut self,
-        limits: gmux_client::retention::ScrollbackLimits,
+        limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<()> {
         self.engine.set_scrollback_limits(limits)
     }
@@ -109,13 +113,13 @@ impl TerminalSession {
         })
     }
 
-    pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
+    pub(crate) fn progress(&self) -> gmux_protocol::progress::Progress {
         self.engine.progress()
     }
-    pub(crate) fn program_status(&self) -> Option<&gmux_client::program_status::Summary> {
+    pub(crate) fn program_status(&self) -> Option<&gmux_protocol::program_status::Summary> {
         self.engine.program_status().summary()
     }
-    pub(crate) fn program_status_records(&self) -> Vec<&gmux_client::program_status::Record> {
+    pub(crate) fn program_status_records(&self) -> Vec<&gmux_protocol::program_status::Record> {
         self.engine.program_status().records()
     }
     pub(crate) fn retain_exited(&self) -> bool {
@@ -155,7 +159,7 @@ impl TerminalSession {
         cursor_style: CursorStyle,
         theme: &Theme,
         history: Option<&[u8]>,
-        limits: gmux_client::retention::ScrollbackLimits,
+        limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut command = CommandBuilder::new(&shell);
@@ -173,7 +177,7 @@ impl TerminalSession {
         theme: &Theme,
         mut command: CommandBuilder,
         history: Option<&[u8]>,
-        limits: gmux_client::retention::ScrollbackLimits,
+        limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<Self> {
         // Complete fallible setup before spawning a process we must clean up.
         let mut engine = Engine::new()?;
@@ -212,7 +216,7 @@ impl TerminalSession {
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "gmux");
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        command.env("GMUX_SOCKET", ipc::socket_path());
+        command.env("GMUX_SOCKET", gmux_platform::unix::ipc::socket_path());
         if let Ok(exe) = std::env::current_exe()
             && let Some(parent) = exe.parent()
         {
@@ -297,7 +301,7 @@ impl TerminalSession {
                 + self.read_reservation.get()
                 + bytes.len()
                 + usize::from(enter)
-                <= 2 * gmux_client::transport::MAX_PASTE - 64 * 1024,
+                <= 2 * gmux_protocol::transport::MAX_PASTE - 64 * 1024,
             "Terminal input queue is full"
         );
         if self.read_responding {
@@ -330,7 +334,7 @@ impl TerminalSession {
             enabled && !self.exited && self.pty.as_ref().is_some_and(|p| p.child.is_some()),
         );
     }
-    pub(crate) fn take_read_request(&mut self) -> Option<gmux_client::clipboard::ReadRequest> {
+    pub(crate) fn take_read_request(&mut self) -> Option<gmux_protocol::clipboard::ReadRequest> {
         self.engine.take_read_request()
     }
     pub(crate) fn clear_grants(&mut self) {
@@ -341,11 +345,11 @@ impl TerminalSession {
     }
     pub(crate) fn complete_read(
         &mut self,
-        result: &gmux_client::clipboard::ReadResult,
+        result: &gmux_protocol::clipboard::ReadResult,
         data: &[u8],
         reservation: usize,
     ) -> anyhow::Result<()> {
-        use gmux_client::clipboard::ReadStatus;
+        use gmux_protocol::clipboard::ReadStatus;
         if result.status == ReadStatus::Success {
             anyhow::ensure!(
                 self.clipboard_queued.get() == 0,
@@ -357,7 +361,7 @@ impl TerminalSession {
                 .ok_or_else(|| anyhow::anyhow!("Session is closed"))?;
             anyhow::ensure!(
                 pty.pending.borrow().len() + self.after_response.borrow().len() + reservation
-                    <= 2 * gmux_client::transport::MAX_PASTE - 64 * 1024,
+                    <= 2 * gmux_protocol::transport::MAX_PASTE - 64 * 1024,
                 "Terminal input is busy"
             );
         }
@@ -366,7 +370,7 @@ impl TerminalSession {
             && let Some(pty) = &self.pty
         {
             anyhow::ensure!(
-                pty.pending.borrow().len() + bytes.len() <= 2 * gmux_client::transport::MAX_PASTE,
+                pty.pending.borrow().len() + bytes.len() <= 2 * gmux_protocol::transport::MAX_PASTE,
                 "Terminal reply queue is full"
             );
             pty.pending.borrow_mut().extend(bytes);
@@ -418,7 +422,7 @@ impl TerminalSession {
     }
     pub(crate) fn user_paste(
         &mut self,
-        destination: gmux_client::clipboard::Destination,
+        destination: gmux_protocol::clipboard::Destination,
         mimes: &[String],
     ) -> anyhow::Result<()> {
         let bytes = self.engine.user_paste(destination, mimes)?;
@@ -431,7 +435,7 @@ impl TerminalSession {
     pub(crate) fn poll_with_clipboard(
         &mut self,
         enabled: bool,
-    ) -> (SessionUpdate, Vec<gmux_client::clipboard::Write>) {
+    ) -> (SessionUpdate, Vec<gmux_protocol::clipboard::Write>) {
         self.engine.set_clipboard_enabled(enabled);
         let update = self.poll();
         self.engine.set_clipboard_enabled(false);
@@ -505,7 +509,7 @@ impl TerminalSession {
                 if pty.eof
                     || self.engine.read_pending() != 0
                     || !self.output_tail.is_empty()
-                    || pending.len() > 2 * gmux_client::transport::MAX_PASTE - 512 * 1024
+                    || pending.len() > 2 * gmux_protocol::transport::MAX_PASTE - 512 * 1024
                 {
                     read_budget_exhausted = !self.output_tail.is_empty();
                     break;
@@ -631,15 +635,15 @@ impl TerminalSession {
                     .is_some_and(|(fg, pid)| fg != pid))
     }
 
-    pub(crate) fn command_state(&self) -> gmux_client::shell::CommandState {
+    pub(crate) fn command_state(&self) -> gmux_protocol::shell::CommandState {
         self.engine.command_state()
     }
 
     pub(crate) fn command_output(
         &mut self,
         point: Option<(u16, u32)>,
-        formats: gmux_client::clipboard::Formats,
-    ) -> anyhow::Result<gmux_client::clipboard::Content> {
+        formats: gmux_protocol::clipboard::Formats,
+    ) -> anyhow::Result<gmux_protocol::clipboard::Content> {
         self.engine.select_output(point)?;
         self.engine.copy_content(formats)
     }
@@ -660,7 +664,7 @@ impl TerminalSession {
         }
 
         anyhow::ensure!(
-            gmux_client::viewport::valid(cols as u64, rows as u64),
+            gmux_protocol::viewport::valid(cols as u64, rows as u64),
             "Invalid terminal size"
         );
         let size = PtySize {
@@ -881,7 +885,7 @@ mod tests {
 
     #[test]
     fn user_paste_waits_for_the_complete_clipboard_response_transaction() {
-        use gmux_client::clipboard::{Destination, ReadDescriptor, ReadResult, ReadStatus};
+        use gmux_protocol::clipboard::{Destination, ReadDescriptor, ReadResult, ReadStatus};
         let directory = TestDirectory::new();
         let mut session = start(1, &directory.0, "sleep 5");
         session.engine.write(b"\x1b[?5522h");

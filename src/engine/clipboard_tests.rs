@@ -1,5 +1,5 @@
 use super::*;
-use gmux_client::clipboard::{Destination, Write};
+use gmux_protocol::clipboard::{Destination, Write};
 
 #[test]
 fn fragmented_clipboard_writes_own_unicode_and_preserve_destinations_and_clear() {
@@ -46,7 +46,7 @@ fn clipboard_admission_bounds_bytes_and_event_count_and_recovers_after_drain() {
         engine.write(b"\x1b]52;c;\x07");
     }
     assert_eq!(engine.take_clipboard_writes().len(), MAX_CLIPBOARD_EVENTS);
-    let text = vec![b'x'; gmux_client::transport::MAX_PASTE];
+    let text = vec![b'x'; gmux_protocol::transport::MAX_PASTE];
     let ud = (&mut *engine.events as *mut Events).cast();
     let admit = |len| {
         let content = GmuxClipboardContent {
@@ -150,7 +150,7 @@ fn rich_application_requests_are_atomic_owned_and_reply_to_the_program() {
 fn clipboard_admission_measurements() {
     for (mime, fill) in [("image/png", 0), ("text/plain", b'x')] {
         let mut engine = Engine::new().unwrap();
-        let data = vec![fill; gmux_client::clipboard::MAX_APPLICATION_BYTES];
+        let data = vec![fill; gmux_protocol::clipboard::MAX_APPLICATION_BYTES];
         let content = GmuxClipboardContent {
             mime: GmuxText {
                 ptr: mime.as_ptr(),
@@ -202,7 +202,7 @@ fn clipboard_admission_measurements() {
 
 #[test]
 fn user_copy_uses_formatter_colors_escaping_and_styles_without_selection_colors() {
-    use gmux_client::clipboard::Formats;
+    use gmux_protocol::clipboard::Formats;
     let mut engine = Engine::new().unwrap();
     engine.resize(80, 6, 0, 0).unwrap();
     engine.write(b"\x1b]10;#123456\x07\x1b]11;#654321\x07\x1b]4;1;#abcdef\x07");
@@ -241,7 +241,7 @@ fn user_copy_uses_formatter_colors_escaping_and_styles_without_selection_colors(
 
 #[test]
 fn rich_copy_tracks_screen_reverse_colors_without_changing_explicit_colors() {
-    use gmux_client::clipboard::Formats;
+    use gmux_protocol::clipboard::Formats;
     let mut engine = Engine::new().unwrap();
     engine.resize(80, 6, 0, 0).unwrap();
     engine.write(b"\x1b]10;#123456\x07\x1b]11;#654321\x07\x1b]4;1;#abcdef\x07");
@@ -279,7 +279,7 @@ fn rich_copy_tracks_screen_reverse_colors_without_changing_explicit_colors() {
 
 #[test]
 fn rich_copy_falls_back_after_bounded_styled_expansion_and_keeps_view_selection() {
-    use gmux_client::clipboard::Formats;
+    use gmux_protocol::clipboard::Formats;
     let mut engine = Engine::new().unwrap();
     engine.resize(1000, 100, 0, 0).unwrap();
     engine.write(
@@ -308,7 +308,7 @@ fn rich_copy_falls_back_after_bounded_styled_expansion_and_keeps_view_selection(
 #[test]
 #[ignore = "copy timing and transient memory measurements"]
 fn copy_measurements() {
-    use gmux_client::clipboard::Formats;
+    use gmux_protocol::clipboard::Formats;
     let case = std::env::var("GMUX_COPY_CASE").unwrap_or_else(|_| "uniform".into());
     let cells = std::env::var("GMUX_COPY_CELLS")
         .ok()
@@ -378,7 +378,7 @@ fn copy_measurements() {
 
 #[test]
 fn deferred_read_feed_preserves_tail_and_native_reply_order() {
-    use gmux_client::clipboard::{ReadDescriptor, ReadResult, ReadStatus};
+    use gmux_protocol::clipboard::{ReadDescriptor, ReadResult, ReadStatus};
     let mut engine = Engine::new().unwrap();
     engine.set_read_enabled(true);
     let chunk = b"before\x1b]52;p;?\x1b\\\x1b[5nafter";
@@ -410,7 +410,7 @@ fn deferred_read_feed_preserves_tail_and_native_reply_order() {
 
 #[test]
 fn checkpoints_exclude_partial_requests_pending_data_and_paste_grants() {
-    use gmux_client::clipboard::{ReadDescriptor, ReadResult, ReadStatus};
+    use gmux_protocol::clipboard::{ReadDescriptor, ReadResult, ReadStatus};
     let mut engine = Engine::new().unwrap();
     engine.set_read_enabled(true);
     engine.write(b"saved history\r\n\x1b[?5522h");

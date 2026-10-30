@@ -1,5 +1,5 @@
 use super::*;
-use gmux_client::transport::{Header, Packet};
+use gmux_protocol::transport::{Header, Packet};
 use std::{hint::black_box, time::Instant};
 
 #[test]
@@ -87,7 +87,7 @@ fn complete_native_clusters_survive_views_history_transport_copy_search_and_refl
         assert!(original[0].blink());
         assert_eq!(
             original[0].underline(),
-            gmux_client::cells::underline::CURLY
+            gmux_protocol::cells::underline::CURLY
         );
         assert_eq!(original[0].fg, [12, 34, 56]);
         assert_eq!(original[width].text(), "X");
@@ -118,7 +118,7 @@ fn complete_native_clusters_survive_views_history_transport_copy_search_and_refl
             header: Header {
                 frame: Some(engine.frame),
                 rows: (0..3).collect(),
-                cache: Some(gmux_client::transport::CachedRows {
+                cache: Some(gmux_protocol::transport::CachedRows {
                     start: 0,
                     row_flags: flags,
                 }),
@@ -132,7 +132,7 @@ fn complete_native_clusters_survive_views_history_transport_copy_search_and_refl
         assert!(decoded.cells == packet.cells);
         engine.select((0, 0), (0, 0), SelectionMode::Cell).unwrap();
         let content = engine
-            .copy_content(gmux_client::clipboard::Formats::TextHtml)
+            .copy_content(gmux_protocol::clipboard::Formats::TextHtml)
             .unwrap();
         assert_eq!(content.text, expected);
         let escaped: String = expected

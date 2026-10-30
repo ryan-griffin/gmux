@@ -1,5 +1,5 @@
 use crate::render::{self, Rect};
-use gmux_client::{
+use gmux_protocol::{
     Cell, Frame,
     cells::{decoration, flags, underline},
     theme::Theme,
@@ -19,7 +19,7 @@ pub struct Scene<'a> {
     pub width: i32,
     pub height: i32,
     pub theme: Theme,
-    pub selection: Option<gmux_client::selection::Selection>,
+    pub selection: Option<gmux_protocol::selection::Selection>,
     /// Half-open range from the hyperlink map captured with this frame.
     pub hovered_link: Option<(usize, usize)>,
     pub matches: &'a [u8],

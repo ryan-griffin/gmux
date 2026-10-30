@@ -37,7 +37,7 @@ mod render;
 mod renderer;
 
 use clap::{Parser, ValueEnum};
-use gmux_client::{
+use gmux_protocol::{
     Cell, Frame,
     cells::{decoration, mouse_shape, underline},
     theme::Theme,
@@ -388,7 +388,7 @@ fn validate_overlapping_fallbacks(
         );
         target.fg = theme.palette[1 + index % 3];
         if index % 3 == 0 {
-            target.flags |= gmux_client::cells::flags::BLINK;
+            target.flags |= gmux_protocol::cells::flags::BLINK;
         }
     }
     let mut scene = scene(&cells, theme);
@@ -585,7 +585,7 @@ fn validate_ligatures(
             scene.matches = &matches;
             scene.text_blink_visible = case != "blink-hidden";
             if case == "selection" {
-                scene.selection = Some(gmux_client::selection::Selection::linear(0, 0));
+                scene.selection = Some(gmux_protocol::selection::Selection::linear(0, 0));
             }
             if case == "cursor" {
                 scene.frame.cursor_x = 1;
@@ -845,7 +845,7 @@ fn validate_cursor_lifecycle(output: &Path) {
     assert_eq!(cursor::timing(&cursor), timing);
     assert_eq!(area.cursor().unwrap().name().as_deref(), Some("pointer"));
     cursor.set_link_hover(true);
-    frame.mouse_shape = gmux_client::cells::mouse_shape::CROSSHAIR;
+    frame.mouse_shape = gmux_protocol::cells::mouse_shape::CROSSHAIR;
     cursor.update(frame, false);
     assert_eq!(area.cursor().unwrap().name().as_deref(), Some("pointer"));
     cursor.set_link_hover(false);
@@ -1150,7 +1150,7 @@ fn validate_batched_patterns(
         s.height = 86;
         s.scale = scale;
         s.origin = origin;
-        s.selection = Some(gmux_client::selection::Selection::linear(1, 19));
+        s.selection = Some(gmux_protocol::selection::Selection::linear(1, 19));
         let expected = gtk::Snapshot::new();
         expected.append_color(
             &rgba(s.frame.background, 1.0),
@@ -1274,7 +1274,7 @@ fn validate_link_hover(
         scene.scale = scale;
         scene.origin = (0.25, 0.5);
         scene.metrics.1 = 21.3;
-        scene.selection = Some(gmux_client::selection::Selection::linear(36, 44));
+        scene.selection = Some(gmux_protocol::selection::Selection::linear(36, 44));
         scene.frame.cursor_visible = 1;
         scene.frame.cursor_style = 1;
         scene.frame.cursor_x = 4;
@@ -1479,7 +1479,7 @@ fn validate_cache(
                 scene.matches = &highlights;
             }
             "selection" => {
-                scene.selection = Some(gmux_client::selection::Selection::linear(42, 45))
+                scene.selection = Some(gmux_protocol::selection::Selection::linear(42, 45))
             }
             "block" => {
                 scene.frame.cursor_visible = 1;
@@ -1621,7 +1621,7 @@ fn validate_text_blink(
     // graphics in the same row. Backgrounds remain visible in both phases.
     for (index, cell) in cells.iter_mut().enumerate() {
         if index % 4 < 2 {
-            cell.flags |= gmux_client::cells::flags::BLINK;
+            cell.flags |= gmux_protocol::cells::flags::BLINK;
         }
         cell.bg = [30, 45, 60];
         cell.decoration = underline::STYLES[(index / 40) % 5]
@@ -1641,8 +1641,8 @@ fn validate_text_blink(
         for cursor_style in [0, 1, 2] {
             for selection in [
                 None,
-                Some(gmux_client::selection::Selection::linear(1, 87)),
-                Some(gmux_client::selection::Selection::rectangle(1, 87, 40)),
+                Some(gmux_protocol::selection::Selection::linear(1, 87)),
+                Some(gmux_protocol::selection::Selection::rectangle(1, 87, 40)),
             ] {
                 let mut renderer = Renderer::new();
                 let mut scene = scene(&cells, theme);
@@ -1673,7 +1673,7 @@ fn validate_text_blink(
                             cell.flags |= 32;
                         }
                         if !shown {
-                            cell.flags &= !gmux_client::cells::flags::BLINK;
+                            cell.flags &= !gmux_protocol::cells::flags::BLINK;
                         }
                     }
                     let expected_scene = Scene {
@@ -1794,7 +1794,7 @@ fn validate_scroll_cache(
             let mut renderer = Renderer::new();
             let mut cells = fixture(theme);
             for cell in cells.iter_mut().step_by(3) {
-                cell.flags |= gmux_client::cells::flags::BLINK;
+                cell.flags |= gmux_protocol::cells::flags::BLINK;
             }
             let mut highlights = vec![0; cells.len()];
             for (step, delta) in [0_isize, 1, -1, 3, -2, 7, -7].into_iter().enumerate() {
@@ -1823,7 +1823,7 @@ fn validate_scroll_cache(
                 scene.scale = scale;
                 scene.origin = origin;
                 if step >= 2 {
-                    scene.selection = Some(gmux_client::selection::Selection::linear(42, 85));
+                    scene.selection = Some(gmux_protocol::selection::Selection::linear(42, 85));
                     highlights.fill(0);
                     highlights[step * 40 + 3] = 1;
                     highlights[step * 40 + 4] = 2;
@@ -1917,7 +1917,7 @@ fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context
     let cells = vec![cell(" ", theme, 0); 320];
     let mut scene = scene(&cells, theme);
     scene.metrics = (10.0, 24.0);
-    scene.selection = Some(gmux_client::selection::Selection::linear(2, 5));
+    scene.selection = Some(gmux_protocol::selection::Selection::linear(2, 5));
     let mut highlights = vec![0; 320];
     highlights[42] = 1;
     highlights[43] = 2;
@@ -1946,7 +1946,7 @@ fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context
     rectangle_cells[46] = cell("", theme, 64);
     scene.cells = &rectangle_cells;
     scene.matches = &[];
-    scene.selection = Some(gmux_client::selection::Selection::rectangle(2, 85, 40));
+    scene.selection = Some(gmux_protocol::selection::Selection::rectangle(2, 85, 40));
     let actual = node(&mut Renderer::new(), &scene, font, context).0;
     let mut expected_cells = rectangle_cells.clone();
     for (row, left, right) in [(0, 1, 5), (1, 2, 6), (2, 2, 5)] {

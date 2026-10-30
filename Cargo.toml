@@ -1,5 +1,5 @@
 [package]
-name = "gmux-core"
+name = "gmux-daemon"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
@@ -9,8 +9,8 @@ build = "build.rs"
 links = "gmux-ghostty"
 
 [workspace]
-members = ["crates/client", "crates/daemon", "crates/gtk"]
-default-members = [".", "crates/client", "crates/daemon", "crates/gtk"]
+members = ["crates/protocol", "crates/platform", "crates/client", "crates/cli", "crates/gtk"]
+default-members = [".", "crates/protocol", "crates/platform", "crates/client", "crates/cli", "crates/gtk"]
 resolver = "3"
 
 [workspace.lints.rust]
@@ -20,13 +20,17 @@ warnings = "deny"
 workspace = true
 
 [dependencies]
-gmux-client = { path = "crates/client" }
+gmux-protocol = { path = "crates/protocol" }
+gmux-platform = { path = "crates/platform" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.9"
 libc = "0.2"
 subtle = "2.6"
+
+[dev-dependencies]
+gmux-client = { path = "crates/client" }
 
 [build-dependencies]
 bindgen = { version = "0.73", default-features = false, features = ["runtime"] }

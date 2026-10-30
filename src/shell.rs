@@ -42,7 +42,10 @@ pub(crate) fn configure(command: &mut CommandBuilder, shell: &Path) {
             command.env_remove("GHOSTTY_BASH_RCFILE");
             command.env_remove("GHOSTTY_BASH_UNEXPORT_HISTFILE");
             if std::env::var_os("HISTFILE").is_none() {
-                command.env("HISTFILE", gmux_client::model::home().join(".bash_history"));
+                command.env(
+                    "HISTFILE",
+                    gmux_platform::unix::paths::home().join(".bash_history"),
+                );
                 command.env("GHOSTTY_BASH_UNEXPORT_HISTFILE", "1");
             }
         }

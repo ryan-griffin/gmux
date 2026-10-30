@@ -1,5 +1,5 @@
 //! Bounded resolution and interruptible Linux TCP connection setup.
-use crate::ipc::Cancellation;
+use gmux_platform::unix::ipc::Cancellation;
 use std::{
     io,
     net::{SocketAddr, TcpStream, ToSocketAddrs},

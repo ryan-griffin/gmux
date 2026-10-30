@@ -1,5 +1,5 @@
 use super::*;
-use gmux_client::retention::{Limit, LimitMode, ScrollbackLimits};
+use gmux_protocol::retention::{Limit, LimitMode, ScrollbackLimits};
 
 fn limits(bytes: Option<usize>, lines: Option<usize>) -> ScrollbackLimits {
     let limit =
@@ -167,7 +167,7 @@ fn restored_history_obeys_limits_before_replay_and_keeps_fresh_shell_state() {
         assert!(!fresh.mode(2004));
         assert_eq!(
             fresh.command_state().phase,
-            gmux_client::shell::CommandPhase::Unknown
+            gmux_protocol::shell::CommandPhase::Unknown
         );
         assert_eq!(fresh.memory_usage().unwrap().prompt_anchors, 0);
     }

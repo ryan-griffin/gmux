@@ -1,4 +1,4 @@
-use gmux_client::{
+use gmux_protocol::{
     model::CursorStyle,
     selection::{Selection, Shape},
     theme::Theme,
@@ -16,7 +16,7 @@ mod ffi {
 use ffi::Frame;
 pub(crate) use ffi::GmuxMemoryUsage as MemoryUsage;
 use ffi::*;
-use gmux_client::Cell;
+use gmux_protocol::Cell;
 
 /// The native bridge lends one complete cell for this synchronous call.
 unsafe extern "C" fn capture_cell(ud: *mut c_void, index: usize, raw: *const GmuxCell) -> bool {
@@ -25,7 +25,7 @@ unsafe extern "C" fn capture_cell(ud: *mut c_void, index: usize, raw: *const Gmu
         return false;
     };
     let raw = unsafe { &*raw };
-    if raw.text_len > gmux_client::cells::MAX_GRAPHEME_BYTES || raw.text.is_null() {
+    if raw.text_len > gmux_protocol::cells::MAX_GRAPHEME_BYTES || raw.text.is_null() {
         return false;
     }
     let bytes = unsafe { std::slice::from_raw_parts(raw.text, raw.text_len) };
@@ -40,7 +40,7 @@ unsafe extern "C" fn capture_cell(ud: *mut c_void, index: usize, raw: *const Gmu
     true
 }
 const _: () = assert!(GMUX_GRAPHEME_MAX_CODEPOINTS == 65);
-const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_client::cells::MAX_GRAPHEME_BYTES);
+const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_protocol::cells::MAX_GRAPHEME_BYTES);
 
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
@@ -196,7 +196,7 @@ fn normalize_history_replay(data: Vec<u8>, cols: u16) -> anyhow::Result<Vec<u8>>
                         // default even when the surrounding text is styled.
                         append(&mut out, b"\x1b[0m")?;
                     }
-                    let spaces = [b' '; gmux_client::viewport::MAX_AXIS];
+                    let spaces = [b' '; gmux_protocol::viewport::MAX_AXIS];
                     append(&mut out, &spaces[..count])?;
                     if sequence[end] == b'C' {
                         append(&mut out, &pen[..pen_len])?;
@@ -226,19 +226,19 @@ struct Events {
     directory_changed: bool,
     progress: crate::progress::RetainedProgress,
     program_status: crate::program_status::Records,
-    clipboard: Vec<gmux_client::clipboard::Write>,
+    clipboard: Vec<gmux_protocol::clipboard::Write>,
     clipboard_bytes: usize,
     read_enabled: bool,
-    read_request: Option<gmux_client::clipboard::ReadRequest>,
+    read_request: Option<gmux_protocol::clipboard::ReadRequest>,
     read_tokens: f64,
     read_refill: Option<std::time::Instant>,
-    command: gmux_client::shell::CommandState,
+    command: gmux_protocol::shell::CommandState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
 const _: () =
-    assert!(GMUX_CLIPBOARD_MAX_BYTES as usize == gmux_client::clipboard::MAX_APPLICATION_BYTES);
+    assert!(GMUX_CLIPBOARD_MAX_BYTES as usize == gmux_protocol::clipboard::MAX_APPLICATION_BYTES);
 const _: () =
-    assert!(GMUX_CLIPBOARD_MAX_CONTENTS as usize == gmux_client::clipboard::MAX_REPRESENTATIONS);
+    assert!(GMUX_CLIPBOARD_MAX_CONTENTS as usize == gmux_protocol::clipboard::MAX_REPRESENTATIONS);
 
 unsafe extern "C" fn clipboard_write(
     ud: *mut c_void,
@@ -246,7 +246,7 @@ unsafe extern "C" fn clipboard_write(
     contents: *const GmuxClipboardContent,
     count: usize,
 ) -> i32 {
-    use gmux_client::clipboard::{self, Destination, InvalidOffer, Offer, Representation, Write};
+    use gmux_protocol::clipboard::{self, Destination, InvalidOffer, Offer, Representation, Write};
     let events = unsafe { &mut *ud.cast::<Events>() };
     if count > clipboard::MAX_REPRESENTATIONS || (count > 0 && contents.is_null()) {
         return GMUX_CLIPBOARD_INVALID as i32;
@@ -318,7 +318,7 @@ unsafe extern "C" fn clipboard_write(
     GMUX_CLIPBOARD_SUCCESS as i32
 }
 unsafe extern "C" fn clipboard_read(ud: *mut c_void, request: *const GmuxClipboardRead) -> i32 {
-    use gmux_client::clipboard::{Destination, ReadRequest, valid_mime};
+    use gmux_protocol::clipboard::{Destination, ReadRequest, valid_mime};
     let events = unsafe { &mut *ud.cast::<Events>() };
     let request = unsafe { &*request };
     if !events.read_enabled {
@@ -387,7 +387,7 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
         3 => events.directory_changed = true,
         4 if len == 2 => {
             let bytes = bytes();
-            use gmux_client::progress::ProgressState;
+            use gmux_protocol::progress::ProgressState;
             let state = match u32::from(bytes[0]) {
                 GMUX_PROGRESS_INACTIVE => ProgressState::Inactive,
                 GMUX_PROGRESS_DETERMINATE => ProgressState::Determinate,
@@ -404,7 +404,7 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
         5 if len == std::mem::size_of::<GmuxCommandEvent>() => {
             // The report and command text are borrowed only for this call.
             let report = unsafe { &*data.cast::<GmuxCommandEvent>() };
-            use gmux_client::shell::CommandPhase;
+            use gmux_protocol::shell::CommandPhase;
             let state = &mut events.command;
             match report.kind {
                 1 | 2 => {
@@ -456,7 +456,7 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
             events.directory_changed = true;
         }
         7 if len == std::mem::size_of::<GmuxProgramStatusEvent>() => {
-            use gmux_client::program_status::{Kind, State};
+            use gmux_protocol::program_status::{Kind, State};
             let report = unsafe { &*data.cast::<GmuxProgramStatusEvent>() };
             // All strings have been validated and decoded by the pinned parser.
             // Copy during this synchronous callback, never queue borrowed data.
@@ -508,14 +508,14 @@ pub struct Engine {
     pub frame: Frame,
     pub cells: Vec<Cell>,
     pub row_flags: Vec<u8>,
-    pub hyperlinks: gmux_client::hyperlinks::Hyperlinks,
+    pub hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     held_cells: Vec<Cell>,
     held_row_flags: Vec<u8>,
-    held_hyperlinks: gmux_client::hyperlinks::Hyperlinks,
+    held_hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     link_revision: u64,
     held_link_revision: u64,
     size: (u16, u16),
-    find: gmux_client::search::HistorySearch,
+    find: gmux_protocol::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
 }
@@ -524,7 +524,7 @@ pub struct Engine {
 pub(crate) struct EngineView {
     raw: NonNull<GmuxView>,
     held_frame: Frame,
-    find: gmux_client::search::HistorySearch,
+    find: gmux_protocol::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
 }
@@ -570,20 +570,20 @@ impl EngineView {
         self.find.restart();
     }
 }
-use gmux_client::cells::viewport_text;
+use gmux_protocol::cells::viewport_text;
 impl Drop for EngineView {
     fn drop(&mut self) {
         unsafe { gmux_engine_view_free(self.raw.as_ptr()) }
     }
 }
 impl Engine {
-    pub(crate) fn command_state(&self) -> gmux_client::shell::CommandState {
+    pub(crate) fn command_state(&self) -> gmux_protocol::shell::CommandState {
         let mut state = self.events.command.clone();
         state.at_prompt = unsafe { gmux_engine_cursor_at_prompt(self.raw.as_ptr()) };
         state
     }
     pub(crate) fn semantic_busy(&self) -> bool {
-        self.events.command.phase == gmux_client::shell::CommandPhase::Running
+        self.events.command.phase == gmux_protocol::shell::CommandPhase::Running
     }
     pub(crate) fn prompt(&mut self, previous: bool) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_prompt(self.raw.as_ptr(), previous) };
@@ -612,7 +612,7 @@ impl Engine {
     }
     pub(crate) fn set_scrollback_limits(
         &mut self,
-        limits: gmux_client::retention::ScrollbackLimits,
+        limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<()> {
         let (max_bytes, max_lines) = limits.resolve_values()?;
         let limit = |value: Option<usize>| GmuxRetentionLimit {
@@ -670,7 +670,7 @@ impl Engine {
     pub(crate) fn set_read_enabled(&mut self, enabled: bool) {
         self.events.read_enabled = enabled;
     }
-    pub(crate) fn take_read_request(&mut self) -> Option<gmux_client::clipboard::ReadRequest> {
+    pub(crate) fn take_read_request(&mut self) -> Option<gmux_protocol::clipboard::ReadRequest> {
         self.events.read_request.take()
     }
     pub(crate) fn read_pending(&self) -> u64 {
@@ -685,7 +685,7 @@ impl Engine {
     }
     pub(crate) fn complete_read(
         &mut self,
-        result: &gmux_client::clipboard::ReadResult,
+        result: &gmux_protocol::clipboard::ReadResult,
         data: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
@@ -743,10 +743,10 @@ impl Engine {
     }
     pub(crate) fn user_paste(
         &mut self,
-        destination: gmux_client::clipboard::Destination,
+        destination: gmux_protocol::clipboard::Destination,
         mimes: &[String],
     ) -> anyhow::Result<Vec<u8>> {
-        gmux_client::clipboard::validate_targets(mimes)?;
+        gmux_protocol::clipboard::validate_targets(mimes)?;
         let names: Vec<_> = mimes
             .iter()
             .map(|s| GmuxText {
@@ -782,7 +782,7 @@ impl Engine {
         }
         (changed, consumed)
     }
-    pub(crate) fn take_clipboard_writes(&mut self) -> Vec<gmux_client::clipboard::Write> {
+    pub(crate) fn take_clipboard_writes(&mut self) -> Vec<gmux_protocol::clipboard::Write> {
         self.events.clipboard_bytes = 0;
         std::mem::take(&mut self.events.clipboard)
     }
@@ -799,7 +799,7 @@ impl Engine {
         Ok(EngineView {
             raw: NonNull::new(unsafe { gmux_engine_view_new(self.raw.as_ptr()) })
                 .ok_or_else(|| anyhow::anyhow!("Could not create terminal view"))?,
-            find: gmux_client::search::HistorySearch::default(),
+            find: gmux_protocol::search::HistorySearch::default(),
             find_row: Vec::new(),
             retention_revision: 0,
             held_frame: Frame::default(),
@@ -908,7 +908,7 @@ impl Engine {
             "Invalid Ghostty snapshot or history exceeds restore budget"
         );
         anyhow::ensure!(
-            gmux_client::viewport::valid(cols as u64, rows as u64),
+            gmux_protocol::viewport::valid(cols as u64, rows as u64),
             "Invalid snapshot dimensions"
         );
         text = normalize_history_replay(text, cols)?;
@@ -950,7 +950,7 @@ impl Engine {
             row_flags: vec![0; 24],
             hyperlinks: Default::default(),
             size: (80, 24),
-            find: gmux_client::search::HistorySearch::default(),
+            find: gmux_protocol::search::HistorySearch::default(),
             find_row: Vec::new(),
             retention_revision: 0,
             held_cells: Vec::new(),
@@ -988,7 +988,7 @@ impl Engine {
         anyhow::ensure!(result == 0, "Ghostty theme update failed ({result})");
         Ok(())
     }
-    pub(crate) fn progress(&self) -> gmux_client::progress::Progress {
+    pub(crate) fn progress(&self) -> gmux_protocol::progress::Progress {
         self.events.progress.value
     }
     pub(crate) fn program_status(&self) -> &crate::program_status::Records {
@@ -1056,7 +1056,7 @@ impl Engine {
         let mut links = std::mem::take(&mut self.hyperlinks);
         links.spans.clear();
         struct Capture<'a> {
-            links: &'a mut gmux_client::hyperlinks::Hyperlinks,
+            links: &'a mut gmux_protocol::hyperlinks::Hyperlinks,
             targets: usize,
         }
         unsafe extern "C" fn collect(
@@ -1111,7 +1111,7 @@ impl Engine {
         let count = range
             .end
             .checked_sub(range.start)
-            .filter(|count| *count <= gmux_client::scroll_cache::capacity(cols) as u64)
+            .filter(|count| *count <= gmux_protocol::scroll_cache::capacity(cols) as u64)
             .ok_or_else(|| anyhow::anyhow!("Invalid scrollback cache range"))?
             as usize;
         let start = u32::try_from(range.start)?;
@@ -1178,7 +1178,7 @@ impl Engine {
         }
         true
     }
-    pub fn find_state(&self) -> gmux_client::search::FindState {
+    pub fn find_state(&self) -> gmux_protocol::search::FindState {
         self.find
             .state(self.frame.scrollback.offset, self.cells.len())
     }
@@ -1241,22 +1241,22 @@ impl Engine {
             })
     }
     pub fn copy(&self) -> anyhow::Result<String> {
-        self.format_copy(false, gmux_client::transport::MAX_PASTE)
+        self.format_copy(false, gmux_protocol::transport::MAX_PASTE)
             .map(|(text, _)| text)
     }
     pub fn copy_content(
         &self,
-        formats: gmux_client::clipboard::Formats,
-    ) -> anyhow::Result<gmux_client::clipboard::Content> {
+        formats: gmux_protocol::clipboard::Formats,
+    ) -> anyhow::Result<gmux_protocol::clipboard::Content> {
         let text = self.copy()?;
-        let html = if formats == gmux_client::clipboard::Formats::TextHtml {
-            self.format_copy(true, gmux_client::clipboard::MAX_HTML)
+        let html = if formats == gmux_protocol::clipboard::Formats::TextHtml {
+            self.format_copy(true, gmux_protocol::clipboard::MAX_HTML)
                 .ok()
                 .and_then(|(raw, colors)| copy_html::normalize(&raw, &text, &colors))
         } else {
             None
         };
-        let mut content = gmux_client::clipboard::Content { text, html };
+        let mut content = gmux_protocol::clipboard::Content { text, html };
         content.bound_html();
         Ok(content)
     }
@@ -1410,8 +1410,8 @@ impl Drop for Engine {
 
 #[cfg(test)]
 mod tests {
-    fn layout(unshifted: u32) -> gmux_client::transport::KeyLayout {
-        gmux_client::transport::KeyLayout {
+    fn layout(unshifted: u32) -> gmux_protocol::transport::KeyLayout {
+        gmux_protocol::transport::KeyLayout {
             unshifted,
             ..Default::default()
         }
@@ -2340,7 +2340,7 @@ mod tests {
     }
     #[test]
     fn viewport_selection_matches_engine_bounds_across_wraps_wide_cells_and_empty_cells() {
-        use gmux_client::{selection::Preview, session::ScreenSnapshot};
+        use gmux_protocol::{selection::Preview, session::ScreenSnapshot};
         let mut engine = Engine::new().unwrap();
         engine.resize(12, 6, 8, 16).unwrap();
         let mut preview = Preview::default();
@@ -3477,7 +3477,7 @@ mod tests {
 
     #[test]
     fn decoration_styles_colors_resets_and_held_frames() {
-        use gmux_client::cells::{decoration, underline};
+        use gmux_protocol::cells::{decoration, underline};
         let mut e = Engine::new().unwrap();
         let dark = Theme::adwaita(true);
         e.set_theme(&dark).unwrap();
@@ -3564,7 +3564,7 @@ mod tests {
 
     #[test]
     fn mouse_shape_defaults_unknown_names_reset_and_sync_output() {
-        use gmux_client::cells::mouse_shape;
+        use gmux_protocol::cells::mouse_shape;
         let mut e = Engine::new().unwrap();
         for (sequence, shape) in [
             ("", mouse_shape::TEXT),
@@ -3669,7 +3669,7 @@ mod search_tests;
 #[cfg(test)]
 mod progress_tests {
     use super::*;
-    use gmux_client::progress::{Progress, ProgressState::*};
+    use gmux_protocol::progress::{Progress, ProgressState::*};
     #[test]
     fn pinned_reports_resolve_values_reset_and_do_not_modify_viewport() {
         let mut engine = Engine::new().unwrap();

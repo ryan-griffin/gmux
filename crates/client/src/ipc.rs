@@ -1,89 +1,18 @@
+//! Execution endpoints and ordered request workers.
+use gmux_platform::unix::ipc::{
+    Cancellation, Wake, call_at_cancellable, companion_path, socket_path,
+};
 use serde_json::Value;
 use std::{
-    io::{BufRead, BufReader, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
+    io::Write,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::UnixStream,
     },
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     time::Duration,
 };
-
-// Leave time for durable execution saves and GTK organization updates.
-const RESPONSE_TIMEOUT: Duration = crate::network::CONTROL_TIMEOUT
-    .saturating_add(crate::network::TIMEOUT)
-    .saturating_add(crate::network::TIMEOUT);
-
-/// Coalesced, nonblocking notifications for a poll loop or GLib fd source.
-#[derive(Clone)]
-pub struct Wake(Arc<OwnedFd>);
-
-impl Wake {
-    pub fn new() -> std::io::Result<Self> {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) })))
-    }
-
-    pub fn notify(&self) {
-        let value = 1u64;
-        loop {
-            let result = unsafe { libc::write(self.as_raw_fd(), (&value as *const u64).cast(), 8) };
-            if result >= 0
-                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                break;
-            }
-        }
-    }
-
-    pub fn drain(&self) {
-        let mut value = 0u64;
-        loop {
-            let result =
-                unsafe { libc::read(self.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
-            if result >= 0
-                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                break;
-            }
-        }
-    }
-}
-
-impl AsRawFd for Wake {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-pub struct Request {
-    pub body: Value,
-    pub reply: mpsc::SyncSender<Value>,
-}
-pub struct Server {
-    pub receiver: mpsc::Receiver<Request>,
-    path: PathBuf,
-    stop: Wake,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-pub fn socket_path() -> PathBuf {
-    std::env::var_os("GMUX_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::temp_dir().join(format!("gmux-{}", unsafe { libc::getuid() }))
-                })
-                .join("gmux.sock")
-        })
-}
-
 /// An execution destination. Connecting never starts a daemon.
 #[derive(Clone)]
 pub enum Endpoint {
@@ -94,11 +23,11 @@ pub enum Endpoint {
     Tcp {
         address: String,
         credentials: crate::network::Credentials,
-        daemon: Option<crate::model::DaemonId>,
+        daemon: Option<gmux_protocol::model::DaemonId>,
     },
     Saved {
         name: String,
-        daemon: Option<crate::model::DaemonId>,
+        daemon: Option<gmux_protocol::model::DaemonId>,
     },
 }
 impl Endpoint {
@@ -108,13 +37,13 @@ impl Endpoint {
     pub fn unix(control: PathBuf, stream: PathBuf) -> Self {
         Self::Unix { control, stream }
     }
-    pub fn remote(name: String, daemon: Option<crate::model::DaemonId>) -> Self {
+    pub fn remote(name: String, daemon: Option<gmux_protocol::model::DaemonId>) -> Self {
         Self::Saved { name, daemon }
     }
     pub fn tcp(
         address: String,
         credentials: crate::network::Credentials,
-        daemon: Option<crate::model::DaemonId>,
+        daemon: Option<gmux_protocol::model::DaemonId>,
     ) -> Self {
         Self::Tcp {
             address,
@@ -125,22 +54,25 @@ impl Endpoint {
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Unix { .. })
     }
-    pub fn pin(&mut self, id: crate::model::DaemonId) {
+    pub fn pin(&mut self, id: gmux_protocol::model::DaemonId) {
         match self {
             Self::Tcp { daemon, .. } | Self::Saved { daemon, .. } => *daemon = Some(id),
             Self::Unix { .. } => (),
         }
     }
-    fn resolve(name: &str, daemon: Option<crate::model::DaemonId>) -> anyhow::Result<Self> {
+    fn resolve(name: &str, daemon: Option<gmux_protocol::model::DaemonId>) -> anyhow::Result<Self> {
         Self::resolve_inner(name, daemon).map_err(crate::network::ConnectionRejected::from_error)
     }
-    fn resolve_inner(name: &str, daemon: Option<crate::model::DaemonId>) -> anyhow::Result<Self> {
+    fn resolve_inner(
+        name: &str,
+        daemon: Option<gmux_protocol::model::DaemonId>,
+    ) -> anyhow::Result<Self> {
         let remote = crate::connections::Catalog::load()?
             .remote(name, daemon)?
             .clone();
         Ok(Self::tcp(
             remote.address,
-            remote.authentication.credentials()?,
+            crate::network::credentials(&remote.authentication)?,
             Some(remote.daemon),
         ))
     }
@@ -160,13 +92,13 @@ impl Endpoint {
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<Value> {
         match self {
-            Self::Unix { control, .. } => call_at_inner(control, body, cancellation),
+            Self::Unix { control, .. } => call_at_cancellable(control, body, cancellation),
             Self::Tcp {
                 address,
                 credentials,
                 daemon,
             } => {
-                use crate::control::{InternalRequest, Request};
+                use gmux_protocol::control::{InternalRequest, Request};
                 let request = Request::decode(body)?;
                 if matches!(request, Request::Internal(InternalRequest::Hello)) {
                     let client = crate::network::Client::connect_cancellable(
@@ -176,7 +108,7 @@ impl Endpoint {
                         cancellation,
                     )?;
                     return Ok(
-                        serde_json::json!({"version":crate::transport::VERSION,"daemon":client.daemon,
+                        serde_json::json!({"version":gmux_protocol::transport::VERSION,"daemon":client.daemon,
                         "hostname":client.hostname,"home_directory":client.home_directory,
                         "machine_kind":client.machine_kind,"quitting":false}),
                     );
@@ -188,9 +120,7 @@ impl Endpoint {
                 })?;
                 let reply = self.execute(&request, cancellation)?;
                 if output_only {
-                    return Ok(serde_json::to_value(
-                        crate::control::CommandOutcome::from_execution(reply)?,
-                    )?);
+                    return Ok(serde_json::to_value(command_outcome(reply)?)?);
                 }
                 Ok(reply)
             }
@@ -203,11 +133,11 @@ impl Endpoint {
     /// execution state; callers decide how to display their command results.
     pub fn execute(
         &self,
-        request: &crate::control::ExecutionRequest,
+        request: &gmux_protocol::control::ExecutionRequest,
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<Value> {
         match self {
-            Self::Unix { control, .. } => call_at_inner(
+            Self::Unix { control, .. } => call_at_cancellable(
                 control,
                 serde_json::json!({"method":"_execution","request":request}),
                 cancellation,
@@ -231,19 +161,19 @@ impl Endpoint {
     pub fn state(
         &self,
         cancellation: Option<&Cancellation>,
-    ) -> anyhow::Result<crate::control::CommandReply> {
+    ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
         Ok(serde_json::from_value(self.execute(
-            &crate::control::ExecutionRequest::State,
+            &gmux_protocol::control::ExecutionRequest::State,
             cancellation,
         )?)?)
     }
     /// Apply a layout command and receive its typed result and execution state.
     pub fn command(
         &self,
-        command: crate::control::Command,
+        command: gmux_protocol::control::Command,
         cancellation: Option<&Cancellation>,
-    ) -> anyhow::Result<crate::control::CommandReply> {
-        let request = crate::control::InternalRequest::Command { command };
+    ) -> anyhow::Result<gmux_protocol::control::CommandReply> {
+        let request = gmux_protocol::control::InternalRequest::Command { command };
         let value = match cancellation {
             Some(c) => self.call_cancellable(request, c)?,
             None => self.call(request)?,
@@ -254,9 +184,9 @@ impl Endpoint {
     /// an execution snapshot; TCP replies are reduced at the control API boundary.
     pub fn command_result(
         &self,
-        command: crate::control::Command,
+        command: gmux_protocol::control::Command,
         cancellation: Option<&Cancellation>,
-    ) -> anyhow::Result<crate::control::CommandOutcome> {
+    ) -> anyhow::Result<gmux_protocol::control::CommandOutcome> {
         let value = match cancellation {
             Some(c) => self.call_cancellable(command, c)?,
             None => self.call(command)?,
@@ -266,8 +196,32 @@ impl Endpoint {
     /// Stop execution and return after this daemon has shut down.
     pub fn stop(&self, cancellation: Option<&Cancellation>) -> anyhow::Result<Value> {
         match self {
-            Self::Unix { .. } => crate::local::stop(self, cancellation),
-            Self::Tcp { .. } => self.execute(&crate::control::ExecutionRequest::Stop, cancellation),
+            Self::Unix { .. } => {
+                let hello = match cancellation {
+                    Some(c) => {
+                        self.call_cancellable(gmux_protocol::control::InternalRequest::Hello, c)?
+                    }
+                    None => self.call(gmux_protocol::control::InternalRequest::Hello)?,
+                };
+                let pid = hello["pid"]
+                    .as_u64()
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .ok_or_else(|| anyhow::anyhow!("Daemon handshake requires a process ID"))?;
+                gmux_platform::unix::local::stop(
+                    pid,
+                    || {
+                        self.execute(
+                            &gmux_protocol::control::ExecutionRequest::Stop,
+                            cancellation,
+                        )
+                    },
+                    cancellation,
+                )
+            }
+            Self::Tcp { .. } => self.execute(
+                &gmux_protocol::control::ExecutionRequest::Stop,
+                cancellation,
+            ),
             Self::Saved { name, daemon } => Self::resolve(name, *daemon)?.stop(cancellation),
         }
     }
@@ -297,7 +251,7 @@ impl Endpoint {
                 let (stream, _) = crate::network::connect_cancellable(
                     address,
                     credentials,
-                    crate::network::Channel::Stream,
+                    gmux_protocol::network::Channel::Stream,
                     *daemon,
                     cancellation,
                 )?;
@@ -311,6 +265,14 @@ impl Endpoint {
         }
     }
 }
+/// Reduce an execution snapshot to the public command result at the client boundary.
+fn command_outcome(mut reply: Value) -> anyhow::Result<gmux_protocol::control::CommandOutcome> {
+    Ok(gmux_protocol::control::CommandOutcome {
+        daemon: serde_json::from_value(reply["daemon"].take())?,
+        result: serde_json::from_value(reply["result"].take())?,
+    })
+}
+
 /// A direct daemon stream over a Unix socket or TCP.
 pub enum Stream {
     Unix(UnixStream),
@@ -381,241 +343,6 @@ impl AsRawFd for Stream {
             Self::Tcp(s) => s.as_raw_fd(),
         }
     }
-}
-
-impl Server {
-    pub fn start_at(path: PathBuf, wake: Wake) -> anyhow::Result<Self> {
-        if UnixStream::connect(&path).is_ok() {
-            anyhow::bail!("gmux is already listening on {}", path.display());
-        }
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
-        if path.exists() {
-            use std::os::unix::fs::FileTypeExt;
-            anyhow::ensure!(
-                std::fs::symlink_metadata(&path)?.file_type().is_socket(),
-                "Refusing to replace a non-socket file at {}",
-                path.display()
-            );
-            std::fs::remove_file(&path)?;
-        }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        let stop = Wake::new()?;
-        let stopping = stop.clone();
-        let (sender, receiver) = mpsc::sync_channel(32);
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let thread = std::thread::spawn(move || {
-            let mut fds = [
-                libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stopping.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            loop {
-                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if fds[1].revents != 0 {
-                    break;
-                }
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            || error.kind() == std::io::ErrorKind::Interrupted =>
-                    {
-                        continue;
-                    }
-                    Err(_) => break,
-                };
-                use std::sync::atomic::Ordering;
-                if active.fetch_add(1, Ordering::Relaxed) >= 64 {
-                    active.fetch_sub(1, Ordering::Relaxed);
-                    continue;
-                }
-                let active = active.clone();
-                let sender = sender.clone();
-                let wake = wake.clone();
-                std::thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                    let mut line = String::new();
-                    use std::io::Read;
-                    let response = if BufReader::new(&stream)
-                        .take(1_048_577)
-                        .read_line(&mut line)
-                        .is_err()
-                    {
-                        serde_json::json!({"error": "Could not read request"})
-                    } else if line.len() > 1_048_576 {
-                        serde_json::json!({"error": "Request is too large"})
-                    } else if let Ok(body) = serde_json::from_str(&line) {
-                        let (reply, response) = mpsc::sync_channel(1);
-                        if sender.try_send(Request { body, reply }).is_err() {
-                            serde_json::json!({"error": "Request queue is full"})
-                        } else {
-                            wake.notify();
-                            response.recv_timeout(RESPONSE_TIMEOUT).unwrap_or_else(
-                                |_| serde_json::json!({"error": "Application did not respond"}),
-                            )
-                        }
-                    } else {
-                        serde_json::json!({"error": "Invalid JSON request"})
-                    };
-                    let _ = writeln!(stream, "{response}");
-                    active.fetch_sub(1, Ordering::Relaxed);
-                });
-            }
-        });
-        Ok(Self {
-            receiver,
-            path,
-            stop,
-            thread: Some(thread),
-        })
-    }
-}
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop.notify();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-pub fn call(request: impl serde::Serialize) -> anyhow::Result<Value> {
-    call_at(&socket_path(), request)
-}
-pub fn call_at(path: &Path, request: impl serde::Serialize) -> anyhow::Result<Value> {
-    call_at_inner(path, request, None)
-}
-/// Probe a client socket, returning None only when no request could have been sent.
-pub fn call_if_running(
-    path: &Path,
-    request: impl serde::Serialize,
-    cancellation: Option<&Cancellation>,
-) -> anyhow::Result<Option<Value>> {
-    if let Some(cancellation) = cancellation {
-        cancellation.check()?;
-    }
-    let stream = match UnixStream::connect(path) {
-        Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            if let Some(cancellation) = cancellation {
-                cancellation.check()?;
-            }
-            return Ok(None);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    call_on(stream, request, cancellation).map(Some)
-}
-
-/// Interrupt one active control call or stream handshake without waiting for its socket timeout.
-#[derive(Clone, Default)]
-pub struct Cancellation(Arc<Mutex<CancelableCall>>);
-#[derive(Default)]
-struct CancelableCall {
-    stopped: bool,
-    socket: Option<OwnedFd>,
-}
-impl Cancellation {
-    pub fn cancel(&self) {
-        let mut call = self.0.lock().unwrap();
-        call.stopped = true;
-        if let Some(socket) = &call.socket {
-            unsafe {
-                libc::shutdown(socket.as_raw_fd(), libc::SHUT_RDWR);
-            }
-        }
-    }
-    pub fn check(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.0.lock().unwrap().stopped, "Request canceled");
-        Ok(())
-    }
-    pub fn register(&self, socket: &impl AsRawFd) -> anyhow::Result<ActiveCall> {
-        let mut call = self.0.lock().unwrap();
-        anyhow::ensure!(!call.stopped, "Request canceled");
-        anyhow::ensure!(
-            call.socket.is_none(),
-            "Request worker already has an active call"
-        );
-        let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        call.socket = Some(unsafe { OwnedFd::from_raw_fd(fd) });
-        Ok(ActiveCall(self.clone()))
-    }
-}
-pub struct ActiveCall(Cancellation);
-impl Drop for ActiveCall {
-    fn drop(&mut self) {
-        self.0.0.lock().unwrap().socket.take();
-    }
-}
-fn call_at_inner(
-    path: &Path,
-    request: impl serde::Serialize,
-    cancellation: Option<&Cancellation>,
-) -> anyhow::Result<Value> {
-    if let Some(cancellation) = cancellation {
-        cancellation.check()?;
-    }
-    let stream = UnixStream::connect(path).map_err(|e| {
-        anyhow::anyhow!(
-            "Cannot connect to gmux at {}: {e}. Run gmux serve first.",
-            path.display()
-        )
-    })?;
-    call_on(stream, request, cancellation)
-}
-fn call_on(
-    mut stream: UnixStream,
-    request: impl serde::Serialize,
-    cancellation: Option<&Cancellation>,
-) -> anyhow::Result<Value> {
-    let _active = cancellation
-        .map(|cancellation| cancellation.register(&stream))
-        .transpose()?;
-    stream.set_read_timeout(Some(RESPONSE_TIMEOUT + Duration::from_secs(1)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(6)))?;
-    let result = (|| {
-        serde_json::to_writer(&mut stream, &request)?;
-        stream.write_all(b"\n")?;
-        let mut response = String::new();
-        BufReader::new(stream).read_line(&mut response)?;
-        let value: Value = serde_json::from_str(&response)?;
-        if let Some(error) = value.get("error") {
-            anyhow::bail!("{}", error.as_str().unwrap_or("Request failed"));
-        }
-        Ok(value)
-    })();
-    if let Some(cancellation) = cancellation {
-        cancellation.check()?;
-    }
-    result
 }
 
 enum Operation<R> {
@@ -788,116 +515,14 @@ impl<R: Send + 'static> Drop for Client<R> {
     }
 }
 
-/// Separate sockets share the explicitly selected runtime directory.
-pub fn companion_path(suffix: &str) -> PathBuf {
-    companion_at(&socket_path(), suffix)
-}
-pub fn companion_at(path: &Path, suffix: &str) -> PathBuf {
-    let mut path = path.as_os_str().to_os_string();
-    path.push(suffix);
-    PathBuf::from(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn client_probe_falls_back_only_before_sending_a_request() {
-        let path = std::env::temp_dir().join(format!(
-            "gmux-client-probe-{}.sock",
-            crate::model::DaemonId::generate().unwrap()
-        ));
-        let request = serde_json::json!({"method":"new"});
-        assert!(call_if_running(&path, &request, None).unwrap().is_none());
-        let listener = UnixListener::bind(&path).unwrap();
-        drop(listener);
-        assert!(path.exists());
-        assert!(call_if_running(&path, &request, None).unwrap().is_none());
-        std::fs::remove_file(&path).unwrap();
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut line = String::new();
-            BufReader::new(socket).read_line(&mut line).unwrap();
-            assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), request);
-            // A crash after accepting a mutation must never resubmit it elsewhere.
-        });
-        assert!(call_if_running(&path, serde_json::json!({"method":"new"}), None).is_err());
-        server.join().unwrap();
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn canceling_a_client_probe_interrupts_the_reply_without_triggering_offline_fallback() {
-        let path = std::env::temp_dir().join(format!(
-            "gmux-cancel-probe-{}.sock",
-            crate::model::DaemonId::generate().unwrap()
-        ));
-        let server = Server::start_at(path.clone(), Wake::new().unwrap()).unwrap();
-        let cancellation = Cancellation::default();
-        let calls = cancellation.clone();
-        let control = path.clone();
-        let worker = std::thread::spawn(move || {
-            call_if_running(
-                &control,
-                serde_json::json!({"method":"remote-access-get"}),
-                Some(&calls),
-            )
-        });
-        let held = server
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        cancellation.cancel();
-        let started = std::time::Instant::now();
-        assert_eq!(
-            worker.join().unwrap().unwrap_err().to_string(),
-            "Request canceled"
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
-        drop(held);
-        drop(server);
-        assert!(
-            call_if_running(
-                &path,
-                serde_json::json!({"method":"remote-access-get"}),
-                Some(&cancellation)
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn dropping_a_server_releases_its_listener_and_allows_restarting() {
-        let path = std::env::temp_dir().join(format!(
-            "gmux-server-lifecycle-test-{}.sock",
-            std::process::id()
-        ));
-        let wake = Wake::new().unwrap();
-        let retained_wake = Arc::downgrade(&wake.0);
-        let server = Server::start_at(path.clone(), wake).unwrap();
-        assert!(retained_wake.upgrade().is_some());
-        drop(server);
-        assert!(retained_wake.upgrade().is_none());
-        assert!(!path.exists());
-
-        let server = Server::start_at(path.clone(), Wake::new().unwrap()).unwrap();
-        let client = std::thread::spawn(move || {
-            call_at(&path, serde_json::json!({"method": "hello"})).unwrap()
-        });
-        let request = server
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(request.body["method"], "hello");
-        request.reply.send(serde_json::json!({"ok": true})).unwrap();
-        assert_eq!(client.join().unwrap()["ok"], true);
-    }
-
+    use gmux_platform::unix::ipc::{call_at, companion_at};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixListener,
+    };
     #[test]
     fn slow_requests_leave_the_caller_free_and_automatic_updates_preserve_command_order() {
         let path =
@@ -977,32 +602,5 @@ mod tests {
         assert_eq!(seen[4]["tab"], 3);
         assert_eq!(seen[5]["session"]["width"], 3);
         std::fs::remove_file(path).unwrap();
-    }
-    #[test]
-    fn wake_coalesces_notifications_and_rearms_after_drain() {
-        let wake = Wake::new().unwrap();
-        let mut fd = libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = |fd: &mut libc::pollfd| unsafe { libc::poll(fd, 1, 0) };
-        wake.drain();
-        assert_eq!(ready(&mut fd), 0);
-        let writer = wake.clone();
-        std::thread::spawn(move || {
-            for _ in 0..1000 {
-                writer.notify();
-            }
-        })
-        .join()
-        .unwrap();
-        assert_eq!(ready(&mut fd), 1);
-        wake.drain();
-        assert_eq!(ready(&mut fd), 0);
-        wake.notify();
-        assert_eq!(ready(&mut fd), 1);
-        wake.drain();
-        assert_eq!(ready(&mut fd), 0);
     }
 }

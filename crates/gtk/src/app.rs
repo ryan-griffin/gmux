@@ -165,7 +165,7 @@ struct Windows {
     retired: RefCell<Vec<Rc<crate::client::backend::Backend>>>,
     retire_source: RefCell<Option<glib::SourceId>>,
     next_id: Cell<u64>,
-    server: RefCell<Option<ipc::Server>>,
+    server: RefCell<Option<gmux_platform::unix::ipc::Server>>,
     source: RefCell<Option<glib::SourceId>>,
     local: local::LocalDaemon,
 }
@@ -218,9 +218,9 @@ impl Windows {
             *self.preferences.borrow_mut() = Some(preferences);
         }
         if self.server.borrow().is_none() {
-            let wake = ipc::Wake::new()?;
-            *self.server.borrow_mut() = Some(ipc::Server::start_at(
-                ipc::companion_path(".ui"),
+            let wake = gmux_platform::unix::ipc::Wake::new()?;
+            *self.server.borrow_mut() = Some(gmux_platform::unix::ipc::Server::start_at(
+                gmux_platform::unix::ipc::companion_path(".ui"),
                 wake.clone(),
             )?);
             let weak = Rc::downgrade(self);
@@ -288,7 +288,7 @@ impl Windows {
         ui.window.present();
         Ok(ui)
     }
-    fn route(self: &Rc<Self>, request: ipc::Request) {
+    fn route(self: &Rc<Self>, request: gmux_platform::unix::ipc::Request) {
         let window = request.body.get("window").cloned();
         let connection = request
             .body

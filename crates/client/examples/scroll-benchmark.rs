@@ -1,9 +1,8 @@
 //! Isolate client scroll latency with a simulated round trip, in milliseconds.
 //! Pass 0 for Unix socket latency; the default is 100 ms.
-use gmux_client::{
-    Cell, Frame, Scrollback, ipc,
-    model::DaemonId,
-    remote::SessionManager,
+use gmux_client::{ipc, remote::SessionManager};
+use gmux_protocol::{
+    Cell, Frame, Scrollback,
     theme::Theme,
     transport::{CachedRows, Header, Metadata, Packet},
 };
@@ -101,8 +100,8 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
     });
     let mut manager = SessionManager::from_stream(
         ipc::Endpoint::local(),
-        ipc::Wake::new()?,
-        DaemonId::generate()?,
+        gmux_platform::unix::ipc::Wake::new()?,
+        gmux_platform::unix::identity::daemon_id()?,
         client,
     )?;
     manager.install_metadata(&[meta], 0);
@@ -136,8 +135,8 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
     Ok(
         serde_json::json!({ "cached": cached, "samples": timings.len(),
         "median_ms": timings[timings.len()/2], "p95_ms": timings[timings.len()*95/100],
-        "cache_budget_bytes": gmux_client::scroll_cache::MAX_BYTES,
-        "cache_rows": if cached { gmux_client::scroll_cache::capacity(80).min(24*5) } else { 0 } }),
+        "cache_budget_bytes": gmux_protocol::scroll_cache::MAX_BYTES,
+        "cache_rows": if cached { gmux_protocol::scroll_cache::capacity(80).min(24*5) } else { 0 } }),
     )
 }
 

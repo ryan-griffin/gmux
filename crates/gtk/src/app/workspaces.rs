@@ -410,7 +410,7 @@ impl Ui {
             .or_else(|| {
                 tab_directory
                     .as_ref()
-                    .map(|(_, path)| model::directory_name(path))
+                    .map(|(_, path)| gmux_platform::unix::paths::directory_name(path))
             })
             .unwrap_or_default();
         let name = adw::EntryRow::builder()
@@ -493,9 +493,9 @@ impl Ui {
                     };
                     let path = selected.borrow();
                     let initial_folder = if path.as_os_str().is_empty() {
-                        model::home()
+                        gmux_platform::unix::paths::home()
                     } else {
-                        model::expand_home(&path)
+                        gmux_platform::unix::paths::expand_home(&path)
                     };
                     drop(path);
                     let chooser = gtk::FileDialog::builder()
@@ -513,12 +513,14 @@ impl Ui {
                                 && let Some(path) = file.path()
                             {
                                 if let Some(row) = row.upgrade() {
-                                    row.set_text(&model::display_path(&path));
+                                    row.set_text(&gmux_platform::unix::paths::display_path(&path));
                                 }
                                 if let Some(name) = name.upgrade()
                                     && name.text().trim().is_empty()
                                 {
-                                    name.set_text(&model::directory_name(&path));
+                                    name.set_text(&gmux_platform::unix::paths::directory_name(
+                                        &path,
+                                    ));
                                 }
                                 *directory.borrow_mut() = path;
                             }
@@ -616,7 +618,7 @@ impl Ui {
                     directories.remove(machine);
                 } else {
                     let path = if Some(*machine) == local {
-                        match std::path::absolute(model::expand_home(&path)) {
+                        match std::path::absolute(gmux_platform::unix::paths::expand_home(&path)) {
                             Ok(path) => path,
                             Err(message) => {
                                 show_error(&error, message);

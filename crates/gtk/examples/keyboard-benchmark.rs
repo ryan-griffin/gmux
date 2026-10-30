@@ -1,5 +1,5 @@
 //! Measure the production GDK layout lookup and device lock queries.
-use gmux_client::transport::KeyLayout;
+use gmux_protocol::transport::KeyLayout;
 use gtk::{gdk, glib, prelude::*};
 use std::{
     alloc::{GlobalAlloc, Layout, System},

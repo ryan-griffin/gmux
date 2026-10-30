@@ -1,8 +1,8 @@
 //! Frontend handles contain cached viewports; terminal engines live in the daemon.
-use crate::{
+use crate::{incoming, ipc};
+use gmux_protocol::{
     Cell, Frame,
     control::InternalRequest,
-    incoming, ipc,
     model::{CursorStyle, ExecutionState},
     selection::Selection,
     session::{ScreenSnapshot, SessionUpdate},
@@ -34,10 +34,11 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const SCROLL_CADENCE: Duration = transport::DEFAULT_FRAME_INTERVAL;
 const CACHED_SCROLL_SETTLE: Duration = Duration::from_millis(100);
 const PING: &[u8] = b"{\"method\":\"ping\"}\n";
-static NO_HYPERLINKS: crate::hyperlinks::Hyperlinks = crate::hyperlinks::Hyperlinks {
-    targets: Vec::new(),
-    spans: Vec::new(),
-};
+static NO_HYPERLINKS: gmux_protocol::hyperlinks::Hyperlinks =
+    gmux_protocol::hyperlinks::Hyperlinks {
+        targets: Vec::new(),
+        spans: Vec::new(),
+    };
 
 struct Heartbeat {
     interval: Duration,
@@ -88,8 +89,8 @@ enum Outgoing {
     Close,
     ClipboardReply {
         pane: u64,
-        result: crate::clipboard::ReadResult,
-        contents: Vec<crate::clipboard::Representation>,
+        result: gmux_protocol::clipboard::ReadResult,
+        contents: Vec<gmux_protocol::clipboard::Representation>,
     },
     Command(Vec<u8>),
     Paste {
@@ -132,7 +133,7 @@ impl Outgoing {
             let mut encoded = transport::command_bytes(&request)?;
             if let StreamCommand::ClipboardReadData { size, bytes, .. } = request.command {
                 anyhow::ensure!(
-                    size == bytes.len() && size <= crate::clipboard::READ_CHUNK,
+                    size == bytes.len() && size <= gmux_protocol::clipboard::READ_CHUNK,
                     "Invalid clipboard chunk"
                 );
                 encoded.extend_from_slice(&bytes);
@@ -175,7 +176,7 @@ impl Outgoing {
                     &StreamRequest::pane(pane, StreamCommand::ClipboardReadResult { result }),
                 )?;
                 for c in contents {
-                    for bytes in c.data.chunks(crate::clipboard::READ_CHUNK) {
+                    for bytes in c.data.chunks(gmux_protocol::clipboard::READ_CHUNK) {
                         transport::command(
                             writer,
                             &StreamRequest::pane(
@@ -210,7 +211,7 @@ impl Outgoing {
 impl Connection {
     fn clipboard_changed(
         &self,
-        destination: crate::clipboard::Destination,
+        destination: gmux_protocol::clipboard::Destination,
         epoch: u64,
     ) -> anyhow::Result<()> {
         // Every pane in a window reports through this connection. Serialize a
@@ -306,7 +307,7 @@ impl Drop for Connection {
 
 pub struct SessionManager {
     endpoint: ipc::Endpoint,
-    daemon: crate::model::DaemonId,
+    daemon: gmux_protocol::model::DaemonId,
     connection: Rc<Connection>,
     receiver: incoming::Receiver,
     sessions: HashMap<u64, SessionHandle>,
@@ -321,16 +322,19 @@ pub struct SessionManager {
     frame_interval_sent: bool,
     clipboard_writes: bool,
     pending_reads: HashMap<u64, u64>,
-    wake: ipc::Wake,
+    wake: gmux_platform::unix::ipc::Wake,
     disconnected: bool,
     disconnect_error: Option<anyhow::Error>,
-    state: Option<crate::control::CommandReply>,
+    state: Option<gmux_protocol::control::CommandReply>,
 }
 
 impl SessionManager {
     /// Connect to an existing daemon without starting a local process or reading
     /// its execution files. Remote tunnels can supply their own endpoint.
-    pub fn connect_at(mut endpoint: ipc::Endpoint, wake: ipc::Wake) -> anyhow::Result<Self> {
+    pub fn connect_at(
+        mut endpoint: ipc::Endpoint,
+        wake: gmux_platform::unix::ipc::Wake,
+    ) -> anyhow::Result<Self> {
         let hello = endpoint.call(InternalRequest::Hello)?;
         anyhow::ensure!(
             hello["version"] == transport::VERSION,
@@ -346,8 +350,8 @@ impl SessionManager {
     }
     pub fn from_stream(
         endpoint: ipc::Endpoint,
-        wake: ipc::Wake,
-        daemon: crate::model::DaemonId,
+        wake: gmux_platform::unix::ipc::Wake,
+        daemon: gmux_protocol::model::DaemonId,
         socket: impl Into<ipc::Stream>,
     ) -> anyhow::Result<Self> {
         let mut socket = socket.into();
@@ -356,7 +360,7 @@ impl SessionManager {
     }
     pub(crate) fn attach_stream(
         socket: &mut ipc::Stream,
-        daemon: crate::model::DaemonId,
+        daemon: gmux_protocol::model::DaemonId,
     ) -> anyhow::Result<()> {
         transport::command(
             socket,
@@ -369,8 +373,8 @@ impl SessionManager {
     }
     pub(crate) fn from_attached_stream(
         endpoint: ipc::Endpoint,
-        wake: ipc::Wake,
-        daemon: crate::model::DaemonId,
+        wake: gmux_platform::unix::ipc::Wake,
+        daemon: gmux_protocol::model::DaemonId,
         socket: ipc::Stream,
     ) -> anyhow::Result<Self> {
         Self::with_heartbeat(
@@ -384,8 +388,8 @@ impl SessionManager {
     }
     fn with_heartbeat(
         endpoint: ipc::Endpoint,
-        wake: ipc::Wake,
-        daemon: crate::model::DaemonId,
+        wake: gmux_platform::unix::ipc::Wake,
+        daemon: gmux_protocol::model::DaemonId,
         socket: ipc::Stream,
         interval: Duration,
         timeout: Duration,
@@ -494,23 +498,26 @@ impl SessionManager {
         self.endpoint = endpoint;
     }
     pub fn execution_state(&mut self) -> anyhow::Result<ExecutionState> {
-        let reply: crate::control::CommandReply =
+        let reply: gmux_protocol::control::CommandReply =
             serde_json::from_value(self.endpoint.call(InternalRequest::State)?)?;
         self.validate_state(&reply)?;
         self.install_metadata(&reply.metadata, reply.revision);
         Ok(reply.execution)
     }
-    pub fn validate_state(&self, reply: &crate::control::CommandReply) -> anyhow::Result<()> {
+    pub fn validate_state(
+        &self,
+        reply: &gmux_protocol::control::CommandReply,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             reply.daemon == self.daemon,
             crate::network::ConnectionRejected("State belongs to a different daemon".into())
         );
         Ok(())
     }
-    pub fn daemon_id(&self) -> crate::model::DaemonId {
+    pub fn daemon_id(&self) -> gmux_protocol::model::DaemonId {
         self.daemon
     }
-    pub fn take_state(&mut self) -> Option<crate::control::CommandReply> {
+    pub fn take_state(&mut self) -> Option<gmux_protocol::control::CommandReply> {
         self.state.take()
     }
     pub fn set_focused(&self, active: bool) -> anyhow::Result<()> {
@@ -682,7 +689,7 @@ impl SessionManager {
             scroll_acknowledged: 0,
             scroll_cadence: self.frame_interval,
             pending_scroll: ValueCell::new(None),
-            find: crate::search::FindState::default(),
+            find: gmux_protocol::search::FindState::default(),
             selection: None,
             selection_serial: ValueCell::new(0),
             selection_acknowledged: 0,
@@ -690,7 +697,7 @@ impl SessionManager {
             row_flags: vec![0; 24],
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
-            cache: crate::scroll_cache::RowCache::default(),
+            cache: gmux_protocol::scroll_cache::RowCache::default(),
             prediction: None,
             scroll_target: None,
             wake: self.wake.clone(),
@@ -707,17 +714,17 @@ impl SessionManager {
     /// copy requests. They are never coalesced into viewport state or replayed.
     pub fn poll_with_clipboard(
         &mut self,
-        mut clipboard: impl FnMut(crate::clipboard::Write),
+        mut clipboard: impl FnMut(gmux_protocol::clipboard::Write),
     ) -> HashMap<u64, SessionUpdate> {
         self.poll_with_clipboard_events(|event| {
-            if let crate::clipboard::Event::Write(write) = event {
+            if let gmux_protocol::clipboard::Event::Write(write) = event {
                 clipboard(write);
             }
         })
     }
     pub fn poll_with_clipboard_events(
         &mut self,
-        mut clipboard: impl FnMut(crate::clipboard::Event),
+        mut clipboard: impl FnMut(gmux_protocol::clipboard::Event),
     ) -> HashMap<u64, SessionUpdate> {
         // A full command queue must not lose a tab's viewport subscription.
         let _ = self.subscribe();
@@ -734,11 +741,11 @@ impl SessionManager {
             match self.receiver.try_recv() {
                 Ok(Ok(mut packet)) => {
                     if let Some(write) = packet.header.copy.take() {
-                        clipboard(crate::clipboard::Event::Write(write));
+                        clipboard(gmux_protocol::clipboard::Event::Write(write));
                         continue;
                     }
                     if let Some(event) = packet.header.clipboard_read.take() {
-                        clipboard(crate::clipboard::Event::Read {
+                        clipboard(gmux_protocol::clipboard::Event::Read {
                             pane: packet.header.meta.id,
                             event,
                         });
@@ -875,12 +882,12 @@ impl SessionManager {
                                 .resize(frame.cols as usize * frame.rows as usize, Cell::default());
                             session.row_flags.resize(frame.rows as usize, 0);
                             let cols = frame.cols as usize;
-                            crate::scroll_cache::shift(
+                            gmux_protocol::scroll_cache::shift(
                                 &mut session.cells,
                                 cols,
                                 packet.header.row_shift,
                             );
-                            crate::scroll_cache::shift(
+                            gmux_protocol::scroll_cache::shift(
                                 &mut session.row_flags,
                                 1,
                                 packet.header.row_shift,
@@ -1033,18 +1040,18 @@ pub struct RemoteSession {
     scroll_acknowledged: u64,
     scroll_cadence: Duration,
     pending_scroll: ValueCell<Option<u64>>,
-    find: crate::search::FindState,
+    find: gmux_protocol::search::FindState,
     selection: Option<Selection>,
     selection_serial: ValueCell<u64>,
     selection_acknowledged: u64,
     selection_origin: Option<u64>,
     row_flags: Vec<u8>,
-    hyperlinks: crate::hyperlinks::Hyperlinks,
+    hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     hyperlink_revision: u64,
-    cache: crate::scroll_cache::RowCache,
+    cache: gmux_protocol::scroll_cache::RowCache,
     prediction: Option<Prediction>,
     scroll_target: Option<u64>,
-    wake: ipc::Wake,
+    wake: gmux_platform::unix::ipc::Wake,
     scroll_defer_until: ValueCell<Option<Instant>>,
     scroll_retry_pending: ValueCell<bool>,
 }
@@ -1062,7 +1069,7 @@ impl RemoteSession {
     }
     pub fn text(&self) -> String {
         let screen = self.snapshot();
-        crate::cells::viewport_text(screen.frame, screen.cells)
+        gmux_protocol::cells::viewport_text(screen.frame, screen.cells)
     }
     fn command(&self, command: StreamCommand) -> anyhow::Result<()> {
         // Key releases and appearance updates do not move the viewport. Keep
@@ -1095,10 +1102,10 @@ impl RemoteSession {
     pub fn unread(&self) -> bool {
         self.meta.unread_sequence > self.read_through
     }
-    pub fn progress(&self) -> crate::progress::Progress {
+    pub fn progress(&self) -> gmux_protocol::progress::Progress {
         self.meta.progress
     }
-    pub fn program_status(&self) -> Option<&crate::program_status::Summary> {
+    pub fn program_status(&self) -> Option<&gmux_protocol::program_status::Summary> {
         self.meta.program_status.as_ref()
     }
     pub fn busy(&self) -> bool {
@@ -1116,7 +1123,7 @@ impl RemoteSession {
     }
     pub fn clipboard_changed(
         &self,
-        destination: crate::clipboard::Destination,
+        destination: gmux_protocol::clipboard::Destination,
         epoch: u64,
     ) -> anyhow::Result<()> {
         self.connection.clipboard_changed(destination, epoch)
@@ -1127,8 +1134,8 @@ impl RemoteSession {
     }
     pub fn clipboard_reply(
         &self,
-        result: crate::clipboard::ReadResult,
-        contents: Vec<crate::clipboard::Representation>,
+        result: gmux_protocol::clipboard::ReadResult,
+        contents: Vec<gmux_protocol::clipboard::Representation>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             result.byte_len()? == contents.iter().map(|c| c.data.len()).sum::<usize>()
@@ -1217,14 +1224,14 @@ impl RemoteSession {
     pub fn find_advance(&self, previous: bool) -> anyhow::Result<()> {
         self.command(StreamCommand::FindAdvance { previous })
     }
-    pub fn find_state(&self) -> &crate::search::FindState {
+    pub fn find_state(&self) -> &gmux_protocol::search::FindState {
         &self.find
     }
     pub fn select(
         &self,
         start: (u16, u32),
         end: (u16, u32),
-        mode: crate::transport::SelectionMode,
+        mode: gmux_protocol::transport::SelectionMode,
     ) -> anyhow::Result<()> {
         let serial = self.selection_serial.get() + 1;
         self.command(StreamCommand::Select {
@@ -1236,16 +1243,16 @@ impl RemoteSession {
         self.selection_serial.set(serial);
         Ok(())
     }
-    pub fn copy(&self, formats: crate::clipboard::Formats) -> anyhow::Result<()> {
+    pub fn copy(&self, formats: gmux_protocol::clipboard::Formats) -> anyhow::Result<()> {
         self.command(StreamCommand::Copy { formats })
     }
-    pub fn command_state(&self) -> &crate::shell::CommandState {
+    pub fn command_state(&self) -> &gmux_protocol::shell::CommandState {
         &self.meta.command
     }
     pub fn select_output(
         &self,
         point: Option<(u16, u32)>,
-        copy: Option<crate::clipboard::Formats>,
+        copy: Option<gmux_protocol::clipboard::Formats>,
     ) -> anyhow::Result<()> {
         self.select_output_target(point, false, copy)
     }
@@ -1254,7 +1261,7 @@ impl RemoteSession {
     }
     pub fn select_anchored_output(
         &self,
-        copy: Option<crate::clipboard::Formats>,
+        copy: Option<gmux_protocol::clipboard::Formats>,
     ) -> anyhow::Result<()> {
         self.select_output_target(None, true, copy)
     }
@@ -1262,7 +1269,7 @@ impl RemoteSession {
         &self,
         point: Option<(u16, u32)>,
         anchored: bool,
-        copy: Option<crate::clipboard::Formats>,
+        copy: Option<gmux_protocol::clipboard::Formats>,
     ) -> anyhow::Result<()> {
         let serial = self.selection_serial.get() + 1;
         self.command(StreamCommand::SelectOutput {
@@ -1500,7 +1507,7 @@ impl RemoteSession {
 mod tests {
     #[test]
     fn clipboard_results_stream_as_one_reserved_operation_with_raw_chunks() {
-        use crate::clipboard::{ReadDescriptor, ReadResult, ReadStatus, Representation};
+        use gmux_protocol::clipboard::{ReadDescriptor, ReadResult, ReadStatus, Representation};
         use std::io::{BufRead, Read};
         let data = (0..=255).cycle().take(40_000).collect::<Vec<u8>>();
         let outgoing = Outgoing::ClipboardReply {
@@ -1537,7 +1544,7 @@ mod tests {
             methods.push(header["method"].as_str().unwrap().to_owned());
             if header["method"] == "clipboard-read-data" {
                 let len = header["size"].as_u64().unwrap() as usize;
-                assert!(len <= crate::clipboard::READ_CHUNK);
+                assert!(len <= gmux_protocol::clipboard::READ_CHUNK);
                 let mut bytes = vec![0; len];
                 reader.read_exact(&mut bytes).unwrap();
                 received.extend(bytes);
@@ -1548,14 +1555,14 @@ mod tests {
         assert_eq!(received, data);
     }
 
-    fn layout(unshifted: u32) -> crate::transport::KeyLayout {
-        crate::transport::KeyLayout {
+    fn layout(unshifted: u32) -> gmux_protocol::transport::KeyLayout {
+        gmux_protocol::transport::KeyLayout {
             unshifted,
             ..Default::default()
         }
     }
     use super::*;
-    use crate::cells::{decoration, underline};
+    use gmux_protocol::cells::{decoration, underline};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -1566,11 +1573,11 @@ mod tests {
         };
         let (socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let wake = ipc::Wake::new().unwrap();
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
         let mut manager = SessionManager::with_heartbeat(
             ipc::Endpoint::local(),
             wake.clone(),
-            crate::model::DaemonId::generate().unwrap(),
+            gmux_platform::unix::identity::daemon_id().unwrap(),
             socket.into(),
             Duration::from_millis(10),
             Duration::from_millis(300),
@@ -1624,8 +1631,8 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let mut manager = SessionManager::with_heartbeat(
             ipc::Endpoint::local(),
-            ipc::Wake::new().unwrap(),
-            crate::model::DaemonId::generate().unwrap(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+            gmux_platform::unix::identity::daemon_id().unwrap(),
             socket.into(),
             Duration::from_millis(20),
             Duration::from_millis(200),
@@ -1812,7 +1819,7 @@ mod tests {
         assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), before);
         assert_eq!(receiver.try_iter().count(), 5);
     }
-    use crate::transport::Header;
+    use gmux_protocol::transport::Header;
     use std::path::PathBuf;
 
     fn manager() -> (SessionManager, incoming::Sender, SessionHandle) {
@@ -1825,7 +1832,7 @@ mod tests {
             socket: socket.into(),
         });
         let (sender, receiver) = incoming::channel(incoming::MAX_BYTES, 64);
-        let wake = ipc::Wake::new().unwrap();
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
         let session = Rc::new(RefCell::new(RemoteSession {
             connection: connection.clone(),
             git: None,
@@ -1857,7 +1864,7 @@ mod tests {
             scroll_acknowledged: 0,
             scroll_cadence: SCROLL_CADENCE,
             pending_scroll: ValueCell::new(None),
-            find: crate::search::FindState::default(),
+            find: gmux_protocol::search::FindState::default(),
             selection: None,
             selection_serial: ValueCell::new(0),
             selection_acknowledged: 0,
@@ -1865,7 +1872,7 @@ mod tests {
             row_flags: vec![0; 2],
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
-            cache: crate::scroll_cache::RowCache::default(),
+            cache: gmux_protocol::scroll_cache::RowCache::default(),
             prediction: None,
             scroll_target: None,
             wake: wake.clone(),
@@ -1875,7 +1882,7 @@ mod tests {
         (
             SessionManager {
                 endpoint: ipc::Endpoint::local(),
-                daemon: crate::model::DaemonId::generate().unwrap(),
+                daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
                 connection,
                 receiver,
                 sessions: HashMap::from([(1, session.clone())]),
@@ -1902,7 +1909,7 @@ mod tests {
 
     #[test]
     fn clipboard_generations_coalesce_across_panes_and_retry_after_queue_pressure() {
-        use crate::clipboard::Destination::{Clipboard, Primary};
+        use gmux_protocol::clipboard::Destination::{Clipboard, Primary};
         let (mut manager, _, first) = manager();
         manager.metadata.insert(
             2,
@@ -1987,7 +1994,7 @@ mod tests {
 
     #[test]
     fn clipboard_packets_keep_cross_pane_wire_order_without_mutating_selection_or_replay() {
-        use crate::clipboard::{Destination, Write};
+        use gmux_protocol::clipboard::{Destination, Write};
         let (mut manager, sender, handle) = manager();
         handle.borrow_mut().selection = Some(Selection::linear(0, 1));
         for (pane, destination, text) in [
@@ -1997,13 +2004,14 @@ mod tests {
             (2, Destination::Clipboard, Some("last")),
         ] {
             let content = text.map(|text| {
-                let mut offer: crate::clipboard::Offer = crate::clipboard::Content {
-                    text: text.into(),
-                    html: (text == "last").then(|| "<div>last</div>".into()),
-                }
-                .into();
+                let mut offer: gmux_protocol::clipboard::Offer =
+                    gmux_protocol::clipboard::Content {
+                        text: text.into(),
+                        html: (text == "last").then(|| "<div>last</div>".into()),
+                    }
+                    .into();
                 if text == "last" {
-                    offer.0.push(crate::clipboard::Representation {
+                    offer.0.push(gmux_protocol::clipboard::Representation {
                         mime: "image/png".into(),
                         data: include_bytes!("../../../scripts/fixtures/clipboard.png").to_vec(),
                     });
@@ -2066,7 +2074,7 @@ mod tests {
 
     #[test]
     fn link_only_frames_and_late_scroll_replies_keep_displayed_targets_atomic() {
-        use crate::hyperlinks::Hyperlinks;
+        use gmux_protocol::hyperlinks::Hyperlinks;
         let (mut first, sender, session) = manager();
         let (mut second, other_sender, other) = manager();
         let send = |sender: &incoming::Sender, handle: &SessionHandle, serial, uri: &str| {
@@ -2153,7 +2161,7 @@ mod tests {
 
     #[test]
     fn cached_predictions_hide_links_until_the_canonical_view_is_displayed() {
-        use crate::hyperlinks::Hyperlinks;
+        use gmux_protocol::hyperlinks::Hyperlinks;
         let (mut manager, sender, handle) = manager();
         manager.visible.insert(1);
         let (commands, _receiver) = mpsc::sync_channel(32);
@@ -2169,7 +2177,7 @@ mod tests {
         let frame = Frame {
             cols: 2,
             rows: 2,
-            scrollback: crate::Scrollback {
+            scrollback: gmux_protocol::Scrollback {
                 total: 20,
                 offset: 4,
                 len: 2,
@@ -2178,7 +2186,7 @@ mod tests {
         };
         let header = |offset, serial| Header {
             frame: Some(Frame {
-                scrollback: crate::Scrollback {
+                scrollback: gmux_protocol::Scrollback {
                     offset,
                     ..frame.scrollback
                 },
@@ -2379,8 +2387,8 @@ mod tests {
             .unwrap();
         let mut manager = SessionManager::from_attached_stream(
             ipc::Endpoint::local(),
-            ipc::Wake::new().unwrap(),
-            crate::model::DaemonId::generate().unwrap(),
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+            gmux_platform::unix::identity::daemon_id().unwrap(),
             socket.into(),
         )
         .unwrap();
@@ -2579,7 +2587,7 @@ mod tests {
         {
             let mut session = session.borrow_mut();
             session.connection = connection;
-            session.frame.scrollback = crate::Scrollback {
+            session.frame.scrollback = gmux_protocol::Scrollback {
                 total: 20,
                 offset: 4,
                 len: 2,
@@ -2601,11 +2609,11 @@ mod tests {
         drop(before);
         let mut meta = session.borrow().meta.clone();
         for state in [
-            crate::progress::ProgressState::Determinate,
-            crate::progress::ProgressState::Error,
-            crate::progress::ProgressState::Paused,
-            crate::progress::ProgressState::Indeterminate,
-            crate::progress::ProgressState::Inactive,
+            gmux_protocol::progress::ProgressState::Determinate,
+            gmux_protocol::progress::ProgressState::Error,
+            gmux_protocol::progress::ProgressState::Paused,
+            gmux_protocol::progress::ProgressState::Indeterminate,
+            gmux_protocol::progress::ProgressState::Inactive,
         ] {
             meta.progress.apply(state, Some(42));
             meta.program_status = Some(serde_json::from_value(serde_json::json!({
@@ -2686,13 +2694,13 @@ mod tests {
         let (mut manager, sender, session) = manager();
         let packet = |daemon| Packet {
             header: Header {
-                state: Some(crate::control::CommandReply {
+                state: Some(gmux_protocol::control::CommandReply {
                     home_directory: "/home/test".into(),
-                    machine_kind: crate::model::MachineKind::Unknown,
+                    machine_kind: gmux_protocol::model::MachineKind::Unknown,
                     hostname: "test-host".into(),
                     daemon,
                     revision: 1,
-                    result: crate::control::CommandOutput::Done { ok: true }.into(),
+                    result: gmux_protocol::control::CommandOutput::Done { ok: true }.into(),
                     execution: ExecutionState::default(),
                     metadata: vec![],
                 }),
@@ -2705,10 +2713,14 @@ mod tests {
         assert!(manager.poll().is_empty());
         assert_eq!(manager.take_state().unwrap().daemon, manager.daemon);
         sender
-            .send(Ok(packet(crate::model::DaemonId::generate().unwrap())))
+            .send(Ok(packet(
+                gmux_platform::unix::identity::daemon_id().unwrap(),
+            )))
             .unwrap();
-        let mut connection =
-            crate::connection::Connection::from_session(manager, ipc::Wake::new().unwrap());
+        let mut connection = crate::connection::Connection::from_session(
+            manager,
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+        );
         connection.set_auto_reconnect(true);
         let update = connection.poll();
         assert!(matches!(
@@ -2904,7 +2916,7 @@ mod tests {
 
     #[test]
     fn selection_replies_wait_for_the_latest_range_or_clear() {
-        use crate::transport::SelectionMode;
+        use gmux_protocol::transport::SelectionMode;
         let (mut manager, sender, session) = manager();
         let (commands, _outgoing) = mpsc::sync_channel(16);
         let (socket, _peer) = UnixStream::pair().unwrap();
@@ -3001,7 +3013,7 @@ mod tests {
         let frame = Frame {
             cols: 2,
             rows: 2,
-            scrollback: crate::Scrollback {
+            scrollback: gmux_protocol::Scrollback {
                 total: 20,
                 offset: 4,
                 len: 2,
@@ -3057,7 +3069,7 @@ mod tests {
             2,
             6,
             Some(Frame {
-                scrollback: crate::Scrollback {
+                scrollback: gmux_protocol::Scrollback {
                     total: 18,
                     offset: 2,
                     len: 2,
@@ -3117,7 +3129,7 @@ mod tests {
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
-        session.frame.scrollback = crate::Scrollback {
+        session.frame.scrollback = gmux_protocol::Scrollback {
             total: 20,
             offset: 4,
             len: 2,
@@ -3158,7 +3170,7 @@ mod tests {
             socket: socket.into(),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
         });
-        session.frame.scrollback = crate::Scrollback {
+        session.frame.scrollback = gmux_protocol::Scrollback {
             total: 20,
             offset: 4,
             len: 2,
@@ -3235,7 +3247,7 @@ mod tests {
         let frame = Frame {
             cols: 2,
             rows: 2,
-            scrollback: crate::Scrollback {
+            scrollback: gmux_protocol::Scrollback {
                 total: 20,
                 offset: 4,
                 len: 2,
@@ -3250,7 +3262,7 @@ mod tests {
                     header: Header {
                         meta: handle.borrow().meta.clone(),
                         frame: Some(Frame {
-                            scrollback: crate::Scrollback {
+                            scrollback: gmux_protocol::Scrollback {
                                 offset,
                                 ..frame.scrollback
                             },
@@ -3331,7 +3343,7 @@ mod tests {
         assert_eq!(handle.borrow().snapshot().cells[0].text(), "e");
         handle
             .borrow()
-            .copy(crate::clipboard::Formats::Text)
+            .copy(gmux_protocol::clipboard::Formats::Text)
             .unwrap();
         assert_eq!(
             wire(receiver.try_recv().unwrap()),
@@ -3677,7 +3689,7 @@ mod tests {
         );
         for serial in [1, 2] {
             let mut frame = session.borrow().frame;
-            frame.scrollback = crate::Scrollback {
+            frame.scrollback = gmux_protocol::Scrollback {
                 total: 100,
                 offset: serial * 10,
                 len: 2,

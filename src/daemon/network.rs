@@ -1,11 +1,11 @@
 //! Incoming TCP authentication and terminal stream forwarding for this daemon.
-use gmux_client::{
+use gmux_platform::tcp::TimedStream;
+use gmux_protocol::{
     control::{ExecutionRequest, InternalRequest},
-    ipc,
     model::DaemonId,
     network::{
         Channel, ConnectionInfo, Handshake, MAX_HANDSHAKE, MAX_REPLY, MAX_REQUEST, TIMEOUT,
-        TimedStream, read_json, write_json,
+        read_json, write_json,
     },
     transport,
 };
@@ -32,14 +32,14 @@ struct Clients {
 
 /// Listener shutdown also interrupts idle authenticated connections.
 pub struct Server {
-    stop: ipc::Wake,
+    stop: gmux_platform::unix::ipc::Wake,
     clients: Arc<Clients>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub address: SocketAddr,
 }
 pub struct PreparedServer {
     listener: Listener,
-    stop: ipc::Wake,
+    stop: gmux_platform::unix::ipc::Wake,
     token: Option<String>,
     address: SocketAddr,
 }
@@ -57,7 +57,7 @@ impl Server {
     pub fn prepare(address: SocketAddr, token: Option<String>) -> anyhow::Result<PreparedServer> {
         let listener = bind(address)?;
         let address = listener.0.local_addr()?;
-        let stop = ipc::Wake::new()?;
+        let stop = gmux_platform::unix::ipc::Wake::new()?;
         Ok(PreparedServer {
             listener,
             stop,
@@ -127,7 +127,7 @@ fn bind(address: SocketAddr) -> std::io::Result<Listener> {
 }
 fn accept(
     listener: Listener,
-    stopping: ipc::Wake,
+    stopping: gmux_platform::unix::ipc::Wake,
     clients: Arc<Clients>,
     control: PathBuf,
     daemon: DaemonId,
@@ -232,9 +232,9 @@ fn serve(
         &ConnectionInfo {
             version: transport::VERSION,
             daemon,
-            home_directory: gmux_client::model::home(),
-            machine_kind: gmux_client::model::MachineKind::local(),
-            hostname: gmux_client::model::hostname().into(),
+            home_directory: gmux_platform::unix::paths::home(),
+            machine_kind: gmux_platform::unix::machine::machine_kind(),
+            hostname: gmux_platform::unix::machine::hostname().into(),
         },
     )?;
     stream.set_write_timeout(Some(TIMEOUT))?;
@@ -247,7 +247,10 @@ fn serve(
                 let result = serde_json::from_value::<ExecutionRequest>(value)
                     .map_err(anyhow::Error::from)
                     .and_then(|request| {
-                        ipc::call_at(control, InternalRequest::Execution { request })
+                        gmux_platform::unix::ipc::call_at(
+                            control,
+                            InternalRequest::Execution { request },
+                        )
                     });
                 let value = result.unwrap_or_else(|error| json!({"error":error.to_string()}));
                 let encoded = serde_json::to_vec(&value)?;
@@ -257,7 +260,7 @@ fn serve(
             }
         }
         Channel::Stream => {
-            gmux_client::network::configure_liveness(&stream)?;
+            gmux_platform::unix::network::configure_liveness(&stream)?;
             reader.get_mut().deadline = Some(Instant::now() + TIMEOUT);
             let value = read_json(&mut reader, MAX_REQUEST)?;
             let mut request: transport::StreamRequest = serde_json::from_value(value)?;
@@ -275,7 +278,8 @@ fn serve(
                 }
                 _ => anyhow::bail!("Remote stream must attach first"),
             }
-            let mut local = UnixStream::connect(ipc::companion_at(control, ".stream"))?;
+            let mut local =
+                UnixStream::connect(gmux_platform::unix::ipc::companion_at(control, ".stream"))?;
             transport::command(&mut local, &request)?;
             bridge(local, stream, reader.buffer())
         }
@@ -470,7 +474,7 @@ mod tests {
 
     #[test]
     fn discarded_and_paused_listeners_release_addresses_with_inherited_descriptors() {
-        let daemon = DaemonId::generate().unwrap();
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
         for running in [false, true] {
             let prepared = Server::prepare("127.0.0.1:0".parse().unwrap(), None).unwrap();
             let address = prepared.address;
@@ -500,7 +504,7 @@ mod tests {
                 .send(serve(
                     socket,
                     Path::new("unused-control.sock"),
-                    DaemonId::generate().unwrap(),
+                    gmux_platform::unix::identity::daemon_id().unwrap(),
                     Some("0123456789abcdef0123456789abcdef"),
                     Instant::now() + Duration::from_millis(100),
                 ))

@@ -1,10 +1,7 @@
 //! This daemon's TCP listener configuration. Outgoing destinations belong to clients.
 use super::network as server;
-use gmux_client::{
-    ipc,
-    model::{self, DaemonId},
-    network, storage,
-};
+use gmux_platform::unix::storage;
+use gmux_protocol::model::DaemonId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, mpsc};
@@ -17,18 +14,18 @@ pub(super) struct RemoteAccess {
     worker: Option<Worker>,
 }
 struct Status {
-    config: network::RemoteAccess,
+    config: gmux_protocol::network::RemoteAccess,
     bound_address: Option<std::net::SocketAddr>,
     error: Option<String>,
 }
 #[derive(Default)]
 struct State {
-    config: network::RemoteAccess,
+    config: gmux_protocol::network::RemoteAccess,
     server: Option<server::Server>,
     error: Option<String>,
 }
 struct Update {
-    config: network::RemoteAccess,
+    config: gmux_protocol::network::RemoteAccess,
     reply: mpsc::SyncSender<Value>,
 }
 struct Worker {
@@ -40,7 +37,7 @@ struct Worker {
 enum Request {
     RemoteAccessGet,
     RemoteAccessSet {
-        remote_access: network::RemoteAccess,
+        remote_access: gmux_protocol::network::RemoteAccess,
     },
 }
 impl Default for RemoteAccess {
@@ -62,13 +59,13 @@ impl RemoteAccess {
             ..Default::default()
         };
         if state.config.enabled {
-            let result = state
-                .config
-                .authentication
-                .token()
+            let result = gmux_platform::unix::network::token(&state.config.authentication)
                 .and_then(|token| server::Server::prepare(state.config.listen_address, token));
             match result {
-                Ok(prepared) => state.server = Some(prepared.start(ipc::socket_path(), daemon)),
+                Ok(prepared) => {
+                    state.server =
+                        Some(prepared.start(gmux_platform::unix::ipc::socket_path(), daemon))
+                }
                 Err(error) => state.error = Some(error.to_string()),
             }
         }
@@ -80,13 +77,13 @@ impl RemoteAccess {
     pub fn handles(method: &str) -> bool {
         matches!(method, "remote-access-get" | "remote-access-set")
     }
-    pub fn handle(&mut self, daemon: DaemonId, request: ipc::Request) {
+    pub fn handle(&mut self, daemon: DaemonId, request: gmux_platform::unix::ipc::Request) {
         let result = (|| -> anyhow::Result<Option<Value>> {
             match serde_json::from_value(request.body)? {
                 Request::RemoteAccessGet => {
                     let status = self.status.lock().unwrap();
                     Ok(Some(
-                        json!({"local":{"name":model::hostname(),"daemon":daemon,"machine_kind":model::MachineKind::local()},"hostname":model::hostname(),"remote_access":status.config,"remote_access_error":status.error,"bound_address":status.bound_address}),
+                        json!({"local":{"name":gmux_platform::unix::machine::hostname(),"daemon":daemon,"machine_kind":gmux_platform::unix::machine::machine_kind()},"hostname":gmux_platform::unix::machine::hostname(),"remote_access":status.config,"remote_access_error":status.error,"bound_address":status.bound_address}),
                     ))
                 }
                 Request::RemoteAccessSet { remote_access } => {
@@ -130,12 +127,12 @@ impl State {
     }
     fn set(
         &mut self,
-        config: network::RemoteAccess,
+        config: gmux_protocol::network::RemoteAccess,
         daemon: DaemonId,
-        save: impl FnOnce(&network::RemoteAccess) -> anyhow::Result<()>,
+        save: impl FnOnce(&gmux_protocol::network::RemoteAccess) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let token = if config.enabled {
-            config.authentication.token()?
+            gmux_platform::unix::network::token(&config.authentication)?
         } else {
             None
         };
@@ -184,7 +181,7 @@ impl State {
                         .server
                         .as_mut()
                         .unwrap()
-                        .resume(ipc::socket_path(), daemon)
+                        .resume(gmux_platform::unix::ipc::socket_path(), daemon)
                 {
                     self.error = Some(format!("Could not restore TCP listener: {restore}"));
                     anyhow::bail!("{error}; {}", self.error.as_ref().unwrap());
@@ -193,7 +190,7 @@ impl State {
             }
         };
         if let Some(prepared) = prepared {
-            self.server = Some(prepared.start(ipc::socket_path(), daemon));
+            self.server = Some(prepared.start(gmux_platform::unix::ipc::socket_path(), daemon));
         } else if !config.enabled {
             self.server = None;
         } else if let Some(server) = &self.server
@@ -244,16 +241,16 @@ mod tests {
 
     #[test]
     fn overlapping_listener_edits_commit_or_restore_the_listener_and_its_clients() {
-        let daemon = DaemonId::generate().unwrap();
+        let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
         let mut state = State::default();
         state
             .set(
-                network::RemoteAccess {
+                gmux_protocol::network::RemoteAccess {
                     enabled: true,
                     // Allocate across all interfaces so another address cannot
                     // already own the port when we later widen the listener.
                     listen_address: "0.0.0.0:0".parse().unwrap(),
-                    authentication: network::Authentication::None,
+                    authentication: gmux_protocol::network::Authentication::None,
                 },
                 daemon,
                 |_| Ok(()),
@@ -265,7 +262,7 @@ mod tests {
         ));
         state
             .set(
-                network::RemoteAccess {
+                gmux_protocol::network::RemoteAccess {
                     listen_address: address,
                     ..state.config.clone()
                 },
@@ -275,10 +272,10 @@ mod tests {
             .unwrap();
         let original = state.config.clone();
         let connect = || {
-            network::connect(
+            gmux_client::network::connect(
                 &address.to_string(),
-                &network::Credentials::default(),
-                network::Channel::Control,
+                &gmux_client::network::Credentials::default(),
+                gmux_protocol::network::Channel::Control,
                 Some(daemon),
             )
             .unwrap()
@@ -288,7 +285,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_millis(25)))
             .unwrap();
-        let replacement = network::RemoteAccess {
+        let replacement = gmux_protocol::network::RemoteAccess {
             listen_address: std::net::SocketAddr::from(([0, 0, 0, 0], address.port())),
             ..original.clone()
         };
@@ -335,7 +332,7 @@ mod tests {
         assert_eq!(client.read(&mut [0]).unwrap(), 0);
         drop(connect());
         // Narrowing the wildcard listener back to loopback uses the same replacement path.
-        let loopback = network::RemoteAccess {
+        let loopback = gmux_protocol::network::RemoteAccess {
             listen_address: address,
             ..original
         };

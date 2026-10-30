@@ -2,10 +2,7 @@
 use super::management::{error_label, show_error};
 use super::*;
 use connections::ConnectionStatus;
-use gmux_client::{
-    model::DaemonId,
-    network::{self, Authentication},
-};
+use gmux_protocol::{model::DaemonId, network::Authentication};
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 struct RemoteDefinition {
@@ -26,7 +23,7 @@ struct ConnectionList {
     running: bool,
     hostname: String,
     remotes: Vec<RemoteDefinition>,
-    remote_access: gmux_client::network::RemoteAccess,
+    remote_access: gmux_protocol::network::RemoteAccess,
     remote_access_error: Option<String>,
 }
 struct RemoteRow {
@@ -62,7 +59,7 @@ struct LocalConnectionFields {
 fn display_address(address: &str) -> &str {
     match address.rsplit_once(':') {
         Some((host, port))
-            if port.parse::<u16>() == Ok(network::DEFAULT_PORT)
+            if port.parse::<u16>() == Ok(gmux_protocol::network::DEFAULT_PORT)
                 && (!host.contains(':') || host.starts_with('[')) =>
         {
             host
@@ -133,7 +130,7 @@ fn authentication_value(selected: u32, token: &str) -> anyhow::Result<Authentica
     if selected == 0 {
         return Ok(Authentication::None);
     }
-    let file = model::expand_home(Path::new(token.trim()));
+    let file = gmux_platform::unix::paths::expand_home(Path::new(token.trim()));
     Ok(Authentication::Token {
         file: if file.as_os_str().is_empty() {
             file
@@ -450,9 +447,9 @@ impl Ui {
         let page = adw::PreferencesPage::new();
         let connection = adw::PreferencesGroup::builder()
             .description(if editing {
-                format!("Enter a hostname or IP address. The default port is {}", network::DEFAULT_PORT)
+                format!("Enter a hostname or IP address. The default port is {}", gmux_protocol::network::DEFAULT_PORT)
             } else {
-                format!("Enter a hostname or IP address. The default port is {}. Leave the name empty to use its hostname", network::DEFAULT_PORT)
+                format!("Enter a hostname or IP address. The default port is {}. Leave the name empty to use its hostname", gmux_protocol::network::DEFAULT_PORT)
             })
             .build();
         let name = adw::EntryRow::builder()
@@ -539,7 +536,8 @@ impl Ui {
                 let token = token.text();
                 let changed = original.as_ref().is_none_or(|remote| {
                     name.trim() != remote.name
-                        || network::with_default_port(address.trim()).as_ref() != remote.address
+                        || gmux_protocol::network::with_default_port(address.trim()).as_ref()
+                            != remote.address
                         || authentication_changed(&remote.authentication, auth.selected(), &token)
                 });
                 submit.set_sensitive(
@@ -606,7 +604,7 @@ impl Ui {
         self: &Rc<Self>,
         current: &str,
         hostname: &str,
-        remote_access: &gmux_client::network::RemoteAccess,
+        remote_access: &gmux_protocol::network::RemoteAccess,
         remote_access_error: Option<&str>,
     ) {
         let Some(dialog) = self
@@ -655,7 +653,7 @@ impl Ui {
         page.add(&local_group);
         let access_group = adw::PreferencesGroup::builder()
             .title("Remote Access")
-            .description(format!("Control how other computers connect when the local daemon is running. The default port is {}", network::DEFAULT_PORT))
+            .description(format!("Control how other computers connect when the local daemon is running. The default port is {}", gmux_protocol::network::DEFAULT_PORT))
             .build();
         let enabled = adw::SwitchRow::builder()
             .title("Allow Remote Connections")
@@ -718,7 +716,8 @@ impl Ui {
                 reset.set_sensitive(name.trim() != default_name);
                 address.set_sensitive(enabled.is_active());
                 credentials.set_sensitive(enabled.is_active());
-                let address = network::parse_listen_address(address.text().trim()).ok();
+                let address =
+                    gmux_protocol::network::parse_listen_address(address.text().trim()).ok();
                 let token = token.text();
                 let changed = execution.is_active() != original_execution
                     || name.trim() != original_name
@@ -774,9 +773,9 @@ impl Ui {
             let abort = editor.clone();
             let editor = editor.clone();
             let finish = move |_: &Rc<Ui>, result| editor.finish(result);
-            let remote_access = gmux_client::network::RemoteAccess {
+            let remote_access = gmux_protocol::network::RemoteAccess {
                 enabled: enabled.is_active(),
-                listen_address: network::parse_listen_address(address.text().trim()).unwrap_or(original_address),
+                listen_address: gmux_protocol::network::parse_listen_address(address.text().trim()).unwrap_or(original_address),
                 authentication,
             };
             let execution = local_connection.is_active();
@@ -844,7 +843,7 @@ mod tests {
         assert!(
             authentication_value(1, "~/gmux-token").unwrap()
                 == Authentication::Token {
-                    file: model::home().join("gmux-token"),
+                    file: gmux_platform::unix::paths::home().join("gmux-token"),
                 }
         );
         assert!(!authentication_changed(

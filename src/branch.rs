@@ -53,7 +53,7 @@ impl BranchCache {
 fn bounded_output(
     command: &mut Command,
     timeout: Duration,
-    cancel: Option<&gmux_client::ipc::Wake>,
+    cancel: Option<&gmux_platform::unix::ipc::Wake>,
 ) -> io::Result<Output> {
     if let Some(cancel) = cancel {
         let mut fd = libc::pollfd {
@@ -170,7 +170,7 @@ fn bounded_output(
     result
 }
 
-fn lookup(directory: &Path, cancel: Option<&gmux_client::ipc::Wake>) -> Option<Branch> {
+fn lookup(directory: &Path, cancel: Option<&gmux_platform::unix::ipc::Wake>) -> Option<Branch> {
     let output = bounded_output(
         Command::new("git").arg("-C").arg(directory).args([
             "rev-parse",
@@ -237,12 +237,12 @@ struct BranchWorker {
     generation: Cell<u64>,
     last_dispatched: Cell<u64>,
     lookups: Cell<u64>,
-    cancel: Option<gmux_client::ipc::Wake>,
+    cancel: Option<gmux_platform::unix::ipc::Wake>,
 }
 
 impl BranchWorker {
-    fn new(wake: gmux_client::ipc::Wake) -> Self {
-        let cancel = gmux_client::ipc::Wake::new().ok();
+    fn new(wake: gmux_platform::unix::ipc::Wake) -> Self {
+        let cancel = gmux_platform::unix::ipc::Wake::new().ok();
         let stop = cancel.clone();
         let mut worker = Self::with_lookup(wake, move |directory| lookup(directory, stop.as_ref()));
         worker.cancel = cancel;
@@ -250,7 +250,7 @@ impl BranchWorker {
     }
 
     fn with_lookup(
-        wake: gmux_client::ipc::Wake,
+        wake: gmux_platform::unix::ipc::Wake,
         lookup: impl Fn(&Path) -> Option<Branch> + Send + Sync + 'static,
     ) -> Self {
         let lookup = Arc::new(lookup);
@@ -380,7 +380,7 @@ mod tests {
 
     fn wait_results(
         worker: &BranchWorker,
-        wake: &gmux_client::ipc::Wake,
+        wake: &gmux_platform::unix::ipc::Wake,
     ) -> Vec<(u64, PathBuf, u64, Option<Branch>)> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -420,7 +420,7 @@ mod tests {
         let (started, lookups) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let gate = Mutex::new(gate);
-        let wake = gmux_client::ipc::Wake::new().unwrap();
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
         let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
             started.send(directory.to_path_buf()).unwrap();
             if directory == Path::new("slow") {
@@ -463,7 +463,7 @@ mod tests {
         let (started, lookups) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let gate = Mutex::new(gate);
-        let wake = gmux_client::ipc::Wake::new().unwrap();
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
         let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
             started.send(directory.to_path_buf()).unwrap();
             if directory.starts_with("held-a") || directory.starts_with("held-b") {
@@ -511,7 +511,7 @@ mod tests {
         let (release_b, gate_b) = mpsc::channel();
         let gate_a = Mutex::new(Some(gate_a));
         let gate_b = Mutex::new(Some(gate_b));
-        let wake = gmux_client::ipc::Wake::new().unwrap();
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
         let worker = BranchWorker::with_lookup(wake.clone(), move |directory| {
             started.send(directory.to_path_buf()).unwrap();
             let gate = if directory == Path::new("a") {

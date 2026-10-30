@@ -159,7 +159,7 @@ mod tests {
 
     fn tab(id: u64, pane: u64, workspace: Option<u64>) -> TabState {
         TabState {
-            daemon: crate::model::DaemonId::generate().unwrap(),
+            daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
             id,
             created_at: id,
             name: format!("Tab {id}"),
@@ -181,8 +181,8 @@ mod tests {
     }
     #[test]
     fn workspace_filter_repairs_selection_across_connections() {
-        let local = crate::model::DaemonId::generate().unwrap();
-        let remote = crate::model::DaemonId::generate().unwrap();
+        let local = gmux_platform::unix::identity::daemon_id().unwrap();
+        let remote = gmux_platform::unix::identity::daemon_id().unwrap();
         let mut own = tab(1, 2, None);
         own.daemon = local;
         let mut foreign = tab(4, 5, Some(7));
@@ -394,7 +394,7 @@ mod tests {
             split.active = active;
             let mut reply = CommandReply {
                 desktop: None,
-                daemon: Some(crate::model::DaemonId::generate().unwrap()),
+                daemon: Some(gmux_platform::unix::identity::daemon_id().unwrap()),
                 revision: 0,
                 result: CommandOutput::Done { ok: true }.into(),
                 session: session(vec![split, tab(3, 301, None)], 1, TabFilter::All),

@@ -3,7 +3,7 @@ use super::*;
 
 /// Run without initializing GTK or creating a graphics context.
 pub fn run() -> anyhow::Result<()> {
-    let path = ipc::socket_path();
+    let path = gmux_platform::unix::ipc::socket_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -13,11 +13,11 @@ pub fn run() -> anyhow::Result<()> {
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(ipc::companion_path(".lock"))?;
+        .open(gmux_platform::unix::ipc::companion_path(".lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Err(gmux_client::local::DaemonAlreadyRunning.into());
+            return Err(gmux_platform::unix::local::DaemonAlreadyRunning.into());
         }
         return Err(error.into());
     }
@@ -34,9 +34,9 @@ pub fn run() -> anyhow::Result<()> {
     let signal_fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
     anyhow::ensure!(signal_fd >= 0, "Could not create signal descriptor");
     let signal_fd = unsafe { OwnedFd::from_raw_fd(signal_fd) };
-    let wake = ipc::Wake::new()?;
-    let server = ipc::Server::start_at(path, wake.clone())?;
-    let stream_path = ipc::companion_path(".stream");
+    let wake = gmux_platform::unix::ipc::Wake::new()?;
+    let server = gmux_platform::unix::ipc::Server::start_at(path, wake.clone())?;
+    let stream_path = gmux_platform::unix::ipc::companion_path(".stream");
     if stream_path.exists() {
         use std::os::unix::fs::FileTypeExt;
         anyhow::ensure!(

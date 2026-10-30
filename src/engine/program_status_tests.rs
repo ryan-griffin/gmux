@@ -1,5 +1,5 @@
 use super::*;
-use gmux_client::program_status::{Kind, MAX_RECORDS, State};
+use gmux_protocol::program_status::{Kind, MAX_RECORDS, State};
 
 fn report(engine: &mut Engine, body: &str) -> bool {
     engine.write(format!("\x1b]7501;{body}\x1b\\").as_bytes())
@@ -257,8 +257,8 @@ fn program_status_measurements() {
     eprintln!(
         "program status inline bytes: Records={}, Summary={}, Metadata={}",
         std::mem::size_of::<crate::program_status::Records>(),
-        std::mem::size_of::<gmux_client::program_status::Summary>(),
-        std::mem::size_of::<gmux_client::transport::Metadata>()
+        std::mem::size_of::<gmux_protocol::program_status::Summary>(),
+        std::mem::size_of::<gmux_protocol::transport::Metadata>()
     );
     let iterations = 100_000;
     let report = b"\x1b]7501;state=working:id=task00:msg=SGVsbG8=\x07";
@@ -292,7 +292,7 @@ fn program_status_measurements() {
         let panes = vec![summary.clone(); count];
         let start = std::time::Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(gmux_client::program_status::representative(
+            std::hint::black_box(gmux_protocol::program_status::representative(
                 panes
                     .iter()
                     .enumerate()
@@ -303,12 +303,12 @@ fn program_status_measurements() {
             "program status aggregation, panes={count}, ns/selection={:.1}",
             start.elapsed().as_nanos() as f64 / f64::from(iterations)
         );
-        let mut legacy = gmux_client::progress::Progress::default();
-        legacy.apply(gmux_client::progress::ProgressState::Error, Some(42));
+        let mut legacy = gmux_protocol::progress::Progress::default();
+        legacy.apply(gmux_protocol::progress::ProgressState::Error, Some(42));
         for mixed in [false, true] {
             let start = std::time::Instant::now();
             for _ in 0..iterations {
-                std::hint::black_box(gmux_client::activity::representative(
+                std::hint::black_box(gmux_protocol::activity::representative(
                     std::hint::black_box(panes.as_slice())
                         .iter()
                         .enumerate()

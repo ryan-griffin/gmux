@@ -7,7 +7,7 @@ builds. Results depend on the compositor, driver, font, and machine.
 ## Grapheme storage and transport
 
 ```sh
-cargo test --locked --release -p gmux-core grapheme_measurements -- --ignored --nocapture
+cargo test --locked --release -p gmux-daemon grapheme_measurements -- --ignored --nocapture
 cargo run --locked --release -p gmux-client --example scroll-benchmark -- 0
 ```
 
@@ -151,7 +151,7 @@ Measure admission and binary transport independently of GTK:
 
 ```sh
 cargo run --locked --release -p gmux-client --example clipboard-benchmark > artifacts/clipboard-transport-benchmark.json
-cargo test --locked --release -p gmux-core clipboard_admission_measurements -- --ignored --nocapture
+cargo test --locked --release -p gmux-daemon clipboard_admission_measurements -- --ignored --nocapture
 python3 scripts/check.py --native --only clipboard clipboard-ui
 ```
 
@@ -230,8 +230,8 @@ clone only their selected record.
 Measure native parsing and retained storage with the matching pinned library:
 
 ```sh
-cargo test --locked --release -p gmux-core program_status_measurements -- --ignored --nocapture
-cargo test --locked --release -p gmux-core maximum_text_and_json_escaping -- --nocapture
+cargo test --locked --release -p gmux-daemon program_status_measurements -- --ignored --nocapture
+cargo test --locked --release -p gmux-daemon maximum_text_and_json_escaping -- --nocapture
 ```
 
 An x86-64 release run at the record cap took about 1.8 microseconds per unchanged
@@ -616,7 +616,7 @@ size accounting, in fresh processes:
 
 ```sh
 GMUX_COPY_CASE=styled GMUX_COPY_CELLS=100000 GMUX_COPY_FORMATS=text-html \
-  cargo test --locked --release -p gmux-core copy_measurements -- --ignored --nocapture
+  cargo test --locked --release -p gmux-daemon copy_measurements -- --ignored --nocapture
 ```
 
 Cases are `uniform`, alternating indexed colors (`styled`), or alternating RGB

@@ -1,5 +1,6 @@
 //! Explicit lifecycle management for execution on this computer.
-use crate::{control::InternalRequest, ipc, transport};
+use super::ipc;
+use gmux_protocol::{control::InternalRequest, transport};
 use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
@@ -8,18 +9,11 @@ use std::{
 
 /// Wait for the actual daemon process to exit, including release of its
 /// execution lock. A successful stop can be followed immediately by serve.
-pub(crate) fn stop(
-    endpoint: &ipc::Endpoint,
+pub fn stop(
+    pid: i32,
+    request: impl FnOnce() -> anyhow::Result<serde_json::Value>,
     cancellation: Option<&ipc::Cancellation>,
 ) -> anyhow::Result<serde_json::Value> {
-    let hello = match cancellation {
-        Some(c) => endpoint.call_cancellable(InternalRequest::Hello, c)?,
-        None => endpoint.call(InternalRequest::Hello)?,
-    };
-    let pid = hello["pid"]
-        .as_u64()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .ok_or_else(|| anyhow::anyhow!("Daemon handshake requires a process ID"))?;
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
     anyhow::ensure!(
         fd >= 0,
@@ -27,8 +21,8 @@ pub(crate) fn stop(
         std::io::Error::last_os_error()
     );
     let process = unsafe { OwnedFd::from_raw_fd(fd) };
-    let reply = endpoint.execute(&crate::control::ExecutionRequest::Stop, cancellation)?;
-    let deadline = Instant::now() + crate::network::CONTROL_TIMEOUT;
+    let reply = request()?;
+    let deadline = Instant::now() + gmux_protocol::network::CONTROL_TIMEOUT;
     loop {
         if let Some(cancellation) = cancellation {
             cancellation.check()?;
@@ -95,12 +89,12 @@ fn spawn_daemon(command: &mut std::process::Command) -> anyhow::Result<std::proc
         "Missing {}. Install the gmux package alongside the GTK client.",
         exe.display()
     );
-    std::fs::create_dir_all(crate::storage::config_dir())?;
+    std::fs::create_dir_all(crate::unix::storage::config_dir())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(crate::storage::config_dir().join("daemon.log"))?;
+        .open(crate::unix::storage::config_dir().join("daemon.log"))?;
     Ok(command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -134,7 +128,11 @@ fn launch_daemon(
                 cancellation.check()?;
             }
             let hello = match cancellation {
-                Some(c) => ipc::Endpoint::local().call_cancellable(InternalRequest::Hello, c),
+                Some(c) => ipc::call_at_cancellable(
+                    &ipc::socket_path(),
+                    serde_json::to_value(InternalRequest::Hello)?,
+                    Some(c),
+                ),
                 None => ipc::call(InternalRequest::Hello),
             };
             if let Ok(value) = hello {
@@ -170,7 +168,7 @@ fn launch_daemon(
                 if status.code() != Some(i32::from(DaemonAlreadyRunning::EXIT_CODE)) {
                     anyhow::bail!(
                         "Daemon exited with {status}. See daemon.log in {}",
-                        crate::storage::config_dir().display()
+                        crate::unix::storage::config_dir().display()
                     );
                 }
                 if existing == ExistingDaemon::Reject {

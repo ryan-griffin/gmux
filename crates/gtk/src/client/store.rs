@@ -3,7 +3,9 @@ use super::{
     control::{BackendReply, Command, CommandOutput},
     model::*,
 };
-use gmux_client::{control as execution, ipc, storage};
+use gmux_client::ipc;
+use gmux_platform::unix::storage;
+use gmux_protocol::control as execution;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -61,7 +63,7 @@ impl Snapshot {
 struct Shared {
     state: Arc<Snapshot>,
     revision: u64,
-    subscribers: HashMap<u64, ipc::Wake>,
+    subscribers: HashMap<u64, gmux_platform::unix::ipc::Wake>,
     next_subscriber: u64,
 }
 pub struct Store {
@@ -100,7 +102,7 @@ impl Store {
             }),
         }))
     }
-    pub fn subscribe(self: &Arc<Self>, wake: ipc::Wake) -> Subscription {
+    pub fn subscribe(self: &Arc<Self>, wake: gmux_platform::unix::ipc::Wake) -> Subscription {
         let mut shared = self.shared.lock().unwrap();
         let id = shared.next_subscriber;
         shared.next_subscriber += 1;
@@ -338,7 +340,7 @@ impl Store {
         endpoint: &ipc::Endpoint,
         local: impl Into<Option<DaemonId>>,
         body: Value,
-        cancellation: &ipc::Cancellation,
+        cancellation: &gmux_platform::unix::ipc::Cancellation,
     ) -> anyhow::Result<BackendReply> {
         self.call_inner(endpoint, body, local.into(), Some(cancellation))
     }
@@ -347,7 +349,7 @@ impl Store {
         endpoint: &ipc::Endpoint,
         mut body: Value,
         local: Option<DaemonId>,
-        cancellation: Option<&ipc::Cancellation>,
+        cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
     ) -> anyhow::Result<BackendReply> {
         let call =
             |request: Value| gmux_client::connections::call_at(endpoint, request, cancellation);
@@ -395,7 +397,7 @@ fn validate_tab(tab: &DesktopTab) -> anyhow::Result<()> {
         tab.active.daemon == tab.reference.daemon && tab.layout.contains(tab.active.id),
         "Invalid desktop pane reference"
     );
-    gmux_client::model::validate_ids(tab.reference.id, tab.layout.ids())
+    gmux_protocol::model::validate_ids(tab.reference.id, tab.layout.ids())
 }
 fn validate_directories(
     local: Option<DaemonId>,
@@ -441,14 +443,14 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let local = DaemonId::generate().unwrap();
+            let local = gmux_platform::unix::identity::daemon_id().unwrap();
             let path = std::env::temp_dir().join(format!("gmux-client-store-{local}"));
             let store = Store::at(path.join("state.json")).unwrap();
             Self {
                 path,
                 store,
                 local,
-                remote: DaemonId::generate().unwrap(),
+                remote: gmux_platform::unix::identity::daemon_id().unwrap(),
             }
         }
         fn workspace(&self, name: &str) -> u64 {
@@ -589,7 +591,11 @@ mod tests {
         );
         assert_eq!(
             f.store
-                .starting_directory(Some(workspace), DaemonId::generate().unwrap(), None)
+                .starting_directory(
+                    Some(workspace),
+                    gmux_platform::unix::identity::daemon_id().unwrap(),
+                    None
+                )
                 .unwrap(),
             None
         );
@@ -701,7 +707,9 @@ mod tests {
                 .len(),
             8
         );
-        let subscription = f.store.subscribe(ipc::Wake::new().unwrap());
+        let subscription = f
+            .store
+            .subscribe(gmux_platform::unix::ipc::Wake::new().unwrap());
         assert_eq!(f.store.shared.lock().unwrap().subscribers.len(), 1);
         drop(subscription);
         assert!(f.store.shared.lock().unwrap().subscribers.is_empty());

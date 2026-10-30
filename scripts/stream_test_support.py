@@ -9,7 +9,7 @@ import time
 # Keep raw fixture clients aligned with the Rust protocol definition.
 PROTOCOL_VERSION = int(re.search(
     r"^pub const VERSION: u32 = (\d+);$",
-    (Path(__file__).resolve().parent.parent / "crates/client/src/transport.rs").read_text(),
+    (Path(__file__).resolve().parent.parent / "crates/protocol/src/transport.rs").read_text(),
     re.MULTILINE,
 )[1])
 

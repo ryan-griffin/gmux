@@ -3,7 +3,7 @@ use super::{
     BranchCache, BranchWorker, Jobs, WORKERS,
     watches::{Change, Watches},
 };
-use gmux_client::{ipc, transport::GitMetadata};
+use gmux_protocol::transport::GitMetadata;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -43,7 +43,7 @@ pub(crate) struct Service {
 }
 
 impl Service {
-    pub(crate) fn new(wake: ipc::Wake) -> Self {
+    pub(crate) fn new(wake: gmux_platform::unix::ipc::Wake) -> Self {
         Self {
             worker: BranchWorker::new(wake),
             cache: BranchCache::default(),

@@ -5,7 +5,7 @@
 //! wrappers, omit links, resolve its palette CSS, and reconcile whitespace with
 //! the authoritative plain copy. Reject any other text difference atomically.
 use super::ffi::GmuxCopyColors;
-use gmux_client::clipboard::MAX_HTML;
+use gmux_protocol::clipboard::MAX_HTML;
 
 pub(super) fn normalize(raw: &str, plain: &str, colors: &GmuxCopyColors) -> Option<String> {
     let mut output = String::new();

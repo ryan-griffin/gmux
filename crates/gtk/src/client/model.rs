@@ -4,9 +4,10 @@ use std::{
     path::PathBuf,
 };
 
-pub use gmux_client::model::{
+pub use gmux_platform::unix::paths::{expand_home, home};
+pub use gmux_protocol::model::{
     CursorStyle, DaemonId, ExecutionState, ExecutionTab, Machine, MachineKind, PaneRef, PaneTree,
-    TabRef, directory_name, display_path, expand_home, home, is_machine_directory,
+    TabRef, is_machine_directory,
 };
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Layout {
@@ -194,14 +195,14 @@ pub struct TabState {
     pub custom_name: bool,
     pub workspace: Option<u64>,
     pub layout: Layout,
-    #[serde(deserialize_with = "gmux_client::model::pane_directories")]
+    #[serde(deserialize_with = "gmux_protocol::model::pane_directories")]
     pub directories: HashMap<u64, PathBuf>,
     pub active: u64,
 }
 
 impl TabState {
     pub fn validate(&self) -> anyhow::Result<()> {
-        gmux_client::model::validate_ids(self.id, self.layout.ids())
+        gmux_protocol::model::validate_ids(self.id, self.layout.ids())
     }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -443,7 +444,7 @@ mod tests {
     #[test]
     fn tab_states_reject_duplicate_and_overflowing_ids() {
         let mut saved = TabState {
-            daemon: DaemonId::generate().unwrap(),
+            daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
             id: 1,
             created_at: 1,
             name: "Project".into(),

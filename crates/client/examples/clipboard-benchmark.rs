@@ -1,5 +1,5 @@
 //! Measure binary clipboard transport without a desktop or terminal parser.
-use gmux_client::{
+use gmux_protocol::{
     clipboard::{Destination, Offer, Representation, Write as ClipboardWrite},
     transport::{Header, Packet},
 };

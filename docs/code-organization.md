@@ -2,13 +2,33 @@
 
 Gmux has a GTK frontend and a headless daemon. The daemon owns terminal processes
 and shared layouts. Each window owns its presentation and terminal views.
-The Cargo workspace has `gmux-core`, `gmux-client`, `gmux`, and `gmux-gtk` packages.
-`gmux-core` exposes the daemon entry points. Shared protocol and connection types
-come directly from `gmux-client`; core does not re-export a client API.
-`gmux` contains the server entry point, `serve --background`, and management CLI.
-`gmux-gtk` builds the optional `gmux-gtk` client and its resources. The daemon has
-no GUI features or dependencies. Build and install scripts compile it independently
-in both modes so GTK dependency features cannot change the shipped artifact.
+The Cargo workspace separates shared protocol, client behavior, and execution:
+
+- `gmux-protocol`, in `crates/protocol`, defines shared terminal values, execution
+  requests and snapshots, network handshakes, and codecs. It uses ordinary Rust
+  serialization dependencies and has no platform I/O or native build dependencies.
+- `gmux-client`, in `crates/client`, owns outgoing connections, retries, terminal
+  caches, and bounded queues. Its `unix` module contains client platform adapters.
+- `gmux-platform`, in `crates/platform`, provides shared platform services.
+  `paths` formats paths against an explicit home directory, and `tcp` applies
+  deadlines through standard-library sockets. `unix` contains the current Linux
+  integration: control sockets, fd wakeups, cancellation, file locking, atomic
+  writes, machine detection, identity generation, and local daemon lifecycle.
+- `gmux-daemon`, at the repository root, owns PTYs, Ghostty and its native bridge,
+  server listeners, execution, and daemon persistence. It exposes the daemon entry
+  points and has no runtime dependency on the client library.
+- `gmux`, in `crates/cli`, contains the `serve` command and management CLI.
+- `gmux-gtk`, in `crates/gtk`, builds the GTK client and its resources.
+
+Linux is currently the supported platform. The protocol crate is independent of
+that choice; client integration still uses Linux implementations for socket
+setup, fd notifications, configuration watches, and process watching. Local Unix
+socket transport and local daemon management are separate responsibilities.
+Additional client platforms require implementations of these adapters.
+
+The daemon has no GUI dependencies. Build and install scripts compile it
+independently in both modes so GTK dependency features cannot change the shipped
+artifact. `scripts/check.py` enforces the package dependency boundaries.
 
 ## Frontend
 
@@ -69,42 +89,55 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 - `frontend.rs`: stream input, paste assembly, subscriptions, and viewport output.
 - `commands.rs`: layout and control commands, including ordered saves.
 
-`crates/client/src/model.rs` and `model/state.rs` define daemon identities, qualified references,
-execution state, and pane topology. `crates/client/src/storage.rs`
+`crates/protocol/src/model.rs` and `model/state.rs` define daemon identities, qualified references,
+execution state, and pane topology. `crates/platform/src/unix/storage.rs`
 loads JSON and writes files atomically. `src/persistence.rs` creates the daemon identity and runs the disk worker.
 The detached launcher only starts a process and waits for its control handshake;
 the daemon validates and restores its own saved execution.
 `src/scrollback.rs` handles history checkpoints.
-`model/machine.rs` detects and caches the hostname and hardware type.
+`crates/platform/src/unix/machine.rs` detects and caches the hostname and hardware type.
+`unix/identity.rs` generates daemon identities from the operating system.
+`unix/paths.rs` discovers the local home directory and expands local home paths;
+formatting with a supplied home directory lives in the portable `paths` module.
 `branch/service.rs` shares requested Git metadata across clients, and
 `branch/watches.rs` tracks repository changes on the owning machine.
 
-`crates/client/src/control.rs` defines execution requests and replies, including
+`crates/protocol/src/control.rs` defines execution requests and replies, including
 tab commands and pane requests shared with GTK. GTK adds workspace and window
-operations. `ipc.rs` handles Unix sockets, direct TCP endpoints, cancellation,
-and request workers.
-`transport.rs` and `transport/requests.rs` encode viewport packets and stream commands.
-`network.rs` contains client TCP authentication and bounded I/O. In core,
-`src/daemon/network.rs` accepts incoming TCP connections and forwards execution
-requests and streams. `src/daemon/remote_access.rs` owns listener configuration and lifecycle.
-There is no outgoing connection registry or proxy in the daemon.
+operations. `crates/client/src/ipc.rs` handles execution endpoints and request
+workers. `crates/platform/src/unix/ipc.rs` supplies local control sockets and cancellation.
+`crates/protocol/src/transport.rs` and `transport/requests.rs` encode viewport
+packets and stream commands. `crates/protocol/src/network.rs` defines handshakes
+and bounded JSON framing. `crates/client/src/network.rs` authenticates outgoing
+TCP connections. Both sides use `gmux-platform::tcp` for deadline-aware I/O.
+`src/daemon/network.rs` accepts incoming TCP connections and
+forwards execution requests and streams. `src/daemon/remote_access.rs` owns
+listener configuration and lifecycle. There is no outgoing connection registry
+or proxy in the daemon.
 
 See [background sessions](terminal-sessions.md) for lifecycle and protocol limits.
 
 ## Client library
 
 `gmux-client`, in `crates/client`, is shared by the built-in CLI and GTK app.
-It has no GTK, PTY, libghostty, or native bridge build dependencies. Viewport
-values are ordinary Rust types; the daemon's generated ABI assertions check their
-layout against the C bridge. `connections.rs` owns saved destinations, identity
-pins, client configuration commands, and catalog notifications. `connection.rs`
-owns one daemon's asynchronous setup, retries, status, and typed state updates.
-`remote.rs` maintains cached viewports and bounded input/output queues.
-`control.rs` defines typed execution requests for both Unix and TCP, with control
-API response conversion outside the transport. Direct TCP endpoints accept
-in-memory credentials; saved connections load credentials from token files.
-`local.rs` provides explicit daemon startup and completed shutdown, separate from connecting.
-GTK and `gmux serve --background` share its detached launcher and readiness check.
+It has no GTK, PTY, libghostty, or native bridge build dependencies. Shared
+protocol types come directly from `gmux-protocol`, without client re-exports.
+Viewport values are ordinary Rust types; the daemon's generated ABI assertions
+check their layout against the C bridge.
+
+`connections.rs` owns saved destinations, identity pins, and client configuration
+commands. `connection.rs` owns one daemon's asynchronous setup, retries, status,
+and typed state updates. `remote.rs` maintains cached viewports and bounded
+input/output queues. Incoming queue admission tests live with the client; codecs
+and value tests live with the protocol.
+
+`unix/connect.rs` implements cancellable TCP setup using the current Linux socket
+APIs. `unix/watch.rs` watches saved connections using inotify. Direct TCP endpoints
+accept in-memory credentials; saved connections load credentials from token files.
+`gmux-platform::unix::local` provides explicit daemon startup and completed shutdown,
+separate from connecting. GTK and `gmux serve --background` share its detached
+launcher and readiness check. Daemon checkpoint formats and restoration stay in
+`gmux-daemon`; GTK organization and saved connections stay with their owners.
 
 ## GTK organization
 

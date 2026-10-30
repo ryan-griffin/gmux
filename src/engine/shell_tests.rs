@@ -1,5 +1,5 @@
 use super::*;
-use gmux_client::shell::CommandPhase::*;
+use gmux_protocol::shell::CommandPhase::*;
 
 fn terminal() -> Engine {
     let mut engine = Engine::new().unwrap();
@@ -86,7 +86,7 @@ fn output_selection_is_linear_unwraps_and_excludes_prompt_input_and_next_prompt(
     e.select_output(None).unwrap();
     assert_eq!(
         e.selection().unwrap().shape,
-        gmux_client::selection::Shape::Linear
+        gmux_protocol::selection::Shape::Linear
     );
     assert_eq!(e.copy().unwrap(), "1234567890abcdef 界🙂");
     e.resize(8, 4, 0, 0).unwrap();

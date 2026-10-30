@@ -1,5 +1,5 @@
 //! One latest value and one deadline per execution. No history or frontend timer.
-use gmux_client::progress::{Progress, ProgressState};
+use gmux_protocol::progress::{Progress, ProgressState};
 use std::time::{Duration, Instant};
 
 const STALE_AFTER: Duration = Duration::from_secs(15);

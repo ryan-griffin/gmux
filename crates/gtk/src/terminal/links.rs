@@ -1,6 +1,6 @@
 //! Link actions read the last painted viewport, including its geometry.
 use super::*;
-use gmux_client::hyperlinks::Hyperlinks;
+use gmux_protocol::hyperlinks::Hyperlinks;
 
 #[derive(Default)]
 pub(super) struct DisplayedLinks {

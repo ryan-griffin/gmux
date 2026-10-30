@@ -1,5 +1,5 @@
 //! Native pane progress bars with mapped-only activity animation.
-use gmux_client::activity::{Activity, Bar};
+use gmux_protocol::activity::{Activity, Bar};
 use gtk::{glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},

@@ -1,6 +1,7 @@
 //! Optional, bounded Ghostty checkpoints owned by the daemon's saved layout.
 use anyhow::Context;
-use gmux_client::{model::ExecutionState, storage};
+use gmux_platform::unix::storage;
+use gmux_protocol::model::ExecutionState;
 use std::{
     collections::HashSet, fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::Path,
 };
@@ -255,7 +256,7 @@ fn temporary_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gmux_client::model::{ExecutionTab, PaneTree};
+    use gmux_protocol::model::{ExecutionTab, PaneTree};
     use std::collections::HashMap;
 
     fn test_directory() -> std::path::PathBuf {
