@@ -113,7 +113,13 @@ formatting with a supplied home directory lives in the portable `paths` module.
 `crates/protocol/src/control.rs` defines execution requests and replies, including
 tab commands and pane requests shared with GTK. GTK adds workspace and window
 operations. `crates/client/src/ipc.rs` handles execution endpoints and request
-workers. `crates/platform/src/unix/ipc.rs` supplies local control sockets and cancellation.
+workers. Sync and async execution APIs return `ExecutionReply`; workers and GTK
+carry these values through consumption. Layout replies reuse `CommandReply`,
+including execution revisions and persistence warnings. Socket readers decode the
+concrete reply selected by the request and reject error envelopes before returning
+payloads. CLI and RPC handlers serialize replies at their JSON boundaries. Status
+instrumentation and client configuration payloads retain their dynamic JSON contract.
+`crates/platform/src/unix/ipc.rs` supplies local control sockets and cancellation.
 `crates/protocol/src/transport.rs` and `transport/requests.rs` encode viewport
 packets and stream commands. `crates/protocol/src/network.rs` defines handshakes
 and bounded JSON framing. `crates/client/src/network.rs` authenticates outgoing

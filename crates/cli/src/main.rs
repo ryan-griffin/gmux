@@ -446,7 +446,7 @@ fn run() -> anyhow::Result<()> {
         let endpoint = connection.map_or_else(ipc::Endpoint::local, |name| {
             ipc::Endpoint::remote(name, None)
         });
-        endpoint.stop(None)?
+        serde_json::to_value(endpoint.stop(None)?)?
     } else if TerminalCommand::supports(request["method"].as_str().unwrap_or("")) {
         let endpoint = connection.map_or_else(ipc::Endpoint::local, |name| {
             ipc::Endpoint::remote(name, None)

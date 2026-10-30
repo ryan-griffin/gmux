@@ -357,27 +357,18 @@ impl Store {
             return gmux_client::runtime::blocking(move || store.call_organization(body, local))
                 .await;
         }
-        let request = if body["method"] == "_connection-call" {
-            &body["request"]
-        } else {
-            &body
-        };
-        let snapshot = execution::Request::decode(request.clone())
-            .is_ok_and(|request| request.returns_snapshot());
-        let reply = gmux_client::connections::call_at_async(
+        match gmux_client::connections::request_at_async(
             endpoint.clone(),
             body,
             Some(cancellation.clone()),
         )
-        .await?;
-        if snapshot {
-            Ok(BackendReply::Execution {
-                reply: serde_json::from_value(reply)?,
-            })
-        } else {
-            Ok(BackendReply::Value(reply))
+        .await?
+        {
+            gmux_client::connections::Reply::Execution(reply) => Ok(BackendReply::Execution(reply)),
+            gmux_client::connections::Reply::Configuration(value) => Ok(BackendReply::Value(value)),
         }
     }
+
     fn call_organization(
         &self,
         mut body: Value,

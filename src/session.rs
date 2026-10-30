@@ -138,9 +138,12 @@ impl TerminalSession {
     ) -> anyhow::Result<()> {
         self.engine.use_view_appearance(view)
     }
-    pub(crate) fn links(&mut self) -> anyhow::Result<serde_json::Value> {
+    pub(crate) fn links(&mut self) -> anyhow::Result<gmux_protocol::control::PaneLinks> {
         self.engine.snapshot()?;
-        Ok(serde_json::json!({"frame": self.engine.frame, "hyperlinks": self.engine.hyperlinks}))
+        Ok(gmux_protocol::control::PaneLinks {
+            frame: self.engine.frame,
+            hyperlinks: self.engine.hyperlinks.clone(),
+        })
     }
     pub(crate) fn new_view(&self) -> anyhow::Result<crate::engine::EngineView> {
         self.engine.new_view()

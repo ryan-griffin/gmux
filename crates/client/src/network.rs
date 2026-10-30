@@ -2,7 +2,11 @@
 use crate::{io, runtime};
 use gmux_platform::unix::ipc::Cancellation;
 use gmux_protocol::network::*;
-use gmux_protocol::{control::ExecutionRequest, model::DaemonId, transport};
+use gmux_protocol::{
+    control::{ExecutionReply, ExecutionRequest},
+    model::DaemonId,
+    transport,
+};
 use serde_json::Value;
 use std::{net::TcpStream, path::PathBuf, time::Instant};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -203,7 +207,7 @@ pub fn call(
     credentials: &Credentials,
     expected: Option<DaemonId>,
     request: &ExecutionRequest,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<ExecutionReply> {
     call_cancellable(address, credentials, expected, request, None)
 }
 pub fn call_cancellable(
@@ -212,7 +216,7 @@ pub fn call_cancellable(
     expected: Option<DaemonId>,
     request: &ExecutionRequest,
     cancellation: Option<&Cancellation>,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<ExecutionReply> {
     runtime::block_on(runtime::cancellable(
         cancellation,
         call_async(address, credentials, expected, request),
@@ -223,7 +227,7 @@ pub(crate) async fn call_async(
     credentials: &Credentials,
     expected: Option<DaemonId>,
     request: &ExecutionRequest,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<ExecutionReply> {
     let deadline = Instant::now() + CONTROL_TIMEOUT;
     let mut client = Client::connect_async(address, credentials, expected, deadline).await?;
     client.call_async(request, deadline).await
@@ -284,24 +288,22 @@ impl Client {
             hostname: hello.hostname,
         })
     }
-    pub fn call(&mut self, request: &ExecutionRequest, deadline: Instant) -> anyhow::Result<Value> {
+    pub fn call(
+        &mut self,
+        request: &ExecutionRequest,
+        deadline: Instant,
+    ) -> anyhow::Result<ExecutionReply> {
         runtime::block_on(self.call_async(request, deadline))
     }
     async fn call_async(
         &mut self,
         request: &ExecutionRequest,
         deadline: Instant,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<ExecutionReply> {
         runtime::deadline(deadline.min(Instant::now() + TIMEOUT), async {
             io::write_json(self.reader.get_mut(), request).await?;
-            let value = io::read_json(&mut self.reader, MAX_REPLY).await?;
-            check_error(&value)?;
-            if let Some(id) = value.get("daemon") {
-                anyhow::ensure!(
-                    serde_json::from_value::<DaemonId>(id.clone())? == self.daemon,
-                    "Remote connection identity changed"
-                );
-            }
+            let bytes = io::read_json_bytes(&mut self.reader, MAX_REPLY).await?;
+            let reply = request.decode_reply_from(&bytes, Some(self.daemon))?;
             if matches!(request, ExecutionRequest::Stop) {
                 let mut trailing = [0; 1];
                 anyhow::ensure!(
@@ -309,7 +311,7 @@ impl Client {
                     "Unexpected reply during daemon shutdown"
                 );
             }
-            Ok(value)
+            Ok(reply)
         })
         .await
     }

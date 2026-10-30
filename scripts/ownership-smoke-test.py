@@ -55,6 +55,24 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         assert a.settings_path.read_text() == "invalid preferences"
         assert not (a.config / "desktop.json").exists() and not (a.config / "workspaces.json").exists()
 
+    with scenario("persistence failures remain warnings on successful command outcomes and snapshots"):
+        path = a.config / "execution.json"
+        saved = path.read_bytes()
+        before = a.rpc("_state")["revision"]
+        path.unlink()
+        path.mkdir()  # Atomic replacement cannot overwrite a directory.
+        try:
+            outcome = a.rpc("rename", tab=x["tab"], name="Unsaved outcome")
+            assert outcome["ok"] and outcome["daemon"] == identity, outcome
+            assert "Could not save execution" in outcome["warning"] and "error" not in outcome, outcome
+            reply = a.rpc("_execution", request=dict(method="rename", tab=x["tab"], name="Unsaved snapshot"))
+            assert reply["result"]["ok"] and reply["revision"] > before, reply
+            assert "Could not save execution" in reply["result"]["warning"], reply
+            assert reply["execution"]["tabs"][0]["name"] == "Unsaved snapshot", reply
+        finally:
+            path.rmdir()
+            path.write_bytes(saved)
+
     with scenario("deleted IDs remain reserved and client files are ignored on restart"):
         transient = a.rpc("new")
         greatest = a.rpc("split",pane=transient["pane"])["pane"]

@@ -1,6 +1,6 @@
 //! Control commands and their ordered persistence.
 use super::*;
-use gmux_protocol::control::{ExecutionRequest, InternalRequest, Request};
+use gmux_protocol::control::*;
 
 pub(super) struct ControlRequest {
     pub(super) body: Request,
@@ -20,15 +20,15 @@ impl ControlRequest {
         }
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplyKind {
-    Direct,
-    Snapshot,
+enum ControlValue {
+    Execution(ExecutionReply),
+    Command(CommandResult),
+    Hello(Value),
 }
 struct ControlReply {
-    kind: ReplyKind,
     sender: std::sync::mpsc::SyncSender<Value>,
-    value: Value,
+    result: anyhow::Result<ControlValue>,
+    output_only: bool,
     broadcast: bool,
 }
 pub(super) struct PendingControl {
@@ -49,15 +49,16 @@ impl PendingControl {
             return None;
         }
         let mut limits = None;
-        let mut kind = ReplyKind::Direct;
         let mut broadcast = false;
-        let result: anyhow::Result<Value> = (|| {
+        let mut output_only = false;
+        let result = (|| {
             if matches!(request.body, Request::Internal(InternalRequest::Hello)) {
-                return Ok(daemon.hello());
+                return Ok(ControlValue::Hello(daemon.hello()));
             }
-            let (request, output_only) = request
+            let (request, only) = request
                 .body
                 .into_execution(|pane| daemon.resolve_pane(pane))?;
+            output_only = only;
             if let ExecutionRequest::Scrollback {
                 max_bytes,
                 max_lines,
@@ -67,25 +68,25 @@ impl PendingControl {
                 let candidate = daemon.limits.update(max_bytes, max_lines)?;
                 daemon.pending_write = Some(Save::Settings(candidate));
                 limits = Some(candidate);
-                return Ok(json!({"limits": candidate, "saved": false, "applied": false}));
+                return Ok(ControlValue::Execution(ExecutionReply::Scrollback(
+                    ScrollbackReply {
+                        limits: candidate,
+                        saved: Some(false),
+                        applied: Some(false),
+                        failures: vec![],
+                        error: None,
+                    },
+                )));
             }
             broadcast = request.changes_layout();
-            if broadcast && !output_only {
-                kind = ReplyKind::Snapshot;
-            }
-            let mut value = daemon.control(request)?;
-            Ok(if output_only {
-                value["result"].take()
-            } else {
-                value
-            })
+            daemon.control(request)
         })();
         let failed = result.is_err();
         let reply = ControlReply {
-            kind,
-            broadcast,
             sender: request.reply,
-            value: result.unwrap_or_else(|error| json!({"error":error.to_string()})),
+            result,
+            output_only,
+            broadcast,
         };
         let save = daemon.pending_write.take();
         if !failed && let Some(save) = save {
@@ -113,7 +114,9 @@ impl PendingControl {
         match result {
             Ok(()) => {
                 if let Some(limits) = limits {
-                    reply.value = daemon.apply_scrollback_limits(limits);
+                    reply.result = Ok(ControlValue::Execution(ExecutionReply::Scrollback(
+                        daemon.apply_scrollback_limits(limits),
+                    )));
                 }
             }
             Err(error) => {
@@ -133,65 +136,80 @@ impl ControlReply {
         error: String,
         current: gmux_protocol::retention::ScrollbackLimits,
     ) -> Self {
-        self.value["limits"] = json!(current);
-        self.value["error"] = json!(format!(
-            "Could not durably save scrollback settings; running limits and history are unchanged: {error}"
-        ));
-        self.value["saved"] = json!(false);
-        self.value["applied"] = json!(false);
+        self.result = Ok(ControlValue::Execution(ExecutionReply::Scrollback(
+            ScrollbackReply {
+                limits: current,
+                saved: Some(false),
+                applied: Some(false),
+                failures: vec![],
+                error: Some(format!(
+                    "Could not durably save scrollback settings; running limits and history are unchanged: {error}"
+                )),
+            },
+        )));
         self
     }
     fn save_failed(mut self, error: String) -> Self {
-        let result = if self.kind == ReplyKind::Snapshot {
-            &mut self.value["result"]
-        } else {
-            &mut self.value
-        };
-        result["warning"] = json!(format!("Could not save execution or scrollback: {error}"));
+        let warning = Some(format!("Could not save execution or scrollback: {error}"));
+        match &mut self.result {
+            Ok(ControlValue::Command(result)) => result.warning = warning,
+            Ok(ControlValue::Execution(ExecutionReply::Stopped(reply))) => reply.warning = warning,
+            _ => (),
+        }
         self
     }
-    fn send(mut self, daemon: &mut Daemon) {
-        if self.broadcast && self.value.get("error").is_none() {
-            daemon.revision += 1;
-            self.value["daemon"] = json!(daemon.id);
-        }
-        if self.kind == ReplyKind::Snapshot && self.value.get("error").is_none() {
-            self.value = (|| -> anyhow::Result<Value> {
-                let result = serde_json::from_value(self.value["result"].take())?;
-                let mut reply = daemon.execution_reply();
-                reply.result = result;
-                Ok(serde_json::to_value(reply)?)
-            })()
+    fn send(self, daemon: &mut Daemon) {
+        let value = self
+            .result
+            .and_then(|value| {
+                if self.broadcast {
+                    daemon.revision += 1;
+                }
+                Ok(match value {
+                    ControlValue::Command(result) if self.output_only => {
+                        serde_json::to_value(CommandOutcome {
+                            daemon: daemon.id,
+                            result,
+                        })?
+                    }
+                    ControlValue::Command(result) => {
+                        let mut reply = daemon.execution_reply();
+                        reply.result = result;
+                        serde_json::to_value(reply)?
+                    }
+                    ControlValue::Execution(reply) => serde_json::to_value(reply)?,
+                    ControlValue::Hello(value) => value,
+                })
+            })
             .unwrap_or_else(|error| json!({"error":error.to_string()}));
-        }
-        let _ = self.sender.try_send(self.value);
+        let _ = self.sender.try_send(value);
     }
 }
 impl Daemon {
     fn apply_scrollback_limits(
         &mut self,
         limits: gmux_protocol::retention::ScrollbackLimits,
-    ) -> Value {
+    ) -> ScrollbackReply {
         // Publication precedes irreversible pruning. Never roll back a policy
         // after applying it to only part of the history.
         self.limits = limits;
         let mut failures = Vec::new();
         for (&id, session) in &mut self.sessions {
             if let Err(error) = session.set_scrollback_limits(limits) {
-                failures.push(json!({"pane": id, "error": error.to_string()}));
+                failures.push(PaneFailure {
+                    pane: id,
+                    error: error.to_string(),
+                });
             }
             self.changed.insert(id);
         }
-        let mut result = json!({"limits": limits, "saved": true, "applied": failures.is_empty()});
-        if !failures.is_empty() {
-            result["error"] = json!(
-                "Settings were saved, but some terminals could not apply them. Removed history cannot be restored"
-            );
-            result["failures"] = json!(failures);
+        let applied = failures.is_empty();
+        ScrollbackReply {
+            limits, saved: Some(true), applied: Some(applied), failures,
+            error: (!applied).then(|| "Settings were saved, but some terminals could not apply them. Removed history cannot be restored".into()),
         }
-        result
     }
-    pub(super) fn list(&mut self) -> anyhow::Result<Value> {
+    pub(super) fn list(&mut self) -> anyhow::Result<ExecutionList> {
         self.refresh_state();
         let tabs: Vec<_> = self
             .state
@@ -202,46 +220,55 @@ impl Daemon {
                 let panes: Vec<_> = ids
                     .iter()
                     .filter_map(|id| self.sessions.get(id))
-                    .map(|session| {
-                        json!({
-                            "id": session.id(),
-                            "reference": PaneRef { daemon: self.id, id: session.id() },
-                            "title": session.title(),
-                            "directory": session.directory(),
-                            "exited": session.exited(),
-                            "busy": session.busy(),
-                            "command": session.command_state(),
-                            "progress": session.progress(),
-                            "program_status": session.program_status(),
-                            "unread": self.unread.contains_key(&session.id()),
-                        })
+                    .map(|session| ListPane {
+                        id: session.id(),
+                        reference: PaneRef {
+                            daemon: self.id,
+                            id: session.id(),
+                        },
+                        title: session.title(),
+                        directory: session.directory().to_owned(),
+                        exited: session.exited(),
+                        busy: session.busy(),
+                        command: session.command_state(),
+                        progress: session.progress(),
+                        program_status: session.program_status().cloned(),
+                        unread: self.unread.contains_key(&session.id()),
                     })
                     .collect();
-                json!({
-                    "id": tab.id,
-                    "created_at": tab.created_at,
-                    "reference": TabRef { daemon: self.id, id: tab.id },
-                    "name": tab.name,
-                    "unread": ids.iter().any(|id| self.unread.contains_key(id)),
-                    "progress": gmux_protocol::progress::representative(ids.iter().filter_map(|id|
-                        self.sessions.get(id).map(|s| (*id, s.progress())))),
-                    "program_status": gmux_protocol::program_status::representative(ids.iter().filter_map(|id|
-                        self.sessions.get(id).map(|s| (*id, s.program_status())))),
-                    "layout": tab.layout,
-                    "panes": panes,
-                })
+                ListTab {
+                    id: tab.id,
+                    created_at: tab.created_at,
+                    reference: TabRef {
+                        daemon: self.id,
+                        id: tab.id,
+                    },
+                    name: tab.name.clone(),
+                    unread: ids.iter().any(|id| self.unread.contains_key(id)),
+                    progress: gmux_protocol::progress::representative(
+                        ids.iter()
+                            .filter_map(|id| self.sessions.get(id).map(|s| (*id, s.progress()))),
+                    ),
+                    program_status: gmux_protocol::program_status::representative(
+                        ids.iter().filter_map(|id| {
+                            self.sessions.get(id).map(|s| (*id, s.program_status()))
+                        }),
+                    ),
+                    layout: tab.layout.clone(),
+                    panes,
+                }
             })
             .collect();
-        Ok(json!({
-            "daemon": self.id,
-            "tabs": tabs,
-        }))
+        Ok(ExecutionList {
+            daemon: self.id,
+            tabs,
+        })
     }
-    fn result_with_state_save(&mut self, output: CommandOutput) -> Value {
+    fn result_with_state_save(&mut self, output: CommandOutput) -> ControlValue {
         self.prepare_state_save();
-        json!({"result":CommandResult::from(output)})
+        ControlValue::Command(output.into())
     }
-    fn control(&mut self, request: ExecutionRequest) -> anyhow::Result<Value> {
+    fn control(&mut self, request: ExecutionRequest) -> anyhow::Result<ControlValue> {
         match request {
             ExecutionRequest::New { directory, name } => {
                 let directory = directory.unwrap_or_else(gmux_platform::unix::paths::home);
@@ -365,44 +392,64 @@ impl Daemon {
                 tab.custom_name = false;
                 Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
             }
-            ExecutionRequest::Scrollback { .. } => Ok(json!({"limits": self.limits})),
-            ExecutionRequest::Status => Ok(json!({
-                "version": transport::VERSION,
-                "daemon": self.id,
-                "hostname": gmux_platform::unix::machine::hostname(),
-                "home_directory": gmux_platform::unix::paths::home(),
-                "machine_kind": gmux_platform::unix::machine::machine_kind(),
-                "bound_address": self.remote_access.bound_address(),
-                "pid": std::process::id(),
-                "local_clients": self.frontends.values().filter(|f| f.attached && !f.remote).count(),
-                "remote_clients": self.frontends.values().filter(|f| f.attached && f.remote).count(),
-                "panes": self.sessions.len(),
-                "uptime_seconds": self.started.elapsed().as_secs(),
-                "snapshots": self.snapshots,
-                "sent_rows": self.sent_rows,
-                "scrollback_limits": self.limits,
-                "terminal_memory": self.sessions.values()
-                    .map(TerminalSession::memory_usage).collect::<anyhow::Result<Vec<_>>>()?,
-                "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),
-                "git": self.git.as_ref().map_or_else(crate::branch::Stats::default, crate::branch::Service::stats),
-            })),
+            ExecutionRequest::Scrollback { .. } => Ok(ControlValue::Execution(
+                ExecutionReply::Scrollback(ScrollbackReply {
+                    limits: self.limits,
+                    saved: None,
+                    applied: None,
+                    failures: vec![],
+                    error: None,
+                }),
+            )),
+            ExecutionRequest::Status => {
+                Ok(ControlValue::Execution(ExecutionReply::Status(json!({
+                    "version": transport::VERSION,
+                    "daemon": self.id,
+                    "hostname": gmux_platform::unix::machine::hostname(),
+                    "home_directory": gmux_platform::unix::paths::home(),
+                    "machine_kind": gmux_platform::unix::machine::machine_kind(),
+                    "bound_address": self.remote_access.bound_address(),
+                    "pid": std::process::id(),
+                    "local_clients": self.frontends.values().filter(|f| f.attached && !f.remote).count(),
+                    "remote_clients": self.frontends.values().filter(|f| f.attached && f.remote).count(),
+                    "panes": self.sessions.len(),
+                    "uptime_seconds": self.started.elapsed().as_secs(),
+                    "snapshots": self.snapshots,
+                    "sent_rows": self.sent_rows,
+                    "scrollback_limits": self.limits,
+                    "terminal_memory": self.sessions.values()
+                        .map(TerminalSession::memory_usage).collect::<anyhow::Result<Vec<_>>>()?,
+                    "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),
+                    "git": self.git.as_ref().map_or_else(crate::branch::Stats::default, crate::branch::Service::stats),
+                }))))
+            }
             ExecutionRequest::Busy { panes: ids } => {
                 let busy = ids
                     .into_iter()
                     .any(|id| self.sessions.get(&id).is_some_and(TerminalSession::busy));
-                Ok(json!({"busy":busy}))
+                Ok(ControlValue::Execution(ExecutionReply::Busy(BusyReply {
+                    busy,
+                })))
             }
             ExecutionRequest::State => {
                 self.refresh_state();
-                Ok(serde_json::to_value(self.execution_reply())?)
+                Ok(ControlValue::Execution(ExecutionReply::Snapshot(Box::new(
+                    self.execution_reply(),
+                ))))
             }
             ExecutionRequest::Metadata { pane: id } => {
                 let session = self.sessions.get_mut(&id).unwrap();
                 session.refresh_directory();
-                Ok(
-                    json!({"meta":Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0)),
-                        "program_status_records": session.program_status_records()}),
-                )
+                Ok(ControlValue::Execution(ExecutionReply::Metadata(Box::new(
+                    PaneMetadata {
+                        meta: Self::metadata(session, self.unread.get(&id).copied().unwrap_or(0)),
+                        program_status_records: session
+                            .program_status_records()
+                            .into_iter()
+                            .cloned()
+                            .collect(),
+                    },
+                ))))
             }
             ExecutionRequest::CommandOutput {
                 pane: id,
@@ -414,7 +461,7 @@ impl Daemon {
                     .get_mut(&id)
                     .unwrap()
                     .command_output(point, formats)?;
-                Ok(serde_json::to_value(content)?)
+                Ok(ControlValue::Execution(ExecutionReply::Content(content)))
             }
             ExecutionRequest::Copy { pane: id, formats } => {
                 let frontend = self
@@ -438,12 +485,14 @@ impl Daemon {
                 } else {
                     String::new().into()
                 };
-                Ok(serde_json::to_value(content)?)
+                Ok(ControlValue::Execution(ExecutionReply::Content(content)))
             }
-            ExecutionRequest::Links { pane: id } => self.sessions.get_mut(&id).unwrap().links(),
-            ExecutionRequest::Read { pane: id } => {
-                Ok(json!({"text":self.sessions.get_mut(&id).unwrap().text()?}))
-            }
+            ExecutionRequest::Links { pane: id } => Ok(ControlValue::Execution(
+                ExecutionReply::Links(self.sessions.get_mut(&id).unwrap().links()?),
+            )),
+            ExecutionRequest::Read { pane: id } => Ok(ControlValue::Execution(
+                ExecutionReply::Content(self.sessions.get_mut(&id).unwrap().text()?.into()),
+            )),
             ExecutionRequest::Stop => {
                 let checkpoint = self.prepare_checkpoint();
                 let warning = match checkpoint {
@@ -458,9 +507,13 @@ impl Daemon {
                 };
                 self.checkpointed = true;
                 self.quitting = true;
-                Ok(json!({"ok":true,"warning":warning}))
+                Ok(ControlValue::Execution(ExecutionReply::Stopped(
+                    StopReply { ok: true, warning },
+                )))
             }
-            ExecutionRequest::List => self.list(),
+            ExecutionRequest::List => {
+                Ok(ControlValue::Execution(ExecutionReply::List(self.list()?)))
+            }
             ExecutionRequest::Send {
                 pane: id,
                 text,
@@ -473,11 +526,15 @@ impl Daemon {
                 } else {
                     session.send_with_enter(text.as_bytes(), enter)?;
                 }
-                Ok(json!({"ok":true}))
+                Ok(ControlValue::Execution(ExecutionReply::Done(
+                    Acknowledgement { ok: true },
+                )))
             }
             ExecutionRequest::Notify { pane: id, message } => {
                 self.queue_notifications(id, [message]);
-                Ok(json!({"ok":true}))
+                Ok(ControlValue::Execution(ExecutionReply::Done(
+                    Acknowledgement { ok: true },
+                )))
             }
         }
     }

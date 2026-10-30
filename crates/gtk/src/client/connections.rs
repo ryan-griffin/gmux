@@ -414,12 +414,14 @@ impl Connections {
         &mut self,
         reply: execution::CommandReply,
     ) -> anyhow::Result<CommandReply> {
-        self.project(BackendReply::Execution { reply })
+        self.project(BackendReply::Execution(
+            execution::ExecutionReply::Snapshot(Box::new(reply)),
+        ))
     }
     pub fn project(&mut self, reply: BackendReply) -> anyhow::Result<CommandReply> {
         self.refresh_organization();
         let result = match reply {
-            BackendReply::Execution { reply } => {
+            BackendReply::Execution(execution::ExecutionReply::Snapshot(reply)) => {
                 // Control replies can create panes before their stream snapshot arrives.
                 // Stream metadata is installed by Connection::poll instead.
                 if let Some(origin) = self.origins.get_mut(&reply.daemon)
@@ -428,10 +430,12 @@ impl Connections {
                 {
                     manager.install_metadata(&reply.metadata, reply.revision);
                 }
-                self.ingest_execution(reply)?
+                self.ingest_execution(*reply)?
             }
             BackendReply::Organization { result } => result,
-            BackendReply::Value(_) => anyhow::bail!("Expected an execution or organization reply"),
+            BackendReply::Value(_) | BackendReply::Execution(_) => {
+                anyhow::bail!("Expected an execution or organization reply")
+            }
         };
         Ok(self.combined(result))
     }

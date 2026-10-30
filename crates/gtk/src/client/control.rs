@@ -224,18 +224,14 @@ impl From<CommandOutput> for CommandResult {
 
 /// Worker results keep execution separate from GTK organization until the window combines them.
 pub enum BackendReply {
-    Execution {
-        reply: gmux_protocol::control::CommandReply,
-    },
-    Organization {
-        result: CommandResult,
-    },
+    Execution(gmux_protocol::control::ExecutionReply),
+    Organization { result: CommandResult },
     Value(serde_json::Value),
 }
 impl BackendReply {
     pub fn into_value(self) -> anyhow::Result<serde_json::Value> {
         Ok(match self {
-            Self::Execution { reply } => serde_json::to_value(reply)?,
+            Self::Execution(reply) => serde_json::to_value(reply)?,
             Self::Organization { result } => serde_json::json!({"result":result}),
             Self::Value(value) => value,
         })

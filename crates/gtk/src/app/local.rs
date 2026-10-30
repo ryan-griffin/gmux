@@ -172,11 +172,33 @@ impl Windows {
 }
 
 impl Ui {
+    pub(super) fn request_stop(
+        self: &Rc<Self>,
+        callback: impl FnOnce(&Rc<Self>, anyhow::Result<gmux_protocol::control::StopReply>) + 'static,
+    ) {
+        self.request_reply(json!({"method":"local-daemon-stop"}), move |ui, result| {
+            callback(
+                ui,
+                result.and_then(|reply| match reply {
+                    // This local lifecycle operation acknowledges an absent daemon
+                    // without receiving a daemon Stop reply.
+                    BackendReply::Execution(gmux_protocol::control::ExecutionReply::Done(
+                        reply,
+                    )) => Ok(gmux_protocol::control::StopReply {
+                        ok: reply.ok,
+                        warning: None,
+                    }),
+                    BackendReply::Execution(reply) => reply.into_stopped(),
+                    _ => anyhow::bail!("Expected a daemon stop reply"),
+                }),
+            );
+        });
+    }
     fn start_local(
         self: &Rc<Self>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<()>) + 'static,
     ) {
-        self.request(json!({"method":"local-daemon-start"}), move |ui, result| {
+        self.request_configuration(json!({"method":"local-daemon-start"}), move |ui, result| {
             let result = result.and_then(|value| {
                 let machine: model::Machine = serde_json::from_value(value["local"].clone())?;
                 ui.each_window(|window| {
@@ -238,7 +260,7 @@ impl Ui {
                 ui.start_local(finish);
             } else {
                 ui.save_session();
-                ui.request(json!({"method":"local-daemon-stop"}), move |ui, result| {
+                ui.request_stop(move |ui, result| {
                     let result = result.map(|_| {
                         ui.each_window(|window| {
                             window.sessions.borrow_mut().disable_local();

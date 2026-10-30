@@ -61,10 +61,10 @@ impl std::os::fd::AsRawFd for Socket {
         }
     }
 }
-pub(crate) async fn read_json(
+pub(crate) async fn read_json_bytes(
     reader: &mut (impl AsyncBufRead + Unpin),
     limit: usize,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take(limit as u64 + 1)
@@ -74,7 +74,15 @@ pub(crate) async fn read_json(
         bytes.len() <= limit && bytes.last() == Some(&b'\n'),
         "Invalid or oversized network message"
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
+}
+pub(crate) async fn read_json(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::from_slice(
+        &read_json_bytes(reader, limit).await?,
+    )?)
 }
 pub(crate) async fn write_json(
     writer: &mut (impl AsyncWrite + Unpin),

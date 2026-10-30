@@ -1,10 +1,10 @@
-//! Measure execution snapshot construction and packet storage without PTYs or GTK.
+//! Measure snapshot construction, packet storage, and control reply decoding without PTYs or GTK.
 // Compile the daemon's private record directly to measure its production projection.
 #[path = "../src/persistence/execution.rs"]
 mod execution;
 use execution::SavedExecution;
 use gmux_protocol::{
-    control::{CommandOutput, CommandReply},
+    control::{CommandOutput, CommandReply, ExecutionRequest},
     model::{DaemonId, ExecutionTab, MachineKind, PaneTree},
     transport::{Header, Packet},
 };
@@ -56,6 +56,33 @@ fn tree(first: u64) -> PaneTree {
             }),
         }),
     }
+}
+
+fn measure_decode(bytes: &[u8], typed: bool) -> anyhow::Result<serde_json::Value> {
+    let iterations = 2_000;
+    let mut timings = Vec::with_capacity(iterations);
+    ALLOCATIONS.store(0, Relaxed);
+    BYTES.store(0, Relaxed);
+    for _ in 0..iterations {
+        let began = Instant::now();
+        if typed {
+            drop(black_box(
+                ExecutionRequest::State.decode_reply(black_box(bytes))?,
+            ));
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(black_box(bytes))?;
+            gmux_protocol::network::check_error(&value)?;
+            drop(black_box(serde_json::from_value::<CommandReply>(value)?));
+        }
+        timings.push(began.elapsed().as_nanos());
+    }
+    let allocations = ALLOCATIONS.load(Relaxed) / iterations;
+    let allocated_bytes = BYTES.load(Relaxed) / iterations;
+    timings.sort_unstable();
+    Ok(serde_json::json!({
+        "allocations": allocations, "allocated_bytes": allocated_bytes,
+        "median_ns": timings[iterations / 2], "p95_ns": timings[iterations * 95 / 100],
+    }))
 }
 
 fn run(tabs: u64, checkpoints: bool) -> anyhow::Result<serde_json::Value> {
@@ -123,8 +150,12 @@ fn run(tabs: u64, checkpoints: bool) -> anyhow::Result<serde_json::Value> {
     let mut wire = Vec::new();
     packet.encode_into(&mut wire)?;
     let decoded = Packet::read(&mut wire.as_slice())?;
+    let reply_bytes = serde_json::to_vec(packet.header.state.as_ref().unwrap())?;
+    let json_decode = measure_decode(&reply_bytes, false)?;
+    let typed_decode = measure_decode(&reply_bytes, true)?;
     Ok(serde_json::json!({
         "tabs": tabs, "checkpoint_references": saved.scrollback.len(),
+        "reply_decoding": {"json_value":json_decode,"typed":typed_decode},
         "allocations_per_snapshot": allocations, "allocated_bytes_per_snapshot": allocated_bytes,
         "median_ns": timings[iterations / 2], "p95_ns": timings[iterations * 95 / 100],
         "wire_bytes": wire.len(), "retained_source_bytes": packet.memory_size(),

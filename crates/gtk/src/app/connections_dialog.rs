@@ -206,7 +206,7 @@ impl ConnectionControls {
             return;
         }
         let weak = Rc::downgrade(self);
-        ui.request(json!({"method":"connection-list"}), move |ui, result| {
+        ui.request_configuration(json!({"method":"connection-list"}), move |ui, result| {
             let Some(controls) = weak.upgrade() else {
                 return;
             };
@@ -259,9 +259,8 @@ impl ConnectionControls {
             let weak = Rc::downgrade(ui);
             row.connect_activated(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.request(
-                        json!({"method":"connection-list"}),
-                        |ui, result| match result
+                    ui.request_configuration(json!({"method":"connection-list"}), |ui, result| {
+                        match result
                             .and_then(|value| Ok(serde_json::from_value::<ConnectionList>(value)?))
                         {
                             Ok(list) => ui.local_connection_editor(
@@ -271,8 +270,8 @@ impl ConnectionControls {
                                 list.remote_access_error.as_deref(),
                             ),
                             Err(error) => ui.message(&error.to_string()),
-                        },
-                    );
+                        }
+                    });
                 }
             });
             self.group.add(&row);
@@ -501,7 +500,7 @@ impl Ui {
                     let Some(ui) = weak.upgrade() else { return };
                     editor.begin(None);
                     let editor = editor.clone();
-                    ui.request(json!({"method":"connection-remove", "connection":name,"daemon":daemon}), move |_, result| {
+                    ui.request_configuration(json!({"method":"connection-remove", "connection":name,"daemon":daemon}), move |_, result| {
                         editor.finish(result.map(|_| ()));
                     });
                 });
@@ -583,7 +582,7 @@ impl Ui {
                 request["name"] = Value::Null;
             }
             let editor = editor.clone();
-            ui.request(request, move |ui, result| {
+            ui.request_configuration(request, move |ui, result| {
                 editor.finish(result.map(|value| {
                     if let Ok(daemon) = serde_json::from_value(value["daemon"].clone()) {
                         ui.sessions.borrow_mut().connect(daemon);
@@ -782,7 +781,7 @@ impl Ui {
             let execution_changed = execution != original_execution;
             let confirm_stop = execution_changed && !execution && ui.settings.borrow().local_daemon_enabled;
             let apply = move |ui: &Rc<Ui>| {
-                ui.request(
+                ui.request_configuration(
                     json!({"method":"connection-edit","connection":"local","name":value,"remote_access":remote_access}),
                     move |ui, result| match result {
                         Ok(_) if execution_changed && execution != ui.settings.borrow().local_daemon_enabled => {
