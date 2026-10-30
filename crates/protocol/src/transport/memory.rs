@@ -2,7 +2,7 @@
 use super::{Metadata, Packet};
 use crate::{
     control::CommandReply,
-    model::{ExecutionState, ExecutionTab, PaneTree},
+    model::{ExecutionSnapshot, ExecutionTab, PaneTree},
 };
 use std::{collections::HashMap, mem::size_of};
 
@@ -76,15 +76,9 @@ fn state_size(state: &CommandReply) -> usize {
         + execution_size(&state.execution)
 }
 
-fn execution_size(state: &ExecutionState) -> usize {
+fn execution_size(state: &ExecutionSnapshot) -> usize {
     state.tabs.capacity() * size_of::<ExecutionTab>()
         + state.tabs.iter().map(tab_size).sum::<usize>()
-        + map_storage(&state.scrollback)
-        + state
-            .scrollback
-            .values()
-            .map(String::capacity)
-            .sum::<usize>()
 }
 
 fn tab_size(tab: &ExecutionTab) -> usize {

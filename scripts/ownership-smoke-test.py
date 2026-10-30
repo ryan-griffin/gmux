@@ -5,7 +5,7 @@ from pathlib import Path
 import socket
 
 from cargo_test_support import cargo_binary
-from stream_test_support import PROTOCOL_VERSION
+from stream_test_support import Client, PROTOCOL_VERSION
 from test_support import AppFixture, scenario, wait_for
 
 binary = cargo_binary("gmux")
@@ -49,7 +49,7 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         assert path.read_bytes() == before
         state = a.rpc("_state")
         assert "desktop" not in state and "catalog" not in state
-        assert "width" not in state["execution"] and "filter" not in state["execution"]
+        assert set(state["execution"]) == {"tabs"}, state
         assert all("workspace" not in tab and "active" not in tab for tab in state["execution"]["tabs"])
         assert invalid_client.read_text() == "{invalid client state"
         assert a.settings_path.read_text() == "invalid preferences"
@@ -61,11 +61,43 @@ with (artifacts / "ownership-smoke.log").open("w") as log, \
         a.rpc("close-tab",tab=transient["tab"])
         a.rpc("stop")
         assert first.wait(timeout=8) == 0
+        saved = json.loads((a.config / "execution.json").read_text())
+        assert saved["last_id"] == greatest
+        assert saved["scrollback"], "Stop must publish checkpoint references on disk"
         first = start(a,log)
+        state = a.rpc("_state")
+        assert set(state["execution"]) == {"tabs"}, state
+        assert state["daemon"] == identity
+        with scenario("control replies and reconnect streams contain only client execution fields"):
+            client = Client(a, x["pane"])
+            try:
+                attached = client.state(state["revision"])
+                assert set(attached["execution"]) == {"tabs"}, attached
+                assert attached["daemon"] == identity
+                reply = a.rpc("_execution", request=dict(method="rename", tab=x["tab"], name="Restored"))
+                assert set(reply["execution"]) == {"tabs"}, reply
+                assert reply["revision"] > state["revision"]
+                updated = client.state(reply["revision"])
+                assert updated["revision"] >= reply["revision"]
+                assert updated["execution"] == reply["execution"]
+                assert updated["daemon"] == identity
+            finally:
+                client.close()
         assert a.rpc("_hello")["daemon"] == identity
         assert a.rpc("status")["panes"] == 1
         replacement = a.rpc("new")
         assert replacement["tab"] > greatest and replacement["pane"] > greatest
+        # Also exercise an empty topology, where no live ID can rebuild the allocator.
+        a.rpc("close-tab", tab=x["tab"])
+        a.rpc("close-tab", tab=replacement["tab"])
+        a.rpc("stop")
+        assert first.wait(timeout=8) == 0
+        saved = json.loads((a.config / "execution.json").read_text())
+        assert not saved["tabs"] and saved["last_id"] == replacement["pane"]
+        first = start(a, log)
+        assert a.rpc("_hello")["daemon"] == identity
+        fresh = a.rpc("new")
+        assert fresh["tab"] > replacement["pane"] and fresh["pane"] > fresh["tab"]
         a.rpc("stop")
         assert first.wait(timeout=8) == 0
         assert second.poll() is None and b.rpc("status")["panes"] == 1

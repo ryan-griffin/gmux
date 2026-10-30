@@ -6,8 +6,8 @@ use super::{
         TabCommand,
     },
     model::{
-        DaemonId, DesktopState, DesktopTab, ExecutionState, Layout, Machine, MachineKind, PaneRef,
-        Session, TabRef, TabState,
+        DaemonId, DesktopState, DesktopTab, ExecutionSnapshot, Layout, Machine, MachineKind,
+        PaneRef, Session, TabRef, TabState,
     },
 };
 use gmux_client::{ipc, remote::SessionHandle};
@@ -28,7 +28,9 @@ struct Origin {
     machine: Machine,
     home_directory: Option<PathBuf>,
     link: Connection,
-    execution: ExecutionState,
+    execution: ExecutionSnapshot,
+    // Retained across snapshots/reconnects so closing the largest live ID is visible.
+    observed_id: u64,
     revision: u64,
 }
 impl Origin {
@@ -43,7 +45,8 @@ impl Origin {
             machine,
             home_directory: None,
             link,
-            execution: ExecutionState::default(),
+            execution: ExecutionSnapshot::default(),
+            observed_id: 0,
             revision: 0,
         }
     }
@@ -517,6 +520,12 @@ impl Connections {
             origin.machine.machine_kind = reply.machine_kind;
             origin.home_directory = Some(reply.home_directory);
             origin.revision = reply.revision;
+            origin.observed_id = reply
+                .execution
+                .tabs
+                .iter()
+                .map(|tab| tab.id.max(tab.layout.max_id()))
+                .fold(origin.observed_id, u64::max);
             origin.execution = reply.execution;
         }
         match &mut result.output {
@@ -888,10 +897,10 @@ impl Connections {
         desktop.tabs.retain(|t| {
             !current_refs.contains(&t.reference)
                 && self.origins.get(&t.reference.daemon).is_none_or(|origin| {
-                    // Organization can arrive before execution. Only an ID already
-                    // allocated in a snapshot can be confirmed closed by its absence.
+                    // Organization can arrive before execution. Confirm absence only
+                    // through IDs observed in accepted topology, never stale replies.
                     origin.link.manager().is_none()
-                        || t.reference.id > origin.execution.last_id
+                        || t.reference.id > origin.observed_id
                         || live_tabs
                             .entry(t.reference.daemon)
                             .or_insert_with(|| {

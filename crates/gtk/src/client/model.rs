@@ -6,8 +6,8 @@ use std::{
 
 pub use gmux_platform::unix::paths::{expand_home, home};
 pub use gmux_protocol::model::{
-    CursorStyle, DaemonId, ExecutionState, ExecutionTab, Machine, MachineKind, PaneRef, PaneTree,
-    TabRef, is_machine_directory,
+    CursorStyle, DaemonId, ExecutionSnapshot, ExecutionTab, Machine, MachineKind, PaneRef,
+    PaneTree, TabRef, is_machine_directory,
 };
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Layout {

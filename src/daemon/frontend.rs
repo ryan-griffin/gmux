@@ -880,7 +880,7 @@ impl Daemon {
         let mut bytes = Vec::new();
         Packet {
             header: Header {
-                state: Some(self.execution_state()),
+                state: Some(self.execution_reply()),
                 meta: Metadata {
                     id: 0,
                     directory: PathBuf::new(),

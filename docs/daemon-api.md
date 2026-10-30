@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 33:
+handshake. The current protocol version is 40:
 
 ```json
-{"version":33,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":40,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -137,7 +137,11 @@ Both transports also expose `state`, `busy`, `metadata`, and `copy` for executio
 clients. `state` returns the execution snapshot in `execution`, together with
 the daemon's identity, `hostname`, revision, and pane metadata. Layout mutations
 over TCP return the same snapshot with `result` containing the operation's
-output. The Rust control helper unwraps those results for CLI-style requests.
+output. `execution` is an `ExecutionSnapshot` with a single `tabs` array.
+Each tab contains `id`, `created_at`, `name`, `custom_name`, `layout`, and
+`directories`. Checkpoint filenames and ID allocation counters belong only to
+the daemon's saved execution file. Stream state packets use the same reply shape.
+The Rust control helper unwraps those results for CLI-style requests.
 GTK's separate client API uses `session` for its assembled window view.
 
 The `rpc` subcommand in both binaries prints the complete JSON reply, including
@@ -172,7 +176,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":33,"daemon":"returned-identity"}
+{"method":"attach","version":40,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -466,7 +470,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 39; clients must match
+cell data are rejected. This is stream protocol version 40; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.

@@ -202,6 +202,22 @@ hidden tabs, reconnect and shared windows. Its widget fixtures check unknown pro
 viewport allocation and stable sidebar title positions at normal/large fonts and
 both text directions.
 
+## Execution snapshot benchmark
+
+Measure the daemon's snapshot projection and retained packet storage without PTYs
+or GTK:
+
+```sh
+cargo run --locked --release -p gmux-daemon --example execution-benchmark
+```
+
+The benchmark clones 0, 1, 8, and 32 four-pane tabs, with and without saved
+checkpoint references. It reports allocation calls, requested bytes, construction
+and destruction latency, wire size, and retained source/decoded packet estimates.
+Each case uses 10,000 iterations. Snapshot allocations depend only on topology;
+checkpoint filenames and the durable ID counter stay in the daemon record.
+Latency excludes serialization, transport I/O, and client reconciliation.
+
 ## Native prerequisites
 
 The native suites need PyGObject and these installed components:

@@ -518,7 +518,7 @@ mod tests {
                 .unwrap();
             request.reply.send(serde_json::json!({
                 "daemon":daemon,"home_directory":"/tmp","machine_kind":"unknown","hostname":"host", "revision":0,
-                "result":{"ok":true},"execution":{"last_id":0,"tabs":[],"scrollback":{}},"metadata":[]
+                "result":{"ok":true},"execution":{"tabs":[]},"metadata":[]
             })).unwrap();
             sender.send(attached).unwrap();
         });
@@ -572,7 +572,7 @@ mod tests {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let state: CommandReply = serde_json::from_value(serde_json::json!({
             "daemon":daemon,"home_directory":"/tmp","machine_kind":"unknown","hostname":"host", "revision":0,
-            "result":{"ok":true},"execution":{"last_id":0,"tabs":[],"scrollback":{}},"metadata":[]
+            "result":{"ok":true},"execution":{"tabs":[]},"metadata":[]
         })).unwrap();
         connection
             .sender

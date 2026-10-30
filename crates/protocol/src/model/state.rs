@@ -1,4 +1,4 @@
-//! Daemon identity and persistent execution topology.
+//! Daemon identity and client-facing execution topology.
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 
@@ -64,6 +64,13 @@ pub enum PaneTree {
     },
 }
 impl PaneTree {
+    pub fn max_id(&self) -> u64 {
+        match self {
+            Self::Pane(id) => *id,
+            Self::Split { first, second, .. } => first.max_id().max(second.max_id()),
+        }
+    }
+
     pub fn ids(&self) -> Vec<u64> {
         fn collect(tree: &PaneTree, ids: &mut Vec<u64>) {
             match tree {
@@ -92,12 +99,10 @@ pub struct ExecutionTab {
     #[serde(deserialize_with = "super::pane_directories")]
     pub directories: HashMap<u64, PathBuf>,
 }
+/// Live topology sent to clients. Persistence metadata belongs to the daemon.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExecutionState {
-    /// IDs are never reused, including after a restart or deletion.
-    pub last_id: u64,
-    pub scrollback: HashMap<u64, String>,
+pub struct ExecutionSnapshot {
     pub tabs: Vec<ExecutionTab>,
 }
 

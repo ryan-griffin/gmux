@@ -1,7 +1,7 @@
 //! Optional, bounded Ghostty checkpoints owned by the daemon's saved layout.
+use crate::persistence::SavedExecution;
 use anyhow::Context;
 use gmux_platform::unix::storage;
-use gmux_protocol::model::ExecutionState;
 use std::{
     collections::HashSet, fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::Path,
 };
@@ -15,13 +15,13 @@ const SOURCE: &str = env!("GMUX_GHOSTTY_REVISION");
 const HEADER: usize = 8 + 4 + 40 + 8 + 8;
 
 pub(crate) struct Checkpoint {
-    pub(crate) session: ExecutionState,
+    pub(crate) session: SavedExecution,
     pub(crate) panes: Vec<(u64, Vec<u8>)>,
     pub(crate) warnings: Vec<String>,
 }
 impl Checkpoint {
     pub(crate) fn new(
-        mut session: ExecutionState,
+        mut session: SavedExecution,
         panes: Vec<(u64, Vec<u8>)>,
         warnings: Vec<String>,
     ) -> anyhow::Result<Self> {
@@ -50,7 +50,7 @@ impl Checkpoint {
         let directory = path.parent().unwrap().join("scrollback");
         // Reclaim interrupted publications before adding another generation.
         // A damaged layout must still remain untouched, as for normal saves.
-        let committed: ExecutionState = storage::load_at(path)?;
+        let committed: SavedExecution = storage::load_at(path)?;
         let ready = prune_at(&committed, &directory).and_then(|()| {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -191,7 +191,7 @@ fn load_at(id: u64, name: &str, path: &Path, max_bytes: usize) -> anyhow::Result
     Ok(bytes)
 }
 
-pub(crate) fn save_execution(session: &ExecutionState) -> anyhow::Result<()> {
+pub(crate) fn save_execution(session: &SavedExecution) -> anyhow::Result<()> {
     storage::with_state_lock("execution.json", |path| {
         storage::save_locked_at(path, session)?;
         prune_at(session, &path.parent().unwrap().join("scrollback"))
@@ -204,7 +204,7 @@ pub(crate) fn prune_committed() -> anyhow::Result<()> {
         prune_at(&session, &path.parent().unwrap().join("scrollback"))
     })
 }
-fn prune_at(session: &ExecutionState, directory: &Path) -> anyhow::Result<()> {
+fn prune_at(session: &SavedExecution, directory: &Path) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -272,8 +272,8 @@ mod tests {
         directory
     }
 
-    fn saved_pane() -> ExecutionState {
-        ExecutionState {
+    fn saved_pane() -> SavedExecution {
+        SavedExecution {
             tabs: vec![ExecutionTab {
                 id: 1,
                 created_at: 1,
@@ -282,7 +282,7 @@ mod tests {
                 custom_name: false,
                 directories: HashMap::new(),
             }],
-            ..ExecutionState::default()
+            ..SavedExecution::default()
         }
     }
 
@@ -301,7 +301,7 @@ mod tests {
                             Checkpoint::new(saved_pane(), vec![(2, vec![writer])], vec![]).unwrap();
                         storage::with_lock_at(path, || checkpoint.write_locked(path)).unwrap();
                         storage::with_lock_at(path, || {
-                            let committed: ExecutionState = storage::load_at(path)?;
+                            let committed: SavedExecution = storage::load_at(path)?;
                             prune_at(&committed, cache)?;
                             let name = &committed.scrollback[&2];
                             let bytes = load_at(2, name, &cache.join(name), MAX_PANE_BYTES)?;
@@ -341,7 +341,7 @@ mod tests {
         assert!(encode(2, &vec![0; MAX_PANE_BYTES + 1]).is_err());
         assert!(
             Checkpoint::new(
-                ExecutionState::default(),
+                SavedExecution::default(),
                 (1..=MAX_PANES as u64 + 1).map(|id| (id, vec![])).collect(),
                 vec![]
             )
@@ -361,7 +361,7 @@ mod tests {
         }
         std::fs::write(directory.join("unrelated"), b"keep").unwrap();
         std::fs::write(directory.join(&temporary), b"incomplete write").unwrap();
-        let session = ExecutionState {
+        let session = SavedExecution {
             scrollback: HashMap::from([(2, live.clone()), (3, deleted.clone())]),
             ..saved_pane()
         };
