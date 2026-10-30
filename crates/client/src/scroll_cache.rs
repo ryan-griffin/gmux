@@ -1,10 +1,10 @@
 //! Bounded, generation-scoped rows for local scroll prediction.
-use crate::{Cell, Frame};
+use gmux_protocol::{Cell, Frame};
 
-pub const MAX_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_ROWS: usize = 512;
+const MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ROWS: usize = 512;
 
-pub fn capacity(cols: usize) -> usize {
+fn capacity(cols: usize) -> usize {
     if cols == 0 {
         return 0;
     }
@@ -15,37 +15,6 @@ pub fn capacity(cols: usize) -> usize {
             + size_of::<usize>()
             + 1))
         .min(MAX_ROWS)
-}
-
-/// Keep two screens on either side, within the per-pane memory limit.
-pub fn window(frame: Frame) -> std::ops::Range<u64> {
-    let count = capacity(frame.cols as usize).min(frame.rows as usize * 5) as u64;
-    if count < frame.rows as u64 {
-        return 0..0;
-    }
-    if frame.scrollback.total <= frame.rows as u64 {
-        return 0..0;
-    }
-    let count = count.min(frame.scrollback.total);
-    let start = frame
-        .scrollback
-        .offset
-        .saturating_sub((count - frame.rows as u64) / 2)
-        .min(frame.scrollback.total.saturating_sub(count));
-    start..start + count
-}
-
-/// Reuse overlapping rows before applying a packet's changed rows.
-pub fn shift<T>(data: &mut [T], cols: usize, rows: i16) {
-    let count = rows.unsigned_abs() as usize * cols;
-    // Exposed rows are overwritten by the packet. Move ownership instead of
-    // cloning overflow Arcs into cells that will immediately be replaced.
-    if rows > 0 {
-        data.rotate_left(count);
-    }
-    if rows < 0 {
-        data.rotate_right(count);
-    }
 }
 
 #[derive(Default)]
@@ -221,11 +190,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_admission_does_not_require_retaining_every_transmitted_row() {
+        let cols = 1000;
+        let count = gmux_protocol::transport::cache_row_limit(cols);
+        assert!(count > capacity(cols));
+        let frame = Frame {
+            cols: cols as u16,
+            rows: 20,
+            scrollback: gmux_protocol::Scrollback {
+                total: 1000,
+                offset: 0,
+                len: 20,
+            },
+            ..Frame::default()
+        };
+        for text in ["a".into(), format!("🧑{}", "\u{1d185}".repeat(64))] {
+            let mut cell = Cell::default();
+            cell.set_text(&text).unwrap();
+            let mut cache = RowCache::default();
+            cache.configure(1, frame);
+            cache.insert(0, &vec![cell; count * cols], &vec![1; count]);
+            assert!(cache.retained_bytes() <= MAX_BYTES);
+            let (mut cells, mut flags) = (Vec::new(), Vec::new());
+            assert!(!cache.copy_view(0, 1, &mut cells, &mut flags));
+            assert!(cache.copy_view(count as u64 - 1, 1, &mut cells, &mut flags));
+            assert_eq!(cells[0].text(), text);
+            assert_eq!(flags, [1]);
+            cache.clear();
+            assert_eq!(cache.retained_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn overflow_is_charged_evicted_and_released_with_its_row() {
         let frame = Frame {
             cols: 1000,
             rows: 20,
-            scrollback: crate::Scrollback {
+            scrollback: gmux_protocol::Scrollback {
                 total: 1000,
                 offset: 0,
                 len: 20,
@@ -237,7 +238,7 @@ mod tests {
         let mut cell = Cell::default();
         cell.set_text(&format!("🧑{}", "\u{1d185}".repeat(64)))
             .unwrap();
-        cell.flags = crate::cells::flags::BLINK;
+        cell.flags = gmux_protocol::cells::flags::BLINK;
         let row = vec![cell; 1000];
         for index in 0..capacity(1000) {
             cache.insert(index as u64, &row, &[0]);
@@ -258,7 +259,7 @@ mod tests {
         let frame = Frame {
             cols: 2,
             rows: 2,
-            scrollback: crate::Scrollback {
+            scrollback: gmux_protocol::Scrollback {
                 total: 20,
                 offset: 4,
                 len: 2,
@@ -270,7 +271,7 @@ mod tests {
             let mut cell = Cell::default();
             cell.set_text_bytes(&[b'a' + row]).unwrap();
             cell.flags = if row % 2 == 1 {
-                crate::cells::flags::BLINK
+                gmux_protocol::cells::flags::BLINK
             } else {
                 0
             };
@@ -279,7 +280,7 @@ mod tests {
         cache.truncate(8);
         assert!(cache.has_margin(
             Frame {
-                scrollback: crate::Scrollback {
+                scrollback: gmux_protocol::Scrollback {
                     total: 10,
                     ..frame.scrollback
                 },
@@ -312,7 +313,7 @@ mod tests {
         let frame = Frame {
             cols: 1000,
             rows: 20,
-            scrollback: crate::Scrollback {
+            scrollback: gmux_protocol::Scrollback {
                 total: 1000,
                 offset: 200,
                 len: 20,

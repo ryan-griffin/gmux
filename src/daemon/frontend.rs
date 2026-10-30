@@ -1040,7 +1040,7 @@ impl Daemon {
                         }
                         if !same_content {
                             old.prefetch_at = (!engine.mode(2026)
-                                && !gmux_protocol::scroll_cache::window(frame).is_empty())
+                                && !super::prefetch::window(frame).is_empty())
                             .then(|| Instant::now() + Duration::from_millis(100));
                         }
                         old.source_revision = Some(engine.revision);
@@ -1056,8 +1056,8 @@ impl Daemon {
                             - old.frame.scrollback.offset.saturating_sub(removed) as i128;
                         if !reset && delta != 0 && delta.unsigned_abs() < frame.rows as u128 {
                             row_shift = delta as i16;
-                            gmux_protocol::scroll_cache::shift(&mut old.cells, cols, row_shift);
-                            gmux_protocol::scroll_cache::shift(&mut old.row_flags, 1, row_shift);
+                            gmux_protocol::viewport::shift_rows(&mut old.cells, cols, row_shift);
+                            gmux_protocol::viewport::shift_rows(&mut old.row_flags, 1, row_shift);
                         }
                         for (row, data) in cells_snapshot.chunks_exact(cols).enumerate() {
                             let previous = &mut old.cells[row * cols..(row + 1) * cols];
@@ -1081,7 +1081,7 @@ impl Daemon {
                         // prefetch live screen rows after output has settled.
                         if !engine.mode(2026) {
                             let quiet = old.prefetch_at.is_none_or(|at| at <= Instant::now());
-                            let mut wanted = gmux_protocol::scroll_cache::window(frame);
+                            let mut wanted = super::prefetch::window(frame);
                             let history_end =
                                 frame.scrollback.total.saturating_sub(frame.rows as u64);
                             if !quiet {

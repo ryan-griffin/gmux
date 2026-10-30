@@ -77,7 +77,7 @@ fn maximum_native_text_grid_and_prefetch_fit_packet_and_queue_bounds() {
     cell.set_text(&glyph).unwrap();
     let cols = 512;
     let rows = gmux_protocol::viewport::MAX_CELLS / cols;
-    let cached = gmux_protocol::scroll_cache::capacity(cols);
+    let cached = gmux_protocol::transport::cache_row_limit(cols);
     let packet = Packet {
         header: Header {
             frame: Some(Frame {

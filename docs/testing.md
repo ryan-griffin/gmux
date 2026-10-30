@@ -105,8 +105,17 @@ request validation before mutation, blocked and failed saves, successive partial
 updates while saving, new and existing panes, and immediate local/remote cache updates with queued replies. Engine tests
 cover Unicode/style history, linear and rectangular selections, Find restarts,
 prompt/output anchors, independent viewports, alternate screens, pruning during
-synchronized-output holds, and byte/line zero semantics. Existing client tests exercise cache predictions and rebasing
-through delayed replies and pruning.
+synchronized-output holds, and byte/line zero semantics. Client tests exercise cache predictions and rebasing
+through delayed replies and pruning, and verify that wire-valid supplemental rows
+can exceed local retention without exceeding its memory budget. Decoded-packet
+session tests check that overlapping supplemental rows cannot replace the
+authoritative viewport or break subsequent row shifts when retention is disabled.
+Protocol tests check row and encoded-byte reservations before reading cells, and
+fragmented
+blocking/async reads with supplemental long graphemes and following packets.
+The maximum-grapheme grid plus the wire-limit history window also passes client
+queue admission. Daemon tests cover prefetch windows across supported dimensions
+and engine extraction at the wire boundary.
 
 Engine retention tests exercise scroll-clear cursor migration with zero and small
 byte/line limits, bold RGB text, OSC 8, and both explicit and shell-prompt clears.

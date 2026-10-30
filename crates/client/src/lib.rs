@@ -8,4 +8,5 @@ pub mod ipc;
 pub mod network;
 pub mod remote;
 pub mod runtime;
+mod scroll_cache;
 pub mod unix;

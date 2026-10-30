@@ -1,5 +1,5 @@
 //! Isolate client scroll latency with a simulated round trip, in milliseconds.
-//! Pass 0 for Unix socket latency; the default is 100 ms.
+//! Arguments: reply delay in ms (default 100), unix|tcp, ascii|long.
 use gmux_client::{ipc, remote::SessionManager};
 use gmux_protocol::{
     Cell, Frame, Scrollback,
@@ -8,23 +8,42 @@ use gmux_protocol::{
 };
 use std::{
     io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream},
     os::unix::net::UnixStream,
     time::{Duration, Instant},
 };
 
-fn cells(start: u64, rows: usize) -> Vec<Cell> {
+fn cells(start: u64, rows: usize, long: bool) -> Vec<Cell> {
     (start..start + rows as u64)
         .flat_map(|row| {
             let mut cell = Cell::default();
-            let text = format!("{row:04}");
+            let text = row_text(row, long);
             cell.set_text(&text).unwrap();
             std::iter::repeat_n(cell, 80)
         })
         .collect()
 }
 
-fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
-    let (client, mut server) = UnixStream::pair()?;
+fn row_text(row: u64, long: bool) -> String {
+    if long {
+        format!("{row:04}{}", "\u{1d185}".repeat(64))
+    } else {
+        format!("{row:04}")
+    }
+}
+
+fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<serde_json::Value> {
+    let (client, mut server): (ipc::Stream, ipc::Stream) = if tcp {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        client.set_nodelay(true)?;
+        server.set_nodelay(true)?;
+        (client.into(), server.into())
+    } else {
+        let (client, server) = UnixStream::pair()?;
+        (client.into(), server.into())
+    };
     let meta = Metadata {
         id: 1,
         size: (80, 24),
@@ -43,9 +62,9 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
     let initial_meta = meta.clone();
     let worker = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut reader = BufReader::new(server.try_clone()?);
-        let mut initial = cells(80, 24);
+        let mut initial = cells(80, 24, long);
         if cached {
-            initial.extend(cells(32, 120));
+            initial.extend(cells(32, 120, long));
         }
         let packet = Packet {
             header: Header {
@@ -88,7 +107,7 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
                     rows: (0..24).collect(),
                     ..Header::default()
                 },
-                cells: cells(row, 24),
+                cells: cells(row, 24, long),
             };
             bytes.clear();
             packet.encode_into(&mut bytes)?;
@@ -113,6 +132,7 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!(Instant::now() < deadline, "Initial viewport timed out");
         std::thread::sleep(Duration::from_micros(100));
     }
+    let cache_retained_bytes = session.borrow().scroll_cache_bytes();
     let mut timings = Vec::new();
     for index in 1..=40 {
         let target = 80 + (index % 2) as u64;
@@ -126,7 +146,7 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
         timings.push(start.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(
             session.borrow().snapshot().cells[0].text(),
-            format!("{target:04}")
+            row_text(target, long)
         );
     }
     timings.sort_by(f64::total_cmp);
@@ -135,8 +155,8 @@ fn run(cached: bool, rtt: Duration) -> anyhow::Result<serde_json::Value> {
     Ok(
         serde_json::json!({ "cached": cached, "samples": timings.len(),
         "median_ms": timings[timings.len()/2], "p95_ms": timings[timings.len()*95/100],
-        "cache_budget_bytes": gmux_protocol::scroll_cache::MAX_BYTES,
-        "cache_rows": if cached { gmux_protocol::scroll_cache::capacity(80).min(24*5) } else { 0 } }),
+        "cache_retained_bytes": cache_retained_bytes,
+        "prefetched_rows": if cached { 120 } else { 0 } }),
     )
 }
 
@@ -148,10 +168,22 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or("100")
             .parse()?,
     );
+    let tcp = match std::env::args().nth(2).as_deref().unwrap_or("unix") {
+        "unix" => false,
+        "tcp" => true,
+        _ => anyhow::bail!("Expected unix or tcp"),
+    };
+    let long = match std::env::args().nth(3).as_deref().unwrap_or("ascii") {
+        "ascii" => false,
+        "long" => true,
+        _ => anyhow::bail!("Expected ascii or long"),
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "simulated_rtt_ms": rtt.as_millis(), "uncached": run(false, rtt)?, "cached": run(true, rtt)?
+            "simulated_rtt_ms": rtt.as_millis(), "transport": if tcp { "tcp" } else { "unix" },
+            "text": if long { "long" } else { "ascii" },
+            "uncached": run(false, rtt, tcp, long)?, "cached": run(true, rtt, tcp, long)?
         }))?
     );
     Ok(())
