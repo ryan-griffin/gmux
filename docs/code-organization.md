@@ -109,7 +109,8 @@ workers. `crates/platform/src/unix/ipc.rs` supplies local control sockets and ca
 `crates/protocol/src/transport.rs` and `transport/requests.rs` encode viewport
 packets and stream commands. `crates/protocol/src/network.rs` defines handshakes
 and bounded JSON framing. `crates/client/src/network.rs` authenticates outgoing
-TCP connections. Both sides use `gmux-platform::tcp` for deadline-aware I/O.
+TCP connections. The client uses async socket I/O and deadlines; the daemon uses
+`gmux-platform::tcp` for deadline-aware blocking handshakes.
 `src/daemon/network.rs` accepts incoming TCP connections and
 forwards execution requests and streams. `src/daemon/remote_access.rs` owns
 listener configuration and lifecycle. There is no outgoing connection registry
@@ -131,8 +132,27 @@ and typed state updates. `remote.rs` maintains cached viewports and bounded
 input/output queues. Incoming queue admission tests live with the client; codecs
 and value tests live with the protocol.
 
-`unix/connect.rs` implements cancellable TCP setup using the current Linux socket
-APIs. `unix/watch.rs` watches saved connections using inotify. Direct TCP endpoints
+`runtime.rs` provides one shared Tokio I/O thread per client process. Connection
+setup, terminal streams, heartbeats, control requests, and inotify watches run as
+tasks. Each stream owns one task with concurrent read and write futures over
+native borrowed socket halves. Queued writes retain their byte reservations
+until completion, failure, or cancellation. Closing the manager aborts the task
+even when cached views retain their handles. Ordered request
+queues own tasks and retain their command ordering and update coalescing.
+`Wake` bridges completed work to the GTK main loop through an eventfd. GTK keeps
+its existing retry and scroll deadlines, and never waits for socket I/O.
+
+Blocking application work uses at most four pooled workers. System DNS uses at
+most two workers and 32 waiting lookups; active lookups keep their permits until
+the system resolver returns, even if the caller cancels. Configuration changes,
+local process lifecycle operations, and durable organization saves run outside
+the I/O thread. Execution requests use async I/O directly. Shutdown cancels
+execution while ordered organization updates and saves finish.
+
+The protocol's optional `async` feature adds a runtime-independent reader using
+`futures-lite` I/O traits. Blocking and async readers share their validation and
+decode incrementally into final packet storage, without a full-record buffer.
+`unix/watch.rs` watches saved connections using inotify on the shared executor. Direct TCP endpoints
 accept in-memory credentials; saved connections load credentials from token files.
 `gmux-platform::unix::local` provides explicit daemon startup and completed shutdown,
 separate from connecting. GTK and `gmux serve --background` share its detached

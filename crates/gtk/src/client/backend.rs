@@ -33,9 +33,12 @@ impl Worker {
     ) -> Self {
         let cancellation = gmux_platform::unix::ipc::Cancellation::default();
         let calls = cancellation.clone();
-        let client = ipc::Client::with_handler(wake, move |body| {
+        let client = ipc::Client::with_async_handler(wake, move |body| {
             let local = *local.lock().unwrap();
-            store.call_cancellable(&endpoint, local, body, &calls)
+            let store = store.clone();
+            let endpoint = endpoint.clone();
+            let calls = calls.clone();
+            async move { store.call_cancellable(&endpoint, local, body, &calls).await }
         });
         Self {
             client,

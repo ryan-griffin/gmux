@@ -332,27 +332,57 @@ impl Store {
 
     /// Execute on a request worker. Client-only requests never reach the daemon socket.
     #[cfg(test)]
-    pub fn call(&self, endpoint: &ipc::Endpoint, body: Value) -> anyhow::Result<BackendReply> {
-        self.call_inner(endpoint, body, None, None)
+    pub fn call(
+        self: &Arc<Self>,
+        endpoint: &ipc::Endpoint,
+        body: Value,
+    ) -> anyhow::Result<BackendReply> {
+        gmux_client::runtime::block_on(self.call_cancellable(
+            endpoint,
+            None,
+            body,
+            &gmux_platform::unix::ipc::Cancellation::default(),
+        ))
     }
-    pub fn call_cancellable(
-        &self,
+    pub async fn call_cancellable(
+        self: &Arc<Self>,
         endpoint: &ipc::Endpoint,
         local: impl Into<Option<DaemonId>>,
         body: Value,
         cancellation: &gmux_platform::unix::ipc::Cancellation,
     ) -> anyhow::Result<BackendReply> {
-        self.call_inner(endpoint, body, local.into(), Some(cancellation))
+        let local = local.into();
+        if super::backend::organization_request(&body) {
+            let store = self.clone();
+            return gmux_client::runtime::blocking(move || store.call_organization(body, local))
+                .await;
+        }
+        let request = if body["method"] == "_connection-call" {
+            &body["request"]
+        } else {
+            &body
+        };
+        let snapshot = execution::Request::decode(request.clone())
+            .is_ok_and(|request| request.returns_snapshot());
+        let reply = gmux_client::connections::call_at_async(
+            endpoint.clone(),
+            body,
+            Some(cancellation.clone()),
+        )
+        .await?;
+        if snapshot {
+            Ok(BackendReply::Execution {
+                reply: serde_json::from_value(reply)?,
+            })
+        } else {
+            Ok(BackendReply::Value(reply))
+        }
     }
-    fn call_inner(
+    fn call_organization(
         &self,
-        endpoint: &ipc::Endpoint,
         mut body: Value,
         local: Option<DaemonId>,
-        cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
     ) -> anyhow::Result<BackendReply> {
-        let call =
-            |request: Value| gmux_client::connections::call_at(endpoint, request, cancellation);
         let method = body["method"].as_str().unwrap_or("").to_owned();
         let output = match method.as_str() {
             "_desktop-save" => {
@@ -370,26 +400,10 @@ impl Store {
             )?),
             _ => None,
         };
-        if let Some(output) = output {
-            return Ok(BackendReply::Organization {
-                result: output.into(),
-            });
-        }
-        let request = if method == "_connection-call" {
-            &body["request"]
-        } else {
-            &body
-        };
-        let snapshot = execution::Request::decode(request.clone())
-            .is_ok_and(|request| request.returns_snapshot());
-        let reply = call(body)?;
-        if snapshot {
-            Ok(BackendReply::Execution {
-                reply: serde_json::from_value(reply)?,
-            })
-        } else {
-            Ok(BackendReply::Value(reply))
-        }
+        let output = output.ok_or_else(|| anyhow::anyhow!("Invalid organization request"))?;
+        Ok(BackendReply::Organization {
+            result: output.into(),
+        })
     }
 }
 fn validate_tab(tab: &DesktopTab) -> anyhow::Result<()> {

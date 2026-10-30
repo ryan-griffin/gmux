@@ -1,17 +1,12 @@
-//! Outgoing authenticated TCP connections.
-use gmux_platform::tcp::{TimedStream, remaining};
-use gmux_platform::unix::network::configure_liveness;
+//! Outgoing authenticated TCP connections on the shared client executor.
+use crate::{io, runtime};
+use gmux_platform::unix::ipc::Cancellation;
 use gmux_protocol::network::*;
 use gmux_protocol::{control::ExecutionRequest, model::DaemonId, transport};
 use serde_json::Value;
-use std::{
-    io::{BufReader, Read},
-    net::TcpStream,
-    path::PathBuf,
-    time::Instant,
-};
-#[path = "unix/connect.rs"]
-mod connect;
+use std::{net::TcpStream, path::PathBuf, time::Instant};
+use tokio::io::{AsyncReadExt, BufReader};
+
 /// Setup was rejected and needs a settings change or an explicit retry.
 #[derive(Debug)]
 pub(crate) struct ConnectionRejected(pub String);
@@ -27,8 +22,6 @@ impl ConnectionRejected {
     }
 }
 
-/// Connection credentials supplied by a client, independently of how it stores
-/// secrets. Saved connections can load these from their configured token file.
 #[derive(Clone, Default)]
 pub struct Credentials {
     token: Option<String>,
@@ -48,76 +41,94 @@ pub fn credentials(authentication: &Authentication) -> anyhow::Result<Credential
         token: gmux_platform::unix::network::token(authentication)?,
     })
 }
-pub fn connect(
-    address: &str,
-    credentials: &Credentials,
-    channel: Channel,
-    expected: Option<DaemonId>,
-) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
-    connect_before(
-        address,
-        credentials,
-        channel,
-        expected,
-        Instant::now() + TIMEOUT,
-        None,
-    )
-}
-fn connect_before(
+
+pub(crate) async fn connect_async(
     address: &str,
     credentials: &Credentials,
     channel: Channel,
     expected: Option<DaemonId>,
     deadline: Instant,
-    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
-) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
-    if let Some(c) = cancellation {
-        c.check()?;
-    }
-    let token = credentials.token.clone();
-    let deadline = deadline.min(Instant::now() + TIMEOUT);
-    let mut failure = None;
-    let mut connected = None;
-    for address in connect::resolve(address, deadline, cancellation)? {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match connect::connect(address, deadline, cancellation) {
-            Ok(stream) => {
-                connected = Some(stream);
-                break;
+) -> anyhow::Result<(tokio::net::TcpStream, ConnectionInfo)> {
+    runtime::deadline(deadline.min(Instant::now() + TIMEOUT), async {
+        let address = with_default_port(address);
+        let mut failure = None;
+        let mut stream = None;
+        for address in resolve(address.as_ref()).await? {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(socket) => {
+                    stream = Some(socket);
+                    break;
+                }
+                Err(error) => failure = Some(error),
             }
-            Err(error) => failure = Some(error),
         }
-    }
-    let stream = connected.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not connect to {address}: {}",
-            failure
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "No reachable address".into())
-        )
-    })?;
-    let _active = cancellation.map(|c| c.register(&stream)).transpose()?;
-    stream.set_nodelay(true)?;
-    if matches!(channel, Channel::Stream) {
-        configure_liveness(&stream)?;
-    }
-    let mut stream = TimedStream {
-        socket: stream,
-        deadline: Some(deadline),
+        let stream = stream.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not connect to {address}: {}",
+                failure.map_or_else(|| "No reachable address".into(), |error| error.to_string())
+            )
+        })?;
+        stream.set_nodelay(true)?;
+        if matches!(channel, Channel::Stream) {
+            gmux_platform::unix::network::configure_liveness(&stream)?;
+        }
+        let mut stream = stream;
+        authenticate(&mut stream, credentials, channel, expected)
+            .await
+            .map(|info| (stream, info))
+    })
+    .await
+}
+// System DNS is blocking and cannot be interrupted. Keep both its workers and
+// waiting requests bounded; active lookups retain their permits after cancellation.
+async fn resolve(address: &str) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    use std::{
+        net::ToSocketAddrs,
+        sync::{Arc, OnceLock},
     };
-    write_json(
-        &mut stream,
+    use tokio::sync::Semaphore;
+    if let Ok(address) = address.parse() {
+        return Ok(vec![address]);
+    }
+    static WORKERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    static REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    let request = REQUESTS
+        .get_or_init(|| Arc::new(Semaphore::new(34)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("Name resolution queue is full"))?;
+    let worker = WORKERS
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .clone()
+        .acquire_owned()
+        .await?;
+    let address = address.to_owned();
+    Ok(tokio::task::spawn_blocking(move || {
+        let (_request, _worker) = (request, worker);
+        address
+            .to_socket_addrs()
+            .map(|addresses| addresses.take(8).collect())
+    })
+    .await??)
+}
+
+async fn authenticate(
+    stream: &mut tokio::net::TcpStream,
+    credentials: &Credentials,
+    channel: Channel,
+    expected: Option<DaemonId>,
+) -> anyhow::Result<ConnectionInfo> {
+    io::write_json(
+        stream,
         &Handshake {
             version: transport::VERSION,
             channel,
-            token,
+            token: credentials.token.clone(),
             daemon: expected,
         },
-    )?;
-    let value = read_handshake(&mut stream)?;
+    )
+    .await?;
+    let value = read_handshake_async(stream).await?;
     check_error(&value).map_err(ConnectionRejected::from_error)?;
     let hello: ConnectionInfo =
         serde_json::from_value(value).map_err(|error| ConnectionRejected(error.to_string()))?;
@@ -129,27 +140,20 @@ fn connect_before(
         expected.is_none_or(|id| hello.daemon == id),
         ConnectionRejected("Remote connection identity changed".into())
     );
-    Ok((stream.socket, hello))
+    Ok(hello)
 }
-
-/// Read in chunks without consuming viewport packets after the handshake.
-fn read_handshake(stream: &mut TimedStream) -> anyhow::Result<Value> {
+/// Peek bounded chunks to leave the first viewport packet on the socket.
+async fn read_handshake_async(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Value> {
     let mut bytes = [0; MAX_HANDSHAKE + 1];
     let mut length = 0;
     loop {
-        if let Some(deadline) = stream.deadline {
-            stream.socket.set_read_timeout(Some(remaining(deadline)?))?;
-        }
-        let available = match stream.socket.peek(&mut bytes[length..]) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
+        let available = stream.peek(&mut bytes[length..]).await?;
         anyhow::ensure!(available != 0, "Incomplete network handshake");
         let size = bytes[length..length + available]
             .iter()
-            .position(|&byte| byte == b'\n')
+            .position(|&b| b == b'\n')
             .map_or(available, |end| end + 1);
-        stream.read_exact(&mut bytes[length..length + size])?;
+        stream.read_exact(&mut bytes[length..length + size]).await?;
         length += size;
         anyhow::ensure!(length <= MAX_HANDSHAKE, "Network handshake is too large");
         if bytes[length - 1] == b'\n' {
@@ -157,8 +161,43 @@ fn read_handshake(stream: &mut TimedStream) -> anyhow::Result<Value> {
         }
     }
 }
-/// Send a public execution request directly to an authenticated remote daemon.
-/// Connection setup and the reply share a bounded deadline. No local daemon is needed.
+
+pub fn connect(
+    address: &str,
+    credentials: &Credentials,
+    channel: Channel,
+    expected: Option<DaemonId>,
+) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
+    connect_cancellable(address, credentials, channel, expected, None)
+}
+pub fn connect_cancellable(
+    address: &str,
+    credentials: &Credentials,
+    channel: Channel,
+    expected: Option<DaemonId>,
+    cancellation: Option<&Cancellation>,
+) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
+    runtime::block_on(runtime::cancellable(cancellation, async {
+        let (stream, info) = connect_async(
+            address,
+            credentials,
+            channel,
+            expected,
+            Instant::now() + TIMEOUT,
+        )
+        .await?;
+        let stream = stream.into_std()?;
+        stream.set_nonblocking(false)?;
+        Ok((stream, info))
+    }))
+}
+pub fn connect_stream(
+    address: &str,
+    credentials: &Credentials,
+    expected: Option<DaemonId>,
+) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
+    connect(address, credentials, Channel::Stream, expected)
+}
 pub fn call(
     address: &str,
     credentials: &Credentials,
@@ -172,65 +211,32 @@ pub fn call_cancellable(
     credentials: &Credentials,
     expected: Option<DaemonId>,
     request: &ExecutionRequest,
-    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
+    cancellation: Option<&Cancellation>,
+) -> anyhow::Result<Value> {
+    runtime::block_on(runtime::cancellable(
+        cancellation,
+        call_async(address, credentials, expected, request),
+    ))
+}
+pub(crate) async fn call_async(
+    address: &str,
+    credentials: &Credentials,
+    expected: Option<DaemonId>,
+    request: &ExecutionRequest,
 ) -> anyhow::Result<Value> {
     let deadline = Instant::now() + CONTROL_TIMEOUT;
-    let mut client =
-        Client::connect_before_cancellable(address, credentials, expected, deadline, cancellation)?;
-    let _active = cancellation
-        .map(|c| c.register(client.socket()))
-        .transpose()?;
-    let result = client.call(request, deadline);
-    if let Some(c) = cancellation {
-        c.check()?;
-    }
-    result
-}
-pub fn connect_cancellable(
-    address: &str,
-    credentials: &Credentials,
-    channel: Channel,
-    expected: Option<DaemonId>,
-    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
-) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
-    let result = connect_before(
-        address,
-        credentials,
-        channel,
-        expected,
-        Instant::now() + TIMEOUT,
-        cancellation,
-    );
-    if let Some(c) = cancellation {
-        c.check()?;
-    }
-    result
-}
-
-/// Open a terminal stream directly to a remote daemon.
-/// Send an `attach` command with the returned version and daemon identity, then subscribe.
-pub fn connect_stream(
-    address: &str,
-    credentials: &Credentials,
-    expected: Option<DaemonId>,
-) -> anyhow::Result<(TcpStream, ConnectionInfo)> {
-    let (stream, info) = connect(address, credentials, Channel::Stream, expected)?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    Ok((stream, info))
+    let mut client = Client::connect_async(address, credentials, expected, deadline).await?;
+    client.call_async(request, deadline).await
 }
 
 pub struct Client {
-    reader: BufReader<TimedStream>,
+    reader: BufReader<tokio::net::TcpStream>,
     pub daemon: DaemonId,
     pub home_directory: PathBuf,
     pub machine_kind: gmux_protocol::model::MachineKind,
     pub hostname: String,
 }
 impl Client {
-    pub fn socket(&self) -> &TcpStream {
-        &self.reader.get_ref().socket
-    }
     pub fn connect(
         address: &str,
         credentials: &Credentials,
@@ -244,42 +250,34 @@ impl Client {
         expected: Option<DaemonId>,
         deadline: Instant,
     ) -> anyhow::Result<Self> {
-        Self::connect_before_cancellable(address, credentials, expected, deadline, None)
+        runtime::block_on(Self::connect_async(
+            address,
+            credentials,
+            expected,
+            deadline,
+        ))
     }
     pub fn connect_cancellable(
         address: &str,
         credentials: &Credentials,
         expected: Option<DaemonId>,
-        cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
+        cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<Self> {
-        Self::connect_before_cancellable(
-            address,
-            credentials,
-            expected,
-            Instant::now() + TIMEOUT,
+        runtime::block_on(runtime::cancellable(
             cancellation,
-        )
+            Self::connect_async(address, credentials, expected, Instant::now() + TIMEOUT),
+        ))
     }
-    fn connect_before_cancellable(
+    pub(crate) async fn connect_async(
         address: &str,
         credentials: &Credentials,
         expected: Option<DaemonId>,
         deadline: Instant,
-        cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
     ) -> anyhow::Result<Self> {
-        let (stream, hello) = connect_before(
-            address,
-            credentials,
-            Channel::Control,
-            expected,
-            deadline,
-            cancellation,
-        )?;
+        let (stream, hello) =
+            connect_async(address, credentials, Channel::Control, expected, deadline).await?;
         Ok(Self {
-            reader: BufReader::new(TimedStream {
-                socket: stream,
-                deadline: Some(deadline),
-            }),
+            reader: BufReader::new(stream),
             daemon: hello.daemon,
             home_directory: hello.home_directory,
             machine_kind: hello.machine_kind,
@@ -287,32 +285,60 @@ impl Client {
         })
     }
     pub fn call(&mut self, request: &ExecutionRequest, deadline: Instant) -> anyhow::Result<Value> {
-        let deadline = deadline.min(Instant::now() + TIMEOUT);
-        self.reader.get_mut().deadline = Some(deadline);
-        remaining(deadline)?;
-        write_json(self.reader.get_mut(), request)?;
-        let value = read_json(&mut self.reader, MAX_REPLY)?;
-        check_error(&value)?;
-        if let Some(id) = value.get("daemon") {
-            anyhow::ensure!(
-                serde_json::from_value::<DaemonId>(id.clone())? == self.daemon,
-                "Remote connection identity changed"
-            );
-        }
-        if matches!(request, ExecutionRequest::Stop) {
-            let mut trailing = [0u8; 1];
-            anyhow::ensure!(
-                self.reader.read(&mut trailing)? == 0,
-                "Unexpected reply during daemon shutdown"
-            );
-        }
-        Ok(value)
+        runtime::block_on(self.call_async(request, deadline))
+    }
+    async fn call_async(
+        &mut self,
+        request: &ExecutionRequest,
+        deadline: Instant,
+    ) -> anyhow::Result<Value> {
+        runtime::deadline(deadline.min(Instant::now() + TIMEOUT), async {
+            io::write_json(self.reader.get_mut(), request).await?;
+            let value = io::read_json(&mut self.reader, MAX_REPLY).await?;
+            check_error(&value)?;
+            if let Some(id) = value.get("daemon") {
+                anyhow::ensure!(
+                    serde_json::from_value::<DaemonId>(id.clone())? == self.daemon,
+                    "Remote connection identity changed"
+                );
+            }
+            if matches!(request, ExecutionRequest::Stop) {
+                let mut trailing = [0; 1];
+                anyhow::ensure!(
+                    self.reader.read(&mut trailing).await? == 0,
+                    "Unexpected reply during daemon shutdown"
+                );
+            }
+            Ok(value)
+        })
+        .await
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufReader, Read};
+    fn read_response(
+        stream: &mut TcpStream,
+        deadline: Instant,
+        handshake: bool,
+    ) -> anyhow::Result<Value> {
+        runtime::block_on(async {
+            let socket = stream.try_clone()?;
+            socket.set_nonblocking(true)?;
+            let mut socket = tokio::net::TcpStream::from_std(socket)?;
+            let result = runtime::deadline(deadline, async {
+                if handshake {
+                    read_handshake_async(&mut socket).await
+                } else {
+                    io::read_json(&mut tokio::io::BufReader::new(&mut socket), MAX_HANDSHAKE).await
+                }
+            })
+            .await;
+            socket.into_std()?.set_nonblocking(false)?;
+            result
+        })
+    }
     use crate::ipc;
     use serde_json::json;
     use std::{
@@ -321,6 +347,43 @@ mod tests {
         os::fd::AsRawFd,
         time::Duration,
     };
+    #[test]
+    fn canceling_a_pending_handshake_releases_its_socket_and_executor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let cancellation = Cancellation::default();
+        let calls = cancellation.clone();
+        let pending = runtime::spawn(async move {
+            runtime::cancellable(
+                Some(&calls),
+                connect_async(
+                    &address,
+                    &Credentials::default(),
+                    Channel::Control,
+                    None,
+                    Instant::now() + TIMEOUT,
+                ),
+            )
+            .await
+        });
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        read_json(
+            &mut BufReader::new(peer.try_clone().unwrap()),
+            MAX_HANDSHAKE,
+        )
+        .unwrap();
+        let (progress, progressed) = std::sync::mpsc::channel();
+        runtime::spawn(async move {
+            progress.send(()).unwrap();
+        });
+        progressed.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancellation.cancel();
+        let error = runtime::block_on(pending).unwrap().err().unwrap();
+        assert_eq!(error.to_string(), "Request canceled");
+        assert_eq!(std::io::Read::read(&mut peer, &mut [0]).unwrap(), 0);
+    }
+
     #[test]
     fn stream_setup_rejects_permanent_errors_and_configures_idle_liveness() {
         let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
@@ -456,11 +519,8 @@ mod tests {
                     peer.write_all(&last).unwrap();
                 }
             });
-            let mut stream = TimedStream {
-                socket,
-                deadline: Some(Instant::now() + Duration::from_secs(2)),
-            };
-            let result = read_handshake(&mut stream);
+            let mut stream = socket;
+            let result = read_response(&mut stream, Instant::now() + Duration::from_secs(2), true);
             if valid {
                 assert_eq!(result.unwrap(), json!({"ok":true}));
                 let mut trailing = [0; 8];
@@ -486,21 +546,18 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(30));
                 }
             });
-            let mut stream = TimedStream {
-                socket,
-                deadline: Some(Instant::now() + Duration::from_millis(100)),
-            };
-            let result = if handshake {
-                read_handshake(&mut stream)
-            } else {
-                read_json(&mut BufReader::new(&mut stream), MAX_HANDSHAKE)
-            };
+            let mut stream = socket;
+            let result = read_response(
+                &mut stream,
+                Instant::now() + Duration::from_millis(100),
+                handshake,
+            );
             let error = result.unwrap_err();
             assert!(matches!(
                 error.downcast_ref::<std::io::Error>().unwrap().kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
             ));
-            stream.socket.shutdown(Shutdown::Both).unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
             writer.join().unwrap();
         }
     }

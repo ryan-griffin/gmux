@@ -162,6 +162,35 @@ fn validate_address(address: &str) -> anyhow::Result<()> {
 pub fn call(body: impl Serialize) -> anyhow::Result<Value> {
     call_at(&ipc::Endpoint::local(), serde_json::to_value(body)?, None)
 }
+/// Async routing keeps execution I/O off the bounded filesystem workers.
+pub async fn call_at_async(
+    mut endpoint: ipc::Endpoint,
+    mut body: Value,
+    cancellation: Option<gmux_platform::unix::ipc::Cancellation>,
+) -> anyhow::Result<Value> {
+    loop {
+        let method = body["method"].as_str().unwrap_or("");
+        if method == "_connection-call" {
+            let Request::ConnectionCall {
+                connection,
+                daemon,
+                request,
+            } = serde_json::from_value(body)?
+            else {
+                unreachable!()
+            };
+            endpoint = ipc::Endpoint::remote(connection, daemon);
+            body = request;
+        } else if handles(method) {
+            return crate::runtime::blocking(move || {
+                call_at(&endpoint, body, cancellation.as_ref())
+            })
+            .await;
+        } else {
+            return endpoint.call_async(body, cancellation.as_ref()).await;
+        }
+    }
+}
 pub fn call_at(
     endpoint: &ipc::Endpoint,
     body: Value,

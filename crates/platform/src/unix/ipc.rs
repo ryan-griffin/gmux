@@ -12,9 +12,16 @@ use std::{
 };
 
 // Leave time for durable execution saves and GTK organization updates.
-const RESPONSE_TIMEOUT: Duration = gmux_protocol::network::CONTROL_TIMEOUT
+const SERVER_RESPONSE_TIMEOUT: Duration = gmux_protocol::network::CONTROL_TIMEOUT
     .saturating_add(gmux_protocol::network::TIMEOUT)
     .saturating_add(gmux_protocol::network::TIMEOUT);
+
+/// Allow a control reply to arrive after the server's response deadline.
+pub const RESPONSE_TIMEOUT: Duration =
+    SERVER_RESPONSE_TIMEOUT.saturating_add(Duration::from_secs(1));
+/// Leave a margin over the shared network setup deadline for a control write.
+pub const REQUEST_TIMEOUT: Duration =
+    gmux_protocol::network::TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// Coalesced, nonblocking notifications for a poll loop or GLib fd source.
 #[derive(Clone)]
@@ -157,27 +164,28 @@ impl Server {
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                     let mut line = String::new();
                     use std::io::Read;
-                    let response = if BufReader::new(&stream)
-                        .take(1_048_577)
-                        .read_line(&mut line)
-                        .is_err()
-                    {
-                        serde_json::json!({"error": "Could not read request"})
-                    } else if line.len() > 1_048_576 {
-                        serde_json::json!({"error": "Request is too large"})
-                    } else if let Ok(body) = serde_json::from_str(&line) {
-                        let (reply, response) = mpsc::sync_channel(1);
-                        if sender.try_send(Request { body, reply }).is_err() {
-                            serde_json::json!({"error": "Request queue is full"})
-                        } else {
-                            wake.notify();
-                            response.recv_timeout(RESPONSE_TIMEOUT).unwrap_or_else(
+                    let response =
+                        if BufReader::new(&stream)
+                            .take(1_048_577)
+                            .read_line(&mut line)
+                            .is_err()
+                        {
+                            serde_json::json!({"error": "Could not read request"})
+                        } else if line.len() > 1_048_576 {
+                            serde_json::json!({"error": "Request is too large"})
+                        } else if let Ok(body) = serde_json::from_str(&line) {
+                            let (reply, response) = mpsc::sync_channel(1);
+                            if sender.try_send(Request { body, reply }).is_err() {
+                                serde_json::json!({"error": "Request queue is full"})
+                            } else {
+                                wake.notify();
+                                response.recv_timeout(SERVER_RESPONSE_TIMEOUT).unwrap_or_else(
                                 |_| serde_json::json!({"error": "Application did not respond"}),
                             )
-                        }
-                    } else {
-                        serde_json::json!({"error": "Invalid JSON request"})
-                    };
+                            }
+                        } else {
+                            serde_json::json!({"error": "Invalid JSON request"})
+                        };
                     let _ = writeln!(stream, "{response}");
                     active.fetch_sub(1, Ordering::Relaxed);
                 });
@@ -235,7 +243,12 @@ pub fn call_if_running(
 
 /// Interrupt one active control call or stream handshake without waiting for its socket timeout.
 #[derive(Clone, Default)]
-pub struct Cancellation(Arc<Mutex<CancelableCall>>);
+pub struct Cancellation(Arc<CancellationState>);
+#[derive(Default)]
+struct CancellationState {
+    call: Mutex<CancelableCall>,
+    canceled: event_listener::Event,
+}
 #[derive(Default)]
 struct CancelableCall {
     stopped: bool,
@@ -243,20 +256,29 @@ struct CancelableCall {
 }
 impl Cancellation {
     pub fn cancel(&self) {
-        let mut call = self.0.lock().unwrap();
+        let mut call = self.0.call.lock().unwrap();
         call.stopped = true;
         if let Some(socket) = &call.socket {
             unsafe {
                 libc::shutdown(socket.as_raw_fd(), libc::SHUT_RDWR);
             }
         }
+        drop(call);
+        self.0.canceled.notify(usize::MAX);
+    }
+    /// Wait for cancellation without polling or blocking a worker.
+    pub async fn cancelled(&self) {
+        let listener = self.0.canceled.listen();
+        if self.check().is_ok() {
+            listener.await;
+        }
     }
     pub fn check(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.0.lock().unwrap().stopped, "Request canceled");
+        anyhow::ensure!(!self.0.call.lock().unwrap().stopped, "Request canceled");
         Ok(())
     }
     pub fn register(&self, socket: &impl AsRawFd) -> anyhow::Result<ActiveCall> {
-        let mut call = self.0.lock().unwrap();
+        let mut call = self.0.call.lock().unwrap();
         anyhow::ensure!(!call.stopped, "Request canceled");
         anyhow::ensure!(
             call.socket.is_none(),
@@ -273,7 +295,7 @@ impl Cancellation {
 pub struct ActiveCall(Cancellation);
 impl Drop for ActiveCall {
     fn drop(&mut self) {
-        self.0.0.lock().unwrap().socket.take();
+        self.0.0.call.lock().unwrap().socket.take();
     }
 }
 pub fn call_at_cancellable(
@@ -300,8 +322,8 @@ fn call_on(
     let _active = cancellation
         .map(|cancellation| cancellation.register(&stream))
         .transpose()?;
-    stream.set_read_timeout(Some(RESPONSE_TIMEOUT + Duration::from_secs(1)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(6)))?;
+    stream.set_read_timeout(Some(RESPONSE_TIMEOUT))?;
+    stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     let result = (|| {
         serde_json::to_writer(&mut stream, &request)?;
         stream.write_all(b"\n")?;

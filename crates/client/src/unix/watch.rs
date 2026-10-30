@@ -1,8 +1,7 @@
 //! Linux notifications for the saved destination catalog.
 pub struct Watch {
     changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop: gmux_platform::unix::ipc::Wake,
-    thread: Option<std::thread::JoinHandle<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl Watch {
     pub fn new(wake: gmux_platform::unix::ipc::Wake) -> anyhow::Result<Self> {
@@ -27,43 +26,37 @@ impl Watch {
             } >= 0,
             "Could not watch connection settings"
         );
-        let stop = gmux_platform::unix::ipc::Wake::new()?;
-        let stopping = stop.clone();
+        // OwnedFd keeps the descriptor stable until its registration is dropped.
+        let fd =
+            crate::runtime::block_on(async { unsafe { tokio::io::unix::AsyncFd::register(fd) } })?;
         let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = changed.clone();
-        let thread = std::thread::spawn(move || {
-            let mut fds = [
-                libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stopping.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
+        let task = crate::runtime::spawn(async move {
             let mut buffer = [0u8; 8192];
             loop {
-                let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                if fds[1].revents != 0 {
+                let Ok(mut ready) = fd.readable().await else {
                     break;
-                }
-                if n < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
+                };
+                let result = ready.try_io(|fd| {
+                    let n = unsafe {
+                        libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                    };
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
                     }
-                    break;
-                }
-                let n =
-                    unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-                if n <= 0 {
-                    continue;
-                }
+                });
+                let n = match result {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => n,
+                    Err(_) => continue,
+                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(Err(_)) => break,
+                };
                 let mut offset = 0;
                 let mut notify = false;
-                while offset + std::mem::size_of::<libc::inotify_event>() <= n as usize {
+                while offset + std::mem::size_of::<libc::inotify_event>() <= n {
                     let event = unsafe {
                         std::ptr::read_unaligned(
                             buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
@@ -71,7 +64,7 @@ impl Watch {
                     };
                     let start = offset + std::mem::size_of::<libc::inotify_event>();
                     let end = start + event.len as usize;
-                    if end > n as usize {
+                    if end > n {
                         break;
                     }
                     let name = &buffer[start..end];
@@ -85,11 +78,7 @@ impl Watch {
                 }
             }
         });
-        Ok(Self {
-            changed,
-            stop,
-            thread: Some(thread),
-        })
+        Ok(Self { changed, task })
     }
     pub fn changed(&self) -> bool {
         self.changed
@@ -98,9 +87,6 @@ impl Watch {
 }
 impl Drop for Watch {
     fn drop(&mut self) {
-        self.stop.notify();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.task.abort();
     }
 }
