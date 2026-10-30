@@ -366,12 +366,20 @@ rows at or beyond that screen row. Apply it before inserting the packet's viewpo
 and supplemental rows. Ordinary output invalidates the previously mutable screen
 rows while preserving older history, even if the displayed viewport is unchanged.
 
-An optional
-`cache` object supplies a starting history row and `row_flags`, one flag per
-extra row. These cells follow the changed viewport cells in the packet. Cache
+An optional `cache` object supplies a starting history row and `row_flags`, one
+flag per extra row. These cells follow the changed viewport cells in the packet. Cache
 rows preserve the viewport's resolved colors, decorations, graphemes, and wide
-cells. The daemon prefetches nearby rows while browsing and sends only missing
-parts as the window moves. Immutable history can be prefetched during output.
+cells. Each packet admits at most 512 supplemental rows and reserves at most
+16 MiB for their encoded cell data, excluding JSON metadata. Each row reserves
+`cols * (13 + 260)` bytes, including the maximum text length in every cell, even
+when the actual text is shorter. Thus a 1,000-column packet admits at most 61
+supplemental rows. Readers check this limit before allocating or decoding cells.
+These wire limits are independent of client retention and Rust cell layout.
+
+The daemon chooses up to five screens and 49,152 cells within the wire limit.
+It skips prefetch when that window cannot cover a viewport, and sends only
+missing parts as the window moves. Immutable history can be prefetched during
+output.
 Live screen prefetch waits for 100 ms without output. Synchronized-output holds
 suspend prefetching.
 
@@ -418,8 +426,10 @@ trip. Commands that depend on the viewport flush the queued target first.
 Apply row deltas from older replies too, since later packets depend on them.
 Keep the latest local scroll target while reconciling older viewport replies.
 
-The history cache retains at most 512 rows and 2 MiB per visible pane, usually
-five screens. Hidden panes release their cache. Unknown rows and search
+The Rust client history cache retains at most 512 rows and 2 MiB per visible
+pane, usually five screens. Row storage and overflow text count toward that budget. Clients
+may evict or ignore supplemental rows without affecting authoritative viewport
+deltas. Hidden panes release their cache. Unknown rows and search
 highlights require an authoritative viewport reply.
 
 Send the connection command `{"method":"ping"}` to check that the daemon's
@@ -456,7 +466,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 38; clients must match
+cell data are rejected. This is stream protocol version 39; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.

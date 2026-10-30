@@ -32,6 +32,7 @@ mod commands;
 mod event_loop;
 mod frontend;
 mod network;
+mod prefetch;
 mod remote_access;
 
 use commands::{ControlRequest, PendingControl};

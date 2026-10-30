@@ -759,7 +759,7 @@ impl SessionManager {
             row_flags: vec![0; 24],
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
-            cache: gmux_protocol::scroll_cache::RowCache::default(),
+            cache: crate::scroll_cache::RowCache::default(),
             prediction: None,
             scroll_target: None,
             wake: self.wake.clone(),
@@ -944,12 +944,12 @@ impl SessionManager {
                                 .resize(frame.cols as usize * frame.rows as usize, Cell::default());
                             session.row_flags.resize(frame.rows as usize, 0);
                             let cols = frame.cols as usize;
-                            gmux_protocol::scroll_cache::shift(
+                            gmux_protocol::viewport::shift_rows(
                                 &mut session.cells,
                                 cols,
                                 packet.header.row_shift,
                             );
-                            gmux_protocol::scroll_cache::shift(
+                            gmux_protocol::viewport::shift_rows(
                                 &mut session.row_flags,
                                 1,
                                 packet.header.row_shift,
@@ -1110,7 +1110,7 @@ pub struct RemoteSession {
     row_flags: Vec<u8>,
     hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     hyperlink_revision: u64,
-    cache: gmux_protocol::scroll_cache::RowCache,
+    cache: crate::scroll_cache::RowCache,
     prediction: Option<Prediction>,
     scroll_target: Option<u64>,
     wake: gmux_platform::unix::ipc::Wake,
@@ -1995,7 +1995,7 @@ mod tests {
             row_flags: vec![0; 2],
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
-            cache: gmux_protocol::scroll_cache::RowCache::default(),
+            cache: crate::scroll_cache::RowCache::default(),
             prediction: None,
             scroll_target: None,
             wake: wake.clone(),
@@ -3357,6 +3357,107 @@ mod tests {
             json!({"method":"frame-interval", "micros":4167})
         );
         assert!(manager.frame_interval_sent);
+    }
+
+    #[test]
+    fn wire_cache_retention_never_replaces_authoritative_viewport_deltas() {
+        // The same wire-valid supplemental window exceeds the ring's row
+        // capacity at this width. A taller viewport disables retention entirely.
+        for rows in [20, 60] {
+            let (mut manager, sender, handle) = manager();
+            manager.visible.insert(1);
+            let cols = 1000;
+            let cached = transport::cache_row_limit(cols);
+            let frame = Frame {
+                cols: cols as u16,
+                rows: rows as u16,
+                scrollback: gmux_protocol::Scrollback {
+                    total: 1000,
+                    offset: 100,
+                    len: rows as u64,
+                },
+                ..Frame::default()
+            };
+            let cell = |text| {
+                let mut cell = Cell::default();
+                cell.set_text(text).unwrap();
+                cell
+            };
+            let send = |header, cells| {
+                let mut bytes = Vec::new();
+                Packet { header, cells }.encode_into(&mut bytes).unwrap();
+                sender
+                    .send(Ok(Packet::read(&mut bytes.as_slice()).unwrap()))
+                    .unwrap();
+            };
+            let mut cells = vec![cell("viewport"); rows * cols];
+            cells.extend(vec![cell("supplemental"); cached * cols]);
+            send(
+                Header {
+                    meta: handle.borrow().meta.clone(),
+                    generation: 1,
+                    frame: Some(frame),
+                    rows: (0..rows as u16).collect(),
+                    row_flags: (0..rows).map(|row| (row % 2) as u8).collect(),
+                    cache: Some(transport::CachedRows {
+                        start: 80,
+                        row_flags: vec![0; cached],
+                    }),
+                    ..Header::default()
+                },
+                cells,
+            );
+            manager.poll();
+            {
+                let session = handle.borrow();
+                assert!(!manager.disconnected);
+                assert!(
+                    session
+                        .snapshot()
+                        .cells
+                        .iter()
+                        .all(|c| c.text() == "viewport")
+                );
+                assert_eq!(session.cache.is_empty(), rows == 60);
+            }
+            // A following delta depends on the authoritative grid, regardless
+            // of which overlapping supplemental rows the client retained.
+            send(
+                Header {
+                    meta: handle.borrow().meta.clone(),
+                    generation: 1,
+                    frame: Some(Frame {
+                        scrollback: gmux_protocol::Scrollback {
+                            offset: 101,
+                            ..frame.scrollback
+                        },
+                        ..frame
+                    }),
+                    row_shift: 1,
+                    rows: vec![rows as u16 - 1],
+                    row_flags: vec![1],
+                    ..Header::default()
+                },
+                vec![cell("exposed"); cols],
+            );
+            manager.poll();
+            let session = handle.borrow();
+            let snapshot = session.snapshot();
+            assert_eq!(snapshot.frame.scrollback.offset, 101);
+            assert!(
+                snapshot.cells[..(rows - 1) * cols]
+                    .iter()
+                    .all(|c| c.text() == "viewport")
+            );
+            assert!(
+                snapshot.cells[(rows - 1) * cols..]
+                    .iter()
+                    .all(|c| c.text() == "exposed")
+            );
+            assert_eq!(snapshot.row_flags[0], 1);
+            assert_eq!(snapshot.row_flags[rows - 1], 1);
+            assert_eq!(session.cache.is_empty(), rows == 60);
+        }
     }
 
     #[test]

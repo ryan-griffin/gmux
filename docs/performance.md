@@ -553,11 +553,15 @@ GMUX_TEST_REFRESH_RATE=144 python3 scripts/check.py --native --only terminal-inp
 ```
 
 The client benchmark compares cached and uncached viewport updates with a
-simulated reply delay, defaulting to 100 ms. Pass `0` for Unix socket timings
-without an added delay. It measures the session snapshot, excluding GTK
-and display presentation. The frontend-input suite measures wire bytes for 64
-single-row scrolls and reports daemon RSS before and after the trace. Its full-grid
-cell-byte count is a reference for sending one complete viewport per step. It
+simulated reply delay, defaulting to 100 ms. Arguments select delay, transport
+`unix` or `tcp`, and text `ascii` or `long`. For example, `-- 0 tcp long` uses
+loopback TCP without an added delay and 260-byte cell text. TCP disables Nagle
+on both ends. Reports include retained prediction-cache bytes after the initial
+120-row prefetch; shared overflow text is charged per owning cell. Long text can
+evict part of that window within the client's 2 MiB budget. The benchmark measures
+the session snapshot, excluding GTK and display presentation. The frontend-input
+suite measures wire bytes for 64 single-row scrolls and reports daemon RSS before
+and after the trace. Its full-grid cell-byte count is a reference for sending one complete viewport per step. It
 also checks that connections with different display intervals remain independent
 and that output preserves unchanged history without repeatedly sending windows.
 

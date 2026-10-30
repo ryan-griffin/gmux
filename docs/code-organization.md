@@ -7,6 +7,7 @@ The Cargo workspace separates shared protocol, client behavior, and execution:
 - `gmux-protocol`, in `crates/protocol`, defines shared terminal values, execution
   requests and snapshots, network handshakes, and codecs. It uses ordinary Rust
   serialization dependencies and has no platform I/O or native build dependencies.
+  Wire cache limits reserve encoded bytes without depending on Rust cell layout.
 - `gmux-client`, in `crates/client`, owns outgoing connections, retries, terminal
   caches, and bounded queues. Its `unix` module contains client platform adapters.
 - `gmux-platform`, in `crates/platform`, provides shared platform services.
@@ -15,8 +16,9 @@ The Cargo workspace separates shared protocol, client behavior, and execution:
   integration: control sockets, fd wakeups, cancellation, file locking, atomic
   writes, machine detection, identity generation, and local daemon lifecycle.
 - `gmux-daemon`, at the repository root, owns PTYs, Ghostty and its native bridge,
-  server listeners, execution, and daemon persistence. It exposes the daemon entry
-  points and has no runtime dependency on the client library.
+  server listeners, execution, history prefetch policy, and daemon persistence.
+  It exposes the daemon entry points and has no runtime dependency on the client
+  library.
 - `gmux`, in `crates/cli`, contains the `serve` command and management CLI.
 - `gmux-gtk`, in `crates/gtk`, builds the GTK client and its resources.
 
@@ -129,8 +131,11 @@ check their layout against the C bridge.
 `connections.rs` owns saved destinations, identity pins, and client configuration
 commands. `connection.rs` owns one daemon's asynchronous setup, retries, status,
 and typed state updates. `remote.rs` maintains cached viewports and bounded
-input/output queues. Incoming queue admission tests live with the client; codecs
-and value tests live with the protocol.
+input/output queues. `scroll_cache.rs` owns prediction-row storage, retention,
+overflow-text accounting, and eviction. The daemon chooses supplemental rows in
+`src/daemon/prefetch.rs`; the engine bounds extraction by the protocol limits.
+Incoming queue admission tests live with the client; codecs and value tests live
+with the protocol.
 
 `runtime.rs` provides one shared Tokio I/O thread per client process. Connection
 setup, terminal streams, heartbeats, control requests, and inotify watches run as

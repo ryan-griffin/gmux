@@ -1111,9 +1111,13 @@ impl Engine {
         let count = range
             .end
             .checked_sub(range.start)
-            .filter(|count| *count <= gmux_protocol::scroll_cache::capacity(cols) as u64)
+            .filter(|count| *count <= gmux_protocol::transport::cache_row_limit(cols) as u64)
             .ok_or_else(|| anyhow::anyhow!("Invalid scrollback cache range"))?
             as usize;
+        anyhow::ensure!(
+            range.end <= self.frame.scrollback.total,
+            "Invalid scrollback cache range"
+        );
         let start = u32::try_from(range.start)?;
         let mut cells = vec![Cell::default(); count * cols];
         let mut flags = vec![0; count];
@@ -1604,6 +1608,37 @@ mod tests {
             engine.history.generation, previous,
             "Clear and refill in one write"
         );
+    }
+
+    #[test]
+    fn history_extraction_uses_wire_bounds_independently_of_prefetch_policy() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .set_scrollback_limits(gmux_protocol::retention::ScrollbackLimits::default())
+            .unwrap();
+        engine.resize(1000, 20, 0, 0).unwrap();
+        engine.write("history\r\n".repeat(100).as_bytes());
+        engine.snapshot().unwrap();
+        let limit = gmux_protocol::transport::cache_row_limit(1000) as u64;
+        let frame = engine.frame;
+        assert!(
+            frame.scrollback.total >= limit,
+            "history rows={}, limit={limit}, cols={}",
+            frame.scrollback.total,
+            frame.cols
+        );
+        let (cells, flags) = engine.cache_rows(0..limit).unwrap();
+        assert_eq!(cells.len(), limit as usize * 1000);
+        assert_eq!(flags.len(), limit as usize);
+        for range in [
+            0..limit + 1,
+            frame.scrollback.total..frame.scrollback.total + 1,
+            limit..limit - 1,
+            u64::MAX..u64::MAX,
+        ] {
+            assert!(engine.cache_rows(range).is_err());
+        }
+        assert!(engine.frame == frame);
     }
 
     #[test]

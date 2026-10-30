@@ -14,7 +14,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 38;
+pub const VERSION: u32 = 39;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -22,7 +22,23 @@ pub const PASTE_CHUNK: usize = 16 * 1024;
 pub const MAX_PACKET: usize = 64 * 1024 * 1024;
 /// Per-cell prefix: UTF-8 length, colors and rendition. Text follows the prefix.
 pub const CELL_PREFIX_BYTES: usize = 13;
+/// Maximum supplemental history rows in one viewport packet.
+pub const MAX_CACHE_ROWS: usize = 512;
+/// Cell-data bytes reserved for supplemental history, excluding JSON metadata.
+/// Admission reserves the maximum encoded grapheme length for every cell, even
+/// when the actual text is shorter. This also bounds allocations before decoding.
+pub const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Wire row limit for a supported width. Independent of Rust cell layout and
+/// any client's choice of history-cache storage or retention budget.
+pub fn cache_row_limit(cols: usize) -> usize {
+    if !(1..=crate::viewport::MAX_AXIS).contains(&cols) {
+        return 0;
+    }
+    (MAX_CACHE_BYTES / (cols * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES)))
+        .min(MAX_CACHE_ROWS)
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
@@ -242,7 +258,7 @@ macro_rules! packet_reader {
                 );
                 let cached = if let Some(cache) = &header.cache {
                     anyhow::ensure!(
-                        cache.row_flags.len() <= crate::scroll_cache::capacity(cols)
+                        cache.row_flags.len() <= cache_row_limit(cols)
                             && cache.row_flags.iter().all(|flag| flag & !1 == 0)
                             && cache.start <= frame.scrollback.total
                             && cache.row_flags.len() as u64 <= frame.scrollback.total - cache.start,
@@ -507,6 +523,75 @@ mod tests {
         }
     }
     #[test]
+    fn wire_cache_limits_reserve_encoded_bytes_and_reject_before_cells() {
+        assert_eq!(cache_row_limit(1), 512);
+        assert_eq!(cache_row_limit(1000), 61);
+        for cols in [0, 1001, usize::MAX] {
+            assert_eq!(cache_row_limit(cols), 0);
+        }
+        for cols in [1, 80, 512, 1000] {
+            let count = cache_row_limit(cols);
+            assert!(count * cols * (CELL_PREFIX_BYTES + 260) <= MAX_CACHE_BYTES);
+            let mut packet = packet();
+            packet.header.frame = Some(Frame {
+                cols: cols as u16,
+                rows: 1,
+                scrollback: crate::Scrollback {
+                    total: 1000,
+                    offset: 0,
+                    len: 1,
+                },
+                ..Frame::default()
+            });
+            packet.header.rows.clear();
+            packet.header.row_flags.clear();
+            packet.header.cache = Some(CachedRows {
+                start: 0,
+                row_flags: vec![0; count],
+            });
+            packet.cells = vec![Cell::default(); count * cols];
+            let mut bytes = Vec::new();
+            packet.encode_into(&mut bytes).unwrap();
+            packet.encode_into(&mut bytes).unwrap();
+            let mut reader = bytes.as_slice();
+            for _ in 0..2 {
+                let decoded = Packet::read(&mut reader).unwrap();
+                assert!(decoded.cells == packet.cells);
+                assert_eq!(decoded.header.cache.unwrap().row_flags.len(), count);
+            }
+            assert!(reader.is_empty());
+
+            // Short text cannot bypass the reservation for worst-case text.
+            // Omit the cell data entirely to prove rejection precedes its read.
+            packet.header.cache.as_mut().unwrap().row_flags.push(0);
+            let header = serde_json::to_vec(&packet.header).unwrap();
+            let size = 4 + header.len() + (count + 1) * cols * CELL_PREFIX_BYTES;
+            let mut bytes = (size as u32).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&header);
+            let mut reader = io::Cursor::new(&bytes);
+            assert_eq!(
+                Packet::read(&mut reader).err().unwrap().to_string(),
+                "Invalid cached rows"
+            );
+            assert_eq!(reader.position() as usize, bytes.len());
+            #[cfg(feature = "async")]
+            futures_lite::future::block_on(async {
+                let mut reader = futures_lite::io::Cursor::new(&bytes);
+                assert_eq!(
+                    Packet::read_message_async(&mut reader)
+                        .await
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    "Invalid cached rows"
+                );
+                assert_eq!(reader.position() as usize, bytes.len());
+            });
+        }
+    }
+
+    #[test]
     fn cached_rows_round_trip_and_invalid_scroll_storage_is_rejected() {
         let mut packet = packet();
         packet.header.generation = 1;
@@ -534,7 +619,7 @@ mod tests {
             (0, u64::MAX, vec![0]),
             (0, 499, vec![0, 0]),
             (0, 0, vec![2]),
-            (0, 0, vec![0; crate::scroll_cache::MAX_ROWS + 1]),
+            (0, 0, vec![0; MAX_CACHE_ROWS + 1]),
         ] {
             packet.header.row_shift = shift;
             packet.header.cache = Some(CachedRows {
@@ -851,6 +936,11 @@ mod tests {
                 cell
             })
             .collect();
+        packet.header.cache = Some(CachedRows {
+            start: 10,
+            row_flags: vec![1, 0],
+        });
+        packet.cells.extend_from_within(..);
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
         // Put an empty delta between two payloads to catch packet overconsumption.

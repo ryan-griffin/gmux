@@ -15,6 +15,19 @@ pub fn constrain(cols: usize, rows: usize) -> (u16, u16) {
     (cols as u16, rows as u16)
 }
 
+/// Reuse overlapping rows before applying a packet's changed rows.
+pub fn shift_rows<T>(data: &mut [T], cols: usize, rows: i16) {
+    let count = rows.unsigned_abs() as usize * cols;
+    // Exposed rows are overwritten by the packet. Move ownership instead of
+    // cloning overflow Arcs into cells that will immediately be replaced.
+    if rows > 0 {
+        data.rotate_left(count);
+    }
+    if rows < 0 {
+        data.rotate_right(count);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
