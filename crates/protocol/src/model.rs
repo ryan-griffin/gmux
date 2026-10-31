@@ -30,8 +30,8 @@ pub enum MachineKind {
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum CursorStyle {
-    #[default]
     Bar = 0,
+    #[default]
     Block = 1,
     Underline = 2,
     HollowBlock = 3,
