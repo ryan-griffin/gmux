@@ -3628,7 +3628,7 @@ mod tests {
     fn cursor_defaults_update_live_and_survive_application_overrides_and_resets() {
         let mut e = Engine::new().unwrap();
         e.snapshot().unwrap();
-        assert_eq!(e.frame.cursor_style, CursorStyle::Bar as u8);
+        assert_eq!(e.frame.cursor_style, CursorStyle::Block as u8);
         for style in CursorStyle::ALL {
             e.set_cursor_style(style).unwrap();
             e.snapshot().unwrap();

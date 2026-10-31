@@ -6,6 +6,18 @@ OSC 133 prompt, input, command-start, and command-end markers. Gmux also accepts
 markers from other shell integrations, including shells with native OSC 133
 support. Unsupported shells start normally and use foreground-process detection.
 
+## Cursor style
+
+Bash and Zsh use a bar cursor at the prompt and restore the terminal's default
+cursor style before running a command. The default is a block, so applications
+such as plain Vim inherit a block even though the prompt uses a bar. Zsh's vi
+command mode uses a block at the prompt.
+
+Default Cursor Style in Preferences changes the style inherited by commands.
+Applications can override it with their own cursor requests, including changes
+for editing modes. Existing profiles retain their saved default; choose Block
+to use a block in applications that do not request a shape.
+
 ## Navigation and output
 
 Use Ctrl+Shift+Up and Ctrl+Shift+Down to go to the previous and next prompt.

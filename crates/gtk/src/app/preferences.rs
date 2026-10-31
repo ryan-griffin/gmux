@@ -309,8 +309,8 @@ impl Ui {
         });
         appearance.add(&pane_titles);
         let cursor = adw::ComboRow::builder()
-            .title("Cursor Style")
-            .subtitle("Applications may choose a different cursor style")
+            .title("Default Cursor Style")
+            .subtitle("Shell prompts use a bar; applications may choose another style")
             .model(&gtk::StringList::new(&[
                 "Bar",
                 "Block",

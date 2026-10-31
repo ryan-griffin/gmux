@@ -59,7 +59,7 @@ pub(crate) fn configure(command: &mut CommandBuilder, shell: &Path) {
         }
         _ => return,
     }
-    // Optional Ghostty features invoke its executable or change user styling.
-    // Gmux uses only semantic marking and working-directory reports.
-    command.env("GHOSTTY_SHELL_FEATURES", "");
+    // Use a bar while editing the prompt and restore the terminal default
+    // before commands. Leave the other optional shell features disabled.
+    command.env("GHOSTTY_SHELL_FEATURES", "cursor");
 }
