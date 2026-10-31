@@ -145,6 +145,7 @@ impl Ui {
             });
             return;
         }
+        let creates_tab = matches!(command, Command::New { .. });
         let route = match self.sessions.borrow().route_command(command, destination) {
             Ok(route) => route,
             Err(error) => {
@@ -152,6 +153,14 @@ impl Ui {
                 return;
             }
         };
+        let creating_tab = route.destination.filter(|_| creates_tab);
+        if let Some(daemon) = creating_tab {
+            *self
+                .pending_tab_creations
+                .borrow_mut()
+                .entry(daemon)
+                .or_default() += 1;
+        }
         let reveal = reveal.then(|| {
             let serial = self.creation_serial.get() + 1;
             self.creation_serial.set(serial);
@@ -165,8 +174,7 @@ impl Ui {
             let reply = match projected {
                 Ok(reply) => reply,
                 Err(error) => {
-                    ui.complete_command();
-                    callback(ui, Err(error));
+                    ui.finish_command(Err(error), reveal, creating_tab, selection, callback);
                     return;
                 }
             };
@@ -191,10 +199,10 @@ impl Ui {
                         reply.result = output;
                         Ok(reply)
                     });
-                    ui.finish_command(result, reveal, selection, callback);
+                    ui.finish_command(result, reveal, creating_tab, selection, callback);
                 });
             } else {
-                ui.finish_command(Ok(reply), reveal, selection, callback);
+                ui.finish_command(Ok(reply), reveal, creating_tab, selection, callback);
             }
         });
     }
@@ -202,9 +210,18 @@ impl Ui {
         self: &Rc<Self>,
         reply: anyhow::Result<CommandReply>,
         reveal: Option<u64>,
+        creating_tab: Option<model::DaemonId>,
         selection: Selection,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>),
     ) {
+        if let Some(daemon) = creating_tab {
+            let mut pending = self.pending_tab_creations.borrow_mut();
+            let count = pending.get_mut(&daemon).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&daemon);
+            }
+        }
         // Connections can complete in different orders. An earlier slow creation
         // must not take focus from a newer tab or split the user has opened.
         let reveal = reveal.is_some_and(|serial| serial == self.creation_serial.get());
@@ -213,6 +230,14 @@ impl Ui {
             && let Some(warning) = &result.warning
         {
             self.message(warning);
+        }
+        // Execution can succeed before its presentation save fails. Release any
+        // deferred tabs even when the creation request returns an error.
+        if creating_tab.is_some() && result.is_err() {
+            let state = self.sessions.borrow_mut().snapshot();
+            if let Err(error) = self.apply_shared(state) {
+                self.message(&error.to_string());
+            }
         }
         self.complete_command();
         callback(self, result);
@@ -259,6 +284,21 @@ impl Ui {
             ..
         } = reply;
         let mut current = Selection::capture(self);
+        // A stream snapshot can announce a new tab before its creation reply.
+        // Keep this window's existing rows in place until that reply can insert
+        // and select the tab together. Other connections still update normally.
+        let revealed_tab = match result.output {
+            crate::client::control::CommandOutput::New { tab, .. } if reveal => Some(tab),
+            _ => None,
+        };
+        state.tabs.retain(|tab| {
+            current.tabs.contains_key(&tab.id)
+                || revealed_tab == Some(tab.id)
+                || !self
+                    .pending_tab_creations
+                    .borrow()
+                    .contains_key(&tab.daemon)
+        });
         if let Some((desired, fallback, filter)) = self.restore_selection.get() {
             if current.active != fallback || current.filter != filter {
                 self.restore_selection.set(None);

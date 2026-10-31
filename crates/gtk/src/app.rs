@@ -126,6 +126,7 @@ pub struct Ui {
     pending: RefCell<HashMap<u64, BackendCallback>>,
     command_count: Cell<usize>,
     creation_serial: Cell<u64>,
+    pending_tab_creations: RefCell<HashMap<model::DaemonId, usize>>,
     command_exits: RefCell<HashSet<u64>>,
     keyboard: Rc<RefCell<crate::terminal::KeyboardState>>,
     update_source: RefCell<Option<glib::SourceId>>,

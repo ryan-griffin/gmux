@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check native window creation, shared layouts, local navigation, and detach."""
+from concurrent.futures import ThreadPoolExecutor
 import os
 import fcntl
 import json
@@ -15,7 +16,7 @@ from gi.repository import Gio, GioUnix
 from clipboard_test_support import check_html
 from progress_test_support import ProgressProbe
 from cargo_test_support import cargo_binary
-from test_support import AppFixture, scenario, stop_process, wait_for
+from test_support import AppFixture, assert_stays, scenario, stop_process, wait_for
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
@@ -76,6 +77,79 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         wait_for(lambda: len(fixture.rpc("windows")["windows"]) == 2)
         wait_for(lambda: fixture.rpc("status")["local_clients"] == 2)
         assert app.poll() is None
+
+    with scenario("new tabs appear and select together while other windows receive execution updates"):
+        lock_path = fixture.config / "clients/gtk/.state.json.lock"
+        with lock_path.open("w") as lock, ThreadPoolExecutor(max_workers=1) as pool:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                pending = pool.submit(fixture.rpc, "new", window=first, name="Atomic insertion")
+                observed = wait_for(lambda: next((t for t in state(second)["tabs"]
+                                                 if t["name"] == "Atomic insertion"), None))
+                assert not pending.done(), "Creation did not wait for its presentation save"
+                assert_stays(lambda: [t["id"] for t in state(first)["tabs"]] == [tab]
+                             and state(first)["active_tab"] == tab, .2,
+                             message="The new tab moved the old selection before it could be selected")
+                assert state(second)["active_tab"] == tab
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            created = pending.result(timeout=12)
+        view = state(first)
+        assert view["tabs"][0]["id"] == view["active_tab"] == created["tab"] == observed["id"], view
+        fixture.rpc("close-tab", window=first, tab=created["tab"])
+        wait_for(lambda: len(state(second)["tabs"]) == 1)
+
+    with scenario("overlapping creations keep the selection in place until the latest tab is ready"):
+        execution_lock = fixture.config / ".execution.json.lock"
+        with lock_path.open("w") as desktop, execution_lock.open("w") as execution, ThreadPoolExecutor(max_workers=2) as pool:
+            fcntl.flock(desktop, fcntl.LOCK_EX)
+            try:
+                earlier = pool.submit(fixture.rpc, "new", window=first, name="Earlier creation")
+                wait_for(lambda: any(t["name"] == "Earlier creation" for t in state(second)["tabs"]))
+                fcntl.flock(execution, fcntl.LOCK_EX)
+                try:
+                    latest = pool.submit(fixture.rpc, "new", window=first, name="Latest creation")
+                    # The daemon has accepted the second command, but its reply
+                    # cannot complete until this execution save is released.
+                    wait_for(lambda: any(t["name"] == "Latest creation"
+                                         for t in fixture.rpc("list", client=False)["tabs"]))
+                    fcntl.flock(desktop, fcntl.LOCK_UN)
+                    first_created = earlier.result(timeout=12)
+                    assert not latest.done(), "The latest creation did not wait for its execution save"
+                    assert_stays(lambda: [t["id"] for t in state(first)["tabs"]] == [tab]
+                                 and state(first)["active_tab"] == tab, .2,
+                                 message="An earlier creation moved the selection while the latest was pending")
+                finally:
+                    fcntl.flock(execution, fcntl.LOCK_UN)
+            finally:
+                fcntl.flock(desktop, fcntl.LOCK_UN)
+            last_created = latest.result(timeout=12)
+        view = state(first)
+        assert [t["id"] for t in view["tabs"]] == [last_created["tab"], first_created["tab"], tab], view
+        assert view["active_tab"] == last_created["tab"], view
+        for created in (last_created, first_created):
+            fixture.rpc("close-tab", window=first, tab=created["tab"])
+        wait_for(lambda: len(state(second)["tabs"]) == 1)
+
+    with scenario("a failed presentation save releases a successfully created execution"):
+        desktop_path = fixture.config / "clients/gtk/state.json"
+        saved = desktop_path.read_bytes()
+        with lock_path.open("w") as lock, ThreadPoolExecutor(max_workers=1) as pool:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                pending = pool.submit(fixture.rpc, "new", window=first, name="Unsaved insertion", check=False)
+                observed = wait_for(lambda: next((t for t in state(second)["tabs"]
+                                                 if t["name"] == "Unsaved insertion"), None))
+                desktop_path.write_text("invalid JSON")
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            try:
+                assert "error" in pending.result(timeout=12)
+                wait_for(lambda: any(t["id"] == observed["id"] for t in state(first)["tabs"]))
+            finally:
+                desktop_path.write_bytes(saved)
+        fixture.rpc("close-tab", window=first, tab=observed["id"])
+        wait_for(lambda: len(state(second)["tabs"]) == 1)
 
     with scenario("each window copies its own selection with both GTK MIME representations"), WaylandInput() as native:
         temporary = fixture.rpc("new", window=first, name="Clipboard selections")
