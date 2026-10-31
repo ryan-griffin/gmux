@@ -43,18 +43,19 @@ entry.terminal-find > button:active { opacity: 0.8; }
   entry.terminal-find > button:hover { opacity: 1; }
   entry.terminal-find > button:active { opacity: 0.9; }
 }
-/* Match AdwTabOverview: native .card shadow and a white inset thumbnail outline. */
 .terminal-pane {
-  border: none;
-  outline: 1px solid rgb(255 255 255 / 7%);
-  outline-offset: -1px;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
 }
-@media (prefers-contrast: more) {
+/* Use a lighter shadow while retaining the native high-contrast card styling. */
+@media (prefers-contrast: no-preference) {
   .terminal-pane {
-    outline-color: rgb(255 255 255 / 30%);
+    box-shadow: 0 0 0 1px rgb(0 0 6 / 3%), 0 1px 3px rgb(0 0 6 / 5%);
   }
 }
-.terminal-pane { background: var(--terminal-bg); color: var(--terminal-fg); }
+@media (prefers-color-scheme: dark) and (prefers-contrast: no-preference) {
+  .terminal-pane { box-shadow: none; }
+}
 .terminal-canvas { margin: 3px; }
 /* Clip only the contents, allowing the card shadow to extend outside the pane. */
 .pane-clip { border-radius: inherit; }
@@ -63,17 +64,16 @@ entry.terminal-find > button:active { opacity: 0.8; }
 .terminal-pane.active-pane .pane-content { opacity: 1; }
 /* Keep a 6px inset and match AdwTabBar's 24px flat close button. */
 .pane-toolbar { padding: 6px; }
-.pane-close { min-width: 24px; min-height: 24px; padding: 0; }
+.pane-close { min-width: 24px; min-height: 24px; }
 .pane-size {
   padding: 4px 8px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--terminal-bg);
-  color: var(--terminal-fg);
   font-variant-numeric: tabular-nums;
 }
-/* Pane outlines define the split. Keep a draggable gutter without a second line. */
-paned.tab-split > separator { min-width: 6px; min-height: 6px; background: none; border: none; box-shadow: none; }
+/* Keep a draggable gutter without a visible separator. */
+paned.tab-split > separator { min-width: 6px; min-height: 6px; box-shadow: none; }
 
 progressbar.pane-progress.error > trough > progress { background: var(--error-color); }
 progressbar.pane-progress.warning > trough > progress { background: var(--warning-color); }
