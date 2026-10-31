@@ -188,6 +188,17 @@ registered with the application, since initialization can fail before a window
 exists. Close has initial focus and handles Enter, Escape, and window dismissal.
 Repeated activation raises the existing error dialog.
 
+Terminal action failures use dismissible `AdwToast` messages in the window's
+`AdwToastOverlay`. Messages identify the tab and, for splits, the pane. Details
+opens an `AdwAlertDialog` with the underlying error as plain text. Repeated
+identical failures are suppressed while their toast is present and for five
+seconds after the first report. Only the latest terminal error is queued.
+
+The active tab shows one `AdwBanner` above its terminals while its connection is
+connecting, reconnecting, or disconnected. Manage Connections opens the existing
+connection controls. The banner follows tab selection and disappears when the
+connection recovers. Input failures during a disconnect do not also show toasts.
+
 The command palette ranks labels, related terms, and small spelling mistakes.
 The search field keeps keyboard focus while the selected row scrolls into view.
 Disabled commands remain visible but keyboard navigation skips them. Accessible

@@ -23,6 +23,7 @@ impl Ui {
             .sessions
             .borrow_mut()
             .attach(id, &Theme::adwaita(adw::StyleManager::default().is_dark()))?;
+        let weak = Rc::downgrade(self);
         Ok(Terminal::new(
             id,
             session,
@@ -33,6 +34,11 @@ impl Ui {
             crate::terminal::InputContext {
                 keyboard: self.keyboard.clone(),
                 clipboard: self.clipboard.clone(),
+                on_error: Rc::new(move |pane, source, summary, details| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.pane_error(pane, source, summary, details);
+                    }
+                }),
             },
         ))
     }
@@ -363,6 +369,7 @@ impl Ui {
             )
         };
         self.active.set(id);
+        self.refresh_connection_banner();
         self.subscribe_visible();
         self.update_tab_actions(true);
         self.changing.set(true);
@@ -421,6 +428,7 @@ impl Ui {
     }
     pub(super) fn show_empty(self: &Rc<Self>) {
         self.active.set(0);
+        self.refresh_connection_banner();
         self.subscribe_visible();
         self.changing.set(true);
         self.sidebar.select_row(None::<&gtk::ListBoxRow>);
@@ -642,6 +650,7 @@ impl Ui {
         }
     }
     pub(super) fn refresh_metadata(self: &Rc<Self>) {
+        self.refresh_connection_banner();
         self.refresh_activity(self.tabs.borrow().iter());
         for w in self.tabs.borrow_mut().iter_mut() {
             machine::update_tab(w, &self.sessions.borrow());

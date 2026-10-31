@@ -570,13 +570,17 @@ impl Desktop {
                 }
                 Ok(Err(error)) => {
                     if paste {
-                        terminal.show_status(&format!("Could not read clipboard: {error}"));
+                        terminal.report_desktop_error(
+                            "Could not paste",
+                            &format!("Could not read clipboard: {error}"),
+                        );
                     }
                     desktop.finish(ReadStatus::IoError, true);
                 }
                 Err(_) => {
                     if paste {
-                        terminal.show_status("Clipboard read timed out");
+                        terminal
+                            .report_desktop_error("Could not paste", "Clipboard read timed out");
                     }
                     desktop.finish(ReadStatus::Busy, true);
                 }

@@ -208,10 +208,8 @@ impl Ui {
             "close-window" => self.window.close(),
             "close-active-tab" => self.request_close_tab(self.active.get()),
             "copy" => {
-                if let Some(p) = self.active_pane()
-                    && !p.copy()
-                {
-                    self.message("Select terminal text to copy it");
+                if let Some(p) = self.active_pane() {
+                    p.copy();
                 }
             }
             "paste" => {

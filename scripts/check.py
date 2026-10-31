@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 HEADLESS = ["serve", "daemon", "ownership", "remote", "git", "multi-client", "frontend-input", "scrollback", "scrollback-limits", "compression", "progress", "hyperlinks", "clipboard", "clipboard-read", "shell", "program-status", "text-blink", "grapheme"]
-DESKTOP = ["local-execution", "smoke", "multi-window", "remote-window", "remotes-ui", "terminal-input", "notifications", "renderer", "progress-ui", "program-status-ui", "clipboard-ui", "clipboard-read-ui"]
+DESKTOP = ["local-execution", "smoke", "multi-window", "remote-window", "remotes-ui", "terminal-input", "terminal-feedback", "notifications", "renderer", "progress-ui", "program-status-ui", "clipboard-ui", "clipboard-read-ui"]
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--native", action="store_true")

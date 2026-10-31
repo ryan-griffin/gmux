@@ -169,6 +169,12 @@ impl Ui {
         search.set_child(Some(&search_clamp));
         search.connect_entry(&search_entry);
         content_box.append(&search);
+        let connection_banner = adw::Banner::builder()
+            .button_label("Manage Connections")
+            .action_name("win.manage-connections")
+            .use_markup(false)
+            .build();
+        content_box.append(&connection_banner);
         let stack = gtk::Stack::builder()
             .hexpand(true)
             .vexpand(true)
@@ -229,6 +235,8 @@ impl Ui {
             terminal_menu,
             heading,
             toast,
+            errors: Rc::new(feedback::Errors::default()),
+            connection_banner,
             settings,
             preferences_dialog: RefCell::new(None),
             connections_dialog: RefCell::new(None),
@@ -545,7 +553,7 @@ impl Ui {
                 let directory_changed = updates.values().any(|update| update.directory_changed);
                 let updates_git_changed = updates.values().any(|update| update.git_changed);
                 let mut status_tabs = HashSet::new();
-                for (id, mut update) in updates {
+                for (id, update) in updates {
                     if update.exited && ui.command_count.get() > 0 {
                         ui.command_exits.borrow_mut().insert(id);
                     }
@@ -567,23 +575,6 @@ impl Ui {
                     }
                     if update.directory_changed {
                         ui.mark_dirty();
-                    }
-                    if let Some(error) = &mut update.error {
-                        let sessions = ui.sessions.borrow();
-                        if !sessions.is_local(id)
-                            && !sessions.connected(sessions.pane_ref(id).daemon)
-                        {
-                            error.push_str(
-                                if matches!(
-                                    sessions.connection_status(sessions.pane_ref(id).daemon),
-                                    connections::ConnectionStatus::Reconnecting { .. }
-                                ) {
-                                    ". Reconnecting…"
-                                } else {
-                                    ". Check Manage Connections"
-                                },
-                            );
-                        }
                     }
                     pane.tick(&update);
                     ui.refresh_tab_title(tab);

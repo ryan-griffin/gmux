@@ -79,7 +79,7 @@ impl Terminal {
                 && !error.matches(gio::IOErrorEnum::Cancelled)
                 && let Some(terminal) = weak.upgrade()
             {
-                terminal.show_status(&format!("Could not open link: {error}"));
+                terminal.report_desktop_error("Could not open link", &error.to_string());
             }
         });
         true

@@ -209,6 +209,13 @@ hidden tabs, reconnect and shared windows. Its widget fixtures check unknown pro
 viewport allocation and stable sidebar title positions at normal/large fonts and
 both text directions.
 
+The native `terminal-feedback` suite exercises real daemon command failures,
+plain-text toasts and their Details dialogs, duplicate suppression, expiry, and
+unchanged terminal allocation. It also checks one connection banner across split
+panes, tab switching, input during disconnection, Manage Connections, and recovery
+with Find open. Find and the banner remain separate rows. Closing Find leaves
+the banner visible, and recovery removes the banner without closing Find.
+
 ## Execution snapshot benchmark
 
 Measure the daemon's snapshot projection and retained packet storage without PTYs
