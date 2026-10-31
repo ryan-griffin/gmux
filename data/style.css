@@ -72,7 +72,6 @@ entry.terminal-find > button:active { opacity: 0.8; }
   color: var(--terminal-fg);
   font-variant-numeric: tabular-nums;
 }
-.pane-status { padding: 3px 6px; }
 /* Pane outlines define the split. Keep a draggable gutter without a second line. */
 paned.tab-split > separator { min-width: 6px; min-height: 6px; background: none; border: none; box-shadow: none; }
 

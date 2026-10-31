@@ -33,6 +33,7 @@ mod branches;
 mod connection_menu;
 mod connections_dialog;
 mod dialogs;
+mod feedback;
 mod local;
 mod machine;
 mod management;
@@ -88,6 +89,8 @@ pub struct Ui {
     terminal_menu: gtk::MenuButton,
     heading: adw::WindowTitle,
     toast: adw::ToastOverlay,
+    errors: Rc<feedback::Errors>,
+    connection_banner: adw::Banner,
     settings: Rc<RefCell<Settings>>,
     preferences_dialog: RefCell<Option<Rc<PreferenceControls>>>,
     connections_dialog: RefCell<Option<Rc<connections_dialog::ConnectionControls>>>,

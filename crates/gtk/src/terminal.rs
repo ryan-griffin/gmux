@@ -76,7 +76,7 @@ pub struct Terminal {
     pub title: gtk::Label,
     title_bar: gtk::CenterBox,
     progress: crate::progress::PaneProgress,
-    status: gtk::Label,
+    on_error: ErrorHandler,
     size_label: gtk::Label,
     size_revealer: gtk::Revealer,
     scroller: gtk::ScrolledWindow,
@@ -133,7 +133,15 @@ use keyboard::mods;
 pub(crate) struct InputContext {
     pub keyboard: Rc<RefCell<KeyboardState>>,
     pub clipboard: Rc<crate::clipboard::Desktop>,
+    pub on_error: ErrorHandler,
 }
+
+pub(crate) enum ErrorSource {
+    Session,
+    Desktop,
+}
+
+pub(crate) type ErrorHandler = Rc<dyn Fn(u64, ErrorSource, &str, &str)>;
 
 impl Terminal {
     pub(crate) fn new(
@@ -148,6 +156,7 @@ impl Terminal {
         let InputContext {
             keyboard,
             clipboard,
+            on_error,
         } = input;
         clipboard.track(&session);
         let directory = session.borrow().directory().to_path_buf();
@@ -265,11 +274,6 @@ impl Terminal {
         canvas.set_measure_overlay(&size_revealer, false);
         canvas.set_clip_overlay(&size_revealer, true);
         content.append(&canvas);
-        let status = gtk::Label::builder().xalign(1.0).visible(false).build();
-        status.add_css_class("caption");
-        status.add_css_class("dimmed");
-        status.add_css_class("pane-status");
-        content.append(&status);
         let im = gtk::IMMulticontext::new();
         im.set_client_widget(Some(&area));
         let cursor_session = session.clone();
@@ -290,7 +294,7 @@ impl Terminal {
             title,
             title_bar: toolbar,
             progress,
-            status,
+            on_error,
             size_label,
             size_revealer,
             scroller,
@@ -429,7 +433,7 @@ impl Terminal {
             endpoint,
             self.selection_mode.get(),
         ) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not select text", &error.to_string());
             return;
         }
         self.drag_request.set(Some(request));
@@ -559,7 +563,7 @@ impl Terminal {
             self.cursor.restart();
         }
         if let Err(error) = self.session.borrow().key(name, layout, mods, action, text) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not send keyboard input", &error.to_string());
         }
     }
     fn mouse(&self, action: i32, button: i32, modifiers: gdk::ModifierType) {
@@ -574,7 +578,7 @@ impl Terminal {
             self.mouse_pressed.get() != 0,
         );
         if let Err(error) = result {
-            self.show_status(&error.to_string());
+            self.report_error("Could not send mouse input", &error.to_string());
         }
     }
     pub fn send_text(&self, text: &str, enter: bool) -> anyhow::Result<()> {
@@ -600,7 +604,7 @@ impl Terminal {
                 ));
         }
         if let Some(error) = &update.error {
-            self.show_status(error);
+            self.report_error("Terminal operation failed", error);
         }
         if update.changed {
             if self.selection_anchor.get().is_some() {
@@ -668,9 +672,11 @@ impl Terminal {
             ));
         });
     }
-    pub(crate) fn show_status(&self, text: &str) {
-        self.status.set_text(text);
-        self.status.set_visible(true);
+    pub(crate) fn report_error(&self, summary: &str, details: &str) {
+        (self.on_error)(self.id, ErrorSource::Session, summary, details);
+    }
+    pub(crate) fn report_desktop_error(&self, summary: &str, details: &str) {
+        (self.on_error)(self.id, ErrorSource::Desktop, summary, details);
     }
     fn refresh_title(&self) {
         let session = self.session.borrow();
@@ -782,7 +788,7 @@ impl Terminal {
             },
         })
     }
-    pub fn copy(&self) -> bool {
+    pub fn copy(&self) {
         self.send_drag_selection();
         // Paint can invalidate the displayed range before a resize reply arrives.
         // The daemon validates its tracked selection in command order.
@@ -791,17 +797,15 @@ impl Terminal {
             .borrow()
             .copy(gmux_protocol::clipboard::Formats::TextHtml)
         {
-            self.show_status(&error.to_string());
-            return false;
+            self.report_error("Could not copy", &error.to_string());
         }
-        true
     }
     pub fn paste(self: &Rc<Self>) {
         self.paste_from(&self.area.clipboard());
     }
     pub fn clear_screen(&self) {
         if let Err(error) = self.session.borrow_mut().clear_screen() {
-            self.show_status(&error.to_string());
+            self.report_error("Could not clear screen", &error.to_string());
             return;
         }
         self.stop_selection_drag();
@@ -809,7 +813,7 @@ impl Terminal {
     pub fn prompt(&self, previous: bool) {
         self.stop_selection_drag();
         if let Err(error) = self.session.borrow_mut().prompt(previous) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not navigate prompts", &error.to_string());
         }
     }
     pub fn select_output(&self, point: Option<(u16, u32)>, copy: bool) {
@@ -818,7 +822,7 @@ impl Terminal {
             point,
             copy.then_some(gmux_protocol::clipboard::Formats::TextHtml),
         ) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not select command output", &error.to_string());
         }
     }
     fn select_context_output(&self, copy: bool) {
@@ -828,7 +832,7 @@ impl Terminal {
             .borrow()
             .select_anchored_output(copy.then_some(gmux_protocol::clipboard::Formats::TextHtml))
         {
-            self.show_status(&error.to_string());
+            self.report_error("Could not select command output", &error.to_string());
         }
     }
     fn paste_from(self: &Rc<Self>, clipboard: &gdk::Clipboard) {
@@ -842,7 +846,7 @@ impl Terminal {
             gmux_protocol::clipboard::Destination::Clipboard
         };
         if let Err(error) = self.clipboard.paste_intent(self, destination) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not paste", &error.to_string());
         }
     }
     pub fn scroll(&self, delta: isize) {
@@ -854,14 +858,14 @@ impl Terminal {
             return;
         }
         if let Err(error) = self.session.borrow().find(query) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not search", &error.to_string());
             return;
         }
         *self.search_query.borrow_mut() = query.to_owned();
     }
     pub fn search_advance(&self, previous: bool) {
         if let Err(error) = self.session.borrow().find_advance(previous) {
-            self.show_status(&error.to_string());
+            self.report_error("Could not navigate search results", &error.to_string());
         }
     }
     pub fn search_status(&self) -> (usize, usize, bool) {
