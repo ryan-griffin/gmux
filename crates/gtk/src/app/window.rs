@@ -271,6 +271,7 @@ impl Ui {
             pending: RefCell::new(HashMap::new()),
             command_count: Cell::new(0),
             creation_serial: Cell::new(0),
+            pending_tab_creations: RefCell::new(HashMap::new()),
             command_exits: RefCell::new(HashSet::new()),
             keyboard,
             update_source: RefCell::new(None),
