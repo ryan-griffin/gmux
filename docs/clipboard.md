@@ -66,8 +66,10 @@ poll admits at most 64 events with 4 MiB of data in total. Local and remote
 streams carry small MIME/length descriptors followed by binary data, without
 base64 or JSON byte arrays. Explicit user copy retains its separate 4 MiB text
 and 8 MiB HTML limits. A stream packet is at most 64 MiB; clipboard metadata is
-at most 16 KiB. Daemon output and client input queues are each limited to 64 MiB;
-the client also limits its queue to 64 packets. A stalled recipient is detached
+at most 16 KiB. Each daemon frontend output buffer and client incoming queue is
+limited to 64 MiB. The client also limits each queue to 64 packets and shares a
+128 MiB incoming allowance across the process. See
+[client resource budgets](resource-budgets.md). A stalled recipient is detached
 when its daemon output queue fills, without blocking terminal output.
 
 The native parser separately limits each Kitty transaction to 64 MIME types and

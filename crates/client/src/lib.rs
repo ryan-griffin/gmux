@@ -11,3 +11,6 @@ pub mod remote;
 pub mod runtime;
 mod scroll_cache;
 pub mod unix;
+
+#[cfg(test)]
+mod resource_benchmark;

@@ -162,6 +162,8 @@ and typed state updates. `remote.rs` maintains cached viewports and bounded
 input/output queues. `scroll_cache.rs` owns prediction-row storage, retention,
 overflow-text accounting, and eviction. The daemon chooses supplemental rows in
 `src/daemon/prefetch.rs`; the engine bounds extraction by the protocol limits.
+Process-wide [resource budgets](resource-budgets.md) cover incoming packets,
+outgoing input, and prediction storage across windows and connections.
 Incoming queue admission tests live with the client; codecs and value tests live
 with the protocol.
 
