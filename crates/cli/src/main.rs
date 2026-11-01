@@ -321,27 +321,41 @@ fn run() -> anyhow::Result<()> {
         Command::Scrollback {
             max_bytes,
             max_lines,
-        } => serde_json::to_value(gmux_protocol::control::ExecutionRequest::Scrollback {
-            max_bytes,
-            max_lines,
-        })?,
-        Command::Status => serde_json::to_value(PublicRequest::Status)?,
-        Command::List => serde_json::to_value(PublicRequest::List)?,
-        Command::New { name, directory } => serde_json::to_value(TerminalCommand::New {
-            name,
-            directory: if remote {
-                directory
-            } else {
-                directory
-                    .map(|path| std::path::absolute(gmux_platform::unix::paths::expand_home(&path)))
-                    .transpose()?
+        } => serde_json::to_value(
+            gmux_protocol::control::ExecutionRequest::<u64, u64>::Scrollback {
+                max_bytes,
+                max_lines,
             },
-        })?,
-        Command::Split { pane, down } => serde_json::to_value(TabCommand::Split { pane, down })?,
-        Command::Close { pane } => serde_json::to_value(TabCommand::Close { pane })?,
-        Command::CloseTab { tab } => serde_json::to_value(TabCommand::CloseTab { tab })?,
-        Command::Rename { tab, name } => serde_json::to_value(TabCommand::Rename { tab, name })?,
-        Command::ResetName { tab } => serde_json::to_value(TabCommand::ResetName { tab })?,
+        )?,
+        Command::Status => serde_json::to_value(PublicRequest::<u64>::Status)?,
+        Command::List => serde_json::to_value(PublicRequest::<u64>::List)?,
+        Command::New { name, directory } => {
+            serde_json::to_value(TerminalCommand::<u64, u64>::New {
+                name,
+                directory: if remote {
+                    directory
+                } else {
+                    directory
+                        .map(|path| {
+                            std::path::absolute(gmux_platform::unix::paths::expand_home(&path))
+                        })
+                        .transpose()?
+                },
+            })?
+        }
+        Command::Split { pane, down } => {
+            serde_json::to_value(TabCommand::<u64, u64>::Split { pane, down })?
+        }
+        Command::Close { pane } => serde_json::to_value(TabCommand::<u64, u64>::Close { pane })?,
+        Command::CloseTab { tab } => {
+            serde_json::to_value(TabCommand::<u64, u64>::CloseTab { tab })?
+        }
+        Command::Rename { tab, name } => {
+            serde_json::to_value(TabCommand::<u64, u64>::Rename { tab, name })?
+        }
+        Command::ResetName { tab } => {
+            serde_json::to_value(TabCommand::<u64, u64>::ResetName { tab })?
+        }
         Command::Send { text, pane, enter } => serde_json::to_value(PaneRequest::Send {
             pane,
             text,
@@ -368,7 +382,7 @@ fn run() -> anyhow::Result<()> {
         Command::Notify { message, pane } => {
             serde_json::to_value(PaneRequest::Notify { pane, message })?
         }
-        Command::Stop => serde_json::to_value(PublicRequest::Stop)?,
+        Command::Stop => serde_json::to_value(PublicRequest::<u64>::Stop)?,
         Command::Rpc { request } => serde_json::from_str(&request)?,
         Command::Connection { command } => match command {
             ConnectionCommand::List => json!({"method":"connection-list"}),
@@ -447,7 +461,7 @@ fn run() -> anyhow::Result<()> {
             ipc::Endpoint::remote(name, None)
         });
         serde_json::to_value(endpoint.stop(None)?)?
-    } else if TerminalCommand::supports(request["method"].as_str().unwrap_or("")) {
+    } else if TerminalCommand::<u64, u64>::supports(request["method"].as_str().unwrap_or("")) {
         let endpoint = connection.map_or_else(ipc::Endpoint::local, |name| {
             ipc::Endpoint::remote(name, None)
         });

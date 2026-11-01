@@ -261,7 +261,7 @@ impl Ui {
             search_previous,
             search_next,
             search_status: Cell::new(None),
-            active: Cell::new(0),
+            active: Cell::new(None),
             changing: Cell::new(false),
             dirty: Cell::new(false),
             save_source: RefCell::new(None),
@@ -363,7 +363,7 @@ impl Ui {
             if let (Some(ui), Some(row)) = (weak.upgrade(), row)
                 && !ui.changing.get()
                 && let Ok(id) = row.widget_name().parse()
-                && id != ui.active.get()
+                && Some(id) != ui.active.get()
             {
                 let focused = row.has_focus();
                 ui.switch(id);
@@ -491,7 +491,7 @@ impl Ui {
         let active = {
             let tabs = ui.tabs.borrow();
             tabs.iter()
-                .find(|w| w.id == session.active)
+                .find(|w| Some(w.id) == session.active)
                 .or_else(|| tabs.first())
                 .map(|w| w.id)
         };
@@ -509,9 +509,11 @@ impl Ui {
         if session.maximized {
             ui.window.maximize();
         }
-        if session.active != 0 && !ui.tabs.borrow().iter().any(|t| t.id == session.active) {
+        if let Some(active) = session.active
+            && !ui.tabs.borrow().iter().any(|t| t.id == active)
+        {
             ui.restore_selection
-                .set(Some((session.active, ui.active.get(), ui.filter.get())));
+                .set(Some((active, ui.active.get(), ui.filter.get())));
         }
         let weak = Rc::downgrade(&ui);
         let source =
@@ -531,14 +533,14 @@ impl Ui {
                 }
                 let updates = ui.sessions.borrow_mut().poll_with_clipboard_events(
                     |event, remote| match event {
-                        gmux_protocol::clipboard::Event::Write(write) => {
+                        connections::ClipboardEvent::Write(write) => {
                             let clipboard = ui.clipboard.clipboard(write.destination);
                             if let Err(error) = crate::clipboard::publish(&clipboard, write.content)
                             {
                                 eprintln!("Could not publish clipboard offer: {error}");
                             }
                         }
-                        gmux_protocol::clipboard::Event::Read { pane, event } => {
+                        connections::ClipboardEvent::Read { pane, event } => {
                             if let Ok(terminal) = ui.pane(Some(pane)) {
                                 ui.clipboard.handle(
                                     &terminal,
@@ -564,7 +566,7 @@ impl Ui {
                         .find_map(|tab| tab.panes.get(&id).map(|pane| (tab.id, pane.clone())));
                     let Some((tab, pane)) = pane else {
                         for message in update.notifications {
-                            ui.notify(0, id, message);
+                            ui.notify(None, id, message);
                         }
                         continue;
                     };
@@ -582,7 +584,7 @@ impl Ui {
                         ui.set_unread(pane.id, unread);
                     }
                     for message in update.notifications {
-                        ui.notify(tab, pane.id, message);
+                        ui.notify(Some(tab), pane.id, message);
                     }
                     if (update.exited || pane.exited())
                         && !pane
@@ -625,14 +627,6 @@ impl Ui {
                 ui.open_initial_directory();
                 if ui.search.is_search_mode() {
                     ui.update_search_count();
-                }
-                if ui.command_count.get() == 0 && ui.pending.borrow().is_empty() {
-                    let tabs = ui.tabs.borrow();
-                    let retained = tabs
-                        .iter()
-                        .flat_map(|tab| std::iter::once(tab.id).chain(tab.layout.borrow().ids()))
-                        .chain(ui.restore_selection.get().map(|(desired, _, _)| desired));
-                    ui.sessions.borrow_mut().prune_handles(retained);
                 }
                 ui.schedule_deadlines(&wake);
                 glib::ControlFlow::Continue
@@ -776,6 +770,17 @@ impl Ui {
             return;
         }
         if let Request::Internal(body) = request {
+            let body = body.map_ids(
+                &mut |id| ui.sessions.borrow().external_pane(None, id),
+                &mut |id| ui.sessions.borrow().external_tab(None, id),
+            );
+            let body = match body {
+                Ok(body) => body,
+                Err(error) => {
+                    let _ = reply.try_send(json!({"error":error.to_string()}));
+                    return;
+                }
+            };
             ui.save_session();
             ui.request_reply(body, move |ui, result| {
                 let result = result.and_then(|raw| {
@@ -800,11 +805,11 @@ impl Ui {
             });
             return;
         }
-        if let Request::Layout(mut command) = request {
+        if let Request::Layout(command) = request {
             let active_pane = ui.active_pane().map(|pane| pane.id);
-            let active_tab = (ui.active.get() != 0).then_some(ui.active.get());
-            let destination = match ui.sessions.borrow().incoming_command(
-                &mut command,
+            let active_tab = ui.active.get();
+            let (command, destination) = match ui.sessions.borrow().incoming_command(
+                command,
                 connection.as_deref(),
                 active_pane,
                 active_tab,
@@ -815,18 +820,21 @@ impl Ui {
                     return;
                 }
             };
-            ui.command_on(command, destination, move |ui, result| {
+            ui.command_on(command, destination, move |_, result| {
                 let response = result
-                    .and_then(|result| ui.sessions.borrow().external_result(result, destination))
+                    .map(|result| result.into_external_value(destination))
                     .unwrap_or_else(|e| json!({"error":e.to_string()}));
                 let _ = reply.try_send(response);
             });
             return;
         }
-        if let Request::Public(PublicRequest::Pane(PaneRequest::Notify { pane, message })) = request
+        if let Request::Public(PublicRequest::Pane(gmux_protocol::control::PaneRequest::Notify {
+            pane,
+            message,
+        })) = request
         {
             let target = pane
-                .map(|id| ui.sessions.borrow().default_handle(id))
+                .map(|id| ui.sessions.borrow().external_pane(None, id))
                 .transpose()
                 .and_then(|id| ui.pane(id));
             let pane = match target {
@@ -850,9 +858,12 @@ impl Ui {
             );
             return;
         }
-        if let Request::Public(PublicRequest::Pane(PaneRequest::Read { pane })) = request {
+        if let Request::Public(PublicRequest::Pane(gmux_protocol::control::PaneRequest::Read {
+            pane,
+        })) = request
+        {
             let pane = match pane
-                .map(|id| ui.sessions.borrow().default_handle(id))
+                .map(|id| ui.sessions.borrow().external_pane(None, id))
                 .transpose()
                 .and_then(|id| ui.pane(id))
             {

@@ -425,7 +425,7 @@ impl SessionManager {
         mut endpoint: ipc::Endpoint,
         wake: gmux_platform::unix::ipc::Wake,
     ) -> anyhow::Result<Self> {
-        let hello = endpoint.call(InternalRequest::Hello)?;
+        let hello = endpoint.call(InternalRequest::<u64, u64>::Hello)?;
         anyhow::ensure!(
             hello["version"] == transport::VERSION,
             "Incompatible gmux daemon"
@@ -561,7 +561,7 @@ impl SessionManager {
     }
     pub fn execution_state(&mut self) -> anyhow::Result<ExecutionSnapshot> {
         let reply: gmux_protocol::control::CommandReply =
-            serde_json::from_value(self.endpoint.call(InternalRequest::State)?)?;
+            serde_json::from_value(self.endpoint.call(InternalRequest::<u64, u64>::State)?)?;
         self.validate_state(&reply)?;
         self.install_metadata(&reply.metadata, reply.revision);
         Ok(reply.execution)

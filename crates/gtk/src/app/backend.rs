@@ -124,7 +124,10 @@ impl Ui {
             Command::New { .. } | Command::Tab(TabCommand::Split { .. })
         );
         if let Command::Move { tab, workspace } = command {
-            let id = tab.unwrap_or(self.active.get());
+            let Some(id) = tab.or(self.active.get()) else {
+                callback(self, Err(anyhow::anyhow!("No active tab")));
+                return;
+            };
             let session = self.view_session();
             let Some(saved) = session.tabs.iter().find(|t| t.id == id) else {
                 callback(self, Err(anyhow::anyhow!("Tab does not exist")));
@@ -295,13 +298,13 @@ impl Ui {
                 || !self
                     .pending_tab_creations
                     .borrow()
-                    .contains_key(&tab.daemon)
+                    .contains_key(&tab.id.daemon)
         });
         if let Some((desired, fallback, filter)) = self.restore_selection.get() {
             if current.active != fallback || current.filter != filter {
                 self.restore_selection.set(None);
             } else if state.tabs.iter().any(|t| t.id == desired) {
-                current.active = desired;
+                current.active = Some(desired);
                 self.restore_selection.set(None);
             }
         }
@@ -327,7 +330,8 @@ impl Ui {
         }
         // Removing a selected tab/pane chooses its adjacent survivor locally.
         // Use that choice instead of a different window's selection in the snapshot.
-        if current.active != 0 && !state.tabs.iter().any(|tab| tab.id == current.active) {
+        if current.active.is_some() && !state.tabs.iter().any(|tab| Some(tab.id) == current.active)
+        {
             state.active = self.active.get();
         }
         for saved in &mut state.tabs {
@@ -351,7 +355,7 @@ impl Ui {
             let existing = self.tabs.borrow().iter().any(|t| t.id == saved.id);
             let connected = {
                 let sessions = self.sessions.borrow();
-                sessions.connected(sessions.tab_ref(saved.id).daemon)
+                sessions.connected(saved.id.daemon)
             };
             if !existing {
                 // A connection can disappear after accepting a creation request.
@@ -372,8 +376,7 @@ impl Ui {
                     .filter(|id| {
                         !tab.panes.contains_key(id) || {
                             let sessions = self.sessions.borrow();
-                            sessions.connected(sessions.pane_ref(*id).daemon)
-                                && !sessions.has_handle(*id)
+                            sessions.connected(id.daemon) && !sessions.is_attached(*id)
                         }
                     })
                     .collect()
@@ -440,14 +443,14 @@ impl Ui {
             .tabs
             .borrow()
             .iter()
-            .find(|tab| tab.id == state.active)
+            .find(|tab| Some(tab.id) == state.active)
             .is_some_and(|tab| self.tab_is_visible(tab));
         if state.active == previous_active && !visible && !reveal {
             // Typing in the sidebar can hide the active row without changing its terminal.
-            self.update_tab_actions(state.active != 0);
-        } else if state.active != 0 && (reveal || visible) {
-            self.switch(state.active);
-        } else if state.active != 0 {
+            self.update_tab_actions(state.active.is_some());
+        } else if state.active.is_some() && (reveal || visible) {
+            self.switch(state.active.unwrap());
+        } else if state.active.is_some() {
             self.set_filter(state.filter);
         } else {
             self.show_empty();
@@ -517,7 +520,6 @@ impl Ui {
                 .borrow()
                 .iter()
                 .map(|w| TabState {
-                    daemon: self.sessions.borrow().tab_ref(w.id).daemon,
                     id: w.id,
                     created_at: w.created_at,
                     name: w.name.clone(),
@@ -542,7 +544,7 @@ impl Ui {
             PublicRequest::RendererInfo { pane } => {
                 let pane = if pane.is_some() {
                     let id = pane
-                        .map(|id| self.sessions.borrow().default_handle(id))
+                        .map(|id| self.sessions.borrow().external_pane(None, id))
                         .transpose()?;
                     Some(self.pane(id)?)
                 } else {
@@ -567,8 +569,8 @@ impl Ui {
                 Ok(json!({
                     "daemon": daemon,
                     "window": self.id,
-                    "active_tab": (self.active.get() != 0).then(|| self.sessions.borrow().tab_ref(self.active.get()).id),
-                    "active_reference": (self.active.get() != 0).then(||self.sessions.borrow().tab_ref(self.active.get())),
+                    "active_tab": self.active.get().map(|tab| tab.id),
+                    "active_reference": self.active.get(),
                     "filter": self.filter.get(),
                     "tab_search": self.sidebar_search.text().as_str(),
                     "sidebar_visible": self.split.shows_sidebar(),
@@ -579,20 +581,20 @@ impl Ui {
                         "unread": tabs.iter().any(|tab| tab.workspace == Some(workspace.id) && !tab.unread.is_empty()),
                     })).collect::<Vec<_>>(),
                     "tabs": tabs.iter().map(|tab| json!({
-                        "id": self.sessions.borrow().tab_ref(tab.id).id, "created_at": tab.created_at, "name": tab.name, "workspace": tab.workspace,
+                        "id": tab.id.id, "created_at": tab.created_at, "name": tab.name, "workspace": tab.workspace,
                         "connection":self.sessions.borrow().connection_name(tab.id),
                         "machine_kind":self.sessions.borrow().machine_kind(tab.id),
                         "branch": tab.branch_label.text().to_string(),
-                        "connected":self.sessions.borrow().connected(self.sessions.borrow().tab_ref(tab.id).daemon),
-                        "reference": self.sessions.borrow().tab_ref(tab.id),
+                        "connected":self.sessions.borrow().connected(tab.id.daemon),
+                        "reference": tab.id,
                         "visible": self.tab_is_visible(tab),
-                        "active_pane": self.sessions.borrow().pane_ref(tab.active).id, "unread": !tab.unread.is_empty(),
+                        "active_pane": tab.active.id, "unread": !tab.unread.is_empty(),
                         "progress": self.tab_progress(tab),
                         "program_status": self.tab_program_status(tab),
-                        "layout": self.sessions.borrow().raw_layout(&tab.layout.borrow()),
+                        "layout": *tab.layout.borrow(),
                         "panes": tab.layout.borrow().ids().iter().filter_map(|id| tab.panes.get(id))
-                            .map(|pane| json!({"id": self.sessions.borrow().pane_ref(pane.id).id, "title": pane.title.text().to_string(),
-                                "reference": self.sessions.borrow().pane_ref(pane.id),
+                            .map(|pane| json!({"id": pane.id.id, "title": pane.title.text().to_string(),
+                                "reference": pane.id,
                                 "directory": pane.directory(), "exited": pane.exited(),
                                 "progress": pane.progress(),
                                 "program_status": pane.program_status().as_deref(),
@@ -629,20 +631,20 @@ impl Ui {
                 self.set_filter(filter);
                 Ok(json!({"ok": true}))
             }
-            PublicRequest::Pane(PaneRequest::Links { pane }) => {
+            PublicRequest::Pane(gmux_protocol::control::PaneRequest::Links { pane }) => {
                 let id = pane
-                    .map(|id| self.sessions.borrow().default_handle(id))
+                    .map(|id| self.sessions.borrow().external_pane(None, id))
                     .transpose()?;
                 Ok(self.pane(id)?.links())
             }
-            PublicRequest::Pane(PaneRequest::Send {
+            PublicRequest::Pane(gmux_protocol::control::PaneRequest::Send {
                 pane,
                 text,
                 paste,
                 enter,
             }) => {
                 let id = pane
-                    .map(|id| self.sessions.borrow().default_handle(id))
+                    .map(|id| self.sessions.borrow().external_pane(None, id))
                     .transpose()?;
                 let pane = self.pane(id)?;
                 if paste {
@@ -662,14 +664,14 @@ impl Ui {
                     let pane = self
                         .sessions
                         .borrow()
-                        .external_handle(connection.as_deref(), pane)?;
+                        .external_pane(connection.as_deref(), pane)?;
                     self.pane(Some(pane))?;
                     self.jump_to_pane(pane);
                 } else if let Some(id) = tab {
                     let id = self
                         .sessions
                         .borrow()
-                        .external_handle(connection.as_deref(), id)?;
+                        .external_tab(connection.as_deref(), id)?;
                     anyhow::ensure!(
                         self.tabs.borrow().iter().any(|w| w.id == id),
                         "Tab {id} does not exist"

@@ -2,7 +2,7 @@
 use super::*;
 
 impl Ui {
-    pub(super) fn request_close(self: &Rc<Self>, id: u64) {
+    pub(super) fn request_close(self: &Rc<Self>, id: PaneRef) {
         self.request_busy(
             InternalRequest::Busy { panes: vec![id] },
             move |ui, result| match result {
@@ -11,7 +11,7 @@ impl Ui {
             },
         );
     }
-    pub(super) fn confirm_close(self: &Rc<Self>, id: u64, busy: bool) {
+    pub(super) fn confirm_close(self: &Rc<Self>, id: PaneRef, busy: bool) {
         if !busy {
             self.command(
                 Command::Tab(TabCommand::Close { pane: Some(id) }),
@@ -124,7 +124,7 @@ impl Ui {
             owner.windows.borrow_mut().retain(|ui| ui.id != self.id);
         }
     }
-    pub(super) fn rename_tab(self: &Rc<Self>, id: u64) {
+    pub(super) fn rename_tab(self: &Rc<Self>, id: TabRef) {
         let Some(name) = self
             .tabs
             .borrow()

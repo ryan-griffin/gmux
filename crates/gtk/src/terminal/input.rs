@@ -1,5 +1,6 @@
 //! Keyboard, pointer, selection, clipboard, and scrolling controllers.
 use super::*;
+use crate::model::PaneRef;
 use keyboard::{ALT, CAPS_LOCK, CONTROL, NUM_LOCK, SHIFT, SUPER, mods};
 
 // Action-only modifiers, removed before encoding terminal input.
@@ -347,7 +348,11 @@ impl Terminal {
         });
         self.area.add_controller(middle);
     }
-    pub(super) fn install_focus(self: &Rc<Self>, canvas: &gtk::Overlay, on_focus: Rc<dyn Fn(u64)>) {
+    pub(super) fn install_focus(
+        self: &Rc<Self>,
+        canvas: &gtk::Overlay,
+        on_focus: Rc<dyn Fn(PaneRef)>,
+    ) {
         let focus_click = gtk::GestureClick::new();
         focus_click.set_button(0);
         focus_click.set_propagation_phase(gtk::PropagationPhase::Capture);

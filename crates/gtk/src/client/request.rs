@@ -1,7 +1,7 @@
 //! Typed operations and destinations retained from the window to its request worker.
 use super::{
     control::{Command, InternalRequest},
-    model::{DaemonId, DesktopState, DesktopTab},
+    model::{DaemonId, DesktopState, DesktopTab, PaneRef, TabRef},
 };
 use gmux_client::{connections, ipc};
 use gmux_protocol::control as execution;
@@ -15,9 +15,9 @@ pub enum OrganizationRequest {
     Assign(DesktopTab),
 }
 
-/// Requests here still use this window's handles. Routing resolves them once.
+/// Qualified identities stay intact until routing selects one daemon.
 pub enum Request {
-    Execution(execution::Request),
+    Execution(execution::Request<PaneRef, TabRef>),
     Organization(OrganizationRequest),
     Configuration(connections::ConfigurationRequest),
 }
@@ -49,8 +49,8 @@ impl From<InternalRequest> for Request {
         Self::Execution(execution::Request::Internal(request))
     }
 }
-impl From<execution::PaneRequest> for Request {
-    fn from(request: execution::PaneRequest) -> Self {
+impl From<execution::PaneRequest<PaneRef>> for Request {
+    fn from(request: execution::PaneRequest<PaneRef>) -> Self {
         Self::Execution(execution::Request::Public(execution::PublicRequest::Pane(
             request,
         )))
@@ -88,79 +88,4 @@ pub enum RoutedRequest {
     },
     Organization(OrganizationRequest),
     Configuration(connections::ConfigurationRequest),
-}
-
-/// Exhaustively translate execution selectors before they leave the window.
-pub fn translate_targets(
-    request: &mut execution::Request,
-    mut translate: impl FnMut(u64) -> anyhow::Result<u64>,
-) -> anyhow::Result<()> {
-    use execution::{
-        Command, ExecutionRequest as E, InternalRequest as I, PaneRequest as P, PublicRequest as U,
-        Request as R, TabCommand,
-    };
-    fn optional(
-        id: &mut Option<u64>,
-        translate: &mut impl FnMut(u64) -> anyhow::Result<u64>,
-    ) -> anyhow::Result<()> {
-        if let Some(id) = id {
-            *id = translate(*id)?;
-        }
-        Ok(())
-    }
-    match request {
-        R::Layout(Command::Tab(command))
-        | R::Internal(I::Command {
-            command: Command::Tab(command),
-        }) => match command {
-            TabCommand::Split { pane, .. } | TabCommand::Close { pane } => {
-                optional(pane, &mut translate)?
-            }
-            TabCommand::CloseTab { tab }
-            | TabCommand::Rename { tab, .. }
-            | TabCommand::ResetName { tab } => *tab = translate(*tab)?,
-        },
-        R::Layout(Command::New { .. })
-        | R::Internal(I::Command {
-            command: Command::New { .. },
-        }) => (),
-        R::Execution(request) | R::Internal(I::Execution { request }) => match request {
-            E::Split { pane, .. }
-            | E::Close { pane }
-            | E::Read { pane }
-            | E::Links { pane }
-            | E::Send { pane, .. }
-            | E::Notify { pane, .. }
-            | E::Metadata { pane }
-            | E::CommandOutput { pane, .. }
-            | E::Copy { pane, .. } => *pane = translate(*pane)?,
-            E::CloseTab { tab } | E::Rename { tab, .. } | E::ResetName { tab } => {
-                *tab = translate(*tab)?
-            }
-            E::Busy { panes } => {
-                for pane in panes {
-                    *pane = translate(*pane)?;
-                }
-            }
-            E::New { .. } | E::State | E::List | E::Status | E::Scrollback { .. } | E::Stop => (),
-        },
-        R::Internal(I::Busy { panes }) => {
-            for pane in panes {
-                *pane = translate(*pane)?;
-            }
-        }
-        R::Internal(I::Metadata { pane } | I::Copy { pane, .. } | I::Read { pane }) => {
-            optional(pane, &mut translate)?
-        }
-        R::Public(U::Pane(request)) => match request {
-            P::Metadata { pane }
-            | P::CommandOutput { pane, .. }
-            | P::Read { pane }
-            | P::Links { pane }
-            | P::Send { pane, .. }
-            | P::Notify { pane, .. } => optional(pane, &mut translate)?,
-        },
-        R::Internal(I::Hello | I::State) | R::Public(U::Status | U::Stop | U::List) => (),
-    }
-    Ok(())
 }

@@ -93,8 +93,10 @@ impl Launcher {
                 // that never replies must not outlive the startup deadline.
                 let hello = tokio::time::timeout_at(
                     deadline.into(),
-                    endpoint
-                        .call_async(serde_json::to_value(InternalRequest::Hello)?, cancellation),
+                    endpoint.call_async(
+                        serde_json::to_value(InternalRequest::<u64, u64>::Hello)?,
+                        cancellation,
+                    ),
                 )
                 .await
                 .map_err(|_| anyhow::anyhow!("Timed out starting daemon"))?;
@@ -215,7 +217,10 @@ pub(crate) async fn stop(
     cancellation: Option<&Cancellation>,
 ) -> anyhow::Result<gmux_protocol::control::StopReply> {
     let hello = endpoint
-        .call_async(serde_json::to_value(InternalRequest::Hello)?, cancellation)
+        .call_async(
+            serde_json::to_value(InternalRequest::<u64, u64>::Hello)?,
+            cancellation,
+        )
         .await?;
     stop_after_hello(endpoint, hello, cancellation).await
 }
@@ -227,7 +232,7 @@ pub(crate) async fn stop_if_running(
 ) -> anyhow::Result<Option<gmux_protocol::control::StopReply>> {
     let Some(hello) = Endpoint::call_unix_if_running(
         control,
-        serde_json::to_value(InternalRequest::Hello)?,
+        serde_json::to_value(InternalRequest::<u64, u64>::Hello)?,
         cancellation,
     )
     .await?
@@ -435,7 +440,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     request,
-                    serde_json::to_value(InternalRequest::Hello).unwrap()
+                    serde_json::to_value(InternalRequest::<u64, u64>::Hello).unwrap()
                 );
                 crate::io::write_json(&mut hello, &serde_json::json!({"pid":pid}))
                     .await

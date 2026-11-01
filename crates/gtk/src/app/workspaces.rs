@@ -93,7 +93,7 @@ impl Ui {
             let tabs = self.tabs.borrow();
             tabs.iter()
                 .filter(|tab| self.tab_is_visible(tab))
-                .find(|tab| tab.id == self.active.get())
+                .find(|tab| Some(tab.id) == self.active.get())
                 .or_else(|| tabs.iter().find(|tab| self.tab_is_visible(tab)))
                 .map(|tab| tab.id)
         };
@@ -215,7 +215,7 @@ impl Ui {
             let tabs = self.tabs.borrow();
             tabs.iter()
                 .filter(|tab| self.tab_is_visible(tab))
-                .find(|tab| tab.id == self.active.get())
+                .find(|tab| Some(tab.id) == self.active.get())
                 .or_else(|| tabs.iter().find(|tab| self.tab_is_visible(tab)))
                 .map(|tab| tab.id)
         };
@@ -290,13 +290,16 @@ impl Ui {
             }
             let menu = gio::Menu::new();
             let rename = gio::MenuItem::new(Some("_Rename Tab…"), None);
-            rename.set_action_and_target_value(Some("win.rename-tab"), Some(&tab.id.to_variant()));
+            rename.set_action_and_target_value(
+                Some("win.rename-tab"),
+                Some(&tab.id.to_string().to_variant()),
+            );
             menu.append_item(&rename);
             if tab.custom_name {
                 let remove_name = gio::MenuItem::new(Some("Use _Automatic Tab Name"), None);
                 remove_name.set_action_and_target_value(
                     Some("win.reset-name"),
-                    Some(&tab.id.to_variant()),
+                    Some(&tab.id.to_string().to_variant()),
                 );
                 menu.append_item(&remove_name);
             }
@@ -312,7 +315,7 @@ impl Ui {
                 let item = gio::MenuItem::new(Some(&label), None);
                 item.set_action_and_target_value(
                     Some("win.assign-tab"),
-                    Some(&(tab.id, workspace.id).to_variant()),
+                    Some(&(tab.id.to_string(), workspace.id).to_variant()),
                 );
                 destinations.append_item(&item);
             }
@@ -324,21 +327,24 @@ impl Ui {
             let create = gio::MenuItem::new(Some("Move to _New Workspace…"), None);
             create.set_action_and_target_value(
                 Some("win.new-workspace-for-tab"),
-                Some(&tab.id.to_variant()),
+                Some(&tab.id.to_string().to_variant()),
             );
             membership.append_item(&create);
             if tab.workspace.is_some() {
                 let unassign = gio::MenuItem::new(Some("Remove _from Workspace"), None);
                 unassign.set_action_and_target_value(
                     Some("win.assign-tab"),
-                    Some(&(tab.id, 0u64).to_variant()),
+                    Some(&(tab.id.to_string(), 0u64).to_variant()),
                 );
                 membership.append_item(&unassign);
             }
             menu.append_section(None, &membership);
             let closing = gio::Menu::new();
             let close = gio::MenuItem::new(Some("_Close Tab"), None);
-            close.set_action_and_target_value(Some("win.close-tab"), Some(&tab.id.to_variant()));
+            close.set_action_and_target_value(
+                Some("win.close-tab"),
+                Some(&tab.id.to_string().to_variant()),
+            );
             closing.append_item(&close);
             menu.append_section(None, &closing);
             tab.menu.set_menu_model(Some(&menu));
@@ -347,7 +353,7 @@ impl Ui {
         self.changing.set(changing);
         self.apply_filter(self.filter.get());
     }
-    pub(super) fn assign_tab(self: &Rc<Self>, id: u64, workspace: Option<u64>) {
+    pub(super) fn assign_tab(self: &Rc<Self>, id: TabRef, workspace: Option<u64>) {
         self.command(
             Command::Move {
                 tab: Some(id),
@@ -363,12 +369,12 @@ impl Ui {
     pub(super) fn workspace_editor(self: &Rc<Self>, id: Option<u64>) {
         self.workspace_editor_with_tab(id, None);
     }
-    pub(super) fn new_workspace_for_tab(self: &Rc<Self>, tab: u64) {
+    pub(super) fn new_workspace_for_tab(self: &Rc<Self>, tab: TabRef) {
         if self.tabs.borrow().iter().any(|current| current.id == tab) {
             self.workspace_editor_with_tab(None, Some(tab));
         }
     }
-    fn workspace_editor_with_tab(self: &Rc<Self>, id: Option<u64>, tab: Option<u64>) {
+    fn workspace_editor_with_tab(self: &Rc<Self>, id: Option<u64>, tab: Option<TabRef>) {
         let existing = id.and_then(|id| {
             self.catalog
                 .borrow()
@@ -383,7 +389,7 @@ impl Ui {
                 .iter()
                 .find(|tab| tab.id == id)
                 .and_then(|tab| tab.panes.get(&tab.active))
-                .map(|pane| (self.sessions.borrow().tab_ref(id).daemon, pane.directory()))
+                .map(|pane| (id.daemon, pane.directory()))
         });
         let Some(dialog) = self.workspace_editor_dialog.create(
             if existing.is_some() {
@@ -700,7 +706,7 @@ impl Ui {
         controls.dialog.present(Some(&self.window));
         *self.workspaces_dialog.borrow_mut() = Some(controls);
     }
-    pub(super) fn request_close_tab(self: &Rc<Self>, id: u64) {
+    pub(super) fn request_close_tab(self: &Rc<Self>, id: TabRef) {
         let panes: Vec<_> = self
             .tabs
             .borrow()
@@ -719,7 +725,7 @@ impl Ui {
             },
         );
     }
-    fn confirm_close_tab(self: &Rc<Self>, id: u64, busy: bool) {
+    fn confirm_close_tab(self: &Rc<Self>, id: TabRef, busy: bool) {
         let close = move |ui: &Rc<Self>| {
             ui.command(
                 Command::Tab(TabCommand::CloseTab { tab: id }),

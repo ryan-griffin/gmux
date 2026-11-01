@@ -15,7 +15,9 @@ mod settings;
 mod terminal;
 mod terminal_canvas;
 
-use crate::client::control::{Command as LayoutCommand, PaneRequest, PublicRequest, TabCommand};
+use crate::client::control::PublicRequest;
+use gmux_protocol::control::{PaneRequest, TabCommand};
+type LayoutCommand = crate::client::control::Command<u64, u64>;
 use crate::client::model;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use gmux_client::ipc;
@@ -371,7 +373,7 @@ fn main() -> anyhow::Result<()> {
                 serde_json::to_value(LayoutCommand::Move { tab, workspace })?
             }
             Command::Split { pane, down } => {
-                serde_json::to_value(TabCommand::Split { pane, down })?
+                serde_json::to_value(TabCommand::<u64, u64>::Split { pane, down })?
             }
             Command::Send { text, pane, enter } => serde_json::to_value(PaneRequest::Send {
                 text,
@@ -394,12 +396,18 @@ fn main() -> anyhow::Result<()> {
                 workspace,
                 pane,
             })?,
-            Command::Close { pane } => serde_json::to_value(TabCommand::Close { pane })?,
-            Command::CloseTab { tab } => serde_json::to_value(TabCommand::CloseTab { tab })?,
-            Command::Rename { tab, name } => {
-                serde_json::to_value(TabCommand::Rename { tab, name })?
+            Command::Close { pane } => {
+                serde_json::to_value(TabCommand::<u64, u64>::Close { pane })?
             }
-            Command::ResetName { tab } => serde_json::to_value(TabCommand::ResetName { tab })?,
+            Command::CloseTab { tab } => {
+                serde_json::to_value(TabCommand::<u64, u64>::CloseTab { tab })?
+            }
+            Command::Rename { tab, name } => {
+                serde_json::to_value(TabCommand::<u64, u64>::Rename { tab, name })?
+            }
+            Command::ResetName { tab } => {
+                serde_json::to_value(TabCommand::<u64, u64>::ResetName { tab })?
+            }
             Command::Screenshot { path } => serde_json::to_value(PublicRequest::Screenshot {
                 path: std::path::absolute(path)?,
             })?,

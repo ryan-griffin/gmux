@@ -713,6 +713,16 @@ with (artifacts / "remote-window-smoke.log").open("w") as log, \
         assert "error" in a.rpc("focus", connection="server", pane=added["pane"], check=False)
         saved = json.loads((a.config / "clients/gtk/state.json").read_text())["desktop"]
         assert len({(t["reference"]["daemon"], t["reference"]["id"]) for t in saved["tabs"]}) == len(saved["tabs"])
+        def layout_panes(layout):
+            if "Pane" in layout:
+                return [layout["Pane"]]
+            split = layout["Split"]
+            return layout_panes(split["first"]) + layout_panes(split["second"])
+
+        for saved_tab in saved["tabs"]:
+            panes = layout_panes(saved_tab["layout"])
+            assert all(p["daemon"] == saved_tab["reference"]["daemon"] for p in panes)
+            assert saved_tab["active"] in panes
         assert saved["active"] == dict(daemon=identities[1], id=added["tab"])
         app = a.start_app(cli, stdout=log, stderr=log)
         first = a.rpc("windows")["windows"][0]["id"]

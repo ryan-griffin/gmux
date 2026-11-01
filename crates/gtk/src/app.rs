@@ -9,7 +9,7 @@ use crate::{
     commands::{COMMANDS, Query},
     find_field::FindField,
     font, ipc,
-    model::{self, Layout, Session, TabFilter, TabState, WorkspaceCatalog},
+    model::{self, Layout, PaneRef, Session, TabFilter, TabRef, TabState, WorkspaceCatalog},
     settings::Settings,
     terminal::Terminal,
     theme::Theme,
@@ -48,14 +48,14 @@ mod workspaces;
 use actions::{TAB_ACTIONS, ZOOM_IN_SHORTCUTS};
 use preferences::{AppPreferences, PreferenceControls, apply_appearance};
 struct Tab {
-    id: u64,
+    id: TabRef,
     created_at: u64,
     name: String,
     custom_name: bool,
     workspace: Option<u64>,
     layout: Rc<RefCell<Layout>>,
-    panes: HashMap<u64, Rc<Terminal>>,
-    active: u64,
+    panes: HashMap<PaneRef, Rc<Terminal>>,
+    active: PaneRef,
     content: gtk::Box,
     row: gtk::ListBoxRow,
     name_label: gtk::Label,
@@ -68,7 +68,7 @@ struct Tab {
     path_label: gtk::Label,
     branch_icon: gtk::Image,
     branch_label: gtk::Label,
-    unread: HashSet<u64>,
+    unread: HashSet<PaneRef>,
     activity: crate::activity::Indicator,
     menu: gtk::PopoverMenu,
     menu_state: Option<(bool, Option<u64>)>,
@@ -117,8 +117,8 @@ pub struct Ui {
     search_previous: gtk::Button,
     search_next: gtk::Button,
     search_status: Cell<Option<(bool, usize, usize, bool)>>,
-    active: Cell<u64>,
-    restore_selection: Cell<Option<(u64, u64, TabFilter)>>,
+    active: Cell<Option<TabRef>>,
+    restore_selection: Cell<Option<(TabRef, Option<TabRef>, TabFilter)>>,
     changing: Cell<bool>,
     dirty: Cell<bool>,
     save_source: RefCell<Option<glib::SourceId>>,
@@ -131,7 +131,7 @@ pub struct Ui {
     command_count: Cell<usize>,
     creation_serial: Cell<u64>,
     pending_tab_creations: RefCell<HashMap<model::DaemonId, usize>>,
-    command_exits: RefCell<HashSet<u64>>,
+    command_exits: RefCell<HashSet<PaneRef>>,
     keyboard: Rc<RefCell<crate::terminal::KeyboardState>>,
     update_source: RefCell<Option<glib::SourceId>>,
     deadline_source: RefCell<Option<(std::time::Instant, glib::SourceId)>>,
@@ -322,7 +322,7 @@ impl Windows {
         if matches!(body, Request::Public(PublicRequest::Windows)) {
             let windows = self.windows.borrow();
             let _ = request.reply.try_send(json!({"windows": windows.iter().map(|ui| {
-                let active = (ui.active.get() != 0).then(|| ui.sessions.borrow().tab_ref(ui.active.get()));
+                let active = ui.active.get();
                 json!({"id":ui.id,"active":ui.window.is_active(),"active_tab":active.map(|r| r.id),"active_reference":active})
             }).collect::<Vec<_>>() }));
         } else if matches!(body, Request::Public(PublicRequest::NewWindow)) {
@@ -515,12 +515,9 @@ pub fn run(
                 .upgrade()
                 .and_then(|owner| owner.active()),
             value.and_then(|v| v.get::<(String, u64)>()),
-        ) && let Ok(daemon) = serde_json::from_value(json!(pane.0))
+        ) && let Ok(daemon) = pane.0.parse()
         {
-            let handle = ui.sessions.borrow().lookup(daemon, pane.1);
-            if let Some(handle) = handle {
-                ui.jump_to_pane(handle);
-            }
+            ui.jump_to_pane(PaneRef { daemon, id: pane.1 });
         }
     });
     application.add_action(&action);
@@ -645,14 +642,13 @@ impl Ui {
     pub(super) fn message(&self, message: &str) {
         self.toast.add_toast(adw::Toast::new(message));
     }
-    pub(super) fn notify(&self, tab: u64, pane: u64, message: String) {
-        let reference = self.sessions.borrow().pane_ref(pane);
+    pub(super) fn notify(&self, tab: Option<TabRef>, pane: PaneRef, message: String) {
+        let reference = pane;
         if self.owner.upgrade().is_some_and(|owner| {
             owner.windows.borrow().iter().any(|ui| {
                 ui.window.is_active()
                     && ui.active_pane().is_some_and(|terminal| {
-                        ui.sessions.borrow().pane_ref(terminal.id) == reference
-                            && terminal.area.has_focus()
+                        terminal.id == reference && terminal.area.has_focus()
                     })
             })
         }) {
@@ -661,7 +657,7 @@ impl Ui {
         }
         let name = {
             let tabs = self.tabs.borrow();
-            if let Some(w) = tabs.iter().find(|w| w.id == tab) {
+            if let Some(w) = tabs.iter().find(|w| Some(w.id) == tab) {
                 w.name.clone()
             } else {
                 "Terminal".into()
@@ -678,12 +674,12 @@ impl Ui {
         );
         self.app.send_notification(None, &notification);
     }
-    pub(super) fn mark_read(&self, pane: u64) {
+    pub(super) fn mark_read(&self, pane: PaneRef) {
         if self.set_unread(pane, false) {
             self.sessions.borrow_mut().mark_read(pane);
         }
     }
-    pub(super) fn set_unread(&self, pane: u64, unread: bool) -> bool {
+    pub(super) fn set_unread(&self, pane: PaneRef, unread: bool) -> bool {
         for w in self.tabs.borrow_mut().iter_mut() {
             if !w.panes.contains_key(&pane) {
                 continue;
@@ -700,7 +696,7 @@ impl Ui {
         }
         false
     }
-    pub(super) fn jump_to_pane(self: &Rc<Self>, id: u64) {
+    pub(super) fn jump_to_pane(self: &Rc<Self>, id: PaneRef) {
         if let Ok(p) = self.pane(Some(id)) {
             self.focus_pane(id);
             self.window.present();

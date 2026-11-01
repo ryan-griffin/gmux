@@ -1,12 +1,13 @@
 //! Organization and navigation requests served by execution clients.
-use crate::client::model::{DaemonId, Session, WorkspaceCatalog};
-pub use gmux_protocol::control::{PaneRequest, TabCommand};
+use crate::client::model::{DaemonId, PaneRef, Session, TabRef, WorkspaceCatalog};
+pub type PaneRequest = gmux_protocol::control::PaneRequest<PaneRef>;
+pub type TabCommand = gmux_protocol::control::TabCommand<PaneRef, TabRef>;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
-pub enum Command {
+pub enum Command<P = PaneRef, T = TabRef> {
     New {
         directory: Option<PathBuf>,
         /// Resolve relative paths against the CLI's directory only for local execution.
@@ -25,7 +26,7 @@ pub enum Command {
         directory: Option<PathBuf>,
         #[serde(default)]
         directories: BTreeMap<DaemonId, PathBuf>,
-        tab: Option<u64>,
+        tab: Option<T>,
     },
     WorkspaceEdit {
         workspace: u64,
@@ -37,12 +38,12 @@ pub enum Command {
         workspace: u64,
     },
     Move {
-        tab: Option<u64>,
+        tab: Option<T>,
         #[serde(deserialize_with = "Option::deserialize")]
         workspace: Option<u64>,
     },
     #[serde(untagged)]
-    Tab(TabCommand),
+    Tab(gmux_protocol::control::TabCommand<P, T>),
 }
 
 // Missing means inherit the current filter; explicit null means unassigned.
@@ -54,17 +55,17 @@ fn workspace_selection<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method")]
-pub enum InternalRequest {
+pub enum InternalRequest<P = PaneRef, T = TabRef> {
     #[serde(rename = "_hello")]
     Hello,
     #[serde(rename = "_execution")]
     Execution {
-        request: gmux_protocol::control::ExecutionRequest,
+        request: gmux_protocol::control::ExecutionRequest<P, T>,
     },
     #[serde(rename = "_busy")]
-    Busy { panes: Vec<u64> },
+    Busy { panes: Vec<P> },
     #[serde(rename = "_command")]
-    Command { command: Command },
+    Command { command: Command<P, T> },
     #[serde(rename = "_desktop-save")]
     DesktopSave {
         desktop: crate::client::model::DesktopState,
@@ -77,11 +78,11 @@ pub enum InternalRequest {
     #[serde(rename = "_state")]
     State,
     #[serde(rename = "_metadata")]
-    Metadata { pane: Option<u64> },
+    Metadata { pane: Option<P> },
     #[serde(rename = "_copy")]
-    Copy { pane: Option<u64> },
+    Copy { pane: Option<P> },
     #[serde(rename = "_read")]
-    Read { pane: Option<u64> },
+    Read { pane: Option<P> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,12 +128,12 @@ pub enum PublicRequest {
         name: String,
     },
     #[serde(untagged)]
-    Pane(PaneRequest),
+    Pane(gmux_protocol::control::PaneRequest),
 }
 
 pub enum Request {
-    Layout(Command),
-    Internal(InternalRequest),
+    Layout(Command<u64, u64>),
+    Internal(InternalRequest<u64, u64>),
     Public(PublicRequest),
 }
 impl Request {
@@ -140,7 +141,7 @@ impl Request {
         let method = value["method"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Request requires a method"))?;
-        Ok(if Command::supports(method) {
+        Ok(if Command::<u64, u64>::supports(method) {
             if let Some(fields) = value.as_object_mut() {
                 fields.remove("window");
                 fields.remove("connection");
@@ -192,12 +193,12 @@ impl Request {
 #[serde(untagged)]
 pub enum CommandOutput {
     New {
-        tab: u64,
-        pane: u64,
+        tab: TabRef,
+        pane: PaneRef,
         workspace: Option<u64>,
     },
     Split {
-        pane: u64,
+        pane: PaneRef,
     },
     Workspace {
         workspace: u64,
@@ -219,6 +220,33 @@ impl From<CommandOutput> for CommandResult {
             output,
             warning: None,
         }
+    }
+}
+
+impl CommandResult {
+    pub fn into_external_value(self, mut daemon: Option<DaemonId>) -> serde_json::Value {
+        let output = match self.output {
+            CommandOutput::New {
+                tab,
+                pane,
+                workspace,
+            } => {
+                daemon = Some(pane.daemon);
+                serde_json::json!({"tab":tab.id, "pane":pane.id, "workspace":workspace})
+            }
+            CommandOutput::Split { pane } => {
+                daemon = Some(pane.daemon);
+                serde_json::json!({"pane":pane.id})
+            }
+            CommandOutput::Workspace { workspace } => serde_json::json!({"workspace":workspace}),
+            CommandOutput::Done { ok } => serde_json::json!({"ok":ok}),
+        };
+        let mut value = output;
+        if let Some(warning) = self.warning {
+            value["warning"] = serde_json::json!(warning);
+        }
+        value["daemon"] = serde_json::json!(daemon);
+        value
     }
 }
 
@@ -249,7 +277,7 @@ pub struct CommandReply {
     pub desktop: Option<crate::client::model::DesktopState>,
 }
 
-impl Command {
+impl<P, T> Command<P, T> {
     pub fn resolve_directory(&mut self, local: bool) -> anyhow::Result<()> {
         if let Self::New {
             directory,
@@ -270,7 +298,7 @@ impl Command {
         Ok(())
     }
     /// Convert after the client resolves workspace membership and its destination directory.
-    pub fn into_execution(self) -> Result<gmux_protocol::control::Command, Self> {
+    pub fn into_execution(self) -> Result<gmux_protocol::control::Command<P, T>, Self> {
         use gmux_protocol::control::Command as Execution;
         Ok(match self {
             Self::New {
@@ -293,6 +321,94 @@ impl Command {
     }
 }
 
+impl<P, T> Command<P, T> {
+    pub fn map_ids<Q, U>(
+        self,
+        pane: &mut impl FnMut(P) -> anyhow::Result<Q>,
+        tab: &mut impl FnMut(T) -> anyhow::Result<U>,
+    ) -> anyhow::Result<Command<Q, U>> {
+        Ok(match self {
+            Self::New {
+                directory,
+                directory_base,
+                name,
+                workspace,
+            } => Command::New {
+                directory,
+                directory_base,
+                name,
+                workspace,
+            },
+            Self::WorkspaceAdd {
+                name,
+                directory,
+                directories,
+                tab: target,
+            } => Command::WorkspaceAdd {
+                name,
+                directory,
+                directories,
+                tab: target.map(&mut *tab).transpose()?,
+            },
+            Self::WorkspaceEdit {
+                workspace,
+                name,
+                directory,
+                directories,
+            } => Command::WorkspaceEdit {
+                workspace,
+                name,
+                directory,
+                directories,
+            },
+            Self::WorkspaceRemove { workspace } => Command::WorkspaceRemove { workspace },
+            Self::Move {
+                tab: target,
+                workspace,
+            } => Command::Move {
+                tab: target.map(&mut *tab).transpose()?,
+                workspace,
+            },
+            Self::Tab(command) => Command::Tab(command.map_ids(pane, tab)?),
+        })
+    }
+}
+
+impl<P, T> InternalRequest<P, T> {
+    pub fn map_ids<Q, U>(
+        self,
+        pane: &mut impl FnMut(P) -> anyhow::Result<Q>,
+        tab: &mut impl FnMut(T) -> anyhow::Result<U>,
+    ) -> anyhow::Result<InternalRequest<Q, U>> {
+        Ok(match self {
+            Self::Hello => InternalRequest::Hello,
+            Self::State => InternalRequest::State,
+            Self::DesktopSave { desktop, revision } => {
+                InternalRequest::DesktopSave { desktop, revision }
+            }
+            Self::DesktopTab { tab } => InternalRequest::DesktopTab { tab },
+            Self::Command { command } => InternalRequest::Command {
+                command: command.map_ids(pane, tab)?,
+            },
+            Self::Execution { request } => InternalRequest::Execution {
+                request: request.map_ids(pane, tab)?,
+            },
+            Self::Busy { panes } => InternalRequest::Busy {
+                panes: panes.into_iter().map(pane).collect::<anyhow::Result<_>>()?,
+            },
+            Self::Metadata { pane: id } => InternalRequest::Metadata {
+                pane: id.map(pane).transpose()?,
+            },
+            Self::Copy { pane: id } => InternalRequest::Copy {
+                pane: id.map(pane).transpose()?,
+            },
+            Self::Read { pane: id } => InternalRequest::Read {
+                pane: id.map(pane).transpose()?,
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,7 +426,7 @@ mod tests {
                 panic!("Expected new")
             };
             assert_eq!(workspace, expected);
-            let encoded = serde_json::to_value(Command::New {
+            let encoded = serde_json::to_value(Command::<u64, u64>::New {
                 directory_base: None,
                 directory: None,
                 name: None,
@@ -326,36 +442,32 @@ mod tests {
         );
     }
     #[test]
-    fn client_sessions_round_trip_pane_directory_keys() {
+    fn client_sessions_round_trip_qualified_directories() {
         use crate::client::model::{Layout, TabState};
         use std::collections::HashMap;
+        let daemon = DaemonId::from_bytes([1; 16]);
+        let tab = TabRef { daemon, id: 1 };
+        let pane = PaneRef { daemon, id: 2 };
         let session = Session {
             tabs: vec![TabState {
-                daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
-                id: 1,
+                id: tab,
                 created_at: 1,
                 name: "Terminal".into(),
                 custom_name: false,
                 workspace: None,
-                layout: Layout::Pane(2),
-                directories: HashMap::from([(2, PathBuf::from("/tmp"))]),
-                active: 2,
+                layout: Layout::Pane(pane),
+                directories: HashMap::from([(pane, PathBuf::from("/tmp"))]),
+                active: pane,
             }],
-            active: 1,
+            active: Some(tab),
             ..Session::default()
         };
         let wire = serde_json::to_value(&session).unwrap();
         let decoded: Session = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(decoded.tabs[0].directories[&2], PathBuf::from("/tmp"));
+        assert_eq!(decoded.tabs[0].directories[&pane], PathBuf::from("/tmp"));
         assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
-        let mut unqualified = wire.clone();
-        unqualified["tabs"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("daemon");
-        assert!(serde_json::from_value::<Session>(unqualified).is_err());
         let mut invalid = wire;
-        invalid["tabs"][0]["directories"] = json!({"invalid":"/tmp"});
+        invalid["tabs"][0]["directories"] = json!([[pane, "/tmp"], [pane, "/other"]]);
         assert!(serde_json::from_value::<Session>(invalid).is_err());
     }
 

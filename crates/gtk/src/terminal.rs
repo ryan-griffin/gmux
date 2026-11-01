@@ -1,3 +1,4 @@
+use crate::model::PaneRef;
 use crate::{
     renderer::{Renderer, Scene},
     settings::Settings,
@@ -70,7 +71,7 @@ struct DragSelectionRequest {
 }
 
 pub struct Terminal {
-    pub id: u64,
+    pub id: PaneRef,
     pub root: gtk::Box,
     pub area: TerminalCanvas,
     pub title: gtk::Label,
@@ -141,15 +142,15 @@ pub(crate) enum ErrorSource {
     Desktop,
 }
 
-pub(crate) type ErrorHandler = Rc<dyn Fn(u64, ErrorSource, &str, &str)>;
+pub(crate) type ErrorHandler = Rc<dyn Fn(PaneRef, ErrorSource, &str, &str)>;
 
 impl Terminal {
     pub(crate) fn new(
-        id: u64,
+        id: PaneRef,
         session: SessionHandle,
         settings: Rc<RefCell<Settings>>,
-        on_focus: Rc<dyn Fn(u64)>,
-        on_close: Rc<dyn Fn(u64)>,
+        on_focus: Rc<dyn Fn(PaneRef)>,
+        on_close: Rc<dyn Fn(PaneRef)>,
         application: &gtk::Application,
         input: InputContext,
     ) -> Rc<Self> {

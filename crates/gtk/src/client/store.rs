@@ -30,8 +30,8 @@ impl Snapshot {
     ) -> super::control::CommandResult {
         let output = match result.output {
             execution::CommandOutput::New { tab, pane } => CommandOutput::New {
-                tab,
-                pane,
+                tab: TabRef { daemon, id: tab },
+                pane: PaneRef { daemon, id: pane },
                 workspace: self
                     .desktop
                     .tabs
@@ -39,7 +39,9 @@ impl Snapshot {
                     .find(|t| t.reference == TabRef { daemon, id: tab })
                     .and_then(|t| t.workspace),
             },
-            execution::CommandOutput::Split { pane } => CommandOutput::Split { pane },
+            execution::CommandOutput::Split { pane } => CommandOutput::Split {
+                pane: PaneRef { daemon, id: pane },
+            },
             execution::CommandOutput::Done { ok } => CommandOutput::Done { ok },
         };
         super::control::CommandResult {
@@ -203,11 +205,10 @@ impl Store {
     }
     #[cfg(test)]
     pub fn command(&self, local: DaemonId, command: Command) -> anyhow::Result<CommandOutput> {
-        self.command_at(Some(local), Some(local), command)
+        self.command_at(Some(local), command)
     }
     fn command_at(
         &self,
-        primary: Option<DaemonId>,
         local: Option<DaemonId>,
         command: Command,
     ) -> anyhow::Result<CommandOutput> {
@@ -230,14 +231,7 @@ impl Store {
                 }
                 validate_directories(local, &mut directories)?;
                 let name = state.catalog.validate_name(&name, None)?;
-                let target = tab
-                    .map(|id| {
-                        primary
-                            .map(|daemon| TabRef { daemon, id })
-                            .ok_or_else(|| anyhow::anyhow!("Local execution is not enabled"))
-                    })
-                    .transpose()?;
-                if let Some(target) = target {
+                if let Some(target) = tab {
                     anyhow::ensure!(
                         state.desktop.tabs.iter().any(|t| t.reference == target),
                         "The tab has been closed"
@@ -249,7 +243,7 @@ impl Store {
                     name,
                     directories,
                 });
-                if let Some(target) = target {
+                if let Some(target) = tab {
                     state
                         .desktop
                         .tabs
@@ -387,7 +381,7 @@ impl Store {
                 return Ok(BackendReply::Value(json!({"ok":true})));
             }
             OrganizationRequest::Assign(tab) => self.assign(tab)?,
-            OrganizationRequest::Command(command) => self.command_at(local, local, command)?,
+            OrganizationRequest::Command(command) => self.command_at(local, command)?,
         };
         Ok(BackendReply::Organization {
             result: output.into(),
@@ -396,10 +390,10 @@ impl Store {
 }
 fn validate_tab(tab: &DesktopTab) -> anyhow::Result<()> {
     anyhow::ensure!(
-        tab.active.daemon == tab.reference.daemon && tab.layout.contains(tab.active.id),
+        tab.layout.contains(tab.active),
         "Invalid desktop pane reference"
     );
-    gmux_protocol::model::validate_ids(tab.reference.id, tab.layout.ids())
+    validate_layout(tab.reference, &tab.layout)
 }
 fn validate_directories(
     local: Option<DaemonId>,
@@ -477,7 +471,7 @@ mod tests {
             DesktopTab {
                 reference: TabRef { daemon, id: 1 },
                 workspace,
-                layout: Layout::Pane(2),
+                layout: Layout::Pane(PaneRef { daemon, id: 2 }),
                 active: PaneRef { daemon, id: 2 },
                 name: "shell".into(),
             }
@@ -487,6 +481,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn desktop_saves_reject_layouts_with_foreign_panes_even_when_numeric_ids_match() {
+        let f = Fixture::new();
+        let mut tab = f.tab(f.local, None);
+        tab.layout = Layout::Split {
+            vertical: false,
+            first: Box::new(Layout::Pane(tab.active)),
+            second: Box::new(Layout::Pane(PaneRef {
+                daemon: f.remote,
+                id: 3,
+            })),
+            ratio: 0.5,
+        };
+        assert!(f.store.assign(tab.clone()).is_err());
+        let desktop = DesktopState {
+            tabs: vec![tab],
+            ..DesktopState::default()
+        };
+        assert!(f.store.save_desktop(desktop, 0).is_err());
+        assert!(f.store.snapshot().0.desktop.tabs.is_empty());
     }
 
     #[test]

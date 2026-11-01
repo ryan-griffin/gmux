@@ -29,6 +29,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
     first = fixture.rpc("windows")["windows"][0]["id"]
     created = fixture.rpc("new", window=first, name="Original", directory=str(root))
     pane, tab = created["pane"], created["tab"]
+    pane_reference = dict(daemon=created["daemon"], id=pane)
 
     def state(window):
         return fixture.rpc("list", window=window)
@@ -205,7 +206,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
         fixture.rpc("action", window=first, name="zoom-in")
         assert fixture.rpc("renderer-info", window=second, pane=pane)["viewport"]["cell_height"] == before
         fixture.rpc("close", window=first, pane=split["pane"])
-        wait_for(lambda: next(t for t in state(second)["tabs"] if t["id"] == tab)["layout"] == {"Pane": pane})
+        wait_for(lambda: next(t for t in state(second)["tabs"] if t["id"] == tab)["layout"] == {"Pane": pane_reference})
 
     with scenario("deleting a selected workspace returns every affected window to All Tabs"):
         kept = fixture.rpc("workspace-add", window=first, name="Remaining workspace", directory=str(root))["workspace"]
@@ -257,7 +258,7 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
                  for name in ("Batch one", "Batch two")]
         order = [t["id"] for t in fixture.rpc("_state")["session"]["tabs"]]
         for window in (first, second):
-            wait_for(lambda: [t["id"] for t in state(window)["tabs"]] == order)
+            wait_for(lambda: [t["reference"] for t in state(window)["tabs"]] == order)
         for created in batch:
             fixture.rpc("_command", command=dict(method="close-tab", tab=created["tab"]))
         for window in (first, second):

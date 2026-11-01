@@ -1,4 +1,5 @@
 //! Permission and asynchronous desktop reads for one frontend window.
+use crate::model::PaneRef;
 use gmux_client::remote::{RemoteSession, SessionHandle};
 use gmux_protocol::{
     clipboard as protocol,
@@ -21,7 +22,7 @@ pub(crate) struct Desktop {
     clipboards: [gdk::Clipboard; 2],
     epochs: [Cell<u64>; 2],
     serial: Cell<u64>,
-    pastes: RefCell<HashMap<u64, LocalPaste>>,
+    pastes: RefCell<HashMap<PaneRef, LocalPaste>>,
     sessions: RefCell<Vec<Weak<RefCell<RemoteSession>>>>,
     active: RefCell<Option<Operation>>,
     handlers: RefCell<Vec<(gdk::Clipboard, glib::SignalHandlerId)>>,
@@ -34,8 +35,8 @@ struct LocalPaste {
     session: Weak<RefCell<RemoteSession>>,
 }
 fn consume_paste(
-    pastes: &mut HashMap<u64, LocalPaste>,
-    pane: u64,
+    pastes: &mut HashMap<PaneRef, LocalPaste>,
+    pane: PaneRef,
     destination: Destination,
     epoch: u64,
     serial: Option<u64>,
@@ -55,7 +56,7 @@ fn consume_paste(
     valid
 }
 struct Operation {
-    pane: u64,
+    pane: PaneRef,
     id: u64,
     destination: Destination,
     session: Weak<RefCell<RemoteSession>>,
@@ -220,7 +221,7 @@ impl Desktop {
         }
         result
     }
-    pub(crate) fn cancel_pane(&self, pane: u64) {
+    pub(crate) fn cancel_pane(&self, pane: PaneRef) {
         self.pastes.borrow_mut().remove(&pane);
         if self
             .active
@@ -592,6 +593,12 @@ impl Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn p(id: u64) -> PaneRef {
+        PaneRef {
+            daemon: crate::model::DaemonId::from_bytes([1; 16]),
+            id,
+        }
+    }
 
     #[test]
     fn remote_claims_require_a_local_one_use_paste_with_matching_scope() {
@@ -600,7 +607,7 @@ mod tests {
         let session = Weak::new();
         assert!(!consume_paste(
             &mut pastes,
-            7,
+            p(7),
             Destination::Clipboard,
             3,
             None,
@@ -608,7 +615,7 @@ mod tests {
             now
         ));
         pastes.insert(
-            7,
+            p(7),
             LocalPaste {
                 serial: 42,
                 destination: Destination::Clipboard,
@@ -619,43 +626,10 @@ mod tests {
         );
         assert!(!consume_paste(
             &mut pastes,
-            8,
-            Destination::Clipboard,
-            3,
-            None,
-            &session,
-            now
-        ));
-        assert!(!consume_paste(
-            &mut pastes,
-            7,
-            Destination::Primary,
-            3,
-            None,
-            &session,
-            now
-        ));
-        assert!(!consume_paste(
-            &mut pastes,
-            7,
-            Destination::Clipboard,
-            4,
-            None,
-            &session,
-            now
-        ));
-        assert!(!consume_paste(
-            &mut pastes,
-            7,
-            Destination::Clipboard,
-            3,
-            Some(41),
-            &session,
-            now
-        ));
-        assert!(consume_paste(
-            &mut pastes,
-            7,
+            PaneRef {
+                daemon: crate::model::DaemonId::from_bytes([2; 16]),
+                id: 7
+            },
             Destination::Clipboard,
             3,
             Some(42),
@@ -664,7 +638,52 @@ mod tests {
         ));
         assert!(!consume_paste(
             &mut pastes,
-            7,
+            p(8),
+            Destination::Clipboard,
+            3,
+            None,
+            &session,
+            now
+        ));
+        assert!(!consume_paste(
+            &mut pastes,
+            p(7),
+            Destination::Primary,
+            3,
+            None,
+            &session,
+            now
+        ));
+        assert!(!consume_paste(
+            &mut pastes,
+            p(7),
+            Destination::Clipboard,
+            4,
+            None,
+            &session,
+            now
+        ));
+        assert!(!consume_paste(
+            &mut pastes,
+            p(7),
+            Destination::Clipboard,
+            3,
+            Some(41),
+            &session,
+            now
+        ));
+        assert!(consume_paste(
+            &mut pastes,
+            p(7),
+            Destination::Clipboard,
+            3,
+            Some(42),
+            &session,
+            now
+        ));
+        assert!(!consume_paste(
+            &mut pastes,
+            p(7),
             Destination::Clipboard,
             3,
             None,
@@ -672,7 +691,7 @@ mod tests {
             now
         ));
         pastes.insert(
-            7,
+            p(7),
             LocalPaste {
                 serial: 43,
                 destination: Destination::Primary,
@@ -683,7 +702,7 @@ mod tests {
         );
         assert!(!consume_paste(
             &mut pastes,
-            7,
+            p(7),
             Destination::Primary,
             4,
             Some(43),

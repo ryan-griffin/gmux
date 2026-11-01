@@ -4,6 +4,19 @@ Benchmarks write local reports under `artifacts/`, which Git ignores. Keep sourc
 revisions and matching frontend/daemon binaries with reports when comparing
 builds. Results depend on the compositor, driver, font, and machine.
 
+## GTK snapshot projection
+
+```sh
+cargo test --locked -p gmux-gtk measure_snapshot_projection -- --ignored --nocapture --test-threads=1
+```
+
+This Linux/glibc probe combines cached snapshots from two daemons with 512 tabs
+and 1,024 panes. It warms up 100 projections and times 5,000 more. Retained heap
+bytes come from `mallinfo2` before and after fixture construction and initial
+projection. Run the test alone in a fresh process and compare the same build
+profile and CPU. The measurement excludes terminal widgets, rendering, stream
+buffers, and persistence I/O.
+
 ## Grapheme storage and transport
 
 ```sh
