@@ -1,3 +1,4 @@
+use super::super::control::InternalRequest;
 use super::*;
 use gmux_client::remote::SessionManager;
 use gmux_protocol::{control as execution, model::MachineKind};
@@ -479,7 +480,7 @@ fn pruning_preserves_disconnected_execution_and_references_until_views_release_t
     );
     assert!(
         f.hub
-            .route_body(json!({"method":"_read", "pane":pane}))
+            .route_request(InternalRequest::Read { pane: Some(pane) })
             .is_err()
     );
 }
@@ -513,8 +514,9 @@ fn routing_rejects_removed_connections_while_their_views_still_hold_handles() {
     }
     assert_eq!(
         f.hub
-            .route_body(json!({"method":"_read", "pane":pane}))
-            .unwrap_err()
+            .route_request(InternalRequest::Read { pane: Some(pane) })
+            .err()
+            .unwrap()
             .to_string(),
         "Connection no longer exists"
     );
@@ -529,72 +531,104 @@ fn pane_routing_requires_one_connection_and_valid_qualified_ids() {
     let local = f.hub.lookup(f.ids[0], 2).unwrap();
     let remote = f.hub.lookup(f.ids[1], 2).unwrap();
     let other = f.hub.lookup(f.ids[1], 3).unwrap();
+    let route = f
+        .hub
+        .route_request(InternalRequest::Busy {
+            panes: vec![remote, other],
+        })
+        .unwrap();
+    assert!(matches!(route, RoutedRequest::Execution {
+        target: Target::Remote { name, daemon },
+        request: execution::Request::Internal(execution::InternalRequest::Busy { panes }),
+    } if name == "host-1" && daemon == f.ids[1] && panes == [2, 3]));
+    let route = f
+        .hub
+        .route_request(InternalRequest::Busy { panes: vec![] })
+        .unwrap();
+    assert!(matches!(route, RoutedRequest::Execution {
+        target: Target::Local(daemon),
+        request: execution::Request::Internal(execution::InternalRequest::Busy { panes }),
+    } if daemon == f.ids[0] && panes.is_empty()));
     assert_eq!(
         f.hub
-            .route_body(json!({"method":"_busy", "panes":[remote, other]}))
-            .unwrap(),
-        (
-            Some(f.ids[1]),
-            json!({"method":"_connection-call", "connection":"host-1", "daemon":f.ids[1],
-                   "request":{"method":"_busy", "panes":[2, 3]}})
-        )
+            .route_request(InternalRequest::Busy {
+                panes: vec![local, remote]
+            })
+            .err()
+            .unwrap()
+            .to_string(),
+        "Panes belong to different connections"
     );
-    assert_eq!(
-        f.hub
-            .route_body(json!({"method":"_busy", "panes":[]}))
-            .unwrap(),
-        (Some(f.ids[0]), json!({"method":"_busy", "panes":[]}))
-    );
-    for request in [
-        json!({"method":"_busy", "panes":[local, remote]}),
-        json!({"method":"_busy", "pane":local, "panes":[remote]}),
-    ] {
-        assert_eq!(
-            f.hub.route_body(request).unwrap_err().to_string(),
-            "Panes belong to different connections"
-        );
-    }
-    for request in [
-        json!({"method":"_read", "pane":"invalid"}),
-        json!({"method":"_busy", "panes":[remote, "invalid"]}),
-        json!({"method":"_busy", "panes":[null]}),
-        json!({"method":"_busy", "panes":null}),
-        json!({"method":"_busy", "panes":42}),
-    ] {
-        assert!(f.hub.route_body(request).is_err());
-    }
+    // Explicit execution requests must resolve their nested selectors, too.
+    let route = f
+        .hub
+        .route_request(InternalRequest::Execution {
+            request: execution::ExecutionRequest::Read { pane: remote },
+        })
+        .unwrap();
+    assert!(matches!(route, RoutedRequest::Execution {
+        target: Target::Remote { daemon, .. },
+        request: execution::Request::Internal(execution::InternalRequest::Execution {
+            request: execution::ExecutionRequest::Read { pane: 2 },
+        }),
+    } if daemon == f.ids[1]));
 }
 
 #[test]
-fn connection_edits_use_the_daemons_queue_and_removal_can_cancel_them() {
+fn connection_configuration_pins_the_selected_daemon() {
+    use gmux_client::connections::ConfigurationRequest as C;
     let f = Fixture::new(3);
     for host in 1..3 {
-        let edit = json!({"method":"connection-edit","connection":format!("host-{host}"),"address":"127.0.0.1:1"});
-        let (destination, body) = f.hub.route_body(edit.clone()).unwrap();
-        assert_eq!(destination, Some(f.ids[host]));
-        assert_eq!(body["daemon"], json!(f.ids[host]));
-
-        let mut stale = edit;
-        stale["daemon"] = json!(f.ids[0]);
+        let edit = || C::ConnectionEdit {
+            connection: format!("host-{host}"),
+            daemon: None,
+            name: None,
+            address: Some("127.0.0.1:1".into()),
+            authentication: None,
+            remote_access: None,
+        };
+        let route = f.hub.route_request(edit()).unwrap();
+        assert!(
+            matches!(route, RoutedRequest::Configuration(C::ConnectionEdit {
+            daemon: Some(id), ..
+        }) if id == f.ids[host])
+        );
+        let mut stale = edit();
+        if let C::ConnectionEdit { daemon, .. } = &mut stale {
+            *daemon = Some(f.ids[0]);
+        }
         assert_eq!(
-            f.hub.route_body(stale).unwrap_err().to_string(),
+            f.hub.route_request(stale).err().unwrap().to_string(),
             "Remote connection identity changed"
         );
-
-        let (destination, body) = f
+        let route = f
             .hub
-            .route_body(json!({"method":"connection-remove","connection":format!("host-{host}")}))
+            .route_request(C::ConnectionRemove {
+                connection: format!("host-{host}"),
+                daemon: None,
+            })
             .unwrap();
-        assert_eq!(destination, None);
-        assert_eq!(body["daemon"], json!(f.ids[host]));
+        assert!(
+            matches!(route, RoutedRequest::Configuration(C::ConnectionRemove {
+            daemon: Some(id), ..
+        }) if id == f.ids[host])
+        );
     }
-    assert_eq!(
-        f.hub
-            .route_body(json!({"method":"connection-edit","connection":"local","name":"desktop"}))
-            .unwrap()
-            .0,
-        None
-    );
+    let route = f
+        .hub
+        .route_request(C::ConnectionEdit {
+            connection: "local".into(),
+            daemon: None,
+            name: Some(Some("desktop".into())),
+            address: None,
+            authentication: None,
+            remote_access: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        route,
+        RoutedRequest::Configuration(C::ConnectionEdit { daemon: None, .. })
+    ));
 }
 
 #[test]
@@ -609,15 +643,23 @@ fn prepared_remote_commands_keep_their_identity_when_names_are_reassigned() {
         .hub
         .route_command(Command::Tab(TabCommand::CloseTab { tab }), Some(original))
         .unwrap();
-    assert_eq!(
-        f.hub.route_body(route.body.clone()).unwrap().0,
-        Some(original)
-    );
     f.hub.origins.get_mut(&original).unwrap().machine.name = "renamed".into();
     f.hub.origins.get_mut(&f.ids[2]).unwrap().machine.name = "host-1".into();
-    assert_eq!(
-        f.hub.route_body(route.body).unwrap_err().to_string(),
-        "Remote connection identity changed"
+    let RoutedRequest::Execution { target, .. } = route.request else {
+        panic!("Expected execution");
+    };
+    let ipc::Endpoint::Saved { name, daemon } = target.into_endpoint(ipc::Endpoint::local()) else {
+        panic!("Expected a saved endpoint");
+    };
+    assert_eq!(name, "host-1");
+    assert_eq!(daemon, Some(original));
+    assert_ne!(
+        daemon,
+        f.hub
+            .origins
+            .values()
+            .find(|o| o.machine.name == name)
+            .map(|o| o.machine.daemon)
     );
 }
 

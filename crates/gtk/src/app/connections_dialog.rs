@@ -206,7 +206,7 @@ impl ConnectionControls {
             return;
         }
         let weak = Rc::downgrade(self);
-        ui.request_configuration(json!({"method":"connection-list"}), move |ui, result| {
+        ui.request_configuration(ConfigurationRequest::ConnectionList, move |ui, result| {
             let Some(controls) = weak.upgrade() else {
                 return;
             };
@@ -259,7 +259,7 @@ impl ConnectionControls {
             let weak = Rc::downgrade(ui);
             row.connect_activated(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.request_configuration(json!({"method":"connection-list"}), |ui, result| {
+                    ui.request_configuration(ConfigurationRequest::ConnectionList, |ui, result| {
                         match result
                             .and_then(|value| Ok(serde_json::from_value::<ConnectionList>(value)?))
                         {
@@ -500,7 +500,7 @@ impl Ui {
                     let Some(ui) = weak.upgrade() else { return };
                     editor.begin(None);
                     let editor = editor.clone();
-                    ui.request_configuration(json!({"method":"connection-remove", "connection":name,"daemon":daemon}), move |_, result| {
+                    ui.request_configuration(ConfigurationRequest::ConnectionRemove { connection: name.clone(), daemon: Some(daemon) }, move |_, result| {
                         editor.finish(result.map(|_| ()));
                     });
                 });
@@ -572,15 +572,22 @@ impl Ui {
             } else {
                 "Connecting…"
             }));
-            let mut request = json!({"method":"connection-add", "name":name.text().trim(),
-                "address":address.text().trim(), "authentication":authentication});
-            if let Some(remote) = &remote {
-                request["method"] = json!("connection-edit");
-                request["connection"] = json!(remote.name);
-                request["daemon"] = json!(remote.daemon);
-            } else if name.text().trim().is_empty() {
-                request["name"] = Value::Null;
-            }
+            let request = if let Some(remote) = &remote {
+                ConfigurationRequest::ConnectionEdit {
+                    connection: remote.name.clone(),
+                    daemon: Some(remote.daemon),
+                    name: Some(Some(name.text().trim().to_owned())),
+                    address: Some(address.text().trim().to_owned()),
+                    authentication: Some(authentication),
+                    remote_access: None,
+                }
+            } else {
+                ConfigurationRequest::ConnectionAdd {
+                    name: (!name.text().trim().is_empty()).then(|| name.text().trim().to_owned()),
+                    address: address.text().trim().to_owned(),
+                    authentication,
+                }
+            };
             let editor = editor.clone();
             ui.request_configuration(request, move |ui, result| {
                 editor.finish(result.map(|value| {
@@ -782,7 +789,7 @@ impl Ui {
             let confirm_stop = execution_changed && !execution && ui.settings.borrow().local_daemon_enabled;
             let apply = move |ui: &Rc<Ui>| {
                 ui.request_configuration(
-                    json!({"method":"connection-edit","connection":"local","name":value,"remote_access":remote_access}),
+                    ConfigurationRequest::ConnectionEdit { connection: "local".into(), daemon: None, name: Some(value), address: None, authentication: None, remote_access: Some(remote_access) },
                     move |ui, result| match result {
                         Ok(_) if execution_changed && execution != ui.settings.borrow().local_daemon_enabled => {
                             ui.set_local_daemon_enabled(execution, finish);

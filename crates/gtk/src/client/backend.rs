@@ -1,11 +1,11 @@
 //! Ordered organization work and independent execution queues outside the UI thread.
 use super::{
     Store,
-    control::{BackendReply, Command},
+    control::BackendReply,
     model::{DaemonId, DesktopState},
+    request::RoutedRequest,
 };
 use gmux_client::ipc;
-use serde_json::Value;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -13,7 +13,7 @@ use std::{
 };
 
 struct Worker {
-    client: ipc::Client<BackendReply>,
+    client: ipc::Client<BackendReply, RoutedRequest>,
     cancellation: gmux_platform::unix::ipc::Cancellation,
     execution: bool,
 }
@@ -38,7 +38,7 @@ impl Worker {
             let store = store.clone();
             let endpoint = endpoint.clone();
             let calls = calls.clone();
-            async move { store.call_cancellable(&endpoint, local, body, &calls).await }
+            async move { store.call_cancellable(endpoint, local, body, &calls).await }
         });
         Self {
             client,
@@ -104,11 +104,7 @@ impl Backend {
     pub fn set_local(&self, local: Option<DaemonId>) {
         *self.local.lock().unwrap() = local;
     }
-    pub fn request(
-        &self,
-        destination: impl Into<Option<DaemonId>>,
-        body: Value,
-    ) -> anyhow::Result<u64> {
+    pub fn request(&self, request: RoutedRequest) -> anyhow::Result<u64> {
         anyhow::ensure!(!self.closed.get(), "Request worker is closed");
         anyhow::ensure!(self.outstanding.get() < 128, "Request queue is full");
         let id = self.next.get();
@@ -116,18 +112,24 @@ impl Backend {
             id.checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("No request IDs remain"))?,
         );
-        if organization_request(&body) {
-            self.organization.client.request_with_id(id, body)?;
+        if matches!(request, RoutedRequest::Organization(_)) {
+            self.organization.client.request_with_id(id, request)?;
         } else {
             let mut workers = self.workers.borrow_mut();
-            // Adding a connection has no pinned daemon ID yet and can wait on a
-            // network handshake. Keep it out of the local execution queue.
-            let lane = if body["method"] == "connection-add" {
-                Lane::AddConnection
-            } else {
-                destination
-                    .into()
-                    .map_or(Lane::Configuration, Lane::Execution)
+            let lane = match &request {
+                RoutedRequest::Execution { target, .. } => Lane::Execution(target.daemon()),
+                RoutedRequest::Configuration(
+                    gmux_client::connections::ConfigurationRequest::ConnectionAdd { .. },
+                ) => Lane::AddConnection,
+                // Removal must be able to cancel a stalled credential edit.
+                RoutedRequest::Configuration(
+                    gmux_client::connections::ConfigurationRequest::ConnectionEdit {
+                        daemon: Some(id),
+                        ..
+                    },
+                ) => Lane::Execution(*id),
+                RoutedRequest::Configuration(_) => Lane::Configuration,
+                RoutedRequest::Organization(_) => unreachable!(),
             };
             if !workers.contains_key(&lane) {
                 // One lane per remote, plus local execution, configuration, and connection setup.
@@ -146,7 +148,7 @@ impl Backend {
                     ),
                 );
             }
-            workers[&lane].client.request_with_id(id, body)?;
+            workers[&lane].client.request_with_id(id, request)?;
         }
         self.outstanding.set(self.outstanding.get() + 1);
         Ok(id)
@@ -212,15 +214,6 @@ impl Drop for Backend {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-pub(super) fn organization_request(body: &Value) -> bool {
-    matches!(
-        body["method"].as_str(),
-        Some("_desktop-save" | "_desktop-tab")
-    ) || body["method"] == "_command"
-        && body["command"]["method"]
-            .as_str()
-            .is_some_and(Command::workspace_method)
 }
 
 #[cfg(test)]

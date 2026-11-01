@@ -206,6 +206,13 @@ tab closes or the connection restarts. Assignments ahead of observed topology
 remain saved until execution catches up. A tab created and closed before this
 client observes it can leave an assignment until the client sees a later ID.
 
+`client/request.rs` defines typed execution, organization, and configuration
+operations. Window routing resolves handles once and attaches a local target or a
+remote name pinned to its daemon identity. The backend selects ordered queues
+from those variants; workers carry the request types through dispatch and encode
+execution requests only when writing to a socket. JSON forwarding envelopes belong
+to CLI/RPC boundaries. Configuration replies and status diagnostics remain dynamic.
+
 Request workers return daemon execution replies or GTK organization results.
 Worker channels carry typed replies; execution snapshots are deserialized before
 reaching GTK. Other control responses retain their JSON values.

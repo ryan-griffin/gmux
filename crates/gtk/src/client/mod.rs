@@ -4,5 +4,6 @@ pub mod connections;
 pub mod control;
 pub mod ipc;
 pub mod model;
+pub mod request;
 mod store;
 pub use store::{Snapshot, Store, Subscription};

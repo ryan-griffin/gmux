@@ -176,7 +176,7 @@ impl Ui {
         self: &Rc<Self>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<gmux_protocol::control::StopReply>) + 'static,
     ) {
-        self.request_reply(json!({"method":"local-daemon-stop"}), move |ui, result| {
+        self.request_reply(ConfigurationRequest::LocalDaemonStop, move |ui, result| {
             callback(
                 ui,
                 result.and_then(|reply| match reply {
@@ -198,7 +198,7 @@ impl Ui {
         self: &Rc<Self>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<()>) + 'static,
     ) {
-        self.request_configuration(json!({"method":"local-daemon-start"}), move |ui, result| {
+        self.request_configuration(ConfigurationRequest::LocalDaemonStart, move |ui, result| {
             let result = result.and_then(|value| {
                 let machine: model::Machine = serde_json::from_value(value["local"].clone())?;
                 ui.each_window(|window| {

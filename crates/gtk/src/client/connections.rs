@@ -1,10 +1,8 @@
 //! Client-local streams, qualified handles, and command routing across daemons.
+use super::request::{self, Request as WorkerRequest, RoutedRequest, Target};
 use super::{
     Snapshot, Store, Subscription,
-    control::{
-        BackendReply, Command, CommandOutput, CommandReply, CommandResult, InternalRequest,
-        TabCommand,
-    },
+    control::{BackendReply, Command, CommandOutput, CommandReply, CommandResult, TabCommand},
     model::{
         DaemonId, DesktopState, DesktopTab, ExecutionSnapshot, Layout, Machine, MachineKind,
         PaneRef, Session, TabRef, TabState,
@@ -74,8 +72,7 @@ pub struct Connections {
     status_changed: bool,
 }
 pub struct Route {
-    pub destination: Option<DaemonId>,
-    pub body: Value,
+    pub request: RoutedRequest,
     pub assign: Option<Assignment>,
 }
 pub enum Assignment {
@@ -945,82 +942,73 @@ impl Connections {
         layout_ids(&mut layout, &mut |id| self.pane_ref(id).id);
         layout
     }
-    pub fn route_body(&self, mut value: Value) -> anyhow::Result<(Option<DaemonId>, Value)> {
-        if matches!(
-            value["method"].as_str(),
-            Some("connection-edit" | "connection-remove")
-        ) {
-            let target = value["connection"]
-                .as_str()
-                .and_then(|name| {
-                    self.origins.values().find(|origin| {
-                        Some(origin.machine.daemon) != self.local && origin.machine.name == name
-                    })
-                })
-                .map(|origin| origin.machine.daemon);
-            if let Some(daemon) = target {
-                let expected: Option<DaemonId> = serde_json::from_value(value["daemon"].clone())?;
-                anyhow::ensure!(
-                    expected.is_none_or(|expected| expected == daemon),
-                    "Remote connection identity changed"
-                );
-                value["daemon"] = json!(daemon);
+    pub fn route_request(
+        &self,
+        request: impl Into<WorkerRequest>,
+    ) -> anyhow::Result<RoutedRequest> {
+        Ok(match request.into() {
+            WorkerRequest::Organization(request) => RoutedRequest::Organization(request),
+            WorkerRequest::Configuration(mut request) => {
+                use gmux_client::connections::ConfigurationRequest as C;
+                match &mut request {
+                    C::ConnectionEdit {
+                        connection, daemon, ..
+                    }
+                    | C::ConnectionRemove { connection, daemon } => {
+                        if let Some(origin) = self.origins.values().find(|origin| {
+                            Some(origin.machine.daemon) != self.local
+                                && origin.machine.name == *connection
+                        }) {
+                            anyhow::ensure!(
+                                daemon.is_none_or(|id| id == origin.machine.daemon),
+                                "Remote connection identity changed"
+                            );
+                            *daemon = Some(origin.machine.daemon);
+                        }
+                    }
+                    C::ConnectionList
+                    | C::RemoteAccessGet
+                    | C::RemoteAccessSet { .. }
+                    | C::ConnectionAdd { .. }
+                    | C::LocalDaemonStart
+                    | C::LocalDaemonStop => (),
+                }
+                RoutedRequest::Configuration(request)
             }
-            // Editing credentials can wait on the remote. Removal stays in the
-            // configuration queue so it can cancel a stalled edit for that daemon.
-            return Ok((
-                target.filter(|_| value["method"] == "connection-edit"),
-                value,
-            ));
-        }
-        if gmux_client::connections::handles(value["method"].as_str().unwrap_or(""))
-            && value["method"] != "_connection-call"
-            || super::backend::organization_request(&value)
-        {
-            return Ok((None, value));
-        }
-        if value["method"] == "_connection-call" {
-            let name = value["connection"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing connection name"))?;
-            let daemon = self.connection_id(name)?;
-            let expected: Option<DaemonId> = serde_json::from_value(value["daemon"].clone())?;
-            anyhow::ensure!(
-                expected.is_none_or(|expected| expected == daemon),
-                "Remote connection identity changed"
-            );
-            value["daemon"] = json!(daemon);
-            return Ok((Some(daemon), value));
-        }
-        let mut daemon = None;
-        let mut translate = |pane: &mut Value| -> anyhow::Result<()> {
-            let id = pane
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("Invalid pane ID"))?;
-            let r = self.checked_ref(id)?;
-            anyhow::ensure!(
-                daemon.is_none_or(|daemon| daemon == r.daemon),
-                "Panes belong to different connections"
-            );
-            daemon = Some(r.daemon);
-            *pane = json!(r.id);
-            Ok(())
-        };
-        if let Some(pane) = value.get_mut("pane").filter(|pane| !pane.is_null()) {
-            translate(pane)?;
-        }
-        if let Some(panes) = value.get_mut("panes") {
-            let panes = panes
-                .as_array_mut()
-                .ok_or_else(|| anyhow::anyhow!("Invalid pane list"))?;
-            for pane in panes {
-                translate(pane)?;
+            WorkerRequest::Execution(mut request) => {
+                let mut daemon = None;
+                request::translate_targets(&mut request, |id| {
+                    let reference = self.checked_ref(id)?;
+                    anyhow::ensure!(
+                        daemon.is_none_or(|id| id == reference.daemon),
+                        "Panes belong to different connections"
+                    );
+                    daemon = Some(reference.daemon);
+                    Ok(reference.id)
+                })?;
+                let daemon = daemon
+                    .or(self.primary)
+                    .ok_or_else(|| anyhow::anyhow!("No connection is selected"))?;
+                RoutedRequest::Execution {
+                    target: self.target(daemon)?,
+                    request,
+                }
             }
-        }
-        let daemon = daemon
-            .or(self.primary)
-            .ok_or_else(|| anyhow::anyhow!("No connection is selected"))?;
-        Ok((Some(daemon), self.wrap(daemon, value)?))
+        })
+    }
+    fn target(&self, daemon: DaemonId) -> anyhow::Result<Target> {
+        let origin = self
+            .origins
+            .get(&daemon)
+            .ok_or_else(|| anyhow::anyhow!("Connection no longer exists"))?;
+        Ok(if Some(daemon) == self.local {
+            Target::Local(daemon)
+        } else {
+            Target::Remote {
+                name: origin.machine.name.clone(),
+                daemon,
+            }
+        })
     }
     /// Resolve socket IDs and implicit window targets before dispatch. A selector
     /// constrains the target even when it is also the window's default connection.
@@ -1103,20 +1091,6 @@ impl Connections {
         value["daemon"] = json!(daemon);
         Ok(value)
     }
-    fn wrap(&self, daemon: DaemonId, value: Value) -> anyhow::Result<Value> {
-        if super::backend::organization_request(&value) {
-            return Ok(value);
-        }
-        let origin = self
-            .origins
-            .get(&daemon)
-            .ok_or_else(|| anyhow::anyhow!("Connection no longer exists"))?;
-        Ok(if Some(daemon) == self.local {
-            value
-        } else {
-            json!({"method":"_connection-call","connection":origin.machine.name,"daemon":daemon,"request":value})
-        })
-    }
     pub fn route_command(
         &self,
         mut command: Command,
@@ -1162,24 +1136,20 @@ impl Connections {
             }
             Command::WorkspaceAdd { tab, .. } => {
                 assign = tab.take().map(|tab| Assignment::CreatedWorkspace { tab });
-                daemon = self.primary;
             }
-            Command::WorkspaceEdit { .. }
-            | Command::WorkspaceRemove { .. }
-            | Command::Move { .. } => daemon = self.primary,
             _ => (),
         }
-        let body = match command.into_execution() {
-            Ok(command) => serde_json::to_value(execution::InternalRequest::Command { command })?,
-            Err(command) => serde_json::to_value(InternalRequest::Command { command })?,
-        };
-        let body = if super::backend::organization_request(&body) {
-            body
-        } else {
-            self.wrap(
-                daemon.ok_or_else(|| anyhow::anyhow!("No connection is selected"))?,
-                body,
-            )?
+        let request = match command.into_execution() {
+            Ok(command) => RoutedRequest::Execution {
+                target: self
+                    .target(daemon.ok_or_else(|| anyhow::anyhow!("No connection is selected"))?)?,
+                request: execution::Request::Internal(execution::InternalRequest::Command {
+                    command,
+                }),
+            },
+            Err(command) => {
+                RoutedRequest::Organization(request::OrganizationRequest::Command(command))
+            }
         };
         if creates_pane {
             anyhow::ensure!(
@@ -1187,11 +1157,7 @@ impl Connections {
                 "Connection is disconnected or connecting. Wait for reconnection or check Manage Connections before creating a tab or pane"
             );
         }
-        Ok(Route {
-            destination: daemon,
-            body,
-            assign,
-        })
+        Ok(Route { request, assign })
     }
 }
 

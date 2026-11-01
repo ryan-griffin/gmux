@@ -225,6 +225,14 @@ impl Endpoint {
         cancellation: Option<&Cancellation>,
     ) -> anyhow::Result<ExecutionReply> {
         let request = gmux_protocol::control::Request::decode(body)?;
+        self.request_async(request, cancellation).await
+    }
+    /// Send an already decoded control request without a JSON value round trip.
+    pub async fn request_async(
+        &self,
+        request: gmux_protocol::control::Request,
+        cancellation: Option<&Cancellation>,
+    ) -> anyhow::Result<ExecutionReply> {
         runtime::cancellable(cancellation, self.execute_control_request_inner(request)).await
     }
     async fn execute_control_request_inner(
@@ -529,21 +537,21 @@ impl AsRawFd for Stream {
     }
 }
 
-enum Operation<R> {
-    Request(Value),
+enum Operation<R, Q> {
+    Request(Q),
     Update(Box<dyn FnOnce() -> anyhow::Result<R> + Send>),
 }
-struct Job<R> {
+struct Job<R, Q> {
     id: u64,
-    operation: Operation<R>,
+    operation: Operation<R, Q>,
     coalesce: Option<&'static str>,
 }
-struct Jobs<R> {
-    queue: std::collections::VecDeque<Job<R>>,
+struct Jobs<R, Q> {
+    queue: std::collections::VecDeque<Job<R, Q>>,
     closed: bool,
     cancel_requests: bool,
 }
-impl<R> Default for Jobs<R> {
+impl<R, Q> Default for Jobs<R, Q> {
     fn default() -> Self {
         Self {
             queue: Default::default(),
@@ -552,8 +560,9 @@ impl<R> Default for Jobs<R> {
         }
     }
 }
-pub struct Client<R: Send + 'static = ExecutionReply> {
-    jobs: Arc<(Mutex<Jobs<R>>, tokio::sync::Notify)>,
+/// Ordered request queue. Callers can carry typed input and replies through the worker.
+pub struct Client<R: Send + 'static = ExecutionReply, Q: Send + 'static = Value> {
+    jobs: Arc<(Mutex<Jobs<R, Q>>, tokio::sync::Notify)>,
     replies: mpsc::Receiver<(u64, anyhow::Result<R>)>,
     next: std::cell::Cell<u64>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -566,10 +575,10 @@ impl Client<ExecutionReply> {
         })
     }
 }
-impl<R: Send + 'static> Client<R> {
+impl<R: Send + 'static, Q: Send + 'static> Client<R, Q> {
     pub fn with_async_handler<F, Fut>(wake: Wake, handler: F) -> Self
     where
-        F: Fn(Value) -> Fut + Send + 'static,
+        F: Fn(Q) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = anyhow::Result<R>> + Send + 'static,
     {
         let jobs = Arc::new((Mutex::new(Jobs::default()), tokio::sync::Notify::new()));
@@ -614,28 +623,11 @@ impl<R: Send + 'static> Client<R> {
             task: Some(task),
         }
     }
-    pub fn request(&self, request: impl serde::Serialize) -> anyhow::Result<u64> {
-        let id = self.next.get();
-        self.next.set(
-            id.checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("No request IDs remain"))?,
-        );
-        self.request_with_id(id, request)?;
-        Ok(id)
-    }
-    pub fn request_with_id(&self, id: u64, request: impl serde::Serialize) -> anyhow::Result<()> {
+    pub fn request_with_id(&self, id: u64, request: Q) -> anyhow::Result<()> {
         self.enqueue(Job {
             id,
-            operation: Operation::Request(serde_json::to_value(request)?),
+            operation: Operation::Request(request),
             coalesce: None,
-        })
-    }
-    /// Queue an automatic update, coalescing adjacent updates of the same kind.
-    pub fn update(&self, key: &'static str, request: impl serde::Serialize) -> anyhow::Result<()> {
-        self.enqueue(Job {
-            id: 0,
-            operation: Operation::Request(serde_json::to_value(request)?),
-            coalesce: Some(key),
         })
     }
     /// Run a typed automatic update on the worker without serializing its data on the caller.
@@ -650,7 +642,7 @@ impl<R: Send + 'static> Client<R> {
             coalesce: Some(key),
         })
     }
-    fn enqueue(&self, job: Job<R>) -> anyhow::Result<()> {
+    fn enqueue(&self, job: Job<R, Q>) -> anyhow::Result<()> {
         let (lock, ready) = &*self.jobs;
         let mut jobs = lock.lock().unwrap();
         anyhow::ensure!(!jobs.closed, "Request worker is closed");
@@ -696,7 +688,26 @@ impl<R: Send + 'static> Client<R> {
         }
     }
 }
-impl<R: Send + 'static> Drop for Client<R> {
+impl<R: Send + 'static> Client<R> {
+    pub fn request(&self, request: impl serde::Serialize) -> anyhow::Result<u64> {
+        let id = self.next.get();
+        self.next.set(
+            id.checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("No request IDs remain"))?,
+        );
+        self.request_with_id(id, serde_json::to_value(request)?)?;
+        Ok(id)
+    }
+    /// Queue an automatic update, coalescing adjacent updates of the same kind.
+    pub fn update(&self, key: &'static str, request: impl serde::Serialize) -> anyhow::Result<()> {
+        self.enqueue(Job {
+            id: 0,
+            operation: Operation::Request(serde_json::to_value(request)?),
+            coalesce: Some(key),
+        })
+    }
+}
+impl<R: Send + 'static, Q: Send + 'static> Drop for Client<R, Q> {
     fn drop(&mut self) {
         self.join();
     }

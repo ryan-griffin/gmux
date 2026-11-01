@@ -1,4 +1,9 @@
 use super::*;
+use crate::client::{
+    control::Command,
+    request::{OrganizationRequest, Target},
+};
+use control::{InternalRequest as Internal, PublicRequest as Public, Request as Execution};
 use gmux_protocol::{control, model::MachineKind};
 use serde_json::json;
 use std::{
@@ -71,8 +76,27 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
-fn remote(name: &str) -> Value {
-    json!({"method":"_command", "command":{"method":"rename", "tab":1, "name":name}})
+fn execution(daemon: DaemonId, request: Execution) -> RoutedRequest {
+    RoutedRequest::Execution {
+        target: Target::Local(daemon),
+        request,
+    }
+}
+fn rename(name: &str) -> Execution {
+    Execution::Internal(Internal::Command {
+        command: control::Command::Tab(control::TabCommand::Rename {
+            tab: 1,
+            name: name.into(),
+        }),
+    })
+}
+fn workspace(name: &str) -> RoutedRequest {
+    RoutedRequest::Organization(OrganizationRequest::Command(Command::WorkspaceAdd {
+        name: name.into(),
+        directory: None,
+        directories: Default::default(),
+        tab: None,
+    }))
 }
 fn collect(backend: &Backend, count: usize) -> Vec<(u64, anyhow::Result<BackendReply>)> {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -93,7 +117,7 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
     let f = Fixture::new();
     let backend = f.backend();
     backend
-        .request(f.local, json!({"method":"status"}))
+        .request(execution(f.local, Execution::Public(Public::Status)))
         .unwrap();
     f.incoming()
         .reply
@@ -105,7 +129,7 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
     );
 
     backend
-        .request(f.local, json!({"method":"_state"}))
+        .request(execution(f.local, Execution::Internal(Internal::State)))
         .unwrap();
     f.incoming().reply.send(json!({"execution":{}})).unwrap();
     assert!(
@@ -114,7 +138,7 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
     );
 
     backend
-        .request(f.local, json!({"method":"_state"}))
+        .request(execution(f.local, Execution::Internal(Internal::State)))
         .unwrap();
     f.answer(f.incoming(), f.local);
     let replies = collect(&backend, 1);
@@ -123,7 +147,10 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
     );
 
     backend
-        .request(f.local, json!({"method":"_busy","panes":[7]}))
+        .request(execution(
+            f.local,
+            Execution::Internal(Internal::Busy { panes: vec![7] }),
+        ))
         .unwrap();
     f.incoming().reply.send(json!({"busy":false})).unwrap();
     let replies = collect(&backend, 1);
@@ -131,7 +158,10 @@ fn workers_decode_snapshots_by_request_and_preserve_ordinary_response_fields() {
         Ok(BackendReply::Execution(control::ExecutionReply::Busy(reply))) if !reply.busy));
 
     backend
-        .request(f.local, json!({"method":"_busy","panes":[7]}))
+        .request(execution(
+            f.local,
+            Execution::Internal(Internal::Busy { panes: vec![7] }),
+        ))
         .unwrap();
     f.incoming()
         .reply
@@ -154,7 +184,13 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
     let backend = f.backend();
     // Invalid setup still allocates its independent lane without starting a handshake.
     let setup = backend
-        .request(None, json!({"method":"connection-add"}))
+        .request(RoutedRequest::Configuration(
+            gmux_client::connections::ConfigurationRequest::ConnectionAdd {
+                name: None,
+                address: String::new(),
+                authentication: gmux_protocol::network::Authentication::None,
+            },
+        ))
         .unwrap();
     let replies = collect(&backend, 1);
     assert!(
@@ -162,12 +198,23 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
             .iter()
             .any(|(id, result)| *id == setup && result.is_err())
     );
-    backend.request(None, remote("configuration")).unwrap();
-    f.answer(f.incoming(), f.local);
+    backend
+        .request(RoutedRequest::Configuration(
+            gmux_client::connections::ConfigurationRequest::RemoteAccessSet {
+                remote_access: gmux_protocol::network::RemoteAccess {
+                    enabled: true,
+                    authentication: gmux_protocol::network::Authentication::Token {
+                        file: f.path.join("missing-token"),
+                    },
+                    ..Default::default()
+                },
+            },
+        ))
+        .unwrap();
     assert!(
         collect(&backend, 1)
             .iter()
-            .all(|(_, result)| result.is_ok())
+            .all(|(_, result)| result.is_err())
     );
 
     let daemons: Vec<_> = std::iter::once(f.local)
@@ -177,7 +224,9 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
         )
         .collect();
     for &daemon in &daemons {
-        let id = backend.request(daemon, remote("execution")).unwrap();
+        let id = backend
+            .request(execution(daemon, rename("execution")))
+            .unwrap();
         f.answer(f.incoming(), daemon);
         let replies = collect(&backend, 1);
         assert!(
@@ -187,10 +236,16 @@ fn full_remote_capacity_leaves_room_for_local_daemon_and_configuration() {
         );
     }
     let replacement = gmux_platform::unix::identity::daemon_id().unwrap();
-    assert!(backend.request(replacement, remote("overflow")).is_err());
+    assert!(
+        backend
+            .request(execution(replacement, rename("overflow")))
+            .is_err()
+    );
     let removed = daemons[1];
     backend.retain_connections(|daemon| daemon != removed);
-    backend.request(replacement, remote("replacement")).unwrap();
+    backend
+        .request(execution(replacement, rename("replacement")))
+        .unwrap();
     f.answer(f.incoming(), replacement);
     assert!(
         collect(&backend, 1)
@@ -206,26 +261,21 @@ fn stalled_remote_does_not_block_other_connections_or_organization_and_preserves
     let backend = f.backend();
     let a = gmux_platform::unix::identity::daemon_id().unwrap();
     let b = gmux_platform::unix::identity::daemon_id().unwrap();
-    let first = backend.request(a, remote("a")).unwrap();
+    let first = backend.request(execution(a, rename("a"))).unwrap();
     let held = f.incoming();
     assert_eq!(held.body["command"]["name"], "a");
-    let second = backend.request(a, remote("renamed-a")).unwrap();
+    let second = backend.request(execution(a, rename("renamed-a"))).unwrap();
     let local = backend
-        .request(f.local, json!({"method":"_state"}))
+        .request(execution(f.local, Execution::Internal(Internal::State)))
         .unwrap();
     let local_request = f.incoming();
     assert_eq!(local_request.body["method"], "_state");
     f.answer(local_request, f.local);
-    let other = backend.request(b, remote("b")).unwrap();
+    let other = backend.request(execution(b, rename("b"))).unwrap();
     let other_request = f.incoming();
     assert_eq!(other_request.body["command"]["name"], "b");
     f.answer(other_request, b);
-    let workspace = backend
-        .request(
-            f.local,
-            json!({"method":"_command", "command":{"method":"workspace-add", "name":"Project"}}),
-        )
-        .unwrap();
+    let workspace = backend.request(workspace("Project")).unwrap();
     backend
         .save_desktop(
             DesktopState {
@@ -272,9 +322,9 @@ fn removing_a_connection_cancels_its_requests_and_shutdown_flushes_the_latest_sa
     let f = Fixture::new();
     let backend = f.backend();
     let a = gmux_platform::unix::identity::daemon_id().unwrap();
-    let first = backend.request(a, remote("a")).unwrap();
+    let first = backend.request(execution(a, rename("a"))).unwrap();
     let held = f.incoming();
-    let second = backend.request(a, remote("a")).unwrap();
+    let second = backend.request(execution(a, rename("a"))).unwrap();
     let before = Instant::now();
     backend.retain_connections(|daemon| daemon == f.local);
     assert!(
@@ -298,12 +348,12 @@ fn removing_a_connection_cancels_its_requests_and_shutdown_flushes_the_latest_sa
     );
     drop(held);
     // A new queue can use the same daemon after removal without reusing request IDs.
-    let third = backend.request(a, remote("a")).unwrap();
+    let third = backend.request(execution(a, rename("a"))).unwrap();
     assert!(third > second);
     let held = f.incoming();
-    backend.request(a, remote("a")).unwrap();
-    backend.request(f.local, json!({"method":"_command", "command":{"method":"workspace-add", "name":"Before close"}})).unwrap();
-    backend.request(f.local, json!({"method":"_command", "command":{"method":"workspace-add", "name":"Queued edit"}})).unwrap();
+    backend.request(execution(a, rename("a"))).unwrap();
+    backend.request(workspace("Before close")).unwrap();
+    backend.request(workspace("Queued edit")).unwrap();
     backend
         .save_desktop(
             DesktopState {
@@ -326,7 +376,7 @@ fn removing_a_connection_cancels_its_requests_and_shutdown_flushes_the_latest_sa
     backend.shutdown();
     assert!(
         backend
-            .request(f.local, json!({"method":"_state"}))
+            .request(execution(f.local, Execution::Internal(Internal::State)))
             .is_err()
     );
     drop(backend);
@@ -355,7 +405,9 @@ fn removing_a_connection_cancels_its_requests_and_shutdown_flushes_the_latest_sa
 fn removing_the_default_remote_cancels_its_execution_queue() {
     let f = Fixture::new();
     let backend = f.backend();
-    let request = backend.request(f.local, remote("default")).unwrap();
+    let request = backend
+        .request(execution(f.local, rename("default")))
+        .unwrap();
     let held = f.incoming();
     let before = Instant::now();
     backend.retain_connections(|_| false);

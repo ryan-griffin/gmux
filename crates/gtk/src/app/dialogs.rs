@@ -70,13 +70,10 @@ impl Ui {
             self.confirm_quit(false);
             return;
         }
-        self.request_busy(
-            json!({"method":"_busy","panes":panes}),
-            |ui, result| match result {
-                Ok(busy) => ui.confirm_quit(busy),
-                Err(e) => ui.message(&e.to_string()),
-            },
-        );
+        self.request_busy(InternalRequest::Busy { panes }, |ui, result| match result {
+            Ok(busy) => ui.confirm_quit(busy),
+            Err(e) => ui.message(&e.to_string()),
+        });
     }
     pub(super) fn confirm_quit(self: &Rc<Self>, busy: bool) {
         if !busy {
