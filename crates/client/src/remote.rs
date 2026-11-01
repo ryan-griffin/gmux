@@ -80,6 +80,20 @@ fn stream_error(error: anyhow::Error) -> String {
 
 pub type SessionHandle = Rc<RefCell<RemoteSession>>;
 
+fn outgoing_budget(control: bool) -> Arc<tokio::sync::Semaphore> {
+    use std::sync::OnceLock;
+    static BULK: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    static CONTROL: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let (budget, bytes) = if control {
+        (&CONTROL, 4 * 1024 * 1024)
+    } else {
+        (&BULK, 32 * 1024 * 1024)
+    };
+    budget
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(bytes)))
+        .clone()
+}
+
 struct Connection {
     commands: tokio::sync::mpsc::Sender<Queued>,
     task: Option<tokio::task::AbortHandle>,
@@ -94,6 +108,7 @@ struct Queued {
 struct Reservation {
     bytes: usize,
     pending: Arc<AtomicUsize>,
+    _shared: tokio::sync::OwnedSemaphorePermit,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -169,6 +184,37 @@ impl Outgoing {
             Self::Command(bytes) => bytes.len(),
             Self::Paste { text, .. } => text.len(),
         }
+    }
+
+    fn is_control(&self) -> bool {
+        matches!(self, Self::Command(bytes) if bytes.capacity() + size_of::<Queued>() <= 32 * 1024)
+    }
+    fn retained_bytes(&self) -> usize {
+        size_of::<Queued>()
+            + match self {
+                Self::Command(bytes) => bytes.capacity(),
+                Self::Paste { text, .. } => text.capacity(),
+                Self::ClipboardReply {
+                    result, contents, ..
+                } => {
+                    // Include the retained result metadata as well as payload capacity.
+                    result.contents.capacity()
+                        * size_of::<gmux_protocol::clipboard::ReadDescriptor>()
+                        + result.available.capacity() * size_of::<String>()
+                        + result.available.iter().map(String::capacity).sum::<usize>()
+                        + contents.capacity()
+                            * size_of::<gmux_protocol::clipboard::Representation>()
+                        + contents
+                            .iter()
+                            .map(|c| c.data.capacity() + c.mime.capacity())
+                            .sum::<usize>()
+                        + result
+                            .contents
+                            .iter()
+                            .map(|r| r.mime.capacity())
+                            .sum::<usize>()
+                }
+            }
     }
 
     #[cfg(test)]
@@ -257,10 +303,32 @@ impl Connection {
         self.enqueue(Outgoing::prepare(request)?)
     }
     fn enqueue(&self, outgoing: Outgoing) -> anyhow::Result<()> {
+        let budget = outgoing_budget(outgoing.is_control());
+        self.enqueue_with_budget(outgoing, budget)
+    }
+    fn enqueue_with_budget(
+        &self,
+        outgoing: Outgoing,
+        budget: Arc<tokio::sync::Semaphore>,
+    ) -> anyhow::Result<()> {
         let bytes = outgoing.bytes();
+        // Bulk input cannot consume the allowance for keys, control commands,
+        // or clipboard read chunks. Rejection leaves ownership with this call
+        // and is reported to the caller, just like the local queue ceiling.
+        let retained = outgoing.retained_bytes();
+        let reserved_slots = (self.commands.max_capacity() / 8).min(8);
+        anyhow::ensure!(
+            outgoing.is_control() || self.commands.capacity() > reserved_slots,
+            "Terminal bulk input queue is full"
+        );
+        let shared = budget
+            .try_acquire_many_owned(retained.try_into()?)
+            .map_err(|_| anyhow::anyhow!("Process terminal input budget is full"))?;
+        let local_limit =
+            2 * transport::MAX_PASTE + if outgoing.is_control() { 64 * 1024 } else { 0 };
         self.pending_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                (pending + bytes <= 2 * transport::MAX_PASTE).then_some(pending + bytes)
+                (pending + bytes <= local_limit).then_some(pending + bytes)
             })
             .map_err(|_| anyhow::anyhow!("Terminal input queue is full"))?;
         let queued = Queued {
@@ -268,6 +336,7 @@ impl Connection {
             reservation: Reservation {
                 bytes,
                 pending: self.pending_bytes.clone(),
+                _shared: shared,
             },
         };
         self.commands
@@ -356,6 +425,7 @@ pub struct SessionManager {
     git: HashMap<u64, transport::GitMetadata>,
     git_panes: HashSet<u64>,
     git_subscription_pending: bool,
+    focused: ValueCell<bool>,
     visible: HashSet<u64>,
     subscription_pending: bool,
     frame_interval: Duration,
@@ -374,15 +444,32 @@ async fn read_packets(
     wake: &gmux_platform::unix::ipc::Wake,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let mut reader = tokio::io::BufReader::new(reader).compat();
+    use tokio::io::AsyncReadExt;
+    let mut reader = tokio::io::BufReader::new(reader);
     loop {
+        // Read the fixed prefix before admission. Idle/partial prefixes and
+        // heartbeat acknowledgements need no allocation or decode reservation.
+        // BufReader retains at most its fixed 8 KiB outside the packet budget.
+        let mut prefix = [0; 4];
+        runtime::deadline(Instant::now() + timeout, async {
+            reader.read_exact(&mut prefix).await?;
+            Ok(())
+        })
+        .await?;
+        if prefix == *transport::HEARTBEAT_REPLY {
+            continue;
+        }
+        let reservation = sender.reserve_decode().await?;
+        // Replay the prefix through the existing codec to keep framing and
+        // validation in one place, without allocating a second packet buffer.
+        let mut record = prefix.as_slice().chain(&mut reader).compat();
         let packet = runtime::deadline(
             Instant::now() + timeout,
-            Packet::read_message_async(&mut reader),
+            Packet::read_message_async(&mut record),
         )
         .await?;
         if let Some(packet) = packet {
-            sender.send_async(Ok(packet)).await?;
+            sender.send_reserved(Ok(packet), Some(reservation)).await?;
             wake.notify();
         }
     }
@@ -544,6 +631,7 @@ impl SessionManager {
             git: HashMap::new(),
             git_panes: HashSet::new(),
             git_subscription_pending: false,
+            focused: ValueCell::new(false),
             visible: HashSet::new(),
             subscription_pending: false,
             frame_interval: transport::DEFAULT_FRAME_INTERVAL,
@@ -583,6 +671,10 @@ impl SessionManager {
         self.state.take()
     }
     pub fn set_focused(&self, active: bool) -> anyhow::Result<()> {
+        self.focused.set(active);
+        for session in self.sessions.values() {
+            session.borrow().cache.set_focused(active);
+        }
         self.connection
             .send(StreamRequest::connection(StreamCommand::Focused { active }))
     }
@@ -759,7 +851,11 @@ impl SessionManager {
             row_flags: vec![0; 24],
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
-            cache: crate::scroll_cache::RowCache::default(),
+            cache: {
+                let cache = crate::scroll_cache::RowCache::default();
+                cache.set_focused(self.focused.get());
+                cache
+            },
             prediction: None,
             scroll_target: None,
             wake: self.wake.clone(),
@@ -800,7 +896,11 @@ impl SessionManager {
         }
         let mut updates: HashMap<u64, SessionUpdate> = HashMap::new();
         for _ in 0..256 {
-            match self.receiver.try_recv() {
+            let (received, _reservation) = match self.receiver.try_recv_reserved() {
+                Ok((item, reservation)) => (Ok(item), Some(reservation)),
+                Err(error) => (Err(error), None),
+            };
+            match received {
                 Ok(Ok(mut packet)) => {
                     if let Some(write) = packet.header.copy.take() {
                         clipboard(gmux_protocol::clipboard::Event::Write(write));
@@ -1065,7 +1165,9 @@ impl SessionManager {
         self.disconnect_error.as_ref()
     }
     pub fn close(&mut self, id: u64) {
-        self.sessions.remove(&id);
+        if let Some(session) = self.sessions.remove(&id) {
+            session.borrow_mut().clear_cache();
+        }
         self.metadata.remove(&id);
         self.git.remove(&id);
         self.git_subscription_pending |= self.git_panes.remove(&id);
@@ -1073,7 +1175,9 @@ impl SessionManager {
     }
     pub fn clear(&mut self) {
         for session in self.sessions.values() {
-            session.borrow_mut().git = None;
+            let mut session = session.borrow_mut();
+            session.git = None;
+            session.clear_cache();
         }
         self.git.clear();
         self.git_panes.clear();
@@ -1121,6 +1225,8 @@ struct Prediction {
     frame: Frame,
     cells: Vec<Cell>,
     row_flags: Vec<u8>,
+    // Drop storage before returning its reservation to the shared pool.
+    reservation: Option<crate::scroll_cache::PredictionReservation>,
 }
 impl RemoteSession {
     pub fn branch(&self) -> &str {
@@ -1419,15 +1525,17 @@ impl RemoteSession {
                 .saturating_sub(self.frame.scrollback.len),
         );
         let mut prediction = self.prediction.take().unwrap_or_else(|| Prediction {
+            reservation: None,
             frame: self.frame,
             cells: Vec::new(),
             row_flags: Vec::new(),
         });
-        if !self.cache.copy_view(
+        if !self.cache.copy_prediction(
             row,
             self.frame.rows as usize,
             &mut prediction.cells,
             &mut prediction.row_flags,
+            &mut prediction.reservation,
         ) {
             // Keep a previously drawn prediction through older replies. An
             // uncached destination waits for authoritative rows.
@@ -1629,6 +1737,49 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
+    fn heartbeat_acknowledgements_bypass_saturated_decode_admission() {
+        let shared = Arc::new(tokio::sync::Semaphore::new(64 * 1024));
+        let held = shared.clone().try_acquire_many_owned(64 * 1024).unwrap();
+        let (sender, receiver) = incoming::channel_with_budget(64 * 1024, 8, shared.clone());
+        // One prefix fits; the writer cannot finish three acknowledgements
+        // unless the reader keeps consuming them with every byte reserved.
+        let (socket, mut peer) = tokio::io::duplex(4);
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
+        let task = runtime::spawn(async move {
+            read_packets(socket, &sender, &wake, Duration::from_secs(2)).await
+        });
+        runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), peer.write_all(&[0; 12]))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(shared.available_permits(), 0);
+            // After releasing admission, a real packet follows the
+            // acknowledgements without losing its replayed prefix or header.
+            drop(held);
+            let mut bytes = Vec::new();
+            Packet {
+                header: gmux_protocol::transport::Header {
+                    notifications: vec!["after heartbeats".into()],
+                    ..Default::default()
+                },
+                cells: Vec::new(),
+            }
+            .encode_into(&mut bytes)
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), peer.write_all(&bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        drop(peer);
+        assert!(runtime::block_on(task).unwrap().is_err());
+        let packet = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(packet.header.notifications, ["after heartbeats"]);
+        assert_eq!(shared.available_permits(), 64 * 1024);
+    }
+
+    #[test]
     fn heartbeat_replies_keep_idle_streams_alive_without_waking_the_ui() {
         use std::{
             io::{BufRead, Write},
@@ -1643,7 +1794,7 @@ mod tests {
             gmux_platform::unix::identity::daemon_id().unwrap(),
             socket.into(),
             Duration::from_millis(10),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
         )
         .unwrap();
         let cached = manager.connection.clone();
@@ -1651,7 +1802,10 @@ mod tests {
         let (release, hold) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let mut reader = BufReader::new(peer.try_clone().unwrap());
-            for _ in 0..40 {
+            // Run longer than the read deadline. Other tests decode maximum
+            // packets on the same process executor and share admission, so a
+            // sub-second scheduling delay must not decide this keepalive test.
+            for _ in 0..120 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 assert_eq!(line.as_bytes(), PING);
@@ -1660,7 +1814,7 @@ mod tests {
             ready.send(()).unwrap();
             let _ = hold.recv();
         });
-        done.recv_timeout(Duration::from_secs(3)).unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(manager.poll().is_empty());
         assert!(!manager.disconnected());
         let mut event = libc::pollfd {
@@ -1758,6 +1912,165 @@ mod tests {
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
+    #[test]
+    fn outgoing_capacity_is_shared_and_failed_or_canceled_work_releases_it() {
+        let make = || {
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let (commands, queue) = tokio::sync::mpsc::channel(16);
+            (
+                Connection {
+                    commands,
+                    task: None,
+                    pending_bytes: Arc::new(AtomicUsize::new(0)),
+                    socket: socket.into(),
+                    clipboard_epochs: Default::default(),
+                },
+                queue,
+                peer,
+            )
+        };
+        let (a, mut aq, _ap) = make();
+        let (b, bq, _bp) = make();
+        let item = || Outgoing::Command(Vec::with_capacity(1024));
+        let bytes = item().retained_bytes();
+        let budget = Arc::new(tokio::sync::Semaphore::new(bytes * 2));
+        a.enqueue_with_budget(item(), budget.clone()).unwrap();
+        b.enqueue_with_budget(item(), budget.clone()).unwrap();
+        assert!(a.enqueue_with_budget(item(), budget.clone()).is_err());
+        assert_eq!(budget.available_permits(), 0);
+        let in_flight = aq.try_recv().unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        drop(in_flight);
+        a.enqueue_with_budget(item(), budget.clone()).unwrap();
+        drop((aq, bq));
+        assert_eq!(budget.available_permits(), bytes * 2);
+        assert!(a.enqueue_with_budget(item(), budget.clone()).is_err());
+        assert_eq!(budget.available_permits(), bytes * 2);
+        assert!(!Arc::ptr_eq(
+            &outgoing_budget(true),
+            &outgoing_budget(false)
+        ));
+    }
+
+    #[test]
+    fn bulk_input_leaves_queue_slots_for_keys_and_control() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (commands, mut queue) = tokio::sync::mpsc::channel(16);
+        let connection = Connection {
+            commands,
+            task: None,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            socket: socket.into(),
+            clipboard_epochs: Default::default(),
+        };
+        for _ in 0..14 {
+            connection
+                .enqueue(Outgoing::Command(vec![b'x'; 40 * 1024]))
+                .unwrap();
+        }
+        assert!(
+            connection
+                .enqueue(Outgoing::Command(vec![b'x'; 40 * 1024]))
+                .is_err()
+        );
+        connection
+            .send(request(
+                json!({"method":"key","pane":1,"name":"a","text":"a","action":"press"}),
+            ))
+            .unwrap();
+        connection
+            .send(StreamRequest::connection(StreamCommand::Focused {
+                active: true,
+            }))
+            .unwrap();
+        assert_eq!(std::iter::from_fn(|| queue.try_recv().ok()).count(), 16);
+        assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cache_pressure_preserves_displayed_prediction_until_real_invalidation() {
+        let (mut manager, sender, session) = manager();
+        let frame = Frame {
+            cols: 2,
+            rows: 2,
+            scrollback: gmux_protocol::Scrollback {
+                total: 20,
+                offset: 0,
+                len: 2,
+            },
+            ..Frame::default()
+        };
+        {
+            let mut session = session.borrow_mut();
+            session.frame = frame;
+            session.cache.configure(7, frame);
+            session.cache.rebase(100);
+            let mut cell = Cell::default();
+            cell.set_text("p").unwrap();
+            session.cache.insert(0, &vec![cell; 20], &[0; 10]);
+            session.scroll_serial.set(2);
+            session.scroll_target = Some(2);
+            assert!(session.predict(2));
+            session.cache.evict();
+        }
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: session.borrow().meta.clone(),
+                    frame: Some(frame),
+                    generation: 7,
+                    cache_origin: 100,
+                    cache: Some(Default::default()),
+                    ..Header::default()
+                },
+                cells: Vec::new(),
+            }))
+            .unwrap();
+        manager.poll();
+        assert!(session.borrow().prediction.is_some());
+        assert_eq!(session.borrow().snapshot().cells[0].text(), "p");
+        sender
+            .send(Ok(Packet {
+                header: Header {
+                    meta: session.borrow().meta.clone(),
+                    generation: 8,
+                    cache_origin: 100,
+                    ..Header::default()
+                },
+                cells: Vec::new(),
+            }))
+            .unwrap();
+        manager.poll();
+        assert!(session.borrow().prediction.is_none());
+    }
+
+    #[test]
+    fn manager_shutdown_releases_optional_storage_even_when_views_survive() {
+        let (mut manager, _, session) = manager();
+        let frame = Frame {
+            cols: 2,
+            rows: 2,
+            scrollback: gmux_protocol::Scrollback {
+                total: 20,
+                offset: 0,
+                len: 2,
+            },
+            ..Frame::default()
+        };
+        {
+            let mut session = session.borrow_mut();
+            session.frame = frame;
+            session.cache.configure(1, frame);
+            session
+                .cache
+                .insert(0, &vec![Cell::default(); 20], &[0; 10]);
+            assert!(session.predict(2));
+        }
+        manager.clear();
+        assert_eq!(session.borrow().cache.retained_bytes(), 0);
+        assert!(session.borrow().prediction.is_none());
+    }
+
     #[test]
     fn large_pastes_use_bounded_utf8_chunks_and_preserve_operation_options() {
         let text = "a界\n\0".repeat(transport::MAX_PASTE / 6);
@@ -2008,6 +2321,7 @@ mod tests {
                 daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
                 connection,
                 receiver,
+                focused: ValueCell::new(false),
                 sessions: HashMap::from([(1, session.clone())]),
                 metadata: HashMap::new(),
                 metadata_revision: 0,
