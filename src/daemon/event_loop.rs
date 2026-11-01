@@ -1,5 +1,6 @@
 //! Poll PTYs, frontend traffic, control requests, and save completions.
 use super::*;
+use crate::persistence::SaveMode;
 
 /// Run without initializing GTK or creating a graphics context.
 pub fn run() -> anyhow::Result<()> {
@@ -61,7 +62,7 @@ pub fn run() -> anyhow::Result<()> {
     daemon.remote_access = remote_access::RemoteAccess::start(daemon.id)?;
     let mut persistence = Worker::new(wake.clone());
     // Optional cache cleanup must not rewrite execution.json during startup.
-    persistence.submit(Save::Prune, false)?;
+    persistence.submit(Save::Prune, SaveMode::Explicit)?;
     let mut saving: Option<PendingControl> = None;
     let mut controls = VecDeque::new();
     let mut next_metadata = Instant::now();
@@ -219,7 +220,7 @@ pub fn run() -> anyhow::Result<()> {
             wake.drain();
         }
         for (id, result) in persistence.results() {
-            if saving.as_ref().is_some_and(|pending| pending.id == id) {
+            if saving.as_ref().is_some_and(|pending| pending.id() == id) {
                 saving.take().unwrap().complete(&mut daemon, result);
             } else if let Err(error) = result {
                 eprintln!("Could not save layout: {error}");
@@ -307,7 +308,7 @@ pub fn run() -> anyhow::Result<()> {
             let Some(request) = ControlRequest::decode(request) else {
                 continue;
             };
-            if saving.is_some() && request.body.mutates_state() {
+            if saving.is_some() && request.body.mutates_state() && !daemon.quitting {
                 controls.push_back(request);
             } else {
                 let pending = PendingControl::start(request, &mut daemon, &persistence);
@@ -411,22 +412,15 @@ pub fn run() -> anyhow::Result<()> {
         } else {
             daemon.flush_frontends();
         }
-        let layout_changed = !exited.is_empty();
-        for id in exited.drain(..) {
-            if !daemon.quitting {
-                daemon.close(id);
-            }
-        }
-        if layout_changed {
-            daemon.revision += 1;
-        }
-        daemon.sync_git(&wake);
-        if layout_changed
-            && !daemon.quitting
-            && let Err(error) = persistence.submit(daemon.state_save(), true)
+        let mutation = daemon.process_exits(exited.drain(..));
+        if let Progress::Complete(Completion::SaveFailed(error)) =
+            mutation
+                .effects
+                .start(&mut daemon, &persistence, SaveMode::Automatic)
         {
             eprintln!("Could not save layout after process exit: {error}");
         }
+        daemon.sync_git(&wake);
         if daemon.frontends.is_empty() {
             daemon.changed.clear();
             daemon.metadata_changed.clear();
@@ -451,24 +445,32 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
     }
+    let mut shutdown = None;
     if !daemon.checkpointed {
-        match daemon.prepare_checkpoint() {
-            Ok(checkpoint) => {
-                if let Err(error) = persistence.submit(Save::Checkpoint(checkpoint), false) {
-                    eprintln!("Could not save scrollback during shutdown: {error}");
-                }
+        let mutation = daemon.shutdown();
+        if let Some(warning) = mutation.value.warning {
+            eprintln!("{warning}");
+        }
+        match mutation
+            .effects
+            .start(&mut daemon, &persistence, SaveMode::Explicit)
+        {
+            Progress::Saving(pending) => shutdown = Some(pending),
+            Progress::Complete(Completion::SaveFailed(error)) => {
+                eprintln!("Could not save during shutdown: {error}");
             }
-            Err(error) => {
-                eprintln!("Could not capture scrollback during shutdown: {error}");
-                if let Err(error) = persistence.submit(daemon.state_save(), false) {
-                    eprintln!("Could not save layout during shutdown: {error}");
-                }
-            }
+            _ => unreachable!(),
         }
     }
     persistence.finish();
-    for (_, result) in persistence.results() {
-        if let Err(error) = result {
+    for (id, result) in persistence.results() {
+        if shutdown.as_ref().is_some_and(|pending| pending.id == id) {
+            if let Completion::SaveFailed(error) =
+                shutdown.take().unwrap().complete(&mut daemon, result)
+            {
+                eprintln!("Could not save during shutdown: {error}");
+            }
+        } else if let Err(error) = result {
             eprintln!("Could not save layout during shutdown: {error}");
         }
     }

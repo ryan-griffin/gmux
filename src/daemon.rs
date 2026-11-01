@@ -31,6 +31,7 @@ mod clipboard;
 mod commands;
 mod event_loop;
 mod frontend;
+mod mutation;
 mod network;
 mod prefetch;
 mod remote_access;
@@ -38,6 +39,7 @@ mod remote_access;
 use commands::{ControlRequest, PendingControl};
 pub use event_loop::run;
 use frontend::Frontend;
+use mutation::{Completion, Effects, Mutation, PendingEffects, Progress};
 
 const MAX_PENDING: usize = 64 * 1024 * 1024;
 const MAX_NOTIFICATIONS: usize = 64;
@@ -110,7 +112,6 @@ struct Daemon {
     snapshots: u64,
     sent_rows: u64,
     started: Instant,
-    pending_write: Option<Save>,
     checkpointed: bool,
     git: Option<crate::branch::Service>,
     git_dirty: bool,
@@ -178,7 +179,6 @@ impl Daemon {
             snapshots: 0,
             sent_rows: 0,
             started: Instant::now(),
-            pending_write: None,
             checkpointed: false,
             git: None,
             git_dirty: false,
@@ -384,9 +384,6 @@ impl Daemon {
     fn state_save(&mut self) -> Save {
         Save::Execution(self.saved_execution())
     }
-    fn prepare_state_save(&mut self) {
-        self.pending_write = Some(self.state_save());
-    }
 
     fn prepare_checkpoint(&mut self) -> anyhow::Result<crate::scrollback::Checkpoint> {
         let mut panes = Vec::new();
@@ -418,6 +415,36 @@ impl Daemon {
             }
         }
         crate::scrollback::Checkpoint::new(self.saved_execution(), panes, warnings)
+    }
+}
+
+#[cfg(test)]
+impl Daemon {
+    fn empty_for_test() -> Self {
+        Self {
+            clipboard: Default::default(),
+            sessions: HashMap::new(),
+            limits: Default::default(),
+            id: gmux_platform::unix::identity::daemon_id().unwrap(),
+            remote_access: Default::default(),
+            state: Default::default(),
+            frontends: HashMap::new(),
+            next_frontend: 0,
+            revision: 0,
+            changed: HashSet::new(),
+            metadata_changed: HashSet::new(),
+            notifications: HashMap::new(),
+            errors: HashMap::new(),
+            unread: HashMap::new(),
+            alert_sequence: 0,
+            quitting: false,
+            snapshots: 0,
+            sent_rows: 0,
+            started: Instant::now(),
+            checkpointed: false,
+            git: None,
+            git_dirty: false,
+        }
     }
 }
 

@@ -90,7 +90,9 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 
 - `event_loop.rs`: PTYs, sockets, signals, and disk-worker completions.
 - `frontend.rs`: stream input, paste assembly, subscriptions, and viewport output.
-- `commands.rs`: layout and control commands, including ordered saves.
+- `commands.rs`: layout and control handlers, ordered command replies, and save warnings.
+- `mutation.rs`: typed mutation outcomes, live execution revision publication,
+  save-before-apply scrollback settings, process-exit topology changes, and shutdown checkpoints.
 
 `crates/protocol/src/model.rs` and `model/state.rs` define daemon identities, qualified references,
 `ExecutionSnapshot`, and pane topology. A snapshot contains only live tabs;
@@ -100,6 +102,20 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 It constructs client snapshots by cloning only the shared tabs.
 `crates/platform/src/unix/storage.rs` loads JSON and writes files atomically.
 `src/persistence.rs` creates the daemon identity and runs the disk worker.
+
+Handlers return `Mutation<T>` with a result and an `Effects` variant. Execution
+changes are already live when returned. Starting their effects advances the
+revision and submits an execution snapshot to the worker. Persistence failure
+adds a warning to the command result without undoing processes or topology.
+Reply serialization and delivery do not change revisions. Process-exit batches
+use the same execution effects with automatic saves, which can coalesce.
+
+Scrollback settings use a different effect. The worker saves the candidate
+policy before the owner applies it to terminal engines. Failure leaves the
+running policy and history unchanged; partial application after a successful
+save reports per-pane failures without rolling back irreversible pruning.
+Shutdown effects preserve restart topology and track checkpoint completion.
+
 The detached launcher only starts a process and waits for its control handshake;
 the daemon validates and restores its own saved execution.
 `src/scrollback.rs` handles history checkpoints.

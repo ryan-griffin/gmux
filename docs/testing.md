@@ -107,6 +107,14 @@ ISO extra key. Engine tests separately check international layout data and exact
 negotiated encoder output. The Wayland fixture uses its default US keymap;
 non-US layout cases currently have direct encoder/model coverage.
 
+The `mutation` headless suite blocks execution writes to check live revision
+publication through reads and streams, ordered command replies, responsive PTYs,
+process exits during pending saves, warnings without rollback, abandoned callers,
+Stop topology preservation, and SIGTERM during a command save. Daemon unit tests
+cover submission failures and checkpoint retry completion. Worker tests check
+that automatic saves coalesce without crossing explicit writes. GTK connection
+tests reject stale topology and metadata after newer stream snapshots.
+
 The `scrollback-limits` headless suite checks saved policy and restart, complete
 request validation before mutation, blocked and failed saves, successive partial
 updates while saving, new and existing panes, and immediate local/remote cache updates with queued replies. Engine tests

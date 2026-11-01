@@ -1,5 +1,6 @@
 //! Control commands and their ordered persistence.
 use super::*;
+use crate::persistence::SaveMode;
 use gmux_protocol::control::*;
 
 pub(super) struct ControlRequest {
@@ -29,12 +30,10 @@ struct ControlReply {
     sender: std::sync::mpsc::SyncSender<Value>,
     result: anyhow::Result<ControlValue>,
     output_only: bool,
-    broadcast: bool,
 }
 pub(super) struct PendingControl {
     reply: ControlReply,
-    pub(super) id: u64,
-    limits: Option<gmux_protocol::retention::ScrollbackLimits>,
+    effects: PendingEffects,
 }
 impl PendingControl {
     pub(super) fn start(
@@ -48,123 +47,72 @@ impl PendingControl {
                 .try_send(json!({"error":"Daemon is shutting down"}));
             return None;
         }
-        let mut limits = None;
-        let mut broadcast = false;
         let mut output_only = false;
-        let result = (|| {
+        let outcome = (|| {
             if matches!(request.body, Request::Internal(InternalRequest::Hello)) {
-                return Ok(ControlValue::Hello(daemon.hello()));
+                return Ok(Mutation::unchanged(ControlValue::Hello(daemon.hello())));
             }
             let (request, only) = request
                 .body
                 .into_execution(|pane| daemon.resolve_pane(pane))?;
             output_only = only;
-            if let ExecutionRequest::Scrollback {
-                max_bytes,
-                max_lines,
-            } = request
-                && (max_bytes.is_some() || max_lines.is_some())
-            {
-                let candidate = daemon.limits.update(max_bytes, max_lines)?;
-                daemon.pending_write = Some(Save::Settings(candidate));
-                limits = Some(candidate);
-                return Ok(ControlValue::Execution(ExecutionReply::Scrollback(
-                    ScrollbackReply {
-                        limits: candidate,
-                        saved: Some(false),
-                        applied: Some(false),
-                        failures: vec![],
-                        error: None,
-                    },
-                )));
-            }
-            broadcast = request.changes_layout();
             daemon.control(request)
         })();
-        let failed = result.is_err();
+        let (result, effects) = match outcome {
+            Ok(Mutation { value, effects }) => (Ok(value), effects),
+            Err(error) => (Err(error), Effects::None),
+        };
         let reply = ControlReply {
             sender: request.reply,
             result,
             output_only,
-            broadcast,
         };
-        let save = daemon.pending_write.take();
-        if !failed && let Some(save) = save {
-            match worker.submit(save, false) {
-                Ok(id) => return Some(Self { reply, id, limits }),
-                Err(error) => {
-                    if limits.is_some() {
-                        reply
-                            .settings_failed(error.to_string(), daemon.limits)
-                            .send(daemon);
-                    } else {
-                        reply.save_failed(error.to_string()).send(daemon);
-                    }
-                }
+        match effects.start(daemon, worker, SaveMode::Explicit) {
+            Progress::Saving(effects) => Some(Self { reply, effects }),
+            Progress::Complete(completion) => {
+                reply.complete(completion).send(daemon);
+                None
             }
-        } else {
-            reply.send(daemon);
         }
-        None
+    }
+    pub(super) fn id(&self) -> u64 {
+        self.effects.id
     }
     pub(super) fn complete(self, daemon: &mut Daemon, result: Result<(), String>) {
-        let Self {
-            mut reply, limits, ..
-        } = self;
-        match result {
-            Ok(()) => {
-                if let Some(limits) = limits {
-                    reply.result = Ok(ControlValue::Execution(ExecutionReply::Scrollback(
-                        daemon.apply_scrollback_limits(limits),
-                    )));
-                }
-            }
-            Err(error) => {
-                reply = if limits.is_some() {
-                    reply.settings_failed(error, daemon.limits)
-                } else {
-                    reply.save_failed(error)
-                };
-            }
-        }
-        reply.send(daemon);
+        let completion = self.effects.complete(daemon, result);
+        self.reply.complete(completion).send(daemon);
     }
 }
 impl ControlReply {
-    fn settings_failed(
-        mut self,
-        error: String,
-        current: gmux_protocol::retention::ScrollbackLimits,
-    ) -> Self {
-        self.result = Ok(ControlValue::Execution(ExecutionReply::Scrollback(
-            ScrollbackReply {
-                limits: current,
-                saved: Some(false),
-                applied: Some(false),
-                failures: vec![],
-                error: Some(format!(
-                    "Could not durably save scrollback settings; running limits and history are unchanged: {error}"
-                )),
-            },
-        )));
-        self
-    }
-    fn save_failed(mut self, error: String) -> Self {
-        let warning = Some(format!("Could not save execution or scrollback: {error}"));
-        match &mut self.result {
-            Ok(ControlValue::Command(result)) => result.warning = warning,
-            Ok(ControlValue::Execution(ExecutionReply::Stopped(reply))) => reply.warning = warning,
-            _ => (),
+    fn complete(mut self, completion: Completion) -> Self {
+        match completion {
+            Completion::Saved => (),
+            Completion::Scrollback(reply) => {
+                self.result = Ok(ControlValue::Execution(ExecutionReply::Scrollback(reply)));
+            }
+            Completion::SaveFailed(error) => {
+                let warning = format!("Could not save execution or scrollback: {error}");
+                let target = match &mut self.result {
+                    Ok(ControlValue::Command(result)) => &mut result.warning,
+                    Ok(ControlValue::Execution(ExecutionReply::Stopped(reply))) => {
+                        &mut reply.warning
+                    }
+                    _ => unreachable!("Only execution mutations and shutdown save before replying"),
+                };
+                if let Some(previous) = target {
+                    previous.push_str("; ");
+                    previous.push_str(&warning);
+                } else {
+                    *target = Some(warning);
+                }
+            }
         }
         self
     }
-    fn send(self, daemon: &mut Daemon) {
+    fn send(self, daemon: &Daemon) {
         let value = self
             .result
             .and_then(|value| {
-                if self.broadcast {
-                    daemon.revision += 1;
-                }
                 Ok(match value {
                     ControlValue::Command(result) if self.output_only => {
                         serde_json::to_value(CommandOutcome {
@@ -186,29 +134,6 @@ impl ControlReply {
     }
 }
 impl Daemon {
-    fn apply_scrollback_limits(
-        &mut self,
-        limits: gmux_protocol::retention::ScrollbackLimits,
-    ) -> ScrollbackReply {
-        // Publication precedes irreversible pruning. Never roll back a policy
-        // after applying it to only part of the history.
-        self.limits = limits;
-        let mut failures = Vec::new();
-        for (&id, session) in &mut self.sessions {
-            if let Err(error) = session.set_scrollback_limits(limits) {
-                failures.push(PaneFailure {
-                    pane: id,
-                    error: error.to_string(),
-                });
-            }
-            self.changed.insert(id);
-        }
-        let applied = failures.is_empty();
-        ScrollbackReply {
-            limits, saved: Some(true), applied: Some(applied), failures,
-            error: (!applied).then(|| "Settings were saved, but some terminals could not apply them. Removed history cannot be restored".into()),
-        }
-    }
     pub(super) fn list(&mut self) -> anyhow::Result<ExecutionList> {
         self.refresh_state();
         let tabs: Vec<_> = self
@@ -264,12 +189,8 @@ impl Daemon {
             tabs,
         })
     }
-    fn result_with_state_save(&mut self, output: CommandOutput) -> ControlValue {
-        self.prepare_state_save();
-        ControlValue::Command(output.into())
-    }
-    fn control(&mut self, request: ExecutionRequest) -> anyhow::Result<ControlValue> {
-        match request {
+    fn control(&mut self, request: ExecutionRequest) -> anyhow::Result<Mutation<ControlValue>> {
+        let value: anyhow::Result<ControlValue> = match request {
             ExecutionRequest::New { directory, name } => {
                 let directory = directory.unwrap_or_else(gmux_platform::unix::paths::home);
                 let directory = gmux_platform::unix::paths::expand_home(&directory);
@@ -313,7 +234,9 @@ impl Daemon {
                         directories: HashMap::from([(pane, directory)]),
                     },
                 );
-                Ok(self.result_with_state_save(CommandOutput::New { tab, pane }))
+                return Ok(self.execution_mutation(ControlValue::Command(
+                    CommandOutput::New { tab, pane }.into(),
+                )));
             }
             ExecutionRequest::Split { pane: target, down } => {
                 let tab = self
@@ -343,11 +266,15 @@ impl Daemon {
                 let tab = self.state.tabs.iter_mut().find(|t| t.id == tab_id).unwrap();
                 tab.layout.split(target, pane, down);
                 tab.directories.insert(pane, directory);
-                Ok(self.result_with_state_save(CommandOutput::Split { pane }))
+                return Ok(self.execution_mutation(ControlValue::Command(
+                    CommandOutput::Split { pane }.into(),
+                )));
             }
             ExecutionRequest::Close { pane } => {
                 self.close(pane);
-                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
+                return Ok(self.execution_mutation(ControlValue::Command(
+                    CommandOutput::Done { ok: true }.into(),
+                )));
             }
             ExecutionRequest::CloseTab { tab } => {
                 let panes = self
@@ -361,7 +288,9 @@ impl Daemon {
                 for pane in panes {
                     self.close(pane);
                 }
-                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
+                return Ok(self.execution_mutation(ControlValue::Command(
+                    CommandOutput::Done { ok: true }.into(),
+                )));
             }
             ExecutionRequest::Rename { tab, name } => {
                 let name = name.trim();
@@ -374,7 +303,9 @@ impl Daemon {
                     .ok_or_else(|| anyhow::anyhow!("Tab {tab} does not exist"))?;
                 tab.name = name.to_owned();
                 tab.custom_name = true;
-                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
+                return Ok(self.execution_mutation(ControlValue::Command(
+                    CommandOutput::Done { ok: true }.into(),
+                )));
             }
             ExecutionRequest::ResetName { tab } => {
                 let tab = self
@@ -390,17 +321,39 @@ impl Daemon {
                 session.refresh_directory();
                 tab.name = session.title();
                 tab.custom_name = false;
-                Ok(self.result_with_state_save(CommandOutput::Done { ok: true }))
+                return Ok(self.execution_mutation(ControlValue::Command(
+                    CommandOutput::Done { ok: true }.into(),
+                )));
             }
-            ExecutionRequest::Scrollback { .. } => Ok(ControlValue::Execution(
-                ExecutionReply::Scrollback(ScrollbackReply {
-                    limits: self.limits,
-                    saved: None,
-                    applied: None,
-                    failures: vec![],
-                    error: None,
-                }),
-            )),
+            ExecutionRequest::Scrollback {
+                max_bytes,
+                max_lines,
+            } => {
+                if max_bytes.is_some() || max_lines.is_some() {
+                    let limits = self.limits.update(max_bytes, max_lines)?;
+                    return Ok(Mutation {
+                        value: ControlValue::Execution(ExecutionReply::Scrollback(
+                            ScrollbackReply {
+                                limits,
+                                saved: Some(false),
+                                applied: Some(false),
+                                failures: vec![],
+                                error: None,
+                            },
+                        )),
+                        effects: Effects::ScrollbackSettings(limits),
+                    });
+                }
+                Ok(ControlValue::Execution(ExecutionReply::Scrollback(
+                    ScrollbackReply {
+                        limits: self.limits,
+                        saved: None,
+                        applied: None,
+                        failures: vec![],
+                        error: None,
+                    },
+                )))
+            }
             ExecutionRequest::Status => {
                 Ok(ControlValue::Execution(ExecutionReply::Status(json!({
                     "version": transport::VERSION,
@@ -494,22 +447,11 @@ impl Daemon {
                 ExecutionReply::Content(self.sessions.get_mut(&id).unwrap().text()?.into()),
             )),
             ExecutionRequest::Stop => {
-                let checkpoint = self.prepare_checkpoint();
-                let warning = match checkpoint {
-                    Ok(checkpoint) => {
-                        self.pending_write = Some(Save::Checkpoint(checkpoint));
-                        None
-                    }
-                    Err(error) => {
-                        self.prepare_state_save();
-                        Some(format!("Could not capture scrollback: {error}"))
-                    }
-                };
-                self.checkpointed = true;
-                self.quitting = true;
-                Ok(ControlValue::Execution(ExecutionReply::Stopped(
-                    StopReply { ok: true, warning },
-                )))
+                let Mutation { value, effects } = self.shutdown();
+                return Ok(Mutation {
+                    value: ControlValue::Execution(ExecutionReply::Stopped(value)),
+                    effects,
+                });
             }
             ExecutionRequest::List => {
                 Ok(ControlValue::Execution(ExecutionReply::List(self.list()?)))
@@ -536,9 +478,144 @@ impl Daemon {
                     Acknowledgement { ok: true },
                 )))
             }
-        }
+        };
+        Ok(Mutation::unchanged(value?))
     }
     fn hello(&self) -> Value {
         json!({"version":transport::VERSION,"daemon":self.id,"pid":std::process::id(),"machine_kind":gmux_platform::unix::machine::machine_kind(),"hostname":gmux_platform::unix::machine::hostname(),"home_directory":gmux_platform::unix::paths::home(),"quitting":self.quitting})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn request(body: Value) -> (ControlRequest, mpsc::Receiver<Value>) {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let request = ControlRequest {
+            body: Request::decode(body).unwrap(),
+            reply,
+        };
+        (request, receiver)
+    }
+    fn daemon() -> Daemon {
+        let mut daemon = Daemon::empty_for_test();
+        daemon.state.tabs.push(ExecutionTab {
+            id: 1,
+            created_at: 1,
+            name: "Before".into(),
+            custom_name: true,
+            layout: PaneTree::Pane(2),
+            directories: HashMap::new(),
+        });
+        daemon
+    }
+
+    #[test]
+    fn live_revision_precedes_save_completion_and_reply_delivery() {
+        let mut daemon = daemon();
+        let mut worker = Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| {
+            anyhow::bail!("disk failure")
+        });
+        let (rename, reply) = request(
+            json!({"method":"_command", "command":{"method":"rename", "tab":1, "name":"After"}}),
+        );
+        let pending = PendingControl::start(rename, &mut daemon, &worker).unwrap();
+        assert_eq!(daemon.revision, 1);
+        assert!(reply.try_recv().is_err());
+        // A read observes the published live revision, even before the owner
+        // consumes the disk result. Reply delivery itself has no effects.
+        let (state, read) = request(json!({"method":"_state"}));
+        assert!(PendingControl::start(state, &mut daemon, &worker).is_none());
+        let state = read.recv().unwrap();
+        assert_eq!(state["revision"], 1);
+        assert_eq!(state["execution"]["tabs"][0]["name"], "After");
+        worker.finish();
+        let (id, result) = worker.results().next().unwrap();
+        assert_eq!(pending.id(), id);
+        pending.complete(&mut daemon, result);
+        let reply = reply.recv().unwrap();
+        assert_eq!(reply["revision"], 1);
+        assert!(
+            reply["result"]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("disk failure")
+        );
+        assert_eq!(daemon.state.tabs[0].name, "After");
+
+        let (invalid, reply) = request(json!({"method":"rename", "tab":1, "name":" "}));
+        assert!(PendingControl::start(invalid, &mut daemon, &worker).is_none());
+        assert!(reply.recv().unwrap()["error"].is_string());
+        assert_eq!(daemon.revision, 1);
+    }
+
+    #[test]
+    fn submission_failure_keeps_live_execution_but_does_not_apply_settings() {
+        let mut daemon = daemon();
+        let limits = daemon.limits;
+        let mut worker =
+            Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| Ok(()));
+        worker.finish();
+        let (rename, reply) = request(json!({"method":"rename", "tab":1, "name":"Live"}));
+        assert!(PendingControl::start(rename, &mut daemon, &worker).is_none());
+        assert!(
+            reply.recv().unwrap()["warning"]
+                .as_str()
+                .unwrap()
+                .contains("closed")
+        );
+        assert_eq!(daemon.revision, 1);
+        assert_eq!(daemon.state.tabs[0].name, "Live");
+
+        let (settings, reply) = request(json!({"method":"scrollback", "max_lines":0}));
+        assert!(PendingControl::start(settings, &mut daemon, &worker).is_none());
+        let reply = reply.recv().unwrap();
+        assert_eq!(reply["saved"], false);
+        assert_eq!(reply["applied"], false);
+        assert_eq!(daemon.limits, limits);
+        assert_eq!(daemon.revision, 1);
+    }
+
+    #[test]
+    fn shutdown_checkpoint_is_durable_only_after_success_and_failure_allows_retry() {
+        let mut daemon = Daemon::empty_for_test();
+        let mut worker = Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| {
+            anyhow::bail!("checkpoint failure")
+        });
+        let (stop, reply) = request(json!({"method":"stop"}));
+        let pending = PendingControl::start(stop, &mut daemon, &worker).unwrap();
+        assert!(daemon.quitting);
+        assert!(!daemon.checkpointed);
+        worker.finish();
+        let (_, result) = worker.results().next().unwrap();
+        pending.complete(&mut daemon, result);
+        assert!(
+            reply.recv().unwrap()["warning"]
+                .as_str()
+                .unwrap()
+                .contains("checkpoint failure")
+        );
+        assert!(!daemon.checkpointed);
+        assert_eq!(daemon.revision, 0);
+
+        let mut retry =
+            Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| Ok(()));
+        let Progress::Saving(pending) =
+            daemon
+                .shutdown()
+                .effects
+                .start(&mut daemon, &retry, SaveMode::Explicit)
+        else {
+            panic!("Expected shutdown save");
+        };
+        retry.finish();
+        let (_, result) = retry.results().next().unwrap();
+        assert!(matches!(
+            pending.complete(&mut daemon, result),
+            Completion::Saved
+        ));
+        assert!(daemon.checkpointed);
     }
 }
