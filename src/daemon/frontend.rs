@@ -1267,31 +1267,8 @@ mod tests {
     fn metadata_dirty_ids_survive_a_skipped_frontend_deadline() {
         // Exercise the fan-out and due filter without PTYs, snapshots or sleeps.
         // Actual progress values/expiry delivery are covered by the stream smoke.
-        let mut daemon = Daemon {
-            clipboard: Default::default(),
-            sessions: HashMap::new(),
-            limits: Default::default(),
-            id: gmux_platform::unix::identity::daemon_id().unwrap(),
-            remote_access: Default::default(),
-            state: Default::default(),
-            frontends: HashMap::new(),
-            next_frontend: 0,
-            revision: 0,
-            changed: HashSet::new(),
-            metadata_changed: HashSet::from([1]),
-            notifications: HashMap::new(),
-            errors: HashMap::new(),
-            unread: HashMap::new(),
-            alert_sequence: 0,
-            quitting: false,
-            snapshots: 0,
-            sent_rows: 0,
-            started: Instant::now(),
-            pending_write: None,
-            checkpointed: false,
-            git: None,
-            git_dirty: false,
-        };
+        let mut daemon = Daemon::empty_for_test();
+        daemon.metadata_changed.insert(1);
         let (mut fast, _fast_peer) = connection();
         let (mut slow, _slow_peer) = connection();
         fast.attached = true;

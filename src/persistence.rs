@@ -46,10 +46,16 @@ impl Save {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveMode {
+    Explicit,
+    Automatic,
+}
+
 struct Job {
     id: u64,
     save: Save,
-    automatic: bool,
+    mode: SaveMode,
 }
 #[derive(Default)]
 struct Jobs {
@@ -66,7 +72,7 @@ impl Worker {
     pub(crate) fn new(wake: gmux_platform::unix::ipc::Wake) -> Self {
         Self::with_save(wake, Save::write)
     }
-    fn with_save(
+    pub(crate) fn with_save(
         wake: gmux_platform::unix::ipc::Wake,
         save: impl Fn(Save) -> anyhow::Result<()> + Send + 'static,
     ) -> Self {
@@ -100,13 +106,13 @@ impl Worker {
             thread: Some(thread),
         }
     }
-    pub(crate) fn submit(&self, save: Save, automatic: bool) -> anyhow::Result<u64> {
+    pub(crate) fn submit(&self, save: Save, mode: SaveMode) -> anyhow::Result<u64> {
         let (lock, ready) = &*self.jobs;
         let mut jobs = lock.lock().unwrap();
         anyhow::ensure!(!jobs.closed, "Persistence worker is closed");
-        if automatic
+        if mode == SaveMode::Automatic
             && let Some(last) = jobs.queue.back_mut()
-            && last.automatic
+            && last.mode == SaveMode::Automatic
             && std::mem::discriminant(&last.save) == std::mem::discriminant(&save)
         {
             last.save = save;
@@ -118,11 +124,7 @@ impl Worker {
             id.checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("No save IDs remain"))?,
         );
-        jobs.queue.push_back(Job {
-            id,
-            save,
-            automatic,
-        });
+        jobs.queue.push_back(Job { id, save, mode });
         ready.notify_one();
         Ok(id)
     }
@@ -235,14 +237,14 @@ mod tests {
                 ..Default::default()
             })
         };
-        worker.submit(session(1), false).unwrap();
+        worker.submit(session(1), SaveMode::Explicit).unwrap();
         began.recv_timeout(Duration::from_secs(3)).unwrap();
-        worker.submit(session(2), true).unwrap();
-        worker.submit(session(3), true).unwrap();
-        worker.submit(session(4), false).unwrap();
-        worker.submit(session(5), true).unwrap();
-        worker.submit(Save::Prune, true).unwrap();
-        worker.submit(session(7), true).unwrap();
+        worker.submit(session(2), SaveMode::Automatic).unwrap();
+        worker.submit(session(3), SaveMode::Automatic).unwrap();
+        worker.submit(session(4), SaveMode::Explicit).unwrap();
+        worker.submit(session(5), SaveMode::Automatic).unwrap();
+        worker.submit(Save::Prune, SaveMode::Automatic).unwrap();
+        worker.submit(session(7), SaveMode::Automatic).unwrap();
         release.send(()).unwrap();
         worker.finish();
         assert_eq!(

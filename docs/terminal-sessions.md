@@ -65,11 +65,30 @@ GTK owns rendering, fonts, the clipboard, and accessible text. An `eventfd` wake
 the frontend when packets or requests arrive. Both sides process bounded batches
 to keep input and other panes responsive.
 
-A disk worker writes daemon state outside the PTY owner thread. Later layout
-mutations wait for earlier command saves; read-only requests and PTYs continue.
-Adjacent automatic execution saves coalesce. A separate client request worker
-persists workspace definitions and assignments together in one atomic write.
-Slow client disk writes leave the UI free to read the last committed state.
+A disk worker writes daemon state outside the PTY owner thread. Explicit layout,
+settings, and Stop mutations wait for earlier command saves; read-only requests,
+terminal input, and PTY processing continue. Execution changes advance the live
+revision before their save completes. Streams and reads can observe that state
+while the originating command waits for a durable reply. Save failures return a
+warning alongside the successful command result; live processes and topology
+remain changed. Delivering a reply does not advance the revision.
+
+Process exits remove panes and publish one revision per nonempty batch through
+the same execution effects. Their automatic saves follow queued writes, and
+adjacent automatic execution saves coalesce. A delayed command reply contains
+the current live topology and revision, including any intervening exits. Clients
+reject snapshots older than their last accepted revision.
+
+Scrollback settings save before the owner publishes and applies the policy.
+A failed save cannot prune history. During shutdown, exiting processes remain
+in restart topology and do not advance its revision. Stop waits for its checkpoint
+write and reports failures; a failed checkpoint gets one final attempt before
+exit. Signal shutdown waits for an outstanding explicit save, then checkpoints.
+The worker drains queued writes before the daemon releases its execution lock.
+
+A separate client request worker persists workspace definitions and assignments
+together in one atomic write. Slow client disk writes leave the UI free to read
+the last committed state.
 
 ## Persistence and recovery
 
@@ -102,9 +121,10 @@ Execution restores only from `execution.json`. Desktop records cannot create
 shells or alter pane topology. Presentation and workspace changes write desktop
 state without rewriting execution or history references. The daemon never loads
 or writes client profiles. Invalid client preferences or organization do not
-prevent a headless daemon from running. New execution saves commit before their
-client records. Missing presentation uses default split
-proportions and leaves a tab unassigned.
+prevent a headless daemon from running. GTK sends creation assignments after the
+execution command reply and preserves any execution save warning. A client
+presentation save cannot make unsaved execution durable. Missing presentation
+uses default split proportions and leaves a tab unassigned.
 
 Daemon identity survives restarts and address changes. Tab and pane IDs are scoped
 to that identity and never reused after deletion or restart. Workspace IDs belong
