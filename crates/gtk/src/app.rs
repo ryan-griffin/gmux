@@ -15,6 +15,7 @@ use crate::{
     theme::Theme,
 };
 use adw::prelude::*;
+use gmux_client::connections::ConfigurationRequest;
 use gtk::{gdk, gio, glib, pango};
 use serde_json::{Value, json};
 use std::{

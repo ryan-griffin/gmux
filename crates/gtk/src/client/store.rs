@@ -2,12 +2,13 @@
 use super::{
     control::{BackendReply, Command, CommandOutput},
     model::*,
+    request::{OrganizationRequest, RoutedRequest},
 };
 use gmux_client::ipc;
 use gmux_platform::unix::storage;
 use gmux_protocol::control as execution;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -330,68 +331,64 @@ impl Store {
         Ok(explicit.or_else(|| configured.cloned()))
     }
 
-    /// Execute on a request worker. Client-only requests never reach the daemon socket.
-    #[cfg(test)]
-    pub fn call(
-        self: &Arc<Self>,
-        endpoint: &ipc::Endpoint,
-        body: Value,
-    ) -> anyhow::Result<BackendReply> {
-        gmux_client::runtime::block_on(self.call_cancellable(
-            endpoint,
-            None,
-            body,
-            &gmux_platform::unix::ipc::Cancellation::default(),
-        ))
-    }
+    /// Execute typed work. Organization requests never reach a daemon socket.
     pub async fn call_cancellable(
         self: &Arc<Self>,
-        endpoint: &ipc::Endpoint,
-        local: impl Into<Option<DaemonId>>,
-        body: Value,
+        endpoint: ipc::Endpoint,
+        local: Option<DaemonId>,
+        request: RoutedRequest,
         cancellation: &gmux_platform::unix::ipc::Cancellation,
     ) -> anyhow::Result<BackendReply> {
-        let local = local.into();
-        if super::backend::organization_request(&body) {
-            let store = self.clone();
-            return gmux_client::runtime::blocking(move || store.call_organization(body, local))
-                .await;
-        }
-        match gmux_client::connections::request_at_async(
-            endpoint.clone(),
-            body,
-            Some(cancellation.clone()),
-        )
-        .await?
-        {
-            gmux_client::connections::Reply::Execution(reply) => Ok(BackendReply::Execution(reply)),
-            gmux_client::connections::Reply::Configuration(value) => Ok(BackendReply::Value(value)),
+        match request {
+            RoutedRequest::Organization(request) => {
+                let store = self.clone();
+                gmux_client::runtime::blocking(move || store.call_organization(request, local))
+                    .await
+            }
+            RoutedRequest::Execution { target, request } => {
+                let endpoint = target.into_endpoint(endpoint);
+                if matches!(
+                    request,
+                    execution::Request::Internal(execution::InternalRequest::Hello)
+                ) {
+                    return endpoint
+                        .call_async(json!({"method":"_hello"}), Some(cancellation))
+                        .await
+                        .map(BackendReply::Value);
+                }
+                endpoint
+                    .request_async(request, Some(cancellation))
+                    .await
+                    .map(BackendReply::Execution)
+            }
+            RoutedRequest::Configuration(request) => {
+                match gmux_client::connections::request_async(request, Some(cancellation.clone()))
+                    .await?
+                {
+                    gmux_client::connections::Reply::Execution(reply) => {
+                        Ok(BackendReply::Execution(reply))
+                    }
+                    gmux_client::connections::Reply::Configuration(value) => {
+                        Ok(BackendReply::Value(value))
+                    }
+                }
+            }
         }
     }
 
     fn call_organization(
         &self,
-        mut body: Value,
+        request: OrganizationRequest,
         local: Option<DaemonId>,
     ) -> anyhow::Result<BackendReply> {
-        let method = body["method"].as_str().unwrap_or("").to_owned();
-        let output = match method.as_str() {
-            "_desktop-save" => {
-                let revision = body["revision"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("Desktop save requires a revision"))?;
-                self.save_desktop(serde_json::from_value(body["desktop"].take())?, revision)?;
+        let output = match request {
+            OrganizationRequest::Save { desktop, revision } => {
+                self.save_desktop(desktop, revision)?;
                 return Ok(BackendReply::Value(json!({"ok":true})));
             }
-            "_desktop-tab" => Some(self.assign(serde_json::from_value(body["tab"].take())?)?),
-            "_command" if super::backend::organization_request(&body) => Some(self.command_at(
-                local,
-                local,
-                serde_json::from_value(body["command"].take())?,
-            )?),
-            _ => None,
+            OrganizationRequest::Assign(tab) => self.assign(tab)?,
+            OrganizationRequest::Command(command) => self.command_at(local, local, command)?,
         };
-        let output = output.ok_or_else(|| anyhow::anyhow!("Invalid organization request"))?;
         Ok(BackendReply::Organization {
             result: output.into(),
         })
@@ -490,29 +487,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
-    }
-
-    #[test]
-    fn desktop_save_requires_an_explicit_revision() {
-        let f = Fixture::new();
-        let mut request = json!({"method":"_desktop-save", "desktop":DesktopState::default()});
-        for revision in [Value::Null, json!("zero"), json!(-1)] {
-            request["revision"] = revision;
-            assert!(
-                f.store
-                    .call(&ipc::Endpoint::local(), request.clone())
-                    .is_err()
-            );
-            assert!(!f.store.path.exists());
-        }
-        request.as_object_mut().unwrap().remove("revision");
-        assert!(
-            f.store
-                .call(&ipc::Endpoint::local(), request.clone())
-                .is_err()
-        );
-        request["revision"] = json!(0);
-        assert!(f.store.call(&ipc::Endpoint::local(), request).is_ok());
     }
 
     #[test]

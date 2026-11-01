@@ -1,5 +1,6 @@
 //! Backend requests, state reconciliation, and presentation persistence.
 use super::*;
+use crate::client::request::RoutedRequest;
 
 mod reconcile;
 pub(super) use reconcile::Selection;
@@ -31,7 +32,7 @@ impl Selection {
 impl Ui {
     pub(super) fn request_busy(
         self: &Rc<Self>,
-        body: impl serde::Serialize,
+        body: impl Into<crate::client::request::Request>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<bool>) + 'static,
     ) {
         self.request_reply(body, move |ui, result| {
@@ -47,7 +48,7 @@ impl Ui {
     /// Configuration requests retain their dynamic JSON result contract.
     pub(super) fn request_configuration(
         self: &Rc<Self>,
-        body: impl serde::Serialize,
+        body: ConfigurationRequest,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<Value>) + 'static,
     ) {
         self.request_reply(body, move |ui, result| {
@@ -62,31 +63,25 @@ impl Ui {
     }
     pub(super) fn request_reply(
         self: &Rc<Self>,
-        body: impl serde::Serialize,
+        body: impl Into<crate::client::request::Request>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<BackendReply>) + 'static,
     ) {
-        let routed = serde_json::to_value(body).and_then(|body| {
-            self.sessions
-                .borrow()
-                .route_body(body)
-                .map_err(serde::ser::Error::custom)
-        });
+        let routed = self.sessions.borrow().route_request(body);
         let routed = match routed {
             Ok(value) => value,
             Err(error) => {
-                callback(self, Err(error.into()));
+                callback(self, Err(error));
                 return;
             }
         };
-        self.submit_request(routed.0, routed.1, callback);
+        self.submit_request(routed, callback);
     }
     fn submit_request(
         self: &Rc<Self>,
-        destination: Option<model::DaemonId>,
-        body: Value,
+        request: RoutedRequest,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<BackendReply>) + 'static,
     ) {
-        match self.backend.request(destination, body) {
+        match self.backend.request(request) {
             Ok(id) => {
                 self.pending.borrow_mut().insert(id, Box::new(callback));
             }
@@ -153,7 +148,10 @@ impl Ui {
                 return;
             }
         };
-        let creating_tab = route.destination.filter(|_| creates_tab);
+        let creating_tab = match &route.request {
+            RoutedRequest::Execution { target, .. } if creates_tab => Some(target.daemon()),
+            _ => None,
+        };
         if let Some(daemon) = creating_tab {
             *self
                 .pending_tab_creations
@@ -169,7 +167,7 @@ impl Ui {
         let selection = Selection::capture(self);
         self.save_session();
         self.command_count.set(self.command_count.get() + 1);
-        self.submit_request(route.destination, route.body, move |ui, result| {
+        self.submit_request(route.request, move |ui, result| {
             let projected = result.and_then(|value| ui.sessions.borrow_mut().project(value));
             let reply = match projected {
                 Ok(reply) => reply,

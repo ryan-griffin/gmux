@@ -837,7 +837,10 @@ impl Ui {
                 }
             };
             ui.request_reply(
-                json!({"method":"notify","pane":pane.id,"message":message}),
+                PaneRequest::Notify {
+                    pane: Some(pane.id),
+                    message,
+                },
                 move |_, result| {
                     let result = result.and_then(BackendReply::into_value);
                     let _ = reply.try_send(

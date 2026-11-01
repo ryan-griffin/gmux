@@ -360,6 +360,19 @@ mod tests {
     }
 
     #[test]
+    fn desktop_save_requires_an_explicit_revision() {
+        let mut request = json!({"method":"_desktop-save", "desktop":crate::client::model::DesktopState::default()});
+        for revision in [serde_json::Value::Null, json!("zero"), json!(-1)] {
+            request["revision"] = revision;
+            assert!(serde_json::from_value::<InternalRequest>(request.clone()).is_err());
+        }
+        request.as_object_mut().unwrap().remove("revision");
+        assert!(serde_json::from_value::<InternalRequest>(request.clone()).is_err());
+        request["revision"] = json!(0);
+        assert!(serde_json::from_value::<InternalRequest>(request).is_ok());
+    }
+
+    #[test]
     fn control_requests_reject_invalid_fields() {
         for wire in [
             json!({"method":"_focus","tab":"invalid"}),

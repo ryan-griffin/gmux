@@ -85,9 +85,10 @@ impl Catalog {
         })
     }
 }
+/// Client-owned configuration and local daemon lifecycle operations.
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
-enum Request {
+pub enum ConfigurationRequest {
     ConnectionList,
     RemoteAccessGet,
     RemoteAccessSet {
@@ -113,6 +114,12 @@ enum Request {
     },
     LocalDaemonStart,
     LocalDaemonStop,
+}
+
+// JSON forwarding exists only at the CLI/RPC boundary, never in typed work queues.
+#[derive(Deserialize)]
+#[serde(tag = "method", deny_unknown_fields)]
+enum ForwardRequest {
     #[serde(rename = "_connection-call")]
     ConnectionCall {
         connection: String,
@@ -184,48 +191,15 @@ pub async fn request_at_async(
     loop {
         let method = body["method"].as_str().unwrap_or("");
         if method == "_connection-call" {
-            let Request::ConnectionCall {
+            let ForwardRequest::ConnectionCall {
                 connection,
                 daemon,
                 request,
-            } = serde_json::from_value(body)?
-            else {
-                unreachable!()
-            };
+            } = serde_json::from_value(body)?;
             endpoint = ipc::Endpoint::remote(connection, daemon);
             body = request;
-        } else if method == "local-daemon-start" {
-            // Readiness and process waits use the I/O runtime, not a blocking slot.
-            serde_json::from_value::<Request>(body)?;
-            crate::local::ensure_daemon(cancellation.as_ref()).await?;
-            let mut state = ipc::Endpoint::local()
-                .call_async(json!({"method":"remote-access-get"}), cancellation.as_ref())
-                .await?;
-            let catalog = crate::runtime::blocking(Catalog::load).await?;
-            state["local"]["name"] = json!(catalog.local_name());
-            if let Some(cancellation) = &cancellation {
-                cancellation.check()?;
-            }
-            return Ok(Reply::Configuration(state));
-        } else if method == "local-daemon-stop" {
-            serde_json::from_value::<Request>(body)?;
-            let stopped = crate::local::stop_if_running(
-                &gmux_platform::unix::ipc::socket_path(),
-                cancellation.as_ref(),
-            )
-            .await?;
-            return Ok(Reply::Execution(match stopped {
-                Some(reply) => gmux_protocol::control::ExecutionReply::Stopped(reply),
-                None => gmux_protocol::control::ExecutionReply::Done(
-                    gmux_protocol::control::Acknowledgement { ok: true },
-                ),
-            }));
         } else if handles(method) {
-            return crate::runtime::blocking(move || {
-                call_configuration(&endpoint, body, cancellation.as_ref())
-            })
-            .await
-            .map(Reply::Configuration);
+            return request_async(serde_json::from_value(body)?, cancellation).await;
         } else {
             if method == "_hello" {
                 return endpoint
@@ -240,6 +214,43 @@ pub async fn request_at_async(
         }
     }
 }
+/// Dispatch an already decoded configuration request. Execution callers use Endpoint directly.
+pub async fn request_async(
+    request: ConfigurationRequest,
+    cancellation: Option<gmux_platform::unix::ipc::Cancellation>,
+) -> anyhow::Result<Reply> {
+    match request {
+        ConfigurationRequest::LocalDaemonStart => {
+            crate::local::ensure_daemon(cancellation.as_ref()).await?;
+            let mut state = ipc::Endpoint::local()
+                .call_async(json!({"method":"remote-access-get"}), cancellation.as_ref())
+                .await?;
+            let catalog = crate::runtime::blocking(Catalog::load).await?;
+            state["local"]["name"] = json!(catalog.local_name());
+            if let Some(cancellation) = &cancellation {
+                cancellation.check()?;
+            }
+            Ok(Reply::Configuration(state))
+        }
+        ConfigurationRequest::LocalDaemonStop => {
+            let stopped = crate::local::stop_if_running(
+                &gmux_platform::unix::ipc::socket_path(),
+                cancellation.as_ref(),
+            )
+            .await?;
+            Ok(Reply::Execution(match stopped {
+                Some(reply) => gmux_protocol::control::ExecutionReply::Stopped(reply),
+                None => gmux_protocol::control::ExecutionReply::Done(
+                    gmux_protocol::control::Acknowledgement { ok: true },
+                ),
+            }))
+        }
+        request => crate::runtime::blocking(move || configure(request, cancellation.as_ref()))
+            .await
+            .map(Reply::Configuration),
+    }
+}
+
 pub async fn call_at_async(
     endpoint: ipc::Endpoint,
     body: Value,
@@ -274,14 +285,31 @@ fn call_configuration(
         Some(c) => endpoint.call_cancellable(request, c),
         None => endpoint.call(request),
     };
+    if body["method"] == "_connection-call" {
+        let ForwardRequest::ConnectionCall {
+            connection,
+            daemon,
+            request,
+        } = serde_json::from_value(body)?;
+        return call(&ipc::Endpoint::remote(connection, daemon), request);
+    }
     if !handles(body["method"].as_str().unwrap_or("")) {
         return call(endpoint, body);
     }
     if let Some(c) = cancellation {
         c.check()?;
     }
-    let result = match serde_json::from_value::<Request>(body)? {
-        Request::ConnectionList => {
+    configure(serde_json::from_value(body)?, cancellation)
+}
+fn configure(
+    request: ConfigurationRequest,
+    cancellation: Option<&gmux_platform::unix::ipc::Cancellation>,
+) -> anyhow::Result<Value> {
+    if let Some(c) = cancellation {
+        c.check()?;
+    }
+    let result = match request {
+        ConfigurationRequest::ConnectionList => {
             let catalog = Catalog::load()?;
             let mut result = remote_access_status(cancellation)?;
             result["local"]["name"] = json!(catalog.local_name());
@@ -289,15 +317,15 @@ fn call_configuration(
             result["remotes"] = json!(catalog.remotes);
             result
         }
-        Request::RemoteAccessGet => remote_access_status(cancellation)?,
-        Request::RemoteAccessSet { remote_access } => {
+        ConfigurationRequest::RemoteAccessGet => remote_access_status(cancellation)?,
+        ConfigurationRequest::RemoteAccessSet { remote_access } => {
             set_remote_access(&remote_access, cancellation)?;
             json!({"remote_access":remote_access})
         }
-        Request::LocalDaemonStart | Request::LocalDaemonStop => {
+        ConfigurationRequest::LocalDaemonStart | ConfigurationRequest::LocalDaemonStop => {
             unreachable!("Local lifecycle requests are routed asynchronously")
         }
-        Request::ConnectionAdd {
+        ConfigurationRequest::ConnectionAdd {
             name,
             address,
             authentication,
@@ -375,7 +403,7 @@ fn call_configuration(
                 Ok(json!({"name":name,"daemon":client.daemon}))
             })?
         }
-        Request::ConnectionEdit {
+        ConfigurationRequest::ConnectionEdit {
             connection,
             daemon,
             name,
@@ -486,20 +514,17 @@ fn call_configuration(
                 })?
             }
         }
-        Request::ConnectionRemove { connection, daemon } => Catalog::edit(|catalog| {
-            anyhow::ensure!(
-                !catalog.is_local(&connection),
-                "The local connection cannot be removed"
-            );
-            let daemon = catalog.remote(&connection, daemon)?.daemon;
-            catalog.remotes.retain(|r| r.daemon != daemon);
-            Ok(json!({"ok":true,"daemon":daemon}))
-        })?,
-        Request::ConnectionCall {
-            connection,
-            daemon,
-            request,
-        } => call(&ipc::Endpoint::remote(connection, daemon), request)?,
+        ConfigurationRequest::ConnectionRemove { connection, daemon } => {
+            Catalog::edit(|catalog| {
+                anyhow::ensure!(
+                    !catalog.is_local(&connection),
+                    "The local connection cannot be removed"
+                );
+                let daemon = catalog.remote(&connection, daemon)?.daemon;
+                catalog.remotes.retain(|r| r.daemon != daemon);
+                Ok(json!({"ok":true,"daemon":daemon}))
+            })?
+        }
     };
     if let Some(c) = cancellation {
         c.check()?;
