@@ -11,7 +11,7 @@ pub use gmux_protocol::model::{
 };
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Layout {
-    Pane(u64),
+    Pane(PaneRef),
     Split {
         vertical: bool,
         first: Box<Layout>,
@@ -20,13 +20,13 @@ pub enum Layout {
     },
 }
 impl Layout {
-    fn first_pane(&self) -> u64 {
+    fn first_pane(&self) -> PaneRef {
         match self {
             Self::Pane(id) => *id,
             Self::Split { first, .. } => first.first_pane(),
         }
     }
-    pub fn contains(&self, target: u64) -> bool {
+    pub fn contains(&self, target: PaneRef) -> bool {
         match self {
             Self::Pane(id) => *id == target,
             Self::Split { first, second, .. } => first.contains(target) || second.contains(target),
@@ -135,8 +135,8 @@ impl Layout {
             copy(self, saved, Some((&splits, &saved_splits)));
         }
     }
-    pub fn ids(&self) -> Vec<u64> {
-        fn collect(layout: &Layout, ids: &mut Vec<u64>) {
+    pub fn ids(&self) -> Vec<PaneRef> {
+        fn collect(layout: &Layout, ids: &mut Vec<PaneRef>) {
             match layout {
                 Layout::Pane(id) => ids.push(*id),
                 Layout::Split { first, second, .. } => {
@@ -149,7 +149,8 @@ impl Layout {
         collect(self, &mut ids);
         ids
     }
-    pub fn split(&mut self, target: u64, new_id: u64, vertical: bool) -> bool {
+    #[cfg(test)]
+    pub fn split(&mut self, target: PaneRef, new_id: PaneRef, vertical: bool) -> bool {
         match self {
             Self::Pane(id) if *id == target => {
                 *self = Self::Split {
@@ -166,7 +167,7 @@ impl Layout {
             }
         }
     }
-    pub fn remove(self, target: u64) -> Option<Self> {
+    pub fn remove(self, target: PaneRef) -> Option<Self> {
         match self {
             Self::Pane(id) => (id != target).then_some(Self::Pane(id)),
             Self::Split {
@@ -188,21 +189,26 @@ impl Layout {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TabState {
-    pub daemon: DaemonId,
-    pub id: u64,
+    pub id: TabRef,
     pub created_at: u64,
     pub name: String,
     pub custom_name: bool,
     pub workspace: Option<u64>,
     pub layout: Layout,
-    #[serde(deserialize_with = "gmux_protocol::model::pane_directories")]
-    pub directories: HashMap<u64, PathBuf>,
-    pub active: u64,
+    #[serde(with = "directories")]
+    pub directories: HashMap<PaneRef, PathBuf>,
+    pub active: PaneRef,
 }
 
 impl TabState {
     pub fn validate(&self) -> anyhow::Result<()> {
-        gmux_protocol::model::validate_ids(self.id, self.layout.ids())
+        validate_layout(self.id, &self.layout)?;
+        anyhow::ensure!(self.layout.contains(self.active), "Invalid active pane");
+        anyhow::ensure!(
+            self.directories.keys().all(|id| self.layout.contains(*id)),
+            "Invalid pane directory"
+        );
+        Ok(())
     }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -211,7 +217,7 @@ pub struct Session {
     // A client view assembled from execution and organization.
     pub tabs: Vec<TabState>,
     pub filter: TabFilter,
-    pub active: u64,
+    pub active: Option<TabRef>,
     pub width: i32,
     pub height: i32,
     pub maximized: bool,
@@ -283,9 +289,131 @@ impl WorkspaceCatalog {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopTab {
+    pub reference: TabRef,
+    pub workspace: Option<u64>,
+    pub layout: Layout,
+    pub active: PaneRef,
+    pub name: String,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopState {
+    pub tabs: Vec<DesktopTab>,
+    pub filter: TabFilter,
+    pub active: Option<TabRef>,
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+impl TabState {
+    /// Saved presentation can decorate execution, but cannot create panes or change topology.
+    pub fn from_execution(
+        daemon: DaemonId,
+        tab: &ExecutionTab,
+        saved: Option<&DesktopTab>,
+    ) -> Self {
+        let mut layout = Layout::from_execution(daemon, &tab.layout);
+        if let Some(saved) = saved {
+            layout.update_ratios(&saved.layout);
+        }
+        let active = saved
+            .filter(|saved| layout.contains(saved.active))
+            .map_or_else(|| layout.first_pane(), |saved| saved.active);
+        Self {
+            id: TabRef { daemon, id: tab.id },
+            created_at: tab.created_at,
+            name: if tab.custom_name {
+                tab.name.clone()
+            } else {
+                saved.map_or_else(|| tab.name.clone(), |saved| saved.name.clone())
+            },
+            custom_name: tab.custom_name,
+            workspace: saved.and_then(|saved| saved.workspace),
+            layout,
+            directories: tab
+                .directories
+                .iter()
+                .map(|(&id, path)| (PaneRef { daemon, id }, path.clone()))
+                .collect(),
+            active,
+        }
+    }
+}
+
+impl Layout {
+    fn from_execution(daemon: DaemonId, tree: &PaneTree) -> Self {
+        match tree {
+            PaneTree::Pane(id) => Self::Pane(PaneRef { daemon, id: *id }),
+            PaneTree::Split {
+                vertical,
+                first,
+                second,
+            } => Self::Split {
+                vertical: *vertical,
+                first: Box::new(Self::from_execution(daemon, first.as_ref())),
+                second: Box::new(Self::from_execution(daemon, second.as_ref())),
+                ratio: 0.5,
+            },
+        }
+    }
+}
+/// A desktop layout belongs to exactly one daemon and cannot alias its tab ID.
+pub fn validate_layout(tab: TabRef, layout: &Layout) -> anyhow::Result<()> {
+    let ids = layout.ids();
+    anyhow::ensure!(
+        ids.iter().all(|pane| pane.daemon == tab.daemon),
+        "Layout contains panes from another daemon"
+    );
+    gmux_protocol::model::validate_ids(tab.id, ids.into_iter().map(|pane| pane.id).collect())
+}
+
+mod directories {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        value: &HashMap<PaneRef, PathBuf>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(value.len()))?;
+        for entry in value {
+            seq.serialize_element(&entry)?;
+        }
+        seq.end()
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<PaneRef, PathBuf>, D::Error> {
+        let entries = Vec::<(PaneRef, PathBuf)>::deserialize(deserializer)?;
+        let mut result = HashMap::with_capacity(entries.len());
+        for (pane, path) in entries {
+            if result.insert(pane, path).is_some() {
+                return Err(serde::de::Error::custom("Duplicate pane directory"));
+            }
+        }
+        Ok(result)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pane(id: u64) -> Layout {
+        Layout::Pane(p(id))
+    }
+    fn p(id: u64) -> PaneRef {
+        PaneRef {
+            daemon: DaemonId::from_bytes([1; 16]),
+            id,
+        }
+    }
+    fn t(id: u64) -> TabRef {
+        TabRef {
+            daemon: DaemonId::from_bytes([1; 16]),
+            id,
+        }
+    }
 
     fn split(first: Layout, second: Layout, vertical: bool, ratio: f64) -> Layout {
         Layout::Split {
@@ -298,14 +426,25 @@ mod tests {
 
     #[test]
     fn ratio_updates_require_exact_pane_identity_order_and_branch_boundaries() {
-        use Layout::Pane;
-        let current = split(split(Pane(1), Pane(2), true, 0.4), Pane(3), false, 0.3);
+        let current = split(split(pane(1), pane(2), true, 0.4), pane(3), false, 0.3);
+        let foreign = |id| {
+            Layout::Pane(PaneRef {
+                daemon: DaemonId::from_bytes([2; 16]),
+                id,
+            })
+        };
         for saved in [
-            split(split(Pane(1), Pane(9), true, 0.8), Pane(3), false, 0.7),
-            split(split(Pane(2), Pane(1), true, 0.8), Pane(3), false, 0.7),
-            split(Pane(1), split(Pane(2), Pane(3), true, 0.8), false, 0.7),
-            split(split(Pane(1), Pane(2), true, 0.8), Pane(3), true, 0.7),
-            split(split(Pane(1), Pane(2), true, 0.8), Pane(4), false, 0.7),
+            split(
+                split(foreign(1), foreign(2), true, 0.8),
+                foreign(3),
+                false,
+                0.7,
+            ),
+            split(split(pane(1), pane(9), true, 0.8), pane(3), false, 0.7),
+            split(split(pane(2), pane(1), true, 0.8), pane(3), false, 0.7),
+            split(pane(1), split(pane(2), pane(3), true, 0.8), false, 0.7),
+            split(split(pane(1), pane(2), true, 0.8), pane(3), true, 0.7),
+            split(split(pane(1), pane(2), true, 0.8), pane(4), false, 0.7),
         ] {
             let mut updated = current.clone();
             updated.update_ratios(&saved);
@@ -315,27 +454,26 @@ mod tests {
 
     #[test]
     fn regrouped_children_keep_matching_ancestor_and_sibling_ratios() {
-        use Layout::Pane;
         let changed = split(
-            split(split(Pane(1), Pane(2), false, 0.5), Pane(3), false, 0.5),
-            Pane(4),
+            split(split(pane(1), pane(2), false, 0.5), pane(3), false, 0.5),
+            pane(4),
             false,
             0.5,
         );
         let mut current = split(
             changed.clone(),
-            split(Pane(5), split(Pane(6), Pane(7), true, 0.5), false, 0.5),
+            split(pane(5), split(pane(6), pane(7), true, 0.5), false, 0.5),
             true,
             0.5,
         );
         let saved = split(
             split(
-                Pane(1),
-                split(Pane(2), split(Pane(3), Pane(4), false, 0.8), false, 0.8),
+                pane(1),
+                split(pane(2), split(pane(3), pane(4), false, 0.8), false, 0.8),
                 false,
                 0.8,
             ),
-            split(Pane(5), split(Pane(6), Pane(7), true, 0.6), false, 0.7),
+            split(pane(5), split(pane(6), pane(7), true, 0.6), false, 0.7),
             true,
             0.9,
         );
@@ -344,7 +482,7 @@ mod tests {
             current,
             split(
                 changed,
-                split(Pane(5), split(Pane(6), Pane(7), true, 0.6), false, 0.7),
+                split(pane(5), split(pane(6), pane(7), true, 0.6), false, 0.7),
                 true,
                 0.9,
             )
@@ -353,30 +491,28 @@ mod tests {
 
     #[test]
     fn differing_orientation_blocks_descendants_but_not_siblings() {
-        use Layout::Pane;
-        let blocked = split(split(Pane(1), Pane(2), false, 0.4), Pane(3), true, 0.3);
+        let blocked = split(split(pane(1), pane(2), false, 0.4), pane(3), true, 0.3);
         let mut current = split(
             blocked.clone(),
-            split(Pane(4), Pane(5), true, 0.5),
+            split(pane(4), pane(5), true, 0.5),
             false,
             0.5,
         );
         let saved = split(
-            split(split(Pane(1), Pane(2), false, 0.8), Pane(3), false, 0.7),
-            split(Pane(4), Pane(5), true, 0.6),
+            split(split(pane(1), pane(2), false, 0.8), pane(3), false, 0.7),
+            split(pane(4), pane(5), true, 0.6),
             false,
             0.9,
         );
         current.update_ratios(&saved);
         assert_eq!(
             current,
-            split(blocked, split(Pane(4), Pane(5), true, 0.6), false, 0.9)
+            split(blocked, split(pane(4), pane(5), true, 0.6), false, 0.9)
         );
     }
 
     #[test]
     fn saved_ratios_clamp_finite_values_and_ignore_nonfinite_values() {
-        use Layout::Pane;
         for (saved_ratio, expected) in [
             (f64::NAN, 0.3),
             (f64::INFINITY, 0.3),
@@ -387,17 +523,17 @@ mod tests {
             (0.95, 0.95),
             (2.0, 0.95),
         ] {
-            let mut current = split(split(Pane(1), Pane(2), true, 0.5), Pane(3), false, 0.3);
+            let mut current = split(split(pane(1), pane(2), true, 0.5), pane(3), false, 0.3);
             let saved = split(
-                split(Pane(1), Pane(2), true, 0.8),
-                Pane(3),
+                split(pane(1), pane(2), true, 0.8),
+                pane(3),
                 false,
                 saved_ratio,
             );
             current.update_ratios(&saved);
             assert_eq!(
                 current,
-                split(split(Pane(1), Pane(2), true, 0.8), Pane(3), false, expected),
+                split(split(pane(1), pane(2), true, 0.8), pane(3), false, expected),
                 "saved ratio: {saved_ratio}"
             );
         }
@@ -433,127 +569,40 @@ mod tests {
     }
     #[test]
     fn removing_a_nested_pane_keeps_its_sibling() {
-        let mut layout = Layout::Pane(1);
-        assert!(layout.split(1, 2, false));
-        assert!(layout.split(2, 3, true));
-        assert_eq!(layout.ids(), vec![1, 2, 3]);
-        let layout = layout.remove(2).unwrap();
-        assert_eq!(layout.ids(), vec![1, 3]);
-        assert_eq!(layout.remove(1).unwrap().ids(), vec![3]);
+        let mut layout = pane(1);
+        assert!(layout.split(p(1), p(2), false));
+        assert!(layout.split(p(2), p(3), true));
+        assert_eq!(layout.ids(), vec![p(1), p(2), p(3)]);
+        let layout = layout.remove(p(2)).unwrap();
+        assert_eq!(layout.ids(), vec![p(1), p(3)]);
+        assert_eq!(layout.remove(p(1)).unwrap().ids(), vec![p(3)]);
     }
     #[test]
     fn tab_states_reject_duplicate_and_overflowing_ids() {
         let mut saved = TabState {
-            daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
-            id: 1,
+            id: t(1),
             created_at: 1,
             name: "Project".into(),
             workspace: None,
             custom_name: false,
-            layout: Layout::Pane(2),
+            layout: pane(2),
             directories: HashMap::new(),
-            active: 2,
+            active: p(2),
         };
         assert!(saved.validate().is_ok());
         for id in [0, 2, u64::MAX] {
-            saved.id = id;
+            saved.id = t(id);
             assert!(saved.validate().is_err());
         }
-        saved.id = 1;
+        saved.id = t(1);
         saved.layout = Layout::Split {
             vertical: false,
-            first: Box::new(Layout::Pane(2)),
-            second: Box::new(Layout::Pane(2)),
+            first: Box::new(pane(2)),
+            second: Box::new(pane(2)),
             ratio: 0.5,
         };
         assert!(saved.validate().is_err());
-        saved.layout = Layout::Pane(u64::MAX);
+        saved.layout = pane(u64::MAX);
         assert!(saved.validate().is_err());
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DesktopTab {
-    pub reference: TabRef,
-    pub workspace: Option<u64>,
-    pub layout: Layout,
-    pub active: PaneRef,
-    pub name: String,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DesktopState {
-    pub tabs: Vec<DesktopTab>,
-    pub filter: TabFilter,
-    pub active: Option<TabRef>,
-    pub width: i32,
-    pub height: i32,
-    pub maximized: bool,
-}
-impl TabState {
-    /// Saved presentation can decorate execution, but cannot create panes or change topology.
-    pub fn from_execution(
-        daemon: DaemonId,
-        tab: &ExecutionTab,
-        saved: Option<&DesktopTab>,
-    ) -> Self {
-        let mut layout = Layout::from(&tab.layout);
-        if let Some(saved) = saved {
-            layout.update_ratios(&saved.layout);
-        }
-        let active = saved
-            .filter(|saved| saved.active.daemon == daemon && layout.contains(saved.active.id))
-            .map_or_else(|| layout.first_pane(), |saved| saved.active.id);
-        Self {
-            daemon,
-            id: tab.id,
-            created_at: tab.created_at,
-            name: if tab.custom_name {
-                tab.name.clone()
-            } else {
-                saved.map_or_else(|| tab.name.clone(), |saved| saved.name.clone())
-            },
-            custom_name: tab.custom_name,
-            workspace: saved.and_then(|saved| saved.workspace),
-            layout,
-            directories: tab.directories.clone(),
-            active,
-        }
-    }
-}
-
-impl From<&PaneTree> for Layout {
-    fn from(tree: &PaneTree) -> Self {
-        match tree {
-            PaneTree::Pane(id) => Self::Pane(*id),
-            PaneTree::Split {
-                vertical,
-                first,
-                second,
-            } => Self::Split {
-                vertical: *vertical,
-                first: Box::new(Self::from(first.as_ref())),
-                second: Box::new(Self::from(second.as_ref())),
-                ratio: 0.5,
-            },
-        }
-    }
-}
-impl From<&Layout> for PaneTree {
-    fn from(layout: &Layout) -> Self {
-        match layout {
-            Layout::Pane(id) => Self::Pane(*id),
-            Layout::Split {
-                vertical,
-                first,
-                second,
-                ..
-            } => Self::Split {
-                vertical: *vertical,
-                first: Box::new(Self::from(first.as_ref())),
-                second: Box::new(Self::from(second.as_ref())),
-            },
-        }
     }
 }

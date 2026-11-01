@@ -26,6 +26,11 @@ the client chooses the combined order. Notifications, output, and tab selection
 do not change that order. Machines should have synchronized clocks for chronology
 across connections. Workspaces belong to the GTK app.
 
+GTK identifies each tab and pane by its daemon identity and daemon-local ID.
+The GTK socket's `list` response includes numeric `id` fields and qualified
+`reference` fields; layout leaves contain qualified pane references. Commands
+accept numeric selectors with the connection that owns them.
+
 Each window keeps its active tab and pane, workspace filter, sidebar search and
 visibility, split proportions, zoom, Find query, selection, scroll position,
 and window dimensions. One terminal engine serves all views of a pane. Input
@@ -80,6 +85,7 @@ State lives under `$XDG_CONFIG_HOME/gmux/`, normally `~/.config/gmux/`:
 - `clients/gtk/state.json`: frontend-owned workspace definitions, starting
   directories keyed by daemon identity, workspace ID allocation, qualified tab
   presentation and assignments, selection, split proportions, and window defaults.
+  Layout leaves and pane selections contain both the daemon identity and pane ID.
 - `connections.json`: client-owned local alias, remote names, addresses,
   authentication file paths, and pinned identities.
 - `remote-access.json`: daemon-owned TCP listener settings.

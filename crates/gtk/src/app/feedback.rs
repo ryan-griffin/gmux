@@ -1,6 +1,7 @@
 //! Transient failures and the active tab's ongoing connection state.
 use super::*;
 use crate::client::connections::ConnectionStatus;
+use crate::model::PaneRef;
 use std::time::Instant;
 
 #[derive(Default)]
@@ -10,7 +11,7 @@ pub(super) struct Errors {
 }
 
 struct RecentError {
-    pane: u64,
+    pane: PaneRef,
     title: String,
     details: String,
     shown_at: Instant,
@@ -21,7 +22,7 @@ impl Errors {
         self: &Rc<Self>,
         window: &adw::ApplicationWindow,
         overlay: &adw::ToastOverlay,
-        pane: u64,
+        pane: PaneRef,
         title: &str,
         details: &str,
     ) {
@@ -87,7 +88,7 @@ impl Errors {
 impl Ui {
     pub(super) fn pane_error(
         &self,
-        pane: u64,
+        pane: PaneRef,
         source: crate::terminal::ErrorSource,
         summary: &str,
         details: &str,
@@ -100,7 +101,7 @@ impl Ui {
         // The banner describes unavailable connections. Ignore the resulting
         // per-pane errors, including keys pressed while reconnecting.
         if matches!(source, crate::terminal::ErrorSource::Session)
-            && !sessions.connected(sessions.pane_ref(pane).daemon)
+            && !sessions.connected(pane.daemon)
         {
             return;
         }
@@ -119,12 +120,12 @@ impl Ui {
 
     pub(super) fn refresh_connection_banner(&self) {
         let tabs = self.tabs.borrow();
-        let Some(tab) = tabs.iter().find(|tab| tab.id == self.active.get()) else {
+        let Some(tab) = tabs.iter().find(|tab| Some(tab.id) == self.active.get()) else {
             self.connection_banner.set_revealed(false);
             return;
         };
         let sessions = self.sessions.borrow();
-        let status = sessions.connection_status(sessions.tab_ref(tab.id).daemon);
+        let status = sessions.connection_status(tab.id.daemon);
         let state = match status {
             ConnectionStatus::Connected => {
                 self.connection_banner.set_revealed(false);

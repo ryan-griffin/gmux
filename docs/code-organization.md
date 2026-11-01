@@ -197,8 +197,8 @@ and saved connections stay with their owners.
 `crates/gtk/src/client/` owns workspaces, assignments, split proportions, filters,
 and window defaults. Its store shares immutable snapshots between GTK windows
 and saves organization atomically. Its connection adapter combines execution
-snapshots with GTK organization, maps qualified daemon IDs to window handles,
-and chooses tab order. It uses the client library for connections and execution.
+snapshots with GTK organization and chooses tab order. Qualified references
+identify the same object in every window without a handle registry. It uses the client library for connections and execution.
 Workspace operations never cross the execution protocol. For each daemon, GTK
 retains the greatest ID observed in accepted topology. An absent tab at or below
 that ID can be pruned from saved organization, including when the highest live
@@ -207,8 +207,11 @@ remain saved until execution catches up. A tab created and closed before this
 client observes it can leave an assignment until the client sees a later ID.
 
 `client/request.rs` defines typed execution, organization, and configuration
-operations. Window routing resolves handles once and attaches a local target or a
-remote name pinned to its daemon identity. The backend selects ordered queues
+operations. GTK carries `PaneRef` and `TabRef` through layouts, terminal views, selections,
+callbacks, and organization. Socket and CLI boundaries qualify numeric selectors
+with the selected daemon and validate the object kind. Routing selects one daemon,
+rejects requests that mix connections, and converts qualified targets to daemon-local
+IDs for transport. Remote targets retain their pinned daemon identity. The backend selects ordered queues
 from those variants; workers carry the request types through dispatch and encode
 execution requests only when writing to a socket. JSON forwarding envelopes belong
 to CLI/RPC boundaries. Configuration replies and status diagnostics remain dynamic.
@@ -223,6 +226,5 @@ Closing a window cancels execution requests and leaves its pending organization
 saves with the application. Finished workers are reclaimed without blocking GTK;
 application exit waits for remaining saves.
 
-Clients prune handles after reconciling views and finishing outstanding commands.
 A burst of stream snapshots produces one combined GTK view per poll. Cached
 execution survives disconnection until a new snapshot confirms what changed.

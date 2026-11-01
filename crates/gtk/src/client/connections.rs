@@ -1,16 +1,15 @@
-//! Client-local streams, qualified handles, and command routing across daemons.
+//! Client-local streams, qualified identities, and command routing across daemons.
 use super::request::{self, Request as WorkerRequest, RoutedRequest, Target};
 use super::{
     Snapshot, Store, Subscription,
     control::{BackendReply, Command, CommandOutput, CommandReply, CommandResult, TabCommand},
     model::{
-        DaemonId, DesktopState, DesktopTab, ExecutionSnapshot, Layout, Machine, MachineKind,
-        PaneRef, Session, TabRef, TabState,
+        DaemonId, DesktopState, DesktopTab, ExecutionSnapshot, Machine, MachineKind, PaneRef,
+        Session, TabRef, TabState,
     },
 };
 use gmux_client::{ipc, remote::SessionHandle};
 use gmux_protocol::{control as execution, session::SessionUpdate, theme::Theme};
-use serde_json::{Value, json};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
@@ -22,6 +21,14 @@ use std::{
 use gmux_client::connection::Connection;
 pub use gmux_client::connection::Status as ConnectionStatus;
 
+/// Stream events qualify pane targets as they enter the GTK adapter.
+pub enum ClipboardEvent {
+    Write(gmux_protocol::clipboard::Write),
+    Read {
+        pane: PaneRef,
+        event: gmux_protocol::clipboard::ReadEvent,
+    },
+}
 struct Origin {
     machine: Machine,
     home_directory: Option<PathBuf>,
@@ -60,13 +67,12 @@ pub struct Connections {
     client_revision: u64,
     _subscription: Subscription,
     origins: HashMap<DaemonId, Origin>,
-    handles: Handles,
     revision: u64,
     desktop: DesktopState,
     organization: Arc<Snapshot>,
     wake: gmux_platform::unix::ipc::Wake,
     snapshot: Option<CommandReply>,
-    attached: HashSet<u64>,
+    attached: HashSet<PaneRef>,
     focused: Cell<bool>,
     frame_interval: Duration,
     status_changed: bool,
@@ -77,10 +83,10 @@ pub struct Route {
 }
 pub enum Assignment {
     CreatedTab { workspace: Option<u64> },
-    CreatedWorkspace { tab: u64 },
+    CreatedWorkspace { tab: TabRef },
 }
 impl Assignment {
-    pub fn resolve(self, output: &CommandOutput) -> Option<(u64, Option<u64>)> {
+    pub fn resolve(self, output: &CommandOutput) -> Option<(TabRef, Option<u64>)> {
         match (self, output) {
             (Self::CreatedTab { workspace }, CommandOutput::New { tab, .. }) => {
                 Some((*tab, workspace))
@@ -89,36 +95,6 @@ impl Assignment {
                 Some((tab, Some(*workspace)))
             }
             _ => None,
-        }
-    }
-}
-#[derive(Default)]
-struct Handles {
-    ids: HashMap<(DaemonId, u64), u64>,
-    references: HashMap<u64, (DaemonId, u64)>,
-    next: u64,
-    dirty: bool,
-    execution_count: usize,
-}
-impl Handles {
-    fn get(&mut self, daemon: DaemonId, id: u64) -> u64 {
-        if id == 0 {
-            return 0;
-        }
-        *self.ids.entry((daemon, id)).or_insert_with(|| {
-            self.next += 1;
-            self.references.insert(self.next, (daemon, id));
-            self.dirty = true;
-            self.next
-        })
-    }
-}
-fn layout_ids(layout: &mut Layout, map: &mut impl FnMut(u64) -> u64) {
-    match layout {
-        Layout::Pane(id) => *id = map(*id),
-        Layout::Split { first, second, .. } => {
-            layout_ids(first, map);
-            layout_ids(second, map);
         }
     }
 }
@@ -156,7 +132,6 @@ impl Connections {
             client_revision,
             _subscription: subscription,
             origins,
-            handles: Handles::default(),
             revision: 0,
             desktop: organization.desktop.clone(),
             organization,
@@ -196,6 +171,7 @@ impl Connections {
         self.local_enabled = false;
         if let Some(id) = self.local.take() {
             self.origins.remove(&id);
+            self.attached.retain(|pane| pane.daemon != id);
             if self.primary == Some(id) {
                 self.primary = None;
             }
@@ -221,14 +197,6 @@ impl Connections {
         let mut reply = self.combined(CommandOutput::Done { ok: true }.into());
         reply.desktop = Some(self.desktop.clone());
         reply
-    }
-    fn required_default(&self) -> anyhow::Result<DaemonId> {
-        self.primary.ok_or_else(|| {
-            anyhow::anyhow!("Enable the Local Daemon or add a connection in Manage Connections")
-        })
-    }
-    fn handle(&mut self, daemon: DaemonId, id: u64) -> u64 {
-        self.handles.get(daemon, id)
     }
     pub fn default_daemon(&self) -> Option<DaemonId> {
         self.primary
@@ -261,43 +229,12 @@ impl Connections {
     pub fn desktop_revision(&self) -> u64 {
         self.client_revision
     }
-    pub fn tab_ref(&self, id: u64) -> TabRef {
-        let &(daemon, id) = self.handles.references.get(&id).expect("Known tab handle");
-        TabRef { daemon, id }
+    pub fn is_local(&self, id: TabRef) -> bool {
+        Some(id.daemon) == self.local
     }
-    fn checked_ref(&self, id: u64) -> anyhow::Result<TabRef> {
-        let &(daemon, id) = self
-            .handles
-            .references
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("The tab or pane has been closed"))?;
-        Ok(TabRef { daemon, id })
-    }
-    pub fn pane_ref(&self, id: u64) -> PaneRef {
-        let tab = self.tab_ref(id);
-        PaneRef {
-            daemon: tab.daemon,
-            id: tab.id,
-        }
-    }
-    pub fn lookup(&self, daemon: DaemonId, id: u64) -> Option<u64> {
-        self.handles.ids.get(&(daemon, id)).copied()
-    }
-    pub fn default_handle(&self, id: u64) -> anyhow::Result<u64> {
-        self.lookup(self.required_default()?, id)
-            .ok_or_else(|| anyhow::anyhow!("ID {id} does not exist on the default connection"))
-    }
-    pub fn is_local(&self, id: u64) -> bool {
-        self.handles
-            .references
-            .get(&id)
-            .is_some_and(|r| Some(r.0) == self.local)
-    }
-    pub fn connection_name(&self, id: u64) -> String {
-        self.handles
-            .references
-            .get(&id)
-            .and_then(|r| self.origins.get(&r.0))
+    pub fn connection_name(&self, id: TabRef) -> String {
+        self.origins
+            .get(&id.daemon)
             .map(|o| o.machine.name.clone())
             .unwrap_or_default()
     }
@@ -311,8 +248,8 @@ impl Connections {
         });
         machines
     }
-    pub fn machine_kind(&self, id: u64) -> MachineKind {
-        self.kind(self.tab_ref(id).daemon)
+    pub fn machine_kind(&self, id: TabRef) -> MachineKind {
+        self.kind(id.daemon)
     }
     pub fn display_directory(&self, daemon: DaemonId, path: &Path) -> String {
         self.origins
@@ -340,14 +277,34 @@ impl Connections {
             .map(|o| o.machine.daemon)
             .ok_or_else(|| anyhow::anyhow!("Connection {name} does not exist"))
     }
-    pub fn external_handle(&self, connection: Option<&str>, id: u64) -> anyhow::Result<u64> {
-        let daemon = connection
+    fn selected_daemon(&self, connection: Option<&str>) -> anyhow::Result<DaemonId> {
+        connection
             .map(|name| self.connection_id(name))
             .transpose()?
             .or(self.primary)
-            .ok_or_else(|| anyhow::anyhow!("No connection is selected"))?;
-        self.lookup(daemon, id)
-            .ok_or_else(|| anyhow::anyhow!("ID {id} does not exist on the selected connection"))
+            .ok_or_else(|| anyhow::anyhow!("No connection is selected"))
+    }
+    pub fn external_pane(&self, connection: Option<&str>, id: u64) -> anyhow::Result<PaneRef> {
+        let daemon = self.selected_daemon(connection)?;
+        anyhow::ensure!(
+            self.origins.get(&daemon).is_some_and(|o| o
+                .execution
+                .tabs
+                .iter()
+                .any(|t| t.layout.contains(id))),
+            "Pane {id} does not exist on the selected connection"
+        );
+        Ok(PaneRef { daemon, id })
+    }
+    pub fn external_tab(&self, connection: Option<&str>, id: u64) -> anyhow::Result<TabRef> {
+        let daemon = self.selected_daemon(connection)?;
+        anyhow::ensure!(
+            self.origins
+                .get(&daemon)
+                .is_some_and(|o| o.execution.tabs.iter().any(|t| t.id == id)),
+            "Tab {id} does not exist on the selected connection"
+        );
+        Ok(TabRef { daemon, id })
     }
     pub fn connected(&self, daemon: DaemonId) -> bool {
         self.origins
@@ -400,8 +357,7 @@ impl Connections {
             // Every attempt creates a new session manager. Existing terminal
             // widgets must attach to it, including after a catalog edit cancels
             // the old link before poll can observe its disconnection.
-            self.attached
-                .retain(|handle| self.handles.references[handle].0 != id);
+            self.attached.retain(|pane| pane.daemon != id);
             self.status_changed = true;
         }
     }
@@ -445,6 +401,7 @@ impl Connections {
             .chain(self.local)
             .collect();
         self.origins.retain(|id, _| keep.contains(id));
+        self.attached.retain(|pane| keep.contains(&pane.daemon));
         let mut reconnect = Vec::new();
         for remote in &catalog.remotes {
             let previous = self.definitions.iter().find(|r| r.daemon == remote.daemon);
@@ -509,7 +466,7 @@ impl Connections {
         &mut self,
         reply: execution::CommandReply,
     ) -> anyhow::Result<CommandResult> {
-        let mut result = self
+        let result = self
             .organization
             .execution_result(reply.daemon, reply.result);
         let daemon = reply.daemon;
@@ -529,14 +486,6 @@ impl Connections {
                 .fold(origin.observed_id, u64::max);
             origin.execution = reply.execution;
         }
-        match &mut result.output {
-            CommandOutput::New { tab, pane, .. } => {
-                *tab = self.handle(daemon, *tab);
-                *pane = self.handle(daemon, *pane);
-            }
-            CommandOutput::Split { pane } => *pane = self.handle(daemon, *pane),
-            _ => (),
-        }
         Ok(result)
     }
     fn combined(&mut self, result: CommandResult) -> CommandReply {
@@ -547,45 +496,25 @@ impl Connections {
             .enumerate()
             .map(|(index, tab)| (tab.reference, index))
             .collect();
-        let mut tabs = Vec::new();
-        let handles = &mut self.handles;
-        let mut execution_count = 0;
+        let tab_count = self.origins.values().map(|o| o.execution.tabs.len()).sum();
+        let mut tabs = Vec::with_capacity(tab_count);
         for (&daemon, origin) in &self.origins {
             for tab in &origin.execution.tabs {
                 let reference = TabRef { daemon, id: tab.id };
                 let saved = desktop_indices
                     .get(&reference)
                     .map(|&index| &self.desktop.tabs[index]);
-                let mut tab = TabState::from_execution(daemon, tab, saved);
-                tab.id = handles.get(daemon, tab.id);
-                tab.active = handles.get(daemon, tab.active);
-                execution_count += 1;
-                layout_ids(&mut tab.layout, &mut |id| {
-                    execution_count += 1;
-                    handles.get(daemon, id)
-                });
-                tab.directories = tab
-                    .directories
-                    .into_iter()
-                    .map(|(id, path)| (handles.get(daemon, id), path))
-                    .collect();
+                let tab = TabState::from_execution(daemon, tab, saved);
                 tabs.push(tab);
             }
         }
-        // Insertions mark themselves dirty. A lower count detects removals without
-        // scanning the maps for ordinary title, directory, or metadata updates.
-        handles.dirty |= handles.execution_count != execution_count;
-        handles.execution_count = execution_count;
         tabs.sort_unstable_by(|a, b| {
             b.created_at
                 .cmp(&a.created_at)
-                .then_with(|| a.daemon.cmp(&b.daemon))
-                .then_with(|| self.tab_ref(b.id).id.cmp(&self.tab_ref(a.id).id))
+                .then_with(|| a.id.daemon.cmp(&b.id.daemon))
+                .then_with(|| b.id.id.cmp(&a.id.id))
         });
-        let active = self
-            .desktop
-            .active
-            .map_or(0, |reference| self.handle(reference.daemon, reference.id));
+        let active = self.desktop.active;
         self.revision += 1;
         CommandReply {
             daemon: self.primary,
@@ -650,8 +579,7 @@ impl Connections {
     pub fn frame_interval(&self) -> Duration {
         self.frame_interval
     }
-    pub fn attach(&mut self, id: u64, theme: &Theme) -> anyhow::Result<SessionHandle> {
-        let reference = self.pane_ref(id);
+    pub fn attach(&mut self, reference: PaneRef, theme: &Theme) -> anyhow::Result<SessionHandle> {
         let manager = self
             .origins
             .get_mut(&reference.daemon)
@@ -660,14 +588,13 @@ impl Connections {
         manager.set_clipboard_writes(true)?;
         manager.set_clipboard_reads(true)?;
         let handle = manager.attach(reference.id, theme)?;
-        self.attached.insert(id);
+        self.attached.insert(reference);
         Ok(handle)
     }
-    pub fn has_handle(&self, id: u64) -> bool {
+    pub fn is_attached(&self, id: PaneRef) -> bool {
         self.attached.contains(&id)
     }
-    pub fn set_visible(&mut self, ids: HashSet<u64>) -> anyhow::Result<()> {
-        let references: Vec<_> = ids.iter().map(|id| self.pane_ref(*id)).collect();
+    pub fn set_visible(&mut self, references: HashSet<PaneRef>) -> anyhow::Result<()> {
         for (&daemon, o) in &mut self.origins {
             if let Some(m) = o.link.manager_mut() {
                 let result = m.set_visible(
@@ -684,15 +611,13 @@ impl Connections {
         }
         Ok(())
     }
-    pub fn is_visible(&self, id: u64) -> bool {
-        let r = self.pane_ref(id);
+    pub fn is_visible(&self, pane: PaneRef) -> bool {
         self.origins
-            .get(&r.daemon)
+            .get(&pane.daemon)
             .and_then(|o| o.link.manager())
-            .is_some_and(|m| m.is_visible(r.id))
+            .is_some_and(|m| m.is_visible(pane.id))
     }
-    pub fn set_git_panes(&mut self, ids: HashSet<u64>) -> anyhow::Result<()> {
-        let references: Vec<_> = ids.iter().map(|id| self.pane_ref(*id)).collect();
+    pub fn set_git_panes(&mut self, references: HashSet<PaneRef>) -> anyhow::Result<()> {
         for (&daemon, origin) in &mut self.origins {
             if let Some(manager) = origin.link.manager_mut() {
                 let result = manager.set_git_panes(
@@ -709,75 +634,23 @@ impl Connections {
         }
         Ok(())
     }
-    pub fn mark_read(&mut self, id: u64) {
-        let r = self.pane_ref(id);
+    pub fn mark_read(&mut self, pane: PaneRef) {
         if let Some(m) = self
             .origins
-            .get_mut(&r.daemon)
+            .get_mut(&pane.daemon)
             .and_then(|o| o.link.manager_mut())
         {
-            m.mark_read(r.id);
+            m.mark_read(pane.id);
         }
     }
-    pub fn close(&mut self, id: u64) {
-        let r = self.pane_ref(id);
-        self.attached.remove(&id);
-        self.handles.dirty = true;
+    pub fn close(&mut self, pane: PaneRef) {
+        self.attached.remove(&pane);
         if let Some(m) = self
             .origins
-            .get_mut(&r.daemon)
+            .get_mut(&pane.daemon)
             .and_then(|o| o.link.manager_mut())
         {
-            m.close(r.id);
-        }
-    }
-    /// Call after reconciling views and completing outstanding command callbacks.
-    /// Retain any additional handles still referenced by client presentation.
-    pub fn prune_handles(&mut self, retained: impl IntoIterator<Item = u64>) {
-        if !std::mem::take(&mut self.handles.dirty) {
-            return;
-        }
-        let mut live = HashSet::new();
-        for (&daemon, origin) in &self.origins {
-            for tab in &origin.execution.tabs {
-                live.insert((daemon, tab.id));
-                live.extend(tab.layout.ids().into_iter().map(|id| (daemon, id)));
-            }
-        }
-        let handles = &mut self.handles;
-        let mut retain = |handle| {
-            if let Some(&reference) = handles.references.get(&handle) {
-                // Sweep again when a temporary presentation reference is released.
-                handles.dirty |= live.insert(reference);
-            }
-        };
-        for handle in retained.into_iter().chain(self.attached.iter().copied()) {
-            retain(handle);
-        }
-        // A projected snapshot may still be waiting for the client to consume it.
-        if let Some(snapshot) = &self.snapshot {
-            for tab in &snapshot.session.tabs {
-                for handle in std::iter::once(tab.id).chain(tab.layout.ids()) {
-                    retain(handle);
-                }
-            }
-            match snapshot.result.output {
-                CommandOutput::New { tab, pane, .. } => {
-                    retain(tab);
-                    retain(pane);
-                }
-                CommandOutput::Split { pane } => retain(pane),
-                _ => (),
-            }
-        }
-        handles.ids.retain(|reference, _| live.contains(reference));
-        handles
-            .references
-            .retain(|_, reference| live.contains(reference));
-        // Reclaim a former peak without shrinking on every closed pane.
-        if handles.ids.capacity() > 64 && handles.ids.len() < handles.ids.capacity() / 4 {
-            handles.ids.shrink_to_fit();
-            handles.references.shrink_to_fit();
+            m.close(pane.id);
         }
     }
     pub fn clear(&mut self) {
@@ -785,7 +658,6 @@ impl Connections {
             self.status_changed |= o.link.cancel();
         }
         self.attached.clear();
-        self.handles.dirty = true;
     }
     pub fn take_state(&mut self) -> Option<CommandReply> {
         self.snapshot.take()
@@ -794,24 +666,24 @@ impl Connections {
         std::mem::take(&mut self.status_changed)
     }
     #[cfg(test)]
-    pub fn poll(&mut self) -> HashMap<u64, SessionUpdate> {
+    pub fn poll(&mut self) -> HashMap<PaneRef, SessionUpdate> {
         self.poll_with_clipboard(|_| {})
     }
     #[cfg(test)]
     pub fn poll_with_clipboard(
         &mut self,
         mut clipboard: impl FnMut(gmux_protocol::clipboard::Write),
-    ) -> HashMap<u64, SessionUpdate> {
+    ) -> HashMap<PaneRef, SessionUpdate> {
         self.poll_with_clipboard_events(|event, _| {
-            if let gmux_protocol::clipboard::Event::Write(write) = event {
+            if let ClipboardEvent::Write(write) = event {
                 clipboard(write);
             }
         })
     }
     pub fn poll_with_clipboard_events(
         &mut self,
-        mut clipboard: impl FnMut(gmux_protocol::clipboard::Event, Option<String>),
-    ) -> HashMap<u64, SessionUpdate> {
+        mut clipboard: impl FnMut(ClipboardEvent, Option<String>),
+    ) -> HashMap<PaneRef, SessionUpdate> {
         if self.watcher.changed()
             && let Err(error) = self.refresh_definitions()
         {
@@ -826,13 +698,11 @@ impl Connections {
             let label = (Some(daemon) != self.local).then(|| origin.machine.name.clone());
             let update = origin.link.poll_at_with_clipboard_events(now, |event| {
                 let event = match event {
-                    gmux_protocol::clipboard::Event::Read { pane, event } => {
-                        gmux_protocol::clipboard::Event::Read {
-                            pane: self.handles.get(daemon, pane),
-                            event,
-                        }
-                    }
-                    other => other,
+                    gmux_protocol::clipboard::Event::Write(write) => ClipboardEvent::Write(write),
+                    gmux_protocol::clipboard::Event::Read { pane, event } => ClipboardEvent::Read {
+                        pane: PaneRef { daemon, id: pane },
+                        event,
+                    },
                 };
                 clipboard(event, label.clone());
             });
@@ -849,8 +719,8 @@ impl Connections {
                 }
             }
             for (id, update) in update.panes {
-                let handle = self.handles.get(daemon, id);
-                updates.insert(handle, update);
+                let pane = PaneRef { daemon, id };
+                updates.insert(pane, update);
             }
             if let Some(state) = update.state {
                 states.push(state);
@@ -880,10 +750,10 @@ impl Connections {
                 .flat_map(|tab| tab.layout.ids())
                 .collect();
             for id in panes {
-                let handle = self.handle(daemon, id);
-                self.attached.remove(&handle);
+                let pane = PaneRef { daemon, id };
+                self.attached.remove(&pane);
                 updates
-                    .entry(handle)
+                    .entry(pane)
                     .or_insert_with(SessionUpdate::default)
                     .error
                     .get_or_insert_with(|| format!("Connection to {name} lost"));
@@ -893,7 +763,7 @@ impl Connections {
     }
     pub fn desktop(&mut self, session: &Session) -> DesktopState {
         let mut desktop = self.desktop.clone();
-        let current_refs: HashSet<_> = session.tabs.iter().map(|t| self.tab_ref(t.id)).collect();
+        let current_refs: HashSet<_> = session.tabs.iter().map(|t| t.id).collect();
         let mut live_tabs: HashMap<DaemonId, HashSet<u64>> = HashMap::new();
         desktop.tabs.retain(|t| {
             !current_refs.contains(&t.reference)
@@ -917,7 +787,7 @@ impl Connections {
             .collect();
         current.extend(desktop.tabs);
         desktop.tabs = current;
-        desktop.active = (session.active != 0).then(|| self.tab_ref(session.active));
+        desktop.active = session.active;
         desktop.filter = session.filter;
         desktop.width = session.width;
         desktop.height = session.height;
@@ -926,21 +796,13 @@ impl Connections {
         desktop
     }
     pub fn desktop_tab(&self, tab: &TabState, workspace: Option<u64>) -> DesktopTab {
-        let reference = self.tab_ref(tab.id);
-        let mut layout = tab.layout.clone();
-        layout_ids(&mut layout, &mut |id| self.pane_ref(id).id);
         DesktopTab {
-            reference,
+            reference: tab.id,
             workspace,
-            layout,
-            active: self.pane_ref(tab.active),
+            layout: tab.layout.clone(),
+            active: tab.active,
             name: tab.name.clone(),
         }
-    }
-    pub fn raw_layout(&self, layout: &Layout) -> Layout {
-        let mut layout = layout.clone();
-        layout_ids(&mut layout, &mut |id| self.pane_ref(id).id);
-        layout
     }
     pub fn route_request(
         &self,
@@ -975,18 +837,23 @@ impl Connections {
                 }
                 RoutedRequest::Configuration(request)
             }
-            WorkerRequest::Execution(mut request) => {
-                let mut daemon = None;
-                request::translate_targets(&mut request, |id| {
-                    let reference = self.checked_ref(id)?;
+            WorkerRequest::Execution(request) => {
+                let selected = Cell::new(None);
+                let check = |id| -> anyhow::Result<u64> {
+                    let (origin, raw) = id;
                     anyhow::ensure!(
-                        daemon.is_none_or(|id| id == reference.daemon),
+                        selected.get().is_none_or(|id| id == origin),
                         "Panes belong to different connections"
                     );
-                    daemon = Some(reference.daemon);
-                    Ok(reference.id)
-                })?;
-                let daemon = daemon
+                    selected.set(Some(origin));
+                    Ok(raw)
+                };
+                let request = request
+                    .map_ids(&mut |pane| check((pane.daemon, pane.id)), &mut |tab| {
+                        check((tab.daemon, tab.id))
+                    })?;
+                let daemon = selected
+                    .get()
                     .or(self.primary)
                     .ok_or_else(|| anyhow::anyhow!("No connection is selected"))?;
                 RoutedRequest::Execution {
@@ -1014,82 +881,62 @@ impl Connections {
     /// constrains the target even when it is also the window's default connection.
     pub fn incoming_command(
         &self,
-        command: &mut Command,
+        command: Command<u64, u64>,
         connection: Option<&str>,
-        active_pane: Option<u64>,
-        active_tab: Option<u64>,
-    ) -> anyhow::Result<Option<DaemonId>> {
+        active_pane: Option<PaneRef>,
+        active_tab: Option<TabRef>,
+    ) -> anyhow::Result<(Command, Option<DaemonId>)> {
         let selected = connection
             .map(|name| self.connection_id(name))
             .transpose()?;
-        let mut destination = selected.or(self.primary);
-        let target = |id: Option<u64>, active: Option<u64>, kind: &str| {
-            let handle = match id {
-                Some(id) => self.external_handle(connection, id)?,
-                None => active.ok_or_else(|| anyhow::anyhow!("No active {kind}"))?,
-            };
-            let reference = self.checked_ref(handle)?;
-            anyhow::ensure!(
-                id.is_some() || selected.is_none_or(|daemon| daemon == reference.daemon),
-                "Specify a {kind} on the selected connection"
-            );
-            Ok::<_, anyhow::Error>((handle, reference.daemon))
-        };
-        match command {
-            Command::Tab(TabCommand::Split { pane, .. })
-            | Command::Tab(TabCommand::Close { pane }) => {
-                let (handle, daemon) = target(*pane, active_pane, "pane")?;
-                *pane = Some(handle);
-                destination = Some(daemon);
-            }
-            Command::Move { tab, .. } => {
-                let (handle, daemon) = target(*tab, active_tab, "tab")?;
-                *tab = Some(handle);
-                destination = Some(daemon);
-            }
-            Command::Tab(TabCommand::Rename { tab: id, .. })
-            | Command::Tab(TabCommand::CloseTab { tab: id })
-            | Command::Tab(TabCommand::ResetName { tab: id }) => {
-                let (handle, daemon) = target(Some(*id), None, "tab")?;
-                *id = handle;
-                destination = Some(daemon);
-            }
+        let destination = Cell::new(selected.or(self.primary));
+        if matches!(
+            command,
             Command::WorkspaceAdd { .. }
-            | Command::WorkspaceEdit { .. }
-            | Command::WorkspaceRemove { .. } => {
+                | Command::WorkspaceEdit { .. }
+                | Command::WorkspaceRemove { .. }
+        ) {
+            anyhow::ensure!(
+                connection.is_none(),
+                "Workspace commands control the GTK app; omit connection"
+            );
+        }
+        let mut command = command.map_ids(
+            &mut |id| {
+                let r = self.external_pane(connection, id)?;
+                destination.set(Some(r.daemon));
+                Ok(r)
+            },
+            &mut |id| {
+                let r = self.external_tab(connection, id)?;
+                destination.set(Some(r.daemon));
+                Ok(r)
+            },
+        )?;
+        match &mut command {
+            Command::Tab(TabCommand::Split { pane, .. } | TabCommand::Close { pane })
+                if pane.is_none() =>
+            {
+                let active = active_pane.ok_or_else(|| anyhow::anyhow!("No active pane"))?;
                 anyhow::ensure!(
-                    connection.is_none(),
-                    "Workspace commands control the GTK app; omit connection"
+                    selected.is_none_or(|d| d == active.daemon),
+                    "Specify a pane on the selected connection"
                 );
-                if let Command::WorkspaceAdd { tab: Some(id), .. } = command {
-                    *id = self.default_handle(*id)?;
-                }
+                *pane = Some(active);
+                destination.set(Some(active.daemon));
             }
-            Command::New { .. } => (),
-        }
-        Ok(destination)
-    }
-    pub fn external_result(
-        &self,
-        mut result: CommandResult,
-        mut daemon: Option<DaemonId>,
-    ) -> anyhow::Result<Value> {
-        let pane = match &mut result.output {
-            CommandOutput::New { tab, pane, .. } => {
-                *tab = self.tab_ref(*tab).id;
-                Some(pane)
+            Command::Move { tab, .. } if tab.is_none() => {
+                let active = active_tab.ok_or_else(|| anyhow::anyhow!("No active tab"))?;
+                anyhow::ensure!(
+                    selected.is_none_or(|d| d == active.daemon),
+                    "Specify a tab on the selected connection"
+                );
+                *tab = Some(active);
+                destination.set(Some(active.daemon));
             }
-            CommandOutput::Split { pane } => Some(pane),
-            CommandOutput::Workspace { .. } | CommandOutput::Done { .. } => None,
-        };
-        if let Some(pane) = pane {
-            let reference = self.pane_ref(*pane);
-            *pane = reference.id;
-            daemon = Some(reference.daemon);
+            _ => (),
         }
-        let mut value = serde_json::to_value(result)?;
-        value["daemon"] = json!(daemon);
-        Ok(value)
+        Ok((command, destination.get()))
     }
     pub fn route_command(
         &self,
@@ -1123,16 +970,12 @@ impl Connections {
             }
             Command::Tab(TabCommand::Split { pane: Some(id), .. })
             | Command::Tab(TabCommand::Close { pane: Some(id) }) => {
-                let r = self.checked_ref(*id)?;
-                daemon = Some(r.daemon);
-                *id = r.id;
+                daemon = Some(id.daemon);
             }
             Command::Tab(TabCommand::CloseTab { tab })
             | Command::Tab(TabCommand::Rename { tab, .. })
             | Command::Tab(TabCommand::ResetName { tab }) => {
-                let r = self.checked_ref(*tab)?;
-                daemon = Some(r.daemon);
-                *tab = r.id;
+                daemon = Some(tab.daemon);
             }
             Command::WorkspaceAdd { tab, .. } => {
                 assign = tab.take().map(|tab| Assignment::CreatedWorkspace { tab });
@@ -1144,7 +987,7 @@ impl Connections {
                 target: self
                     .target(daemon.ok_or_else(|| anyhow::anyhow!("No connection is selected"))?)?,
                 request: execution::Request::Internal(execution::InternalRequest::Command {
-                    command,
+                    command: command.map_ids(&mut |pane| Ok(pane.id), &mut |tab| Ok(tab.id))?,
                 }),
             },
             Err(command) => {

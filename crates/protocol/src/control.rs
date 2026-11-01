@@ -5,6 +5,7 @@ use crate::{
 };
 
 mod replies;
+mod targets;
 pub use replies::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -35,9 +36,11 @@ pub fn pane_method(method: &str) -> bool {
     )
 }
 
+/// Numeric selectors are the wire format. Clients can carry qualified pane/tab
+/// references until choosing their execution endpoint.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ExecutionRequest {
+pub enum ExecutionRequest<P = u64, T = u64> {
     State,
     List,
     Status,
@@ -61,31 +64,31 @@ pub enum ExecutionRequest {
         name: Option<String>,
     },
     Split {
-        pane: u64,
+        pane: P,
         #[serde(default)]
         down: bool,
     },
     Close {
-        pane: u64,
+        pane: P,
     },
     CloseTab {
-        tab: u64,
+        tab: T,
     },
     Rename {
-        tab: u64,
+        tab: T,
         name: String,
     },
     ResetName {
-        tab: u64,
+        tab: T,
     },
     Read {
-        pane: u64,
+        pane: P,
     },
     Links {
-        pane: u64,
+        pane: P,
     },
     Send {
-        pane: u64,
+        pane: P,
         text: String,
         #[serde(default)]
         paste: bool,
@@ -93,23 +96,23 @@ pub enum ExecutionRequest {
         enter: bool,
     },
     Notify {
-        pane: u64,
+        pane: P,
         message: String,
     },
     Busy {
-        panes: Vec<u64>,
+        panes: Vec<P>,
     },
     Metadata {
-        pane: u64,
+        pane: P,
     },
     CommandOutput {
-        pane: u64,
+        pane: P,
         point: Option<(u16, u32)>,
         #[serde(default)]
         formats: crate::clipboard::Formats,
     },
     Copy {
-        pane: u64,
+        pane: P,
         #[serde(default)]
         formats: crate::clipboard::Formats,
     },
@@ -145,95 +148,95 @@ impl ExecutionRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum Command {
+pub enum Command<P = u64, T = u64> {
     New {
         directory: Option<PathBuf>,
         name: Option<String>,
     },
     #[serde(untagged)]
-    Tab(TabCommand),
+    Tab(TabCommand<P, T>),
 }
 
 /// Commands that act on an existing tab or one of its panes.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum TabCommand {
+pub enum TabCommand<P = u64, T = u64> {
     Split {
-        pane: Option<u64>,
+        pane: Option<P>,
         #[serde(default)]
         down: bool,
     },
     Close {
-        pane: Option<u64>,
+        pane: Option<P>,
     },
     CloseTab {
-        tab: u64,
+        tab: T,
     },
     Rename {
-        tab: u64,
+        tab: T,
         name: String,
     },
     ResetName {
-        tab: u64,
+        tab: T,
     },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", deny_unknown_fields)]
-pub enum InternalRequest {
+pub enum InternalRequest<P = u64, T = u64> {
     #[serde(rename = "_hello")]
     Hello,
     #[serde(rename = "_execution")]
-    Execution { request: ExecutionRequest },
+    Execution { request: ExecutionRequest<P, T> },
     #[serde(rename = "_busy")]
-    Busy { panes: Vec<u64> },
+    Busy { panes: Vec<P> },
     #[serde(rename = "_command")]
-    Command { command: Command },
+    Command { command: Command<P, T> },
     #[serde(rename = "_state")]
     State,
     #[serde(rename = "_metadata")]
-    Metadata { pane: Option<u64> },
+    Metadata { pane: Option<P> },
     #[serde(rename = "_copy")]
     Copy {
-        pane: Option<u64>,
+        pane: Option<P>,
         #[serde(default)]
         formats: crate::clipboard::Formats,
     },
     #[serde(rename = "_read")]
-    Read { pane: Option<u64> },
+    Read { pane: Option<P> },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
-pub enum PublicRequest {
+pub enum PublicRequest<P = u64> {
     Status,
     Stop,
     List,
     #[serde(untagged)]
-    Pane(PaneRequest),
+    Pane(PaneRequest<P>),
 }
 
 /// Input and inspection requests with the same options in every client.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
-pub enum PaneRequest {
+pub enum PaneRequest<P = u64> {
     Metadata {
-        pane: Option<u64>,
+        pane: Option<P>,
     },
     CommandOutput {
-        pane: Option<u64>,
+        pane: Option<P>,
         point: Option<(u16, u32)>,
         #[serde(default)]
         formats: crate::clipboard::Formats,
     },
     Read {
-        pane: Option<u64>,
+        pane: Option<P>,
     },
     Links {
-        pane: Option<u64>,
+        pane: Option<P>,
     },
     Send {
-        pane: Option<u64>,
+        pane: Option<P>,
         text: String,
         #[serde(default)]
         paste: bool,
@@ -241,18 +244,18 @@ pub enum PaneRequest {
         enter: bool,
     },
     Notify {
-        pane: Option<u64>,
+        pane: Option<P>,
         message: String,
     },
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
-pub enum Request {
-    Layout(Command),
-    Execution(ExecutionRequest),
-    Internal(InternalRequest),
-    Public(PublicRequest),
+pub enum Request<P = u64, T = u64> {
+    Layout(Command<P, T>),
+    Execution(ExecutionRequest<P, T>),
+    Internal(InternalRequest<P, T>),
+    Public(PublicRequest<P>),
 }
 impl Request {
     /// Normalize control requests, resolving and validating pane targets through

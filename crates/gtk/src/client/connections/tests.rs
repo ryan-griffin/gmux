@@ -1,7 +1,9 @@
 use super::super::control::InternalRequest;
 use super::*;
+use crate::model::Layout;
 use gmux_client::remote::SessionManager;
 use gmux_protocol::{control as execution, model::MachineKind};
+use serde_json::{Value, json};
 use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -51,7 +53,6 @@ impl Fixture {
             store: Arc::clone(&store),
             client_revision: 0,
             origins,
-            handles: Handles::default(),
             revision: 0,
             desktop: DesktopState::default(),
             organization: store.snapshot().0,
@@ -117,11 +118,16 @@ fn directory_labels_use_each_daemons_home_without_changing_paths_or_trusting_sta
         .directories
         .insert(2, "/root/project".into());
     let reply = f.hub.project_execution(remote).unwrap();
-    let local_pane = f.hub.lookup(f.ids[0], 2).unwrap();
-    let remote_pane = f.hub.lookup(f.ids[1], 2).unwrap();
-    let display = |hub: &Connections, id, path| {
-        hub.display_directory(hub.pane_ref(id).daemon, Path::new(path))
+    let local_pane = PaneRef {
+        daemon: f.ids[0],
+        id: 2,
     };
+    let remote_pane = PaneRef {
+        daemon: f.ids[1],
+        id: 2,
+    };
+    let display =
+        |hub: &Connections, id: PaneRef, path| hub.display_directory(id.daemon, Path::new(path));
     assert_eq!(
         display(&f.hub, local_pane, "/home/desktop/project"),
         "~/project"
@@ -144,7 +150,7 @@ fn directory_labels_use_each_daemons_home_without_changing_paths_or_trusting_sta
         .session
         .tabs
         .iter()
-        .find(|tab| f.hub.tab_ref(tab.id).daemon == f.ids[1])
+        .find(|tab| tab.id.daemon == f.ids[1])
         .unwrap();
     assert_eq!(tab.directories[&remote_pane], Path::new("/root/project"));
 
@@ -169,7 +175,10 @@ fn connection_names_remain_routable_independently_of_live_status() {
     let remote = f.ids[1];
     let reply = f.execution(1, 1, 1);
     f.hub.project_execution(reply).unwrap();
-    let tab = f.hub.lookup(remote, 1).unwrap();
+    let tab = TabRef {
+        daemon: remote,
+        id: 1,
+    };
     let name = f.hub.connection_name(tab);
     f.hub.connect(remote);
     assert_eq!(f.hub.connection_name(tab), name);
@@ -215,7 +224,7 @@ fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_sta
         f.hub
             .project_execution(with_metadata(f.execution(host, 1, 2), "control"))
             .unwrap();
-        let pane = f.hub.lookup(daemon, 2).unwrap();
+        let pane = PaneRef { daemon, id: 2 };
         let handle = f.hub.attach(pane, &Theme::adwaita(true)).unwrap();
         assert_eq!(handle.borrow().title(), "control");
         f.hub
@@ -240,7 +249,7 @@ fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_sta
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(handle.borrow().title(), "stream");
-        let new_pane = f.hub.lookup(daemon, 5).unwrap();
+        let new_pane = PaneRef { daemon, id: 5 };
         let new_handle = f.hub.attach(new_pane, &Theme::adwaita(true)).unwrap();
         assert_eq!(new_handle.borrow().title(), "stream");
     }
@@ -276,7 +285,7 @@ fn stream_loss_updates_local_and_remote_status_without_discarding_cached_executi
                 ));
                 assert_eq!(f.hub.origins[&daemon].execution.tabs.len(), 1);
                 if host != 0 {
-                    let pane = f.hub.lookup(daemon, 2).unwrap();
+                    let pane = PaneRef { daemon, id: 2 };
                     assert!(updates[&pane].error.is_some());
                     assert!(!updates[&pane].exited);
                 }
@@ -315,7 +324,7 @@ fn rejected_stream_state_preserves_cached_views_and_the_disconnect_reason() {
         ..Default::default()
     });
     f.hub.project_execution(snapshot).unwrap();
-    let pane = f.hub.lookup(daemon, 2).unwrap();
+    let pane = PaneRef { daemon, id: 2 };
     let view = f.hub.attach(pane, &Theme::adwaita(true)).unwrap();
     let packet = Packet {
         header: Header {
@@ -343,7 +352,7 @@ fn rejected_stream_state_preserves_cached_views_and_the_disconnect_reason() {
                 ConnectionStatus::Disconnected { error: Some(_) }
             ));
             assert!(f.hub.next_retry().is_none());
-            assert!(!f.hub.has_handle(pane));
+            assert!(!f.hub.is_attached(pane));
             assert_eq!(view.borrow().title(), "retained");
             break;
         }
@@ -444,56 +453,20 @@ fn abandoned_connection_setup_releases_sockets_in_both_phases_and_retries_cleanl
 }
 
 #[test]
-fn pruning_preserves_disconnected_execution_and_references_until_views_release_them() {
-    let mut f = Fixture::new(2);
-    for host in 0..2 {
-        f.hub.project_execution(f.execution(host, 1, 1)).unwrap();
-    }
-    let local = f.hub.lookup(f.ids[0], 1).unwrap();
-    let pane = f.hub.lookup(f.ids[0], 2).unwrap();
-    let remote = f.hub.lookup(f.ids[1], 1).unwrap();
-    assert_ne!(local, remote);
-    f.hub.attached.insert(pane);
-    f.hub.project_execution(f.execution(0, 0, 2)).unwrap();
-    f.hub.prune_handles([local]);
-    assert_eq!(f.hub.tab_ref(local).daemon, f.ids[0]);
-    assert_eq!(f.hub.pane_ref(pane).daemon, f.ids[0]);
-    assert_eq!(f.hub.tab_ref(remote).daemon, f.ids[1]);
-    f.hub.close(pane);
-    f.hub.prune_handles([]);
-    assert_eq!(f.hub.lookup(f.ids[0], 1), None);
-    assert_eq!(f.hub.lookup(f.ids[0], 2), None);
-    assert_eq!(f.hub.lookup(f.ids[1], 1), Some(remote));
-    assert_eq!(f.hub.handles.ids.len(), 3);
-    f.hub.origins.remove(&f.ids[1]);
-    f.hub.handles.dirty = true;
-    f.hub.prune_handles([]);
-    assert!(f.hub.handles.ids.is_empty());
-    assert!(f.hub.handles.references.is_empty());
-    assert!(
-        f.hub
-            .route_command(
-                Command::Tab(TabCommand::CloseTab { tab: local }),
-                Some(f.ids[0])
-            )
-            .is_err()
-    );
-    assert!(
-        f.hub
-            .route_request(InternalRequest::Read { pane: Some(pane) })
-            .is_err()
-    );
-}
-
-#[test]
-fn routing_rejects_removed_connections_while_their_views_still_hold_handles() {
+fn routing_rejects_removed_connections_while_views_retain_references() {
     let mut f = Fixture::new(2);
     f.hub.project_execution(f.execution(1, 1, 1)).unwrap();
     let remote = f.ids[1];
-    let tab = f.hub.lookup(remote, 1).unwrap();
-    let pane = f.hub.lookup(remote, 2).unwrap();
+    let tab = TabRef {
+        daemon: remote,
+        id: 1,
+    };
+    let pane = PaneRef {
+        daemon: remote,
+        id: 2,
+    };
     f.hub.origins.remove(&remote);
-    // Presentation and pending callbacks can keep these handles past removal.
+    // Presentation and pending callbacks can keep these references past removal.
     for command in [
         Command::Tab(TabCommand::CloseTab { tab }),
         Command::New {
@@ -528,9 +501,18 @@ fn pane_routing_requires_one_connection_and_valid_qualified_ids() {
     for host in 0..2 {
         f.hub.project_execution(f.execution(host, 1, 1)).unwrap();
     }
-    let local = f.hub.lookup(f.ids[0], 2).unwrap();
-    let remote = f.hub.lookup(f.ids[1], 2).unwrap();
-    let other = f.hub.lookup(f.ids[1], 3).unwrap();
+    let local = PaneRef {
+        daemon: f.ids[0],
+        id: 2,
+    };
+    let remote = PaneRef {
+        daemon: f.ids[1],
+        id: 2,
+    };
+    let other = PaneRef {
+        daemon: f.ids[1],
+        id: 3,
+    };
     let route = f
         .hub
         .route_request(InternalRequest::Busy {
@@ -638,7 +620,10 @@ fn prepared_remote_commands_keep_their_identity_when_names_are_reassigned() {
         f.hub.project_execution(f.execution(host, 1, 1)).unwrap();
     }
     let original = f.ids[1];
-    let tab = f.hub.lookup(original, 1).unwrap();
+    let tab = TabRef {
+        daemon: original,
+        id: 1,
+    };
     let route = f
         .hub
         .route_command(Command::Tab(TabCommand::CloseTab { tab }), Some(original))
@@ -661,49 +646,6 @@ fn prepared_remote_commands_keep_their_identity_when_names_are_reassigned() {
             .find(|o| o.machine.name == name)
             .map(|o| o.machine.daemon)
     );
-}
-
-#[test]
-fn closed_results_remain_translatable_and_handle_storage_is_bounded_under_churn() {
-    let mut f = Fixture::new(1);
-    f.hub.project_execution(f.execution(0, 256, 1)).unwrap();
-    assert!(f.hub.handles.ids.capacity() > 64);
-    f.hub.project_execution(f.execution(0, 0, 2)).unwrap();
-    f.hub.prune_handles([]);
-    assert!(f.hub.handles.ids.is_empty());
-    assert!(f.hub.handles.ids.capacity() <= 64);
-    let mut previous = f.hub.handles.next;
-    for id in 1000..2000 {
-        let mut raw = f.execution(0, 0, id);
-        raw.result = execution::CommandOutput::New {
-            tab: id * 2,
-            pane: id * 2 + 1,
-        }
-        .into();
-        // A newer shared snapshot can already have removed the just-created tab.
-        let projected = f.hub.project_execution(raw).unwrap();
-        let CommandOutput::New { tab, pane, .. } = projected.result.output else {
-            panic!("New result expected")
-        };
-        assert!(tab > previous);
-        previous = pane;
-        f.hub.snapshot = Some(projected);
-        f.hub.prune_handles([]);
-        let projected = f.hub.take_state().unwrap();
-        let result = f
-            .hub
-            .external_result(projected.result, Some(f.ids[0]))
-            .unwrap();
-        assert_eq!(
-            result,
-            json!({"tab":id * 2, "pane":id * 2 + 1, "workspace":null, "daemon":f.ids[0]})
-        );
-        f.hub.prune_handles([]);
-        assert!(f.hub.handles.ids.is_empty());
-        assert!(f.hub.handles.references.is_empty());
-    }
-    assert!(f.hub.handles.ids.capacity() <= 64);
-    assert!(f.hub.handles.references.capacity() <= 64);
 }
 
 #[test]
@@ -735,11 +677,11 @@ fn organization_changes_reproject_cached_execution_without_changing_its_topology
         .session
         .tabs
         .iter()
-        .find(|t| t.daemon == daemon)
+        .find(|t| t.id.daemon == daemon)
         .unwrap();
     assert_eq!(tab.name, "Updated presentation");
     assert!(matches!(tab.layout, Layout::Split { ratio: 0.8, .. }));
-    assert_eq!(f.hub.pane_ref(tab.active).id, 3);
+    assert_eq!(tab.active.id, 3);
     assert_eq!(f.hub.origins[&daemon].revision, 1);
 
     let mut desktop = f.hub.store.snapshot().0.desktop.clone();
@@ -748,7 +690,7 @@ fn organization_changes_reproject_cached_execution_without_changing_its_topology
         .iter_mut()
         .find(|t| t.reference.daemon == daemon)
         .unwrap();
-    saved.layout = Layout::Pane(99);
+    saved.layout = Layout::Pane(PaneRef { daemon, id: 99 });
     saved.active.id = 99;
     f.hub
         .store
@@ -759,18 +701,18 @@ fn organization_changes_reproject_cached_execution_without_changing_its_topology
         .session
         .tabs
         .iter()
-        .find(|t| t.daemon == daemon)
+        .find(|t| t.id.daemon == daemon)
         .unwrap();
     assert_eq!(
         tab.layout
             .ids()
             .into_iter()
-            .map(|id| f.hub.pane_ref(id).id)
+            .map(|id| id.id)
             .collect::<Vec<_>>(),
         [2, 3]
     );
     assert!(matches!(tab.layout, Layout::Split { ratio: 0.5, .. }));
-    assert_eq!(f.hub.pane_ref(tab.active).id, 2);
+    assert_eq!(tab.active.id, 2);
 
     let mut named = f.execution(1, 1, 2);
     named.execution.tabs[0].custom_name = true;
@@ -780,7 +722,7 @@ fn organization_changes_reproject_cached_execution_without_changing_its_topology
         view.session
             .tabs
             .iter()
-            .find(|t| t.daemon == daemon)
+            .find(|t| t.id.daemon == daemon)
             .unwrap()
             .name,
         "Shared name"
@@ -818,8 +760,14 @@ fn execution_projection_uses_current_organization_without_reusing_ids_across_hos
             workspace: Some(workspace),
             layout: Layout::Split {
                 vertical: false,
-                first: Box::new(Layout::Pane(2)),
-                second: Box::new(Layout::Pane(3)),
+                first: Box::new(Layout::Pane(PaneRef {
+                    daemon: f.ids[1],
+                    id: 2,
+                })),
+                second: Box::new(Layout::Pane(PaneRef {
+                    daemon: f.ids[1],
+                    id: 3,
+                })),
                 ratio: 0.7,
             },
             active: PaneRef {
@@ -840,10 +788,10 @@ fn execution_projection_uses_current_organization_without_reusing_ids_across_hos
         .session
         .tabs
         .iter()
-        .find(|tab| f.hub.tab_ref(tab.id).daemon == f.ids[1])
+        .find(|tab| tab.id.daemon == f.ids[1])
         .unwrap();
     assert_eq!(
-        f.hub.tab_ref(remote.id),
+        (remote.id),
         TabRef {
             daemon: f.ids[1],
             id: 1
@@ -852,7 +800,7 @@ fn execution_projection_uses_current_organization_without_reusing_ids_across_hos
     assert_eq!(remote.workspace, Some(workspace));
     assert_eq!(remote.name, "saved title");
     assert_eq!(
-        f.hub.pane_ref(remote.active),
+        (remote.active),
         PaneRef {
             daemon: f.ids[1],
             id: 3
@@ -869,7 +817,7 @@ fn execution_projection_uses_current_organization_without_reusing_ids_across_hos
             .session
             .tabs
             .iter()
-            .find(|tab| f.hub.tab_ref(tab.id).daemon == f.ids[1])
+            .find(|tab| tab.id.daemon == f.ids[1])
             .unwrap()
             .workspace,
         Some(workspace)
@@ -926,7 +874,7 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
             .assign(DesktopTab {
                 reference,
                 workspace: Some(workspace),
-                layout: Layout::Pane(5),
+                layout: Layout::Pane(PaneRef { daemon, id: 5 }),
                 active: PaneRef { daemon, id: 5 },
                 name: "New tab in another window".into(),
             })
@@ -934,13 +882,7 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
         // The store wakes this window before its stream delivers the new tab.
         f.hub.poll();
         let delayed = f.hub.take_state().unwrap();
-        assert!(
-            delayed
-                .session
-                .tabs
-                .iter()
-                .all(|t| f.hub.tab_ref(t.id) != reference)
-        );
+        assert!(delayed.session.tabs.iter().all(|t| t.id != reference));
         let desktop = f.hub.desktop(&delayed.session);
         f.hub
             .store
@@ -974,14 +916,12 @@ fn saves_preserve_assignments_ahead_of_execution_and_prune_only_confirmed_closed
             .session
             .tabs
             .iter()
-            .find(|t| f.hub.tab_ref(t.id) == reference)
+            .find(|t| t.id == reference)
             .unwrap();
         assert_eq!(tab.workspace, Some(workspace));
         // A tab awaiting its widgets is still live in the daemon snapshot.
         let mut presentation = caught_up.session;
-        presentation
-            .tabs
-            .retain(|t| f.hub.tab_ref(t.id) != reference);
+        presentation.tabs.retain(|t| t.id != reference);
         let desktop = f.hub.desktop(&presentation);
         f.hub
             .store
@@ -1035,12 +975,12 @@ fn creation_times_merge_remote_imports_and_external_tabs_without_saved_order_ove
         reference(1, 1),
         reference(0, 1),
     ];
-    let references = |hub: &Connections, reply: &CommandReply| {
+    let references = |_hub: &Connections, reply: &CommandReply| {
         reply
             .session
             .tabs
             .iter()
-            .map(|tab| hub.tab_ref(tab.id))
+            .map(|tab| tab.id)
             .collect::<Vec<_>>()
     };
     assert_eq!(references(&f.hub, &reply), expected);
@@ -1095,12 +1035,7 @@ fn snapshot_bursts_advance_the_view_once_and_removed_connections_cannot_reappear
     let reply = f.hub.project_execution_batch(inputs).unwrap();
     assert_eq!(reply.revision, before + 1);
     assert_eq!(reply.session.tabs.len(), 3);
-    let refs: HashSet<_> = reply
-        .session
-        .tabs
-        .iter()
-        .map(|tab| f.hub.tab_ref(tab.id))
-        .collect();
+    let refs: HashSet<_> = reply.session.tabs.iter().map(|tab| tab.id).collect();
     assert_eq!(
         refs,
         f.ids
@@ -1121,12 +1056,11 @@ fn snapshot_bursts_advance_the_view_once_and_removed_connections_cannot_reappear
             .session
             .tabs
             .iter()
-            .all(|tab| f.hub.tab_ref(tab.id).daemon != f.ids[2])
+            .all(|tab| tab.id.daemon != f.ids[2])
     );
     assert_eq!(f.hub.origins[&f.ids[1]].revision, 2);
     assert_eq!(f.hub.origins[&f.ids[1]].execution.tabs.len(), 2);
-    f.hub.prune_handles([]);
-    assert_eq!(f.hub.lookup(f.ids[2], 1), None);
+    assert!(f.hub.external_tab(Some("host-2"), 1).is_err());
     let before = f.hub.revision;
     f.hub
         .store
@@ -1145,4 +1079,140 @@ fn snapshot_bursts_advance_the_view_once_and_removed_connections_cannot_reappear
     assert_eq!(reply.revision, before + 1);
     assert_eq!(reply.catalog.workspaces[0].name, "Fresh organization");
     assert_eq!(reply.session.tabs.len(), 3);
+}
+
+#[test]
+fn closed_creation_results_keep_their_identity_without_live_topology() {
+    let mut f = Fixture::new(2);
+    for host in 0..2 {
+        let daemon = f.ids[host];
+        let mut raw = f.execution(host, 0, 1);
+        raw.result = execution::CommandOutput::New { tab: 1, pane: 2 }.into();
+        let projected = f.hub.project_execution(raw).unwrap();
+        assert!(projected.session.tabs.is_empty());
+        let CommandOutput::New { tab, pane, .. } = projected.result.output else {
+            panic!("Expected creation")
+        };
+        assert_eq!(tab, TabRef { daemon, id: 1 });
+        assert_eq!(pane, PaneRef { daemon, id: 2 });
+        f.hub.origins.remove(&daemon);
+        assert_eq!(
+            projected.result.into_external_value(None),
+            json!({"tab":1,"pane":2,"workspace":null,"daemon":daemon})
+        );
+    }
+}
+
+#[test]
+fn socket_selectors_qualify_by_kind_and_connection_before_routing() {
+    let mut f = Fixture::new(2);
+    for host in 0..2 {
+        f.hub.project_execution(f.execution(host, 1, 1)).unwrap();
+    }
+    let local = f.ids[0];
+    let remote = f.ids[1];
+    assert!(f.hub.external_pane(None, 1).is_err());
+    assert!(f.hub.external_tab(None, 2).is_err());
+    let local_pane = PaneRef {
+        daemon: local,
+        id: 2,
+    };
+    let remote_pane = PaneRef {
+        daemon: remote,
+        id: 2,
+    };
+    let raw = || Command::Tab(execution::TabCommand::Close { pane: Some(2) });
+    let (command, destination) = f
+        .hub
+        .incoming_command(raw(), Some("host-1"), Some(local_pane), None)
+        .unwrap();
+    assert_eq!(destination, Some(remote));
+    assert!(
+        matches!(command, Command::Tab(TabCommand::Close { pane: Some(pane) }) if pane == remote_pane)
+    );
+    let Route {
+        request: RoutedRequest::Execution { target, request },
+        ..
+    } = f.hub.route_command(command, destination).unwrap()
+    else {
+        panic!("Expected execution")
+    };
+    assert_eq!(target.daemon(), remote);
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({"method":"_command","command":{"method":"close","pane":2}})
+    );
+    let implicit = Command::Tab(execution::TabCommand::Close { pane: None });
+    assert!(
+        f.hub
+            .incoming_command(implicit, Some("host-1"), Some(local_pane), None)
+            .is_err()
+    );
+    assert!(
+        f.hub
+            .route_request(InternalRequest::Busy {
+                panes: vec![local_pane, remote_pane]
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn snapshot_order_and_window_history_do_not_change_qualified_identity() {
+    let mut f = Fixture::new(2);
+    let mut other = Fixture::new(1);
+    other.hub.origins = f
+        .ids
+        .iter()
+        .map(|&daemon| {
+            (
+                daemon,
+                Origin::new(
+                    f.hub.origins[&daemon].machine.clone(),
+                    other.hub.wake.clone(),
+                ),
+            )
+        })
+        .collect();
+    other.hub.primary = Some(f.ids[0]);
+    other.hub.local = Some(f.ids[0]);
+    for host in [0, 1] {
+        f.hub.project_execution(f.execution(host, 1, 1)).unwrap();
+    }
+    for host in [1, 0] {
+        other
+            .hub
+            .project_execution(f.execution(host, 1, 1))
+            .unwrap();
+    }
+    let left = f.hub.snapshot().session;
+    let right = other.hub.snapshot().session;
+    for tab in left.tabs {
+        let matching = right.tabs.iter().find(|other| other.id == tab.id).unwrap();
+        assert_eq!(tab.layout, matching.layout);
+        assert_eq!(tab.active, matching.active);
+        assert_eq!(tab.directories, matching.directories);
+    }
+}
+
+#[test]
+#[ignore = "snapshot projection measurement; run alone with --nocapture"]
+fn measure_snapshot_projection() {
+    let before = unsafe { libc::mallinfo2() }.uordblks;
+    let mut f = Fixture::new(2);
+    for host in 0..2 {
+        f.hub.project_execution(f.execution(host, 256, 1)).unwrap();
+    }
+    let retained = unsafe { libc::mallinfo2() }.uordblks.saturating_sub(before);
+    for _ in 0..100 {
+        std::hint::black_box(f.hub.snapshot());
+    }
+    let start = Instant::now();
+    for _ in 0..5000 {
+        std::hint::black_box(f.hub.snapshot());
+    }
+    eprintln!(
+        "snapshot_projection tabs=512 panes=1024 iterations=5000 elapsed_us={} retained_heap_bytes={retained}",
+        start.elapsed().as_micros()
+    );
 }

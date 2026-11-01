@@ -1,20 +1,20 @@
 //! Merge daemon snapshots with frontend selections and observed pane exits.
 use crate::client::control::CommandReply;
-use crate::model::{Session, TabFilter, WorkspaceCatalog};
+use crate::model::{PaneRef, Session, TabFilter, TabRef, WorkspaceCatalog};
 use std::collections::{HashMap, HashSet};
 
 pub(in crate::app) struct Selection {
-    pub(super) active: u64,
+    pub(super) active: Option<TabRef>,
     pub(super) filter: TabFilter,
-    pub(super) tabs: HashMap<u64, TabSelection>,
+    pub(super) tabs: HashMap<TabRef, TabSelection>,
 }
 
 pub(super) struct TabSelection {
-    pub(super) active: u64,
+    pub(super) active: PaneRef,
     pub(super) workspace: Option<u64>,
 }
 
-pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<u64>) {
+pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<PaneRef>) {
     if exited.is_empty() {
         return;
     }
@@ -99,8 +99,9 @@ pub(super) fn reconcile_selection(
             _ => true,
         };
         if current.active != requested.active
-            && (current.active != 0 || filter_survived)
-            && (current.active == 0 || state.tabs.iter().any(|tab| tab.id == current.active))
+            && (current.active.is_some() || filter_survived)
+            && (current.active.is_none()
+                || state.tabs.iter().any(|tab| Some(tab.id) == current.active))
         {
             state.active = current.active;
         }
@@ -126,10 +127,10 @@ fn repair_active_tab(state: &mut Session, current: &Selection) {
     let active_matches = state
         .tabs
         .iter()
-        .any(|tab| tab.id == state.active && state.filter.matches(tab.workspace));
+        .any(|tab| Some(tab.id) == state.active && state.filter.matches(tab.workspace));
     // A move can populate an empty view or move its selected tab away. Keep
     // views emptied by sidebar text when the workspace hasn't gained tabs.
-    let workspace_gained_tab = state.active == 0
+    let workspace_gained_tab = state.active.is_none()
         && state.tabs.iter().any(|saved| {
             state.filter.matches(saved.workspace)
                 && current
@@ -137,56 +138,73 @@ fn repair_active_tab(state: &mut Session, current: &Selection) {
                     .get(&saved.id)
                     .is_none_or(|tab| !state.filter.matches(tab.workspace))
         });
-    if !active_matches && (state.active != 0 || workspace_gained_tab) {
+    if !active_matches && (state.active.is_some() || workspace_gained_tab) {
         let mut matching = state
             .tabs
             .iter()
             .filter(|tab| state.filter.matches(tab.workspace));
         let first = matching.next();
         state.active = first
-            .filter(|tab| tab.id == current.active)
-            .or_else(|| matching.find(|tab| tab.id == current.active))
+            .filter(|tab| Some(tab.id) == current.active)
+            .or_else(|| matching.find(|tab| Some(tab.id) == current.active))
             .or(first)
-            .map_or(0, |tab| tab.id);
+            .map(|tab| tab.id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn p(id: u64) -> PaneRef {
+        PaneRef {
+            daemon: crate::model::DaemonId::from_bytes([1; 16]),
+            id,
+        }
+    }
+    fn t(id: u64) -> Option<TabRef> {
+        (id != 0).then_some(TabRef {
+            daemon: crate::model::DaemonId::from_bytes([1; 16]),
+            id,
+        })
+    }
+
     use crate::client::control::CommandOutput;
     use crate::model::{Layout, TabState, WorkspaceDefinition};
 
     fn tab(id: u64, pane: u64, workspace: Option<u64>) -> TabState {
         TabState {
-            daemon: gmux_platform::unix::identity::daemon_id().unwrap(),
-            id,
+            id: t(id).unwrap(),
             created_at: id,
             name: format!("Tab {id}"),
             custom_name: false,
             workspace,
-            layout: Layout::Pane(pane),
-            directories: HashMap::from([(pane, ".".into())]),
-            active: pane,
+            layout: Layout::Pane(p(pane)),
+            directories: HashMap::from([(p(pane), ".".into())]),
+            active: p(pane),
         }
     }
 
     fn session(tabs: Vec<TabState>, active: u64, filter: TabFilter) -> Session {
         Session {
             tabs,
-            active,
+            active: t(active),
             filter,
             ..Session::default()
         }
     }
     #[test]
     fn workspace_filter_repairs_selection_across_connections() {
-        let local = gmux_platform::unix::identity::daemon_id().unwrap();
+        let local = crate::model::DaemonId::from_bytes([1; 16]);
         let remote = gmux_platform::unix::identity::daemon_id().unwrap();
         let mut own = tab(1, 2, None);
-        own.daemon = local;
-        let mut foreign = tab(4, 5, Some(7));
-        foreign.daemon = remote;
+        own.id.daemon = local;
+        own.active.daemon = local;
+        own.layout = Layout::Pane(own.active);
+        let mut foreign = tab(1, 2, Some(7));
+        foreign.id.daemon = remote;
+        foreign.active.daemon = remote;
+        foreign.layout = Layout::Pane(foreign.active);
+        foreign.directories = HashMap::from([(foreign.active, ".".into())]);
         let mut state = session(vec![own, foreign], 1, TabFilter::Workspace(7));
         let catalog = WorkspaceCatalog {
             last_id: 7,
@@ -197,15 +215,21 @@ mod tests {
             }],
         };
         let current = Selection {
-            active: 1,
+            active: t(1),
             filter: state.filter,
             tabs: HashMap::new(),
         };
         preserve_window_state(&mut state, &catalog, &current);
-        assert_eq!(state.active, 4);
+        assert_eq!(
+            state.active,
+            Some(TabRef {
+                daemon: remote,
+                id: 1
+            })
+        );
         state.tabs.pop();
         preserve_window_state(&mut state, &catalog, &current);
-        assert_eq!(state.active, 0);
+        assert_eq!(state.active, t(0));
     }
 
     fn selection(state: &Session) -> Selection {
@@ -231,7 +255,7 @@ mod tests {
     #[test]
     fn shared_snapshots_preserve_the_windows_existing_tab_pane_and_filter() {
         let mut split = tab(1, 101, Some(10));
-        split.layout.split(101, 102, false);
+        split.layout.split(p(101), p(102), false);
         let local = session(
             vec![split.clone(), tab(2, 201, None)],
             1,
@@ -246,21 +270,21 @@ mod tests {
                 directories: Default::default(),
             }],
         };
-        split.active = 102;
+        split.active = p(102);
         let mut incoming = session(
             vec![tab(3, 301, None), split, tab(2, 201, None)],
             3,
             TabFilter::All,
         );
         preserve_window_state(&mut incoming, &catalog, &current);
-        assert_eq!(incoming.active, 1);
+        assert_eq!(incoming.active, t(1));
         assert!(incoming.filter == TabFilter::Workspace(10));
-        assert_eq!(incoming.tabs[1].active, 101);
+        assert_eq!(incoming.tabs[1].active, p(101));
         let empty = selection(&session(local.tabs, 0, TabFilter::All));
         preserve_window_state(&mut incoming, &catalog, &empty);
         // A new shared tab populates a previously empty view without changing its filter.
         assert!(incoming.filter == TabFilter::All);
-        assert_eq!(incoming.active, 3);
+        assert_eq!(incoming.active, t(3));
     }
 
     fn reconcile(state: &mut Session, requested: &Selection, current: &Selection, reveal: bool) {
@@ -285,25 +309,25 @@ mod tests {
             1,
             TabFilter::All,
         );
-        state.tabs[1].layout.split(201, 202, false);
+        state.tabs[1].layout.split(p(201), p(202), false);
         let requested = selection(&state);
         let mut current = selection(&state);
-        current.active = 2;
+        current.active = t(2);
         current.filter = TabFilter::Workspace(20);
-        current.tabs.get_mut(&2).unwrap().active = 202;
+        current.tabs.get_mut(&t(2).unwrap()).unwrap().active = p(202);
 
         let mut reply = state.clone();
         reconcile(&mut reply, &requested, &current, false);
-        assert_eq!(reply.active, 2);
+        assert_eq!(reply.active, t(2));
         assert!(reply.filter == TabFilter::Workspace(20));
-        assert_eq!(reply.tabs[1].active, 202);
+        assert_eq!(reply.tabs[1].active, p(202));
 
         state.tabs.push(tab(3, 301, None));
-        state.active = 3;
+        state.active = t(3);
         reconcile(&mut state, &requested, &current, true);
-        assert_eq!(state.active, 3);
+        assert_eq!(state.active, t(3));
         assert!(state.filter == TabFilter::All);
-        assert_eq!(state.tabs[1].active, 201);
+        assert_eq!(state.tabs[1].active, p(201));
     }
 
     #[test]
@@ -319,11 +343,11 @@ mod tests {
             }
             let requested = selection(&state);
             let mut current = selection(&state);
-            current.active = 0;
+            current.active = t(0);
             current.filter = TabFilter::Workspace(20);
             state.tabs[0].workspace = Some(20);
             reconcile(&mut state, &requested, &current, false);
-            assert_eq!(state.active, 1);
+            assert_eq!(state.active, t(1));
             assert!(state.filter == TabFilter::Workspace(20));
         }
 
@@ -334,10 +358,10 @@ mod tests {
         );
         let requested = selection(&state);
         let mut current = selection(&state);
-        current.active = 1;
+        current.active = t(1);
         state.tabs[0].workspace = Some(20);
         reconcile(&mut state, &requested, &current, false);
-        assert_eq!(state.active, 2);
+        assert_eq!(state.active, t(2));
         assert!(state.filter == TabFilter::Workspace(10));
     }
 
@@ -346,9 +370,9 @@ mod tests {
         let mut state = session(vec![tab(1, 101, Some(20))], 1, TabFilter::Workspace(20));
         let requested = selection(&state);
         let mut current = selection(&state);
-        current.active = 0;
+        current.active = t(0);
         reconcile(&mut state, &requested, &current, false);
-        assert_eq!(state.active, 0);
+        assert_eq!(state.active, t(0));
     }
 
     #[test]
@@ -361,10 +385,10 @@ mod tests {
             );
             let requested = selection(&state);
             let mut current = selection(&state);
-            current.active = active;
+            current.active = t(active);
             current.filter = TabFilter::Workspace(30);
             reconcile(&mut state, &requested, &current, false);
-            assert_eq!(state.active, if active == 0 { 1 } else { 2 });
+            assert_eq!(state.active, t(if active == 0 { 1 } else { 2 }));
             assert!(state.filter == TabFilter::All);
         }
 
@@ -375,10 +399,10 @@ mod tests {
         );
         let requested = selection(&state);
         let mut current = selection(&state);
-        current.active = 1;
+        current.active = t(1);
         state.tabs.remove(0);
         reconcile(&mut state, &requested, &current, false);
-        assert_eq!(state.active, 2);
+        assert_eq!(state.active, t(2));
     }
 
     #[test]
@@ -388,10 +412,10 @@ mod tests {
         {
             let mut split = tab(1, 101, None);
             for id in 102..=104 {
-                split.layout.split(id - 1, id, false);
-                split.directories.insert(id, ".".into());
+                split.layout.split(p(id - 1), p(id), false);
+                split.directories.insert(p(id), ".".into());
             }
-            split.active = active;
+            split.active = p(active);
             let mut reply = CommandReply {
                 desktop: None,
                 daemon: Some(gmux_platform::unix::identity::daemon_id().unwrap()),
@@ -404,10 +428,10 @@ mod tests {
             remove_exited_panes(&mut reply, &HashSet::new());
             assert_eq!(serde_json::to_value(&reply).unwrap(), original);
 
-            let exited = HashSet::from(exiting);
+            let exited = HashSet::from(exiting.map(p));
             remove_exited_panes(&mut reply, &exited);
             assert_eq!(reply.session.tabs.len(), 1);
-            assert_eq!(reply.session.tabs[0].active, expected);
+            assert_eq!(reply.session.tabs[0].active, p(expected));
             assert_eq!(reply.session.tabs[0].layout.ids().len(), 2);
             assert_eq!(reply.session.tabs[0].directories.len(), 2);
         }

@@ -121,21 +121,29 @@ impl Ui {
         });
         self.window.add_action(&action);
         let action =
-            gio::SimpleAction::new("assign-tab", Some(&<(u64, u64)>::static_variant_type()));
+            gio::SimpleAction::new("assign-tab", Some(&<(String, u64)>::static_variant_type()));
         let weak = Rc::downgrade(self);
         action.connect_activate(move |_, value| {
             if let (Some(ui), Some((tab, workspace))) =
-                (weak.upgrade(), value.and_then(|v| v.get::<(u64, u64)>()))
+                (weak.upgrade(), value.and_then(|v| v.get::<(String, u64)>()))
+                && let Ok(tab) = tab.parse()
             {
                 ui.assign_tab(tab, (workspace != 0).then_some(workspace));
             }
         });
         self.window.add_action(&action);
-        let action =
-            gio::SimpleAction::new("new-workspace-for-tab", Some(&u64::static_variant_type()));
+        let action = gio::SimpleAction::new(
+            "new-workspace-for-tab",
+            Some(&String::static_variant_type()),
+        );
         let weak = Rc::downgrade(self);
         action.connect_activate(move |_, value| {
-            if let (Some(ui), Some(tab)) = (weak.upgrade(), value.and_then(|v| v.get::<u64>())) {
+            if let (Some(ui), Some(tab)) = (
+                weak.upgrade(),
+                value
+                    .and_then(|v| v.get::<String>())
+                    .and_then(|s| s.parse::<TabRef>().ok()),
+            ) {
                 ui.new_workspace_for_tab(tab);
             }
         });
@@ -151,33 +159,48 @@ impl Ui {
             }
         });
         self.window.add_action(&action);
-        let action = gio::SimpleAction::new("rename-tab", Some(&u64::static_variant_type()));
+        let action = gio::SimpleAction::new("rename-tab", Some(&String::static_variant_type()));
         let weak = Rc::downgrade(self);
         action.connect_activate(move |_, value| {
-            if let (Some(ui), Some(id)) = (weak.upgrade(), value.and_then(|v| v.get::<u64>())) {
+            if let (Some(ui), Some(id)) = (
+                weak.upgrade(),
+                value
+                    .and_then(|v| v.get::<String>())
+                    .and_then(|s| s.parse::<TabRef>().ok()),
+            ) {
                 ui.rename_tab(id);
             }
         });
         self.window.add_action(&action);
-        let action = gio::SimpleAction::new("reset-name", Some(&u64::static_variant_type()));
+        let action = gio::SimpleAction::new("reset-name", Some(&String::static_variant_type()));
         let weak = Rc::downgrade(self);
         action.connect_activate(move |_, value| {
-            if let (Some(ui), Some(id)) = (weak.upgrade(), value.and_then(|v| v.get::<u64>())) {
+            if let (Some(ui), Some(id)) = (
+                weak.upgrade(),
+                value
+                    .and_then(|v| v.get::<String>())
+                    .and_then(|s| s.parse::<TabRef>().ok()),
+            ) {
                 ui.reset_tab_name(id);
             }
         });
         self.window.add_action(&action);
-        let action = gio::SimpleAction::new("close-tab", Some(&u64::static_variant_type()));
+        let action = gio::SimpleAction::new("close-tab", Some(&String::static_variant_type()));
         let weak = Rc::downgrade(self);
         action.connect_activate(move |_, value| {
-            if let (Some(ui), Some(id)) = (weak.upgrade(), value.and_then(|v| v.get::<u64>())) {
+            if let (Some(ui), Some(id)) = (
+                weak.upgrade(),
+                value
+                    .and_then(|v| v.get::<String>())
+                    .and_then(|s| s.parse::<TabRef>().ok()),
+            ) {
                 ui.request_close_tab(id);
             }
         });
         self.window.add_action(&action);
     }
     pub(super) fn action(self: &Rc<Self>, name: &str) {
-        if TAB_ACTIONS.contains(&name) && self.active.get() == 0 {
+        if TAB_ACTIONS.contains(&name) && self.active.get().is_none() {
             return;
         }
         match name {
@@ -204,9 +227,9 @@ impl Ui {
                     self.request_close(p.id);
                 }
             }
-            "close-empty-window" if self.active.get() == 0 => self.window.close(),
+            "close-empty-window" if self.active.get().is_none() => self.window.close(),
             "close-window" => self.window.close(),
-            "close-active-tab" => self.request_close_tab(self.active.get()),
+            "close-active-tab" => self.request_close_tab(self.active.get().unwrap()),
             "copy" => {
                 if let Some(p) = self.active_pane() {
                     p.copy();
@@ -257,7 +280,7 @@ impl Ui {
                     .filter(|tab| self.tab_is_visible(tab))
                     .map(|w| w.id)
                     .collect::<Vec<_>>();
-                if let Some(index) = ids.iter().position(|id| *id == self.active.get()) {
+                if let Some(index) = ids.iter().position(|id| Some(*id) == self.active.get()) {
                     let next =
                         (index + if name == "next-tab" { 1 } else { ids.len() - 1 }) % ids.len();
                     self.switch(ids[next]);
@@ -272,7 +295,10 @@ impl Ui {
             "next-pane" | "previous-pane" => {
                 let (ids, active) = {
                     let list = self.tabs.borrow();
-                    let w = list.iter().find(|w| w.id == self.active.get()).unwrap();
+                    let w = list
+                        .iter()
+                        .find(|w| Some(w.id) == self.active.get())
+                        .unwrap();
                     let ids = w.layout.borrow().ids();
                     (ids, w.active)
                 };
@@ -297,8 +323,8 @@ impl Ui {
             }
             "preferences" => self.preferences(),
             "shortcuts" => self.shortcuts(),
-            "rename" => self.rename_tab(self.active.get()),
-            "reset-active-tab-name" => self.reset_tab_name(self.active.get()),
+            "rename" => self.rename_tab(self.active.get().unwrap()),
+            "reset-active-tab-name" => self.reset_tab_name(self.active.get().unwrap()),
             "fullscreen" => {
                 if self.window.is_fullscreen() {
                     self.window.unfullscreen();
@@ -311,7 +337,7 @@ impl Ui {
             _ => (),
         }
     }
-    pub(super) fn reset_tab_name(self: &Rc<Self>, id: u64) {
+    pub(super) fn reset_tab_name(self: &Rc<Self>, id: TabRef) {
         if !self
             .tabs
             .borrow()

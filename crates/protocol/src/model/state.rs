@@ -27,13 +27,20 @@ impl Serialize for DaemonId {
 impl<'de> Deserialize<'de> for DaemonId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+impl std::str::FromStr for DaemonId {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut bytes = [0; 16];
-        if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(serde::de::Error::custom("Invalid daemon identity"));
-        }
+        anyhow::ensure!(
+            text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Invalid daemon identity"
+        );
         for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
-            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
-                .map_err(serde::de::Error::custom)?;
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)?;
         }
         Ok(Self(bytes))
     }
@@ -149,6 +156,91 @@ impl PaneTree {
                 }),
                 (first, second) => first.or(second),
             },
+        }
+    }
+}
+
+macro_rules! reference_text {
+    ($reference:ty) => {
+        impl std::fmt::Display for $reference {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}:{}", self.daemon, self.id)
+            }
+        }
+        impl std::str::FromStr for $reference {
+            type Err = anyhow::Error;
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                let (daemon, id) = text
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("Expected daemon:id"))?;
+                Ok(Self {
+                    daemon: daemon.parse()?,
+                    id: id.parse()?,
+                })
+            }
+        }
+    };
+}
+reference_text!(PaneRef);
+reference_text!(TabRef);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_text_targets_preserve_identity_and_reject_malformed_selectors() {
+        for (daemon, bytes) in [
+            (
+                "00112233445566778899aabbccddeeff",
+                [
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff,
+                ],
+            ),
+            (
+                "FFEEDDCCBBAA99887766554433221100",
+                [
+                    0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33,
+                    0x22, 0x11, 0x00,
+                ],
+            ),
+        ] {
+            let text = format!("{daemon}:42");
+            let pane: PaneRef = text.parse().unwrap();
+            let tab: TabRef = text.parse().unwrap();
+            let from_json: DaemonId = serde_json::from_value(serde_json::json!(daemon)).unwrap();
+            let expected = DaemonId::from_bytes(bytes);
+            assert_eq!(
+                pane,
+                PaneRef {
+                    daemon: expected,
+                    id: 42
+                }
+            );
+            assert_eq!(
+                tab,
+                TabRef {
+                    daemon: expected,
+                    id: 42
+                }
+            );
+            assert_eq!(from_json, expected);
+            assert_eq!(pane.to_string().parse::<PaneRef>().unwrap(), pane);
+            assert_eq!(tab.to_string().parse::<TabRef>().unwrap(), tab);
+        }
+        for text in [
+            "42",
+            ":42",
+            "001122:42",
+            "gg112233445566778899aabbccddeeff:42",
+            "00112233445566778899aabbccddeeff:",
+            "00112233445566778899aabbccddeeff:-1",
+            "00112233445566778899aabbccddeeff:18446744073709551616",
+            "00112233445566778899aabbccddeeff:42:1",
+        ] {
+            assert!(text.parse::<PaneRef>().is_err(), "{text}");
+            assert!(text.parse::<TabRef>().is_err(), "{text}");
         }
     }
 }

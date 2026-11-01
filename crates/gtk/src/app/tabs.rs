@@ -2,11 +2,11 @@
 use super::*;
 
 impl Ui {
-    pub(super) fn display_directory(&self, pane: u64, path: &Path) -> String {
+    pub(super) fn display_directory(&self, pane: PaneRef, path: &Path) -> String {
         let sessions = self.sessions.borrow();
-        sessions.display_directory(sessions.pane_ref(pane).daemon, path)
+        sessions.display_directory(pane.daemon, path)
     }
-    pub(super) fn terminal(self: &Rc<Self>, id: u64) -> anyhow::Result<Rc<Terminal>> {
+    pub(super) fn terminal(self: &Rc<Self>, id: PaneRef) -> anyhow::Result<Rc<Terminal>> {
         let weak = Rc::downgrade(self);
         let focus = Rc::new(move |id| {
             if let Some(ui) = weak.upgrade() {
@@ -94,13 +94,10 @@ impl Ui {
         saved.validate()?;
         let ids = saved.layout.ids();
         anyhow::ensure!(
-            self.tabs.borrow().iter().all(|w| {
-                w.id != saved.id
-                    && !w.panes.contains_key(&saved.id)
-                    && ids
-                        .iter()
-                        .all(|id| *id != w.id && !w.panes.contains_key(id))
-            }),
+            self.tabs
+                .borrow()
+                .iter()
+                .all(|w| { w.id != saved.id && ids.iter().all(|id| !w.panes.contains_key(id)) }),
             "Saved tab IDs conflict with another tab"
         );
         let mut panes = HashMap::new();
@@ -308,7 +305,7 @@ impl Ui {
         self.mark_dirty();
         Ok(())
     }
-    pub(super) fn rebuild(self: &Rc<Self>, tab: u64) {
+    pub(super) fn rebuild(self: &Rc<Self>, tab: TabRef) {
         let tabs = self.tabs.borrow();
         let Some(w) = tabs.iter().find(|w| w.id == tab) else {
             return;
@@ -332,7 +329,7 @@ impl Ui {
             p.set_active(p.id == w.active);
         }
     }
-    pub(super) fn switch(self: &Rc<Self>, id: u64) {
+    pub(super) fn switch(self: &Rc<Self>, id: TabRef) {
         self.refresh_tab_title(id);
         let workspace = self
             .tabs
@@ -368,7 +365,7 @@ impl Ui {
                 w.name.clone(),
             )
         };
-        self.active.set(id);
+        self.active.set(Some(id));
         self.refresh_connection_banner();
         self.subscribe_visible();
         self.update_tab_actions(true);
@@ -421,13 +418,13 @@ impl Ui {
                             .tabs
                             .borrow()
                             .iter()
-                            .any(|tab| tab.id == self.active.get() && tab.custom_name));
+                            .any(|tab| Some(tab.id) == self.active.get() && tab.custom_name));
                 action.set_enabled(available);
             }
         }
     }
     pub(super) fn show_empty(self: &Rc<Self>) {
-        self.active.set(0);
+        self.active.set(None);
         self.refresh_connection_banner();
         self.subscribe_visible();
         self.changing.set(true);
@@ -446,7 +443,7 @@ impl Ui {
             .tabs
             .borrow()
             .iter()
-            .find(|tab| tab.id == self.active.get())
+            .find(|tab| Some(tab.id) == self.active.get())
             .into_iter()
             .flat_map(|tab| tab.panes.keys().copied())
             .collect();
@@ -454,7 +451,7 @@ impl Ui {
             eprintln!("{error}");
         }
     }
-    pub(super) fn focus_pane(self: &Rc<Self>, id: u64) {
+    pub(super) fn focus_pane(self: &Rc<Self>, id: PaneRef) {
         // GtkStack may briefly restore the previous pane's focus when showing
         // a tab. Only the explicitly selected pane should clear unread alerts.
         if self.changing.get() {
@@ -473,7 +470,7 @@ impl Ui {
         };
         self.refresh_tab_title(tab);
         self.refresh_metadata();
-        if self.active.get() != tab {
+        if self.active.get() != Some(tab) {
             self.switch(tab);
         }
         self.mark_read(id);
@@ -484,10 +481,10 @@ impl Ui {
         self.tabs
             .borrow()
             .iter()
-            .find(|w| w.id == self.active.get())
+            .find(|w| Some(w.id) == self.active.get())
             .and_then(|w| w.panes.get(&w.active).cloned())
     }
-    pub(super) fn pane(&self, id: Option<u64>) -> anyhow::Result<Rc<Terminal>> {
+    pub(super) fn pane(&self, id: Option<PaneRef>) -> anyhow::Result<Rc<Terminal>> {
         if let Some(id) = id {
             self.tabs
                 .borrow()
@@ -499,7 +496,7 @@ impl Ui {
                 .ok_or_else(|| anyhow::anyhow!("No active terminal"))
         }
     }
-    pub(super) fn split_pane(self: &Rc<Self>, id: u64, down: bool) {
+    pub(super) fn split_pane(self: &Rc<Self>, id: PaneRef, down: bool) {
         self.command(
             Command::Tab(TabCommand::Split {
                 pane: Some(id),
@@ -512,7 +509,7 @@ impl Ui {
             },
         );
     }
-    pub(super) fn close_pane(self: &Rc<Self>, id: u64) -> anyhow::Result<()> {
+    pub(super) fn close_pane(self: &Rc<Self>, id: PaneRef) -> anyhow::Result<()> {
         let tab = self
             .tabs
             .borrow()
@@ -521,7 +518,7 @@ impl Ui {
             .map(|w| w.id)
             .ok_or_else(|| anyhow::anyhow!("Pane {id} does not exist"))?;
         self.sessions.borrow_mut().close(id);
-        let was_active = self.active.get() == tab;
+        let was_active = self.active.get() == Some(tab);
         let remaining = {
             let mut tabs = self.tabs.borrow_mut();
             let w = tabs.iter_mut().find(|w| w.id == tab).unwrap();
@@ -586,7 +583,7 @@ impl Ui {
         self.mark_dirty();
         Ok(())
     }
-    pub(super) fn refresh_tab_title(self: &Rc<Self>, id: u64) {
+    pub(super) fn refresh_tab_title(self: &Rc<Self>, id: TabRef) {
         let mut tabs = self.tabs.borrow_mut();
         let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
@@ -603,7 +600,7 @@ impl Ui {
         }
         tab.name = title;
         tab.name_label.set_text(&tab.name);
-        if tab.id == self.active.get() {
+        if Some(tab.id) == self.active.get() {
             self.heading.set_title(&tab.name);
             self.window.set_title(Some(&format!("{} — Gmux", tab.name)));
         }
@@ -613,32 +610,25 @@ impl Ui {
     }
     pub(super) fn tab_progress(&self, tab: &Tab) -> Option<gmux_protocol::progress::PaneProgress> {
         gmux_protocol::progress::representative(
-            tab.panes
-                .iter()
-                .map(|(&id, pane)| (self.sessions.borrow().pane_ref(id).id, pane.progress())),
+            tab.panes.iter().map(|(&id, pane)| (id.id, pane.progress())),
         )
     }
     pub(super) fn tab_program_status(
         &self,
         tab: &Tab,
     ) -> Option<gmux_protocol::program_status::PaneStatus> {
-        gmux_protocol::program_status::representative(tab.panes.iter().map(|(&id, pane)| {
-            (
-                self.sessions.borrow().pane_ref(id).id,
-                pane.program_status(),
-            )
-        }))
+        gmux_protocol::program_status::representative(
+            tab.panes
+                .iter()
+                .map(|(&id, pane)| (id.id, pane.program_status())),
+        )
     }
     pub(super) fn refresh_tab_activity(&self, tab: &Tab) {
-        let sessions = self.sessions.borrow();
-        let selected =
-            gmux_protocol::activity::representative(tab.panes.iter().map(|(&id, pane)| {
-                (
-                    sessions.pane_ref(id).id,
-                    pane.program_status(),
-                    pane.progress(),
-                )
-            }));
+        let selected = gmux_protocol::activity::representative(
+            tab.panes
+                .iter()
+                .map(|(&id, pane)| (id.id, pane.program_status(), pane.progress())),
+        );
         tab.activity.update(
             selected.as_ref().map(|s| s.activity()),
             !tab.unread.is_empty(),
@@ -660,7 +650,7 @@ impl Ui {
                 w.path_label.set_text(&display);
                 w.path_label
                     .set_tooltip_text(Some(&path.display().to_string()));
-                if w.id == self.active.get() {
+                if Some(w.id) == self.active.get() {
                     self.heading.set_title(&w.name);
                     self.window.set_title(Some(&format!("{} — Gmux", w.name)));
                     self.heading.set_subtitle(&display);
@@ -698,7 +688,7 @@ pub(super) fn detach(widget: &gtk::Box) {
 }
 fn layout_widget(
     layout: &Layout,
-    panes: &HashMap<u64, Rc<Terminal>>,
+    panes: &HashMap<PaneRef, Rc<Terminal>>,
     saved: Rc<RefCell<Layout>>,
     path: Vec<bool>,
     ui: std::rc::Weak<Ui>,

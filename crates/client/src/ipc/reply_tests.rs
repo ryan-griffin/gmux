@@ -156,7 +156,9 @@ fn sync_async_and_queued_execution_preserve_payloads_and_errors_on_both_transpor
         let ids: Vec<_> = (0..3)
             .map(|_| {
                 client
-                    .request(gmux_protocol::control::InternalRequest::Busy { panes: vec![7] })
+                    .request(gmux_protocol::control::InternalRequest::<u64, u64>::Busy {
+                        panes: vec![7],
+                    })
                     .unwrap()
             })
             .collect();
@@ -312,18 +314,20 @@ fn unix_control_replies_do_not_require_resolving_implicit_targets() {
         .unwrap();
     let mut client = endpoint.client(Wake::new().unwrap());
     client
-        .request(gmux_protocol::control::InternalRequest::Read { pane: None })
+        .request(gmux_protocol::control::InternalRequest::<u64, u64>::Read { pane: None })
         .unwrap();
     client
-        .request(gmux_protocol::control::PaneRequest::Read { pane: None })
+        .request(gmux_protocol::control::PaneRequest::<u64>::Read { pane: None })
         .unwrap();
     client
-        .request(gmux_protocol::control::InternalRequest::Execution {
-            request: ExecutionRequest::New {
-                directory: Some("relative".into()),
-                name: None,
+        .request(
+            gmux_protocol::control::InternalRequest::<u64, u64>::Execution {
+                request: ExecutionRequest::New {
+                    directory: Some("relative".into()),
+                    name: None,
+                },
             },
-        })
+        )
         .unwrap();
     client.join();
     let mut replies = client.replies();
