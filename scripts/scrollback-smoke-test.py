@@ -50,10 +50,10 @@ class History:
             assert size <= 64 * 1024 * 1024
             body = self.exact(size)
             header_size, = struct.unpack("<I", body[:4])
-            header = json.loads(body[4:4 + header_size])
+            header = json.loads(body[16:16 + header_size])
             if header["meta"]["id"] == self.pane and header["frame"] is not None:
                 frame = header["frame"]
-                cells = decode_cells(body[4 + header_size:])
+                cells = decode_cells(body[16 + header_size:])
                 assert len(cells) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * frame["cols"]
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells = {}

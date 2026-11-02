@@ -636,6 +636,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-lite",
+ "memchr",
  "serde",
  "serde_json",
 ]

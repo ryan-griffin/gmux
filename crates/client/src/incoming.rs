@@ -6,10 +6,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const PROCESS_BYTES: usize = 128 * 1024 * 1024;
 
+const SMALL_BYTES: usize = 64 * 1024;
+const SMALL_PROCESS_BYTES: usize = 8 * 1024 * 1024;
+
 fn process_budget() -> Arc<Semaphore> {
     static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
     BUDGET
-        .get_or_init(|| Arc::new(Semaphore::new(PROCESS_BYTES)))
+        .get_or_init(|| Arc::new(Semaphore::new(PROCESS_BYTES - SMALL_PROCESS_BYTES)))
         .clone()
 }
 
@@ -33,6 +36,7 @@ pub struct Sender {
     sender: tokio::sync::mpsc::Sender<Message>,
     budget: Arc<Budget>,
     shared: Arc<Semaphore>,
+    small: Arc<Semaphore>,
 }
 pub struct Receiver {
     receiver: std::cell::RefCell<tokio::sync::mpsc::Receiver<Message>>,
@@ -55,13 +59,31 @@ impl std::fmt::Display for SendError {
 impl std::error::Error for SendError {}
 
 pub fn channel(bytes: usize, packets: usize) -> (Sender, Receiver) {
-    channel_with_budget(bytes, packets, process_budget())
+    static SMALL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    channel_with_pools(
+        bytes,
+        packets,
+        process_budget(),
+        SMALL
+            .get_or_init(|| Arc::new(Semaphore::new(SMALL_PROCESS_BYTES)))
+            .clone(),
+    )
 }
 
+#[cfg(test)]
 pub(super) fn channel_with_budget(
     bytes: usize,
     packets: usize,
     shared: Arc<Semaphore>,
+) -> (Sender, Receiver) {
+    channel_with_pools(bytes, packets, shared.clone(), shared)
+}
+
+pub(super) fn channel_with_pools(
+    bytes: usize,
+    packets: usize,
+    shared: Arc<Semaphore>,
+    small: Arc<Semaphore>,
 ) -> (Sender, Receiver) {
     let (sender, receiver) = tokio::sync::mpsc::channel(packets);
     let budget = Arc::new(Budget {
@@ -72,6 +94,7 @@ pub(super) fn channel_with_budget(
         Sender {
             sender,
             budget: budget.clone(),
+            small,
             shared,
         },
         Receiver {
@@ -85,17 +108,17 @@ impl Sender {
     pub fn send(&self, item: Result<Packet, String>) -> Result<(), SendError> {
         crate::runtime::block_on(self.send_async(item))
     }
-    // Wait only after a non-heartbeat prefix. Idle connections hold no decode
-    // reservation. The full local ceiling covers decoding and admission; shrink
-    // it to retained capacity when the packet moves into the queue.
-    pub async fn reserve_decode(&self) -> Result<OwnedSemaphorePermit, SendError> {
-        self.acquire_shared(self.budget.limit).await
+    pub async fn reserve_decode(&self, bytes: usize) -> Result<OwnedSemaphorePermit, SendError> {
+        if bytes > self.budget.limit {
+            return Err(SendError::TooLarge);
+        }
+        self.acquire_shared(bytes).await
     }
     async fn acquire_shared(&self, bytes: usize) -> Result<OwnedSemaphorePermit, SendError> {
         tokio::select! {
             biased;
             _ = self.sender.closed() => Err(SendError::Closed),
-            permit = self.shared.clone().acquire_many_owned(bytes as u32) => {
+            permit = (if bytes <= SMALL_BYTES { &self.small } else { &self.shared }).clone().acquire_many_owned(bytes as u32) => {
                 permit.map_err(|_| SendError::Closed)
             }
         }
@@ -112,6 +135,23 @@ impl Sender {
             Ok(packet) => packet_size(packet),
             Err(error) => std::mem::size_of::<Message>() + error.capacity(),
         };
+        self.send_sized(item, shared, bytes).await
+    }
+    pub(super) async fn send_decoded(
+        &self,
+        packet: Packet,
+        shared: OwnedSemaphorePermit,
+        retained: usize,
+    ) -> Result<(), SendError> {
+        let bytes = retained + size_of::<Message>() - size_of::<Packet>();
+        self.send_sized(Ok(packet), Some(shared), bytes).await
+    }
+    async fn send_sized(
+        &self,
+        item: Result<Packet, String>,
+        shared: Option<OwnedSemaphorePermit>,
+        bytes: usize,
+    ) -> Result<(), SendError> {
         if bytes > self.budget.limit {
             return Err(SendError::TooLarge);
         }
@@ -119,7 +159,9 @@ impl Sender {
             Some(permit) => permit,
             None => self.acquire_shared(bytes).await?,
         };
-        assert!(shared.num_permits() >= bytes);
+        if shared.num_permits() < bytes {
+            return Err(SendError::TooLarge);
+        }
         let excess = shared.num_permits() - bytes;
         drop(shared.split(excess));
         let permit = self
@@ -266,7 +308,7 @@ mod shared_tests {
         let size = size_of::<Message>() + 100;
         let shared = Arc::new(Semaphore::new(size * 8));
         let (sender, receiver) = channel_with_budget(size * 4, 1, shared.clone());
-        let decode = crate::runtime::block_on(sender.reserve_decode()).unwrap();
+        let decode = crate::runtime::block_on(sender.reserve_decode(size * 4)).unwrap();
         assert_eq!(shared.available_permits(), size * 4);
         crate::runtime::block_on(sender.send_reserved(Err("x".repeat(100)), Some(decode))).unwrap();
         assert_eq!(shared.available_permits(), size * 7);
@@ -298,9 +340,9 @@ mod shared_tests {
             assert_eq!(shared.available_permits(), 0);
         }
         assert_eq!(shared.available_permits(), size);
-        let decode = crate::runtime::block_on(b.reserve_decode()).unwrap();
+        let decode = crate::runtime::block_on(b.reserve_decode(size)).unwrap();
         assert_eq!(shared.available_permits(), 0);
-        let mut waiting = pin!(b.reserve_decode());
+        let mut waiting = pin!(b.reserve_decode(size));
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         drop(br);
         assert!(matches!(

@@ -31,10 +31,10 @@ def decode_cells(data):
 def decode_packet(body):
     """Decode a stream body into its header and cell bytes."""
     header_size, = struct.unpack("<I", body[:4])
-    header = json.loads(body[4:4 + header_size])
+    header = json.loads(body[16:16 + header_size])
     if (write := header.get("copy")) is not None:
         assert header["frame"] is None and not header["rows"], header
-        offset = 4 + header_size
+        offset = 16 + header_size
         if write["content"] is not None:
             representations = {}
             for item in write["content"]:
@@ -54,7 +54,7 @@ def decode_packet(body):
                     write["content"][mime] = data
         assert offset == len(body), (offset, len(body))
         return header, b""
-    return header, body[4 + header_size:]
+    return header, body[16 + header_size:]
 
 
 class Client:

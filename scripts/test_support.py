@@ -206,7 +206,7 @@ class DelayedViewport:
                 self._reply_remaining -= count
                 data = data[count:]
                 continue
-            count = min(len(data), (4 if len(self._reply_prefix) < 4 else 8) - len(self._reply_prefix))
+            count = min(len(data), (4 if len(self._reply_prefix) < 4 else 20) - len(self._reply_prefix))
             self._reply_prefix.extend(data[:count])
             data = data[count:]
             if len(self._reply_prefix) < 4:
@@ -214,11 +214,11 @@ class DelayedViewport:
             size = int.from_bytes(self._reply_prefix[:4], "little")
             if size == 0:
                 self._reply_prefix.clear()
-            elif len(self._reply_prefix) == 8:
-                header = int.from_bytes(self._reply_prefix[4:], "little")
-                assert 4 <= size <= 64 * 1024 * 1024 and header <= size - 4
-                self.reply_cell_bytes += size - 4 - header
-                self._reply_remaining = size - 4
+            elif len(self._reply_prefix) == 20:
+                header = int.from_bytes(self._reply_prefix[4:8], "little")
+                assert 16 <= size <= 64 * 1024 * 1024 and header <= size - 16
+                self.reply_cell_bytes += size - 16 - header
+                self._reply_remaining = size - 16
                 self._reply_prefix.clear()
 
     def __enter__(self):

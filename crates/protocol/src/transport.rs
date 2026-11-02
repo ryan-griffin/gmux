@@ -8,13 +8,16 @@ use std::{
     path::PathBuf,
 };
 
+mod header;
 mod memory;
+mod record;
+pub use record::{RECORD_PREFIX_BYTES, Record, RecordKind};
 mod requests;
 pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 40;
+pub const VERSION: u32 = 41;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -70,8 +73,7 @@ pub struct CachedRows {
     pub row_flags: Vec<u8>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-pub struct Header {
+header::packet_header! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<crate::control::CommandReply>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,10 +108,11 @@ pub struct Header {
     pub selection_serial: u64,
     #[serde(default)]
     pub selection_origin: Option<u64>,
-    #[serde(default, with = "crate::clipboard::wire")]
-    pub copy: Option<crate::clipboard::Write>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard_read: Option<crate::clipboard::ReadEvent>,
+    ;
+    #[serde(default, serialize_with = "crate::clipboard::wire::serialize")]
+    pub copy: Option<crate::clipboard::Write>,
 }
 
 fn is_zero(value: &i16) -> bool {
@@ -121,7 +124,7 @@ pub struct Packet {
     pub cells: Vec<Cell>,
 }
 
-/// Bound clipboard metadata separately from its binary payload.
+/// Bound metadata while serializing, before growing the daemon output queue.
 struct HeaderWriter<'a> {
     bytes: &'a mut Vec<u8>,
     end: usize,
@@ -141,33 +144,31 @@ impl Write for HeaderWriter<'_> {
 
 // Keep validation and allocation behavior identical for blocking and async I/O.
 macro_rules! packet_reader {
-    ($name:ident, [$($async:tt)*], $reader:ty, [$($wait:tt)*], $take:path) => {
+    ($name:ident, $body:ident, [$($async:tt)*], $reader:ty, [$($wait:tt)*], $take:path, [$($yield:tt)*]) => {
         /// Read a viewport packet or a heartbeat acknowledgement, represented by None.
         pub $($async)* fn $name(reader: &mut $reader) -> anyhow::Result<Option<Self>> {
-            let mut size = [0; 4];
-            reader.read_exact(&mut size)$($wait)*?;
-            let size = u32::from_le_bytes(size) as usize;
-            if size == 0 {
-                return Ok(None);
-            }
-            anyhow::ensure!(
-                (4..=MAX_PACKET).contains(&size),
-                "Invalid viewport packet size"
-            );
-            let mut header_size = [0; 4];
-            reader.read_exact(&mut header_size)$($wait)*?;
-            let header_size = u32::from_le_bytes(header_size) as usize;
-            anyhow::ensure!(header_size <= size - 4, "Invalid viewport header size");
-            let header = {
-                let mut bytes = vec![0; header_size];
-                reader.read_exact(&mut bytes)$($wait)*?;
-                serde_json::from_slice::<Header>(&bytes)?
-            };
+            let mut prefix = [0; RECORD_PREFIX_BYTES];
+            reader.read_exact(&mut prefix[..4])$($wait)*?;
+            if Record::is_heartbeat(prefix[..4].try_into().unwrap())? { return Ok(None); }
+            reader.read_exact(&mut prefix[4..])$($wait)*?;
+            let record = Record::decode(prefix)?;
+            let mut bytes = vec![0; record.header_size()];
+            reader.read_exact(&mut bytes)$($wait)*?;
+            let header = record.parse_header(&bytes)?;
+            drop(bytes);
+            let packet = Self::$body(reader, record, header)$($wait)*?;
+            record.validate_packet(&packet)?;
+            Ok(Some(packet))
+        }
+
+        pub $($async)* fn $body(reader: &mut $reader, record: Record, header: Header) -> anyhow::Result<Self> {
+            let header_size = record.header_size();
+            let size = record.size();
             if let Some(event) = &header.clipboard_read {
                 event.validate()?;
                 anyhow::ensure!(
                     header_size <= crate::clipboard::MAX_HEADER_BYTES
-                        && size == 4 + header_size
+                        && size == RECORD_PREFIX_BYTES - 4 + header_size
                         && header.copy.is_none(),
                     "Invalid clipboard read packet"
                 );
@@ -176,7 +177,7 @@ macro_rules! packet_reader {
                     cells: Vec::new(),
                 };
                 anyhow::ensure!(packet.clipboard_only(), "Mixed clipboard read packet");
-                return Ok(Some(packet));
+                return Ok(packet);
             }
             if header.copy.is_some() {
                 let mut packet = Self {
@@ -190,7 +191,7 @@ macro_rules! packet_reader {
                 let write = packet.header.copy.as_mut().unwrap();
                 let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
                 anyhow::ensure!(
-                    size - 4 - header_size == payload,
+                    size - (RECORD_PREFIX_BYTES - 4) - header_size == payload,
                     "Invalid clipboard payload length"
                 );
                 if let Some(content) = &mut write.content {
@@ -198,8 +199,7 @@ macro_rules! packet_reader {
                         reader.read_exact(&mut representation.data)$($wait)*?;
                     }
                 }
-                write.validate()?;
-                return Ok(Some(packet));
+                return Ok(packet);
             }
             if let Some(end) = header.cache_valid_before {
                 anyhow::ensure!(
@@ -279,7 +279,8 @@ macro_rules! packet_reader {
                 );
                 0
             };
-            let payload = size - 4 - header_size;
+            anyhow::ensure!(expected == record.cell_count(), "Incorrect cell count");
+            let payload = size - (RECORD_PREFIX_BYTES - 4) - header_size;
             anyhow::ensure!(
                 (expected * CELL_PREFIX_BYTES
                     ..=expected * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES))
@@ -291,10 +292,14 @@ macro_rules! packet_reader {
             let mut remaining = payload;
             let mut cells = Vec::with_capacity(expected);
             while cells.len() < expected {
+                $($yield)*
                 let bytes = match reader.fill_buf()$($wait)* {
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     result => result?,
                 };
+                // Bound synchronous work even for readers exposing a whole
+                // record at once. Client sockets normally expose only 8 KiB.
+                let bytes = &bytes[..bytes.len().min(8192)];
                 let mut consumed = 0;
                 while bytes.len() - consumed >= CELL_PREFIX_BYTES && cells.len() < expected {
                     let len = cell_length(&bytes[consumed..])?;
@@ -317,7 +322,7 @@ macro_rules! packet_reader {
                 cells.push(decode_cell(&bytes[..len])?);
             }
             anyhow::ensure!(remaining == 0, "Trailing viewport cell data");
-            Ok(Some(Self { header, cells }))
+            Ok(Self { header, cells })
         }
     };
 }
@@ -341,7 +346,10 @@ impl Packet {
         let clipboard_payload = if let Some(write) = &self.header.copy {
             let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
             // Reject backpressure before scanning text or growing the queue.
-            anyhow::ensure!(8 + payload <= limit, "Frontend is too slow");
+            anyhow::ensure!(
+                RECORD_PREFIX_BYTES + payload <= limit,
+                "Frontend is too slow"
+            );
             anyhow::ensure!(
                 self.clipboard_only() && self.cells.is_empty(),
                 "Clipboard offers require a dedicated packet"
@@ -353,39 +361,47 @@ impl Packet {
         };
         // Serialize into the reusable output buffer, then fill the lengths.
         // A failed packet must leave previously queued packets untouched.
-        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0; RECORD_PREFIX_BYTES]);
         let result = (|| {
-            if let Some(payload) = clipboard_payload {
-                serde_json::to_writer(
-                    HeaderWriter {
-                        bytes,
-                        end: start
-                            + 8
-                            + (limit - 8 - payload).min(crate::clipboard::MAX_HEADER_BYTES),
-                    },
-                    &self.header,
-                )?;
-            } else {
-                // Keep ordinary viewport traffic on serde's direct Vec writer.
-                serde_json::to_writer(&mut *bytes, &self.header)?;
-            }
-            let header_size = bytes.len() - start - 8;
+            let payload = clipboard_payload.unwrap_or(0);
+            anyhow::ensure!(
+                limit >= RECORD_PREFIX_BYTES + payload,
+                "Frontend is too slow"
+            );
+            serde_json::to_writer(
+                HeaderWriter {
+                    bytes,
+                    end: start
+                        + RECORD_PREFIX_BYTES
+                        + (limit - RECORD_PREFIX_BYTES - payload).min(
+                            if clipboard_payload.is_some() || self.header.clipboard_read.is_some() {
+                                crate::clipboard::MAX_HEADER_BYTES
+                            } else {
+                                record::MAX_HEADER_BYTES
+                            },
+                        ),
+                },
+                &self.header,
+            )?;
+            let header_size = bytes.len() - start - RECORD_PREFIX_BYTES;
+            let json_budget = record::json_budget(&bytes[start + RECORD_PREFIX_BYTES..])?;
+            let cell_bytes: usize = self
+                .cells
+                .iter()
+                .map(|cell| CELL_PREFIX_BYTES + cell.text().len())
+                .sum();
+            let size = bytes.len() - start - 4 + payload + cell_bytes;
+            anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
+            anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
+            let kind = RecordKind::of(&self.header);
+            let record = Record::new(size, header_size, kind, json_budget, self.cells.len())?;
+            bytes[start..start + RECORD_PREFIX_BYTES].copy_from_slice(&record.encode());
             if let Some(content) = self.header.copy.as_ref().and_then(|w| w.content.as_ref()) {
                 bytes.reserve(content.byte_len());
                 for representation in &content.0 {
                     bytes.extend_from_slice(&representation.data);
                 }
             }
-            let cell_bytes: usize = self
-                .cells
-                .iter()
-                .map(|cell| CELL_PREFIX_BYTES + cell.text().len())
-                .sum();
-            let size = bytes.len() - start - 4 + cell_bytes;
-            anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
-            anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
-            bytes[start..start + 4].copy_from_slice(&(size as u32).to_le_bytes());
-            bytes[start + 4..start + 8].copy_from_slice(&(header_size as u32).to_le_bytes());
             bytes.reserve(cell_bytes);
             for cell in &self.cells {
                 let len = (cell.text().len() as u16).to_le_bytes();
@@ -438,9 +454,17 @@ impl Packet {
         }
     }
 
-    packet_reader!(read_message, [], impl BufRead, [], std::io::Read::take);
+    packet_reader!(
+        read_message,
+        read_body,
+        [],
+        impl BufRead,
+        [],
+        std::io::Read::take,
+        []
+    );
     #[cfg(feature = "async")]
-    packet_reader!(read_message_async, [async], (impl futures_lite::io::AsyncBufRead + Unpin), [.await], futures_lite::io::AsyncReadExt::take);
+    packet_reader!(read_message_async, read_body_async, [async], (impl futures_lite::io::AsyncBufRead + Unpin), [.await], futures_lite::io::AsyncReadExt::take, [futures_lite::future::yield_now().await;]);
 }
 
 fn cell_length(bytes: &[u8]) -> anyhow::Result<usize> {
@@ -565,9 +589,17 @@ mod tests {
             // Omit the cell data entirely to prove rejection precedes its read.
             packet.header.cache.as_mut().unwrap().row_flags.push(0);
             let header = serde_json::to_vec(&packet.header).unwrap();
-            let size = 4 + header.len() + (count + 1) * cols * CELL_PREFIX_BYTES;
-            let mut bytes = (size as u32).to_le_bytes().to_vec();
-            bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            let size =
+                RECORD_PREFIX_BYTES - 4 + header.len() + (count + 1) * cols * CELL_PREFIX_BYTES;
+            let record = Record::new(
+                size,
+                header.len(),
+                RecordKind::Update,
+                record::json_budget(&header).unwrap(),
+                (count + 1) * cols,
+            )
+            .unwrap();
+            let mut bytes = record.encode().to_vec();
             bytes.extend_from_slice(&header);
             let mut reader = io::Cursor::new(&bytes);
             assert_eq!(
@@ -744,11 +776,15 @@ mod tests {
             assert_eq!(reader.position(), 4, "read beyond an invalid packet size");
         }
         // A claimed header that exceeds the packet must fail before reading it.
-        let mut bytes = vec![4, 0, 0, 0, 1, 0, 0, 0];
+        let mut bytes = vec![16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0];
         bytes.extend_from_slice(&encoded);
         let mut reader = io::Cursor::new(bytes);
         assert!(Packet::read(&mut reader).is_err());
-        assert_eq!(reader.position(), 8, "read beyond an invalid header size");
+        assert_eq!(
+            reader.position(),
+            RECORD_PREFIX_BYTES as u64,
+            "read beyond an invalid header size"
+        );
 
         packet = self::packet();
         encoded.clear();
@@ -759,7 +795,7 @@ mod tests {
             assert!(Packet::read(&mut encoded.as_slice()).is_err());
         }
         encoded[..4].copy_from_slice(&size.to_le_bytes());
-        encoded[8] = b'!';
+        encoded[RECORD_PREFIX_BYTES] = b'!';
         assert!(Packet::read(&mut encoded.as_slice()).is_err());
     }
 
@@ -851,7 +887,8 @@ mod tests {
         packet.cells[0].set_text("X").unwrap();
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
-        let start = 8 + u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+        let start =
+            RECORD_PREFIX_BYTES + u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
         for length in [261u16, u16::MAX] {
             let mut bad = encoded.clone();
             bad[start..start + 2].copy_from_slice(&length.to_le_bytes());
@@ -1074,12 +1111,14 @@ mod tests {
         let mut bytes = vec![];
         packet.encode_into(&mut bytes).unwrap();
         let header_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes[RECORD_PREFIX_BYTES..RECORD_PREFIX_BYTES + header_len])
+                .unwrap();
         assert_eq!(
             header["copy"]["content"][0],
             serde_json::json!({"mime":"image/png", "len":png.len()})
         );
-        assert_eq!(&bytes[8 + header_len..][..png.len()], png);
+        assert_eq!(&bytes[RECORD_PREFIX_BYTES + header_len..][..png.len()], png);
         // Read through very small buffers to cross header and binary boundaries.
         for capacity in [1, 3, 79, 65536] {
             let decoded =
@@ -1128,11 +1167,29 @@ mod tests {
 
         // Bypass encoding to verify the same metadata bound on remote input.
         let header = serde_json::to_vec(&packet.header).unwrap();
-        let mut oversized = ((4 + header.len() + 5) as u32).to_le_bytes().to_vec();
-        oversized.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        let record = Record::new(
+            RECORD_PREFIX_BYTES - 4 + header.len() + 5,
+            header.len(),
+            RecordKind::Clipboard,
+            record::json_budget(&header).unwrap(),
+            0,
+        );
+        assert!(record.is_err());
+        let mut oversized: Vec<_> = [
+            RECORD_PREFIX_BYTES - 4 + header.len() + 5,
+            header.len(),
+            RecordKind::Clipboard as usize,
+            record::json_budget(&header).unwrap(),
+            0,
+        ]
+        .into_iter()
+        .flat_map(|value| (value as u32).to_le_bytes())
+        .collect();
         oversized.extend_from_slice(&header);
         oversized.extend_from_slice(b"value");
-        assert!(Packet::read(&mut oversized.as_slice()).is_err());
+        let mut reader = io::Cursor::new(oversized);
+        assert!(Packet::read(&mut reader).is_err());
+        assert_eq!(reader.position(), RECORD_PREFIX_BYTES as u64);
     }
 
     #[test]
@@ -1166,8 +1223,15 @@ mod tests {
         cases.push(mixed);
         for header in cases {
             let header = serde_json::to_vec(&header).unwrap();
-            let mut wire = ((header.len() + 5) as u32).to_le_bytes().to_vec();
-            wire.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            let record = Record::new(
+                RECORD_PREFIX_BYTES - 4 + header.len() + 1,
+                header.len(),
+                RecordKind::Clipboard,
+                record::json_budget(&header).unwrap(),
+                0,
+            )
+            .unwrap();
+            let mut wire = record.encode().to_vec();
             wire.extend_from_slice(&header);
             wire.push(0);
             assert!(Packet::read(&mut wire.as_slice()).is_err());

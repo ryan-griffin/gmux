@@ -81,7 +81,7 @@ TCP listening is opt-in. The connection begins with one newline-terminated JSON
 handshake. The current protocol version is 40:
 
 ```json
-{"version":40,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":41,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":40,"daemon":"returned-identity"}
+{"method":"attach","version":41,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -264,11 +264,15 @@ headless observers do not become clipboard recipients. An eligible connection
 must also subscribe to the pane. The last focused eligible connection wins,
 with connection order as the fallback. Detached writes are dropped immediately.
 
-Replies are binary viewport packets. Each packet begins with a little-endian
-32-bit payload length. The payload begins with a little-endian 32-bit JSON
-header length, then that many UTF-8 JSON bytes, then cell bytes or a dedicated
-clipboard payload. The header
-contains pane `meta`, an optional `frame`, changed `rows`, and optional execution
+Replies are binary records. Each starts with five little-endian `u32` values:
+remaining record length, JSON header length, kind (`1` update, `2` execution state,
+`3` clipboard event), JSON decode allowance, and cell count. The remaining length
+includes the last four prefix fields. The prefix is followed by UTF-8 JSON and
+incremental cell bytes or a dedicated clipboard payload. Execution state records
+have no binary payload. The allowance bounds JSON input, parsing scratch, and
+storage expansion; it is validated before typed parsing. See
+[resource budgets](resource-budgets.md) for admission limits and the schema audit.
+The header contains pane `meta`, an optional `frame`, changed `rows`, and optional execution
 `state`, Git metadata, notifications, search results, selection, clipboard offers, or
 errors. A full viewport arrives on subscription; later packets contain changed
 rows. Before applying changed rows, shift the previous viewport by `row_shift`

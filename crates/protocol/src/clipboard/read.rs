@@ -68,7 +68,7 @@ impl ReadRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadEvent {
     Request {
@@ -82,6 +82,52 @@ pub enum ReadEvent {
         destination: Destination,
         epoch: u64,
     },
+}
+// Deriving Deserialize for an internally tagged enum buffers arbitrary JSON in
+// serde's Content tree before decoding fields. Decode the flat envelope directly
+// so packet admission only needs to cover this schema's typed allocations.
+impl<'de> Deserialize<'de> for ReadEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Kind {
+            Request,
+            Cancel,
+            PasteText,
+        }
+        #[derive(Deserialize)]
+        struct Event {
+            kind: Kind,
+            request: Option<ReadRequest>,
+            id: Option<u64>,
+            serial: Option<u64>,
+            destination: Option<Destination>,
+            epoch: Option<u64>,
+        }
+        let event = Event::deserialize(deserializer)?;
+        use serde::de::Error;
+        Ok(match event.kind {
+            Kind::Request => Self::Request {
+                request: event
+                    .request
+                    .ok_or_else(|| D::Error::missing_field("request"))?,
+            },
+            Kind::Cancel => Self::Cancel {
+                id: event.id.ok_or_else(|| D::Error::missing_field("id"))?,
+            },
+            Kind::PasteText => Self::PasteText {
+                serial: event
+                    .serial
+                    .ok_or_else(|| D::Error::missing_field("serial"))?,
+                destination: event
+                    .destination
+                    .ok_or_else(|| D::Error::missing_field("destination"))?,
+                epoch: event
+                    .epoch
+                    .ok_or_else(|| D::Error::missing_field("epoch"))?,
+            },
+        })
+    }
 }
 impl ReadEvent {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -168,5 +214,31 @@ mod tests {
         r.status = ReadStatus::Success;
         r.contents.push(r.contents[0].clone());
         assert!(r.byte_len().is_err());
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn read_event_envelopes_preserve_variants_and_require_their_fields() {
+        for value in [
+            serde_json::json!({"request":{"id":1,"destination":"clipboard","mimes":["text/plain"],"list":false,"name":"","granted":false,"epoch":null},"kind":"request"}),
+            serde_json::json!({"id":42,"kind":"cancel"}),
+            serde_json::json!({"epoch":3,"serial":4,"destination":"primary","kind":"paste_text"}),
+        ] {
+            let event: ReadEvent = serde_json::from_value(value.clone()).unwrap();
+            event.validate().unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), value);
+        }
+        for text in [
+            r#"{"kind":"request"}"#,
+            r#"{"kind":"cancel"}"#,
+            r#"{"kind":"paste_text","serial":4,"destination":"primary"}"#,
+            r#"{"kind":"cancel","id":1,"id":2}"#,
+        ] {
+            assert!(serde_json::from_str::<ReadEvent>(text).is_err());
+        }
     }
 }

@@ -2,7 +2,7 @@
 use super::*;
 use serde::{
     Deserializer, Serializer,
-    de::{self, SeqAccess, Visitor},
+    de::{self, DeserializeSeed, SeqAccess, Visitor},
 };
 
 #[derive(Deserialize)]
@@ -81,14 +81,30 @@ impl<'de> Deserialize<'de> for Descriptors {
     }
 }
 
-pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Write>, D::Error> {
-    #[derive(Deserialize)]
-    struct Incoming {
-        destination: Destination,
-        content: Option<Descriptors>,
-    }
-    Ok(
-        Option::<Incoming>::deserialize(deserializer)?.map(|write| Write {
+/// Validate framed payload length before allocating binary representation data.
+/// Standalone Header deserialization has no frame, so it uses only MIME limits.
+pub(crate) struct WriteSeed {
+    pub payload: Option<usize>,
+}
+impl<'de> DeserializeSeed<'de> for WriteSeed {
+    type Value = Option<Write>;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        #[derive(Deserialize)]
+        struct Incoming {
+            destination: Destination,
+            content: Option<Descriptors>,
+        }
+        let write = Option::<Incoming>::deserialize(deserializer)?;
+        if let Some(payload) = self.payload {
+            let declared = write
+                .as_ref()
+                .and_then(|w| w.content.as_ref())
+                .map_or(0, |d| d.0.iter().map(|r| r.len).sum());
+            if declared != payload {
+                return Err(de::Error::custom("Invalid clipboard payload length"));
+            }
+        }
+        Ok(write.map(|write| Write {
             destination: write.destination,
             content: write.content.map(|d| {
                 Offer(
@@ -100,6 +116,6 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<
                         .collect(),
                 )
             }),
-        }),
-    )
+        }))
+    }
 }
