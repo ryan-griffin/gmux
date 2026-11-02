@@ -3,15 +3,17 @@ use crate::client::control::CommandReply;
 use crate::model::{PaneRef, Session, TabFilter, TabRef, WorkspaceCatalog};
 use std::collections::{HashMap, HashSet};
 
-pub(in crate::app) struct Selection {
-    pub(super) active: Option<TabRef>,
-    pub(super) filter: TabFilter,
-    pub(super) tabs: HashMap<TabRef, TabSelection>,
+#[derive(Clone)]
+pub struct Selection {
+    pub active: Option<TabRef>,
+    pub filter: TabFilter,
+    pub tabs: HashMap<TabRef, TabSelection>,
 }
 
-pub(super) struct TabSelection {
-    pub(super) active: PaneRef,
-    pub(super) workspace: Option<u64>,
+#[derive(Clone)]
+pub struct TabSelection {
+    pub active: PaneRef,
+    pub workspace: Option<u64>,
 }
 
 pub(super) fn remove_exited_panes(reply: &mut CommandReply, exited: &HashSet<PaneRef>) {
@@ -76,48 +78,6 @@ pub(super) fn preserve_window_state(
             && saved.layout.contains(tab.active)
         {
             saved.active = tab.active;
-        }
-    }
-    repair_active_tab(state, current);
-}
-
-pub(super) fn reconcile_selection(
-    state: &mut Session,
-    catalog: &WorkspaceCatalog,
-    requested: &Selection,
-    current: &Selection,
-    reveal: bool,
-) {
-    if !reveal {
-        // A reply can wait for persistence while the user navigates. Keep
-        // later choices when their targets survived the command.
-        let filter_survived = match current.filter {
-            TabFilter::Workspace(id) => catalog
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.id == id),
-            _ => true,
-        };
-        if current.active != requested.active
-            && (current.active.is_some() || filter_survived)
-            && (current.active.is_none()
-                || state.tabs.iter().any(|tab| Some(tab.id) == current.active))
-        {
-            state.active = current.active;
-        }
-        if filter_survived && current.filter != requested.filter {
-            state.filter = current.filter;
-        }
-        for saved in &mut state.tabs {
-            if let Some(tab) = current.tabs.get(&saved.id)
-                && requested
-                    .tabs
-                    .get(&saved.id)
-                    .is_some_and(|before| before.active != tab.active)
-                && saved.layout.contains(tab.active)
-            {
-                saved.active = tab.active;
-            }
         }
     }
     repair_active_tab(state, current);
@@ -195,7 +155,7 @@ mod tests {
     #[test]
     fn workspace_filter_repairs_selection_across_connections() {
         let local = crate::model::DaemonId::from_bytes([1; 16]);
-        let remote = gmux_platform::unix::identity::daemon_id().unwrap();
+        let remote = crate::model::DaemonId::from_bytes([2; 16]);
         let mut own = tab(1, 2, None);
         own.id.daemon = local;
         own.active.daemon = local;
@@ -287,7 +247,7 @@ mod tests {
         assert_eq!(incoming.active, t(3));
     }
 
-    fn reconcile(state: &mut Session, requested: &Selection, current: &Selection, reveal: bool) {
+    fn reconcile(state: &mut Session, current: &Selection) {
         let catalog = WorkspaceCatalog {
             last_id: 0,
             workspaces: [10, 20]
@@ -299,35 +259,7 @@ mod tests {
                 })
                 .collect(),
         };
-        reconcile_selection(state, &catalog, requested, current, reveal);
-    }
-
-    #[test]
-    fn later_navigation_survives_replies_but_new_panes_reveal_the_command_result() {
-        let mut state = session(
-            vec![tab(1, 101, Some(10)), tab(2, 201, Some(20))],
-            1,
-            TabFilter::All,
-        );
-        state.tabs[1].layout.split(p(201), p(202), false);
-        let requested = selection(&state);
-        let mut current = selection(&state);
-        current.active = t(2);
-        current.filter = TabFilter::Workspace(20);
-        current.tabs.get_mut(&t(2).unwrap()).unwrap().active = p(202);
-
-        let mut reply = state.clone();
-        reconcile(&mut reply, &requested, &current, false);
-        assert_eq!(reply.active, t(2));
-        assert!(reply.filter == TabFilter::Workspace(20));
-        assert_eq!(reply.tabs[1].active, p(202));
-
-        state.tabs.push(tab(3, 301, None));
-        state.active = t(3);
-        reconcile(&mut state, &requested, &current, true);
-        assert_eq!(state.active, t(3));
-        assert!(state.filter == TabFilter::All);
-        assert_eq!(state.tabs[1].active, p(201));
+        preserve_window_state(state, &catalog, current);
     }
 
     #[test]
@@ -341,12 +273,11 @@ mod tests {
             if populated {
                 state.tabs.push(tab(3, 301, Some(20)));
             }
-            let requested = selection(&state);
             let mut current = selection(&state);
             current.active = t(0);
             current.filter = TabFilter::Workspace(20);
             state.tabs[0].workspace = Some(20);
-            reconcile(&mut state, &requested, &current, false);
+            reconcile(&mut state, &current);
             assert_eq!(state.active, t(1));
             assert!(state.filter == TabFilter::Workspace(20));
         }
@@ -356,11 +287,10 @@ mod tests {
             2,
             TabFilter::Workspace(10),
         );
-        let requested = selection(&state);
         let mut current = selection(&state);
         current.active = t(1);
         state.tabs[0].workspace = Some(20);
-        reconcile(&mut state, &requested, &current, false);
+        reconcile(&mut state, &current);
         assert_eq!(state.active, t(2));
         assert!(state.filter == TabFilter::Workspace(10));
     }
@@ -368,10 +298,9 @@ mod tests {
     #[test]
     fn sidebar_search_can_keep_a_view_empty_when_workspace_membership_is_unchanged() {
         let mut state = session(vec![tab(1, 101, Some(20))], 1, TabFilter::Workspace(20));
-        let requested = selection(&state);
         let mut current = selection(&state);
         current.active = t(0);
-        reconcile(&mut state, &requested, &current, false);
+        reconcile(&mut state, &current);
         assert_eq!(state.active, t(0));
     }
 
@@ -383,12 +312,12 @@ mod tests {
                 1,
                 TabFilter::All,
             );
-            let requested = selection(&state);
             let mut current = selection(&state);
             current.active = t(active);
             current.filter = TabFilter::Workspace(30);
-            reconcile(&mut state, &requested, &current, false);
-            assert_eq!(state.active, t(if active == 0 { 1 } else { 2 }));
+            reconcile(&mut state, &current);
+            // An already empty view stays empty when all memberships are unchanged.
+            assert_eq!(state.active, t(active));
             assert!(state.filter == TabFilter::All);
         }
 
@@ -397,11 +326,10 @@ mod tests {
             2,
             TabFilter::All,
         );
-        let requested = selection(&state);
         let mut current = selection(&state);
         current.active = t(1);
         state.tabs.remove(0);
-        reconcile(&mut state, &requested, &current, false);
+        reconcile(&mut state, &current);
         assert_eq!(state.active, t(2));
     }
 
@@ -418,7 +346,7 @@ mod tests {
             split.active = p(active);
             let mut reply = CommandReply {
                 desktop: None,
-                daemon: Some(gmux_platform::unix::identity::daemon_id().unwrap()),
+                daemon: Some(crate::model::DaemonId::from_bytes([2; 16])),
                 revision: 0,
                 result: CommandOutput::Done { ok: true }.into(),
                 session: session(vec![split, tab(3, 301, None)], 1, TabFilter::All),

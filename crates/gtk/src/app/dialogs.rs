@@ -116,6 +116,12 @@ impl Ui {
         self.close_window();
     }
     pub(super) fn close_window(&self) {
+        self.controller.borrow_mut().close();
+        self.pending.borrow_mut().clear();
+        self.command_callbacks.borrow_mut().clear();
+        if let Some(source) = self.update_source.borrow_mut().take() {
+            source.remove();
+        }
         self.backend.shutdown();
         self.sessions.borrow_mut().clear();
         self.window.destroy();

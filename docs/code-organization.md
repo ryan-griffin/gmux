@@ -44,8 +44,8 @@ the same connection selection and queued directory handling. Its submodules hand
   and sidebar search.
 - `actions.rs`, `dialogs.rs`, `preferences.rs`: actions, dialogs, command palette,
   and settings.
-- `backend.rs`: asynchronous requests, state reconciliation, presentation saves,
-  and GUI socket commands.
+- `backend.rs`: the window controller adapter, asynchronous effects, widget updates,
+  presentation saves, and GUI socket commands.
 - `management.rs`: management lists and temporary editor dialogs.
 - `connections_dialog.rs`: local connection name and remote access editor, remote connection list and forms,
   authentication file selection, reconnect, and removal dialogs.
@@ -234,12 +234,33 @@ from those variants; workers carry the request types through dispatch and encode
 execution requests only when writing to a socket. JSON forwarding envelopes belong
 to CLI/RPC boundaries. Configuration replies and status diagnostics remain dynamic.
 
+`client/window.rs` owns window command coordination without GTK dependencies.
+Its event methods accept routed commands, projected replies, shared snapshots,
+navigation, pane exits, selection restoration, and closure. It returns assignment
+requests and completed presentation updates. Pending commands retain their phase,
+qualified creation destination, and focus serial, without copying the window's
+tabs. Explicit navigation and newer creations invalidate older reveals. Per-daemon
+creation counts defer stream-announced rows until assignment finishes; observed
+exits cover every outstanding reply, including panes not yet attached.
+
+`Connections` remains the execution and organization authority. It rejects stale
+per-daemon execution and metadata before projecting replies. The controller checks
+projected presentation revisions and merges each update with the window's current
+selection. It has no execution cache or saved organization. GTK supplies active
+targets when dispatching commands and captures selection for projected replies
+and snapshots. It applies widget changes and retains private split proportions
+and the adjacent visible selection after removing rows.
+Viewport updates do not build or clone controller state. Reconciliation and event
+interleaving tests run without constructing widgets.
+
 Request workers return daemon execution replies or GTK organization results.
-Worker channels carry typed replies; execution snapshots are deserialized before
-reaching GTK. Other control responses retain their JSON values.
-The window applies its current organization when combining replies. Remote
-connection edits use the selected daemon's queue and carry its pinned identity;
-removal uses the configuration queue so it can cancel a stalled edit.
+The GTK adapter projects each reply through `Connections`, passes it to the
+controller, and executes assignment effects through the existing backend queues.
+Native actions and CLI/socket layout commands enter the same controller.
+Configuration and diagnostic callbacks remain in the adapter; callbacks and
+controller pending state are discarded on closure. Remote connection edits use
+the selected daemon's queue and carry its pinned identity; removal uses the
+configuration queue so it can cancel a stalled edit.
 Closing a window cancels execution requests and leaves its pending organization
 saves with the application. Finished workers are reclaimed without blocking GTK;
 application exit waits for remaining saves.

@@ -118,26 +118,24 @@ pub struct Ui {
     search_next: gtk::Button,
     search_status: Cell<Option<(bool, usize, usize, bool)>>,
     active: Cell<Option<TabRef>>,
-    restore_selection: Cell<Option<(TabRef, Option<TabRef>, TabFilter)>>,
     changing: Cell<bool>,
     dirty: Cell<bool>,
     save_source: RefCell<Option<glib::SourceId>>,
     owner: std::rc::Weak<Windows>,
     id: u64,
-    revision: Cell<u64>,
     detaching: Cell<bool>,
     backend: Rc<crate::client::backend::Backend>,
     pending: RefCell<HashMap<u64, BackendCallback>>,
-    command_count: Cell<usize>,
-    creation_serial: Cell<u64>,
-    pending_tab_creations: RefCell<HashMap<model::DaemonId, usize>>,
-    command_exits: RefCell<HashSet<PaneRef>>,
+    controller: RefCell<crate::client::window::Controller>,
+    command_callbacks: RefCell<HashMap<crate::client::window::CommandId, CommandCallback>>,
+    presenting: Cell<bool>,
     keyboard: Rc<RefCell<crate::terminal::KeyboardState>>,
     update_source: RefCell<Option<glib::SourceId>>,
     deadline_source: RefCell<Option<(std::time::Instant, glib::SourceId)>>,
     theme_handler: RefCell<Option<glib::SignalHandlerId>>,
     frame_clock_handler: RefCell<Option<(gtk::gdk::FrameClock, glib::SignalHandlerId)>>,
 }
+type CommandCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<CommandResult>)>;
 type BackendCallback = Box<dyn FnOnce(&Rc<Ui>, anyhow::Result<BackendReply>)>;
 
 impl Drop for Ui {
