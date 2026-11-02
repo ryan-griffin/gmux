@@ -1,13 +1,13 @@
 //! Backend requests, state reconciliation, and presentation persistence.
 use super::*;
-use crate::client::request::RoutedRequest;
-
-mod reconcile;
-pub(super) use reconcile::Selection;
-use reconcile::{TabSelection, preserve_window_state, reconcile_selection, remove_exited_panes};
+use crate::client::{
+    connections::Route,
+    request::{OrganizationRequest, RoutedRequest},
+    window::{CommandId, Controller, Effect, Selection, TabSelection, Update},
+};
 
 impl Selection {
-    pub(super) fn capture(ui: &Ui) -> Self {
+    fn capture(ui: &Ui) -> Self {
         Self {
             active: ui.active.get(),
             filter: ui.filter.get(),
@@ -29,7 +29,28 @@ impl Selection {
     }
 }
 
+struct Presentation<'a> {
+    flag: &'a Cell<bool>,
+    previous: bool,
+}
+impl Drop for Presentation<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.previous);
+    }
+}
+
 impl Ui {
+    pub(super) fn presenting(&self) -> impl Drop + '_ {
+        Presentation {
+            flag: &self.presenting,
+            previous: self.presenting.replace(true),
+        }
+    }
+    pub(super) fn navigated(&self) {
+        if !self.presenting.get() && !self.changing.get() {
+            self.controller.borrow_mut().navigated();
+        }
+    }
     pub(super) fn request_busy(
         self: &Rc<Self>,
         body: impl Into<crate::client::request::Request>,
@@ -102,214 +123,125 @@ impl Ui {
         destination: Option<model::DaemonId>,
         callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>) + 'static,
     ) {
-        // Resolve implicit targets in this window before crossing the daemon boundary.
-        match &mut command {
-            Command::New { workspace, .. } if workspace.is_none() => {
-                *workspace = Some(self.selected_workspace());
-            }
-            Command::Tab(TabCommand::Split { pane, .. })
-            | Command::Tab(TabCommand::Close { pane })
-                if pane.is_none() =>
+        let route = (|| {
+            Controller::resolve(
+                &mut command,
+                self.active.get(),
+                self.active_pane().map(|pane| pane.id),
+                self.filter.get(),
+            )?;
+            if let Command::Move {
+                tab: Some(id),
+                workspace,
+            } = command
             {
-                let Some(active) = self.active_pane() else {
-                    callback(self, Err(anyhow::anyhow!("No active terminal")));
-                    return;
-                };
-                *pane = Some(active.id);
-            }
-            _ => (),
-        }
-        let reveal = matches!(
-            command,
-            Command::New { .. } | Command::Tab(TabCommand::Split { .. })
-        );
-        if let Command::Move { tab, workspace } = command {
-            let Some(id) = tab.or(self.active.get()) else {
-                callback(self, Err(anyhow::anyhow!("No active tab")));
-                return;
-            };
-            let session = self.view_session();
-            let Some(saved) = session.tabs.iter().find(|t| t.id == id) else {
-                callback(self, Err(anyhow::anyhow!("Tab does not exist")));
-                return;
-            };
-            let tab = self.sessions.borrow().desktop_tab(saved, workspace);
-            self.request_reply(InternalRequest::DesktopTab { tab }, move |ui, result| {
-                let result = result.and_then(|v| {
-                    let reply = ui.sessions.borrow_mut().project(v)?;
-                    ui.apply_backend(reply, false, Selection::capture(ui))
+                let tabs = self.tabs.borrow();
+                let saved = tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("Tab does not exist"))?;
+                return Ok(Route {
+                    request: RoutedRequest::Organization(OrganizationRequest::Assign(
+                        model::DesktopTab {
+                            reference: saved.id,
+                            workspace,
+                            layout: saved.layout.borrow().clone(),
+                            active: saved.active,
+                            name: saved.name.clone(),
+                        },
+                    )),
+                    assign: None,
                 });
-                callback(ui, result);
+            }
+            self.sessions.borrow().route_command(command, destination)
+        })();
+        let submission = route.and_then(|route| self.controller.borrow_mut().begin(route));
+        match submission {
+            Ok((id, request)) => {
+                self.save_session();
+                self.command_callbacks
+                    .borrow_mut()
+                    .insert(id, Box::new(callback));
+                self.submit_command(id, request);
+            }
+            Err(error) => callback(self, Err(error)),
+        }
+    }
+    fn submit_command(self: &Rc<Self>, id: CommandId, request: RoutedRequest) {
+        self.submit_request(request, move |ui, result| {
+            let reply = result.and_then(|raw| {
+                let mut sessions = ui.sessions.borrow_mut();
+                let reply = sessions.project(raw)?;
+                sessions.validate_state(&reply)?;
+                Ok(reply)
             });
-            return;
-        }
-        let creates_tab = matches!(command, Command::New { .. });
-        let route = match self.sessions.borrow().route_command(command, destination) {
-            Ok(route) => route,
-            Err(error) => {
-                callback(self, Err(error));
-                return;
-            }
-        };
-        let creating_tab = match &route.request {
-            RoutedRequest::Execution { target, .. } if creates_tab => Some(target.daemon()),
-            _ => None,
-        };
-        if let Some(daemon) = creating_tab {
-            *self
-                .pending_tab_creations
+            let effect = ui
+                .controller
                 .borrow_mut()
-                .entry(daemon)
-                .or_default() += 1;
-        }
-        let reveal = reveal.then(|| {
-            let serial = self.creation_serial.get() + 1;
-            self.creation_serial.set(serial);
-            serial
-        });
-        let selection = Selection::capture(self);
-        self.save_session();
-        self.command_count.set(self.command_count.get() + 1);
-        self.submit_request(route.request, move |ui, result| {
-            let projected = result.and_then(|value| ui.sessions.borrow_mut().project(value));
-            let reply = match projected {
-                Ok(reply) => reply,
-                Err(error) => {
-                    ui.finish_command(Err(error), reveal, creating_tab, selection, callback);
-                    return;
+                .reply(id, reply, Selection::capture(ui));
+            match effect {
+                Some(Effect::Assign { id, tab }) => {
+                    ui.submit_command(
+                        id,
+                        RoutedRequest::Organization(OrganizationRequest::Assign(tab)),
+                    );
                 }
-            };
-            let assignment = route
-                .assign
-                .and_then(|assignment| assignment.resolve(&reply.result.output));
-            if let Some((target, workspace)) = assignment
-                && let Some(saved) = reply.session.tabs.iter().find(|t| t.id == target)
-            {
-                let tab = ui.sessions.borrow().desktop_tab(saved, workspace);
-                let mut output = reply.result;
-                if let crate::client::control::CommandOutput::New {
-                    workspace: assigned,
-                    ..
-                } = &mut output.output
-                {
-                    *assigned = workspace;
+                Some(Effect::Finished {
+                    id,
+                    update,
+                    refresh_on_failure,
+                }) => {
+                    let result = update.and_then(|update| ui.apply_update(update));
+                    if let Ok(result) = &result
+                        && let Some(warning) = &result.warning
+                    {
+                        ui.message(warning);
+                    }
+                    // Execution can succeed before its presentation save fails.
+                    if refresh_on_failure && result.is_err() {
+                        let state = ui.sessions.borrow_mut().snapshot();
+                        if let Err(error) = ui.apply_shared(state) {
+                            ui.message(&error.to_string());
+                        }
+                    }
+                    ui.controller.borrow_mut().settled(id);
+                    let callback = ui.command_callbacks.borrow_mut().remove(&id);
+                    if let Some(callback) = callback {
+                        callback(ui, result);
+                    }
                 }
-                ui.request_reply(InternalRequest::DesktopTab { tab }, move |ui, result| {
-                    let result = result.and_then(|value| {
-                        let mut reply = ui.sessions.borrow_mut().project(value)?;
-                        reply.result = output;
-                        Ok(reply)
-                    });
-                    ui.finish_command(result, reveal, creating_tab, selection, callback);
-                });
-            } else {
-                ui.finish_command(Ok(reply), reveal, creating_tab, selection, callback);
+                None => (),
             }
         });
-    }
-    fn finish_command(
-        self: &Rc<Self>,
-        reply: anyhow::Result<CommandReply>,
-        reveal: Option<u64>,
-        creating_tab: Option<model::DaemonId>,
-        selection: Selection,
-        callback: impl FnOnce(&Rc<Self>, anyhow::Result<CommandResult>),
-    ) {
-        if let Some(daemon) = creating_tab {
-            let mut pending = self.pending_tab_creations.borrow_mut();
-            let count = pending.get_mut(&daemon).unwrap();
-            *count -= 1;
-            if *count == 0 {
-                pending.remove(&daemon);
-            }
-        }
-        // Connections can complete in different orders. An earlier slow creation
-        // must not take focus from a newer tab or split the user has opened.
-        let reveal = reveal.is_some_and(|serial| serial == self.creation_serial.get());
-        let result = reply.and_then(|reply| self.apply_backend(reply, reveal, selection));
-        if let Ok(result) = &result
-            && let Some(warning) = &result.warning
-        {
-            self.message(warning);
-        }
-        // Execution can succeed before its presentation save fails. Release any
-        // deferred tabs even when the creation request returns an error.
-        if creating_tab.is_some() && result.is_err() {
-            let state = self.sessions.borrow_mut().snapshot();
-            if let Err(error) = self.apply_shared(state) {
-                self.message(&error.to_string());
-            }
-        }
-        self.complete_command();
-        callback(self, result);
-    }
-    fn complete_command(&self) {
-        self.command_count.set(self.command_count.get() - 1);
-        if self.command_count.get() == 0 {
-            self.command_exits.borrow_mut().clear();
-        }
     }
 
     pub(super) fn apply_shared(self: &Rc<Self>, reply: CommandReply) -> anyhow::Result<()> {
-        if reply.revision <= self.revision.get() {
-            return Ok(());
+        self.sessions.borrow().validate_state(&reply)?;
+        let update = self
+            .controller
+            .borrow_mut()
+            .shared(reply, Selection::capture(self));
+        if let Some(update) = update {
+            self.apply_update(update)?;
         }
-        let selection = Selection::capture(self);
-        self.apply_backend(reply, false, selection)?;
         Ok(())
     }
-    pub(super) fn apply_backend(
-        self: &Rc<Self>,
-        reply: CommandReply,
-        reveal: bool,
-        selection: Selection,
-    ) -> anyhow::Result<CommandResult> {
-        self.sessions.borrow().validate_state(&reply)?;
+    fn apply_update(self: &Rc<Self>, update: Update) -> anyhow::Result<CommandResult> {
+        let _presenting = self.presenting();
+        let Update {
+            result,
+            state,
+            reveal,
+            previous: current,
+        } = update;
+        let Some((mut state, catalog)) = state else {
+            if reveal {
+                self.reveal_result(&result);
+            }
+            return Ok(result);
+        };
         let previous_active = self.active.get();
         let previous_focus = gtk::prelude::GtkWindowExt::focus(&self.window);
-        if reply.revision < self.revision.get() {
-            if reveal {
-                self.reveal_result(&reply.result);
-            }
-            return Ok(reply.result);
-        }
-        self.revision.set(reply.revision);
-        let mut reply = reply;
-        // Keep observed exits until every outstanding snapshot is handled,
-        // including panes that exited before they could be attached.
-        remove_exited_panes(&mut reply, &self.command_exits.borrow());
-        let CommandReply {
-            result,
-            session: mut state,
-            catalog,
-            ..
-        } = reply;
-        let mut current = Selection::capture(self);
-        // A stream snapshot can announce a new tab before its creation reply.
-        // Keep this window's existing rows in place until that reply can insert
-        // and select the tab together. Other connections still update normally.
-        let revealed_tab = match result.output {
-            crate::client::control::CommandOutput::New { tab, .. } if reveal => Some(tab),
-            _ => None,
-        };
-        state.tabs.retain(|tab| {
-            current.tabs.contains_key(&tab.id)
-                || revealed_tab == Some(tab.id)
-                || !self
-                    .pending_tab_creations
-                    .borrow()
-                    .contains_key(&tab.id.daemon)
-        });
-        if let Some((desired, fallback, filter)) = self.restore_selection.get() {
-            if current.active != fallback || current.filter != filter {
-                self.restore_selection.set(None);
-            } else if state.tabs.iter().any(|t| t.id == desired) {
-                current.active = Some(desired);
-                self.restore_selection.set(None);
-            }
-        }
-        preserve_window_state(&mut state, &catalog, &current);
-        reconcile_selection(&mut state, &catalog, &selection, &current, reveal);
         // Split geometry belongs to this window. Keep ratios for surviving split nodes.
         for saved in &mut state.tabs {
             if let Some(tab) = self.tabs.borrow().iter().find(|tab| tab.id == saved.id) {
@@ -738,7 +670,7 @@ impl Ui {
     // Diagnostic screenshots need a fresh snapshot even when the compositor
     // pauses the window. WidgetPaintable returns its cached render node in that
     // case. See docs/ui.md for the screenshot diagnostic's constraints.
-    pub(super) fn capture_window(&self, path: &Path) -> anyhow::Result<()> {
+    pub(crate) fn capture_window(&self, path: &Path) -> anyhow::Result<()> {
         let bounds = self
             .window
             .compute_bounds(&self.window)

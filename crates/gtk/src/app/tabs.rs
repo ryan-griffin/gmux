@@ -330,6 +330,7 @@ impl Ui {
         }
     }
     pub(super) fn switch(self: &Rc<Self>, id: TabRef) {
+        self.navigated();
         self.refresh_tab_title(id);
         let workspace = self
             .tabs
@@ -424,6 +425,7 @@ impl Ui {
         }
     }
     pub(super) fn show_empty(self: &Rc<Self>) {
+        self.navigated();
         self.active.set(None);
         self.refresh_connection_banner();
         self.subscribe_visible();
@@ -457,6 +459,7 @@ impl Ui {
         if self.changing.get() {
             return;
         }
+        self.navigated();
         let tab = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(w) = tabs.iter_mut().find(|w| w.panes.contains_key(&id)) else {

@@ -267,8 +267,6 @@ impl Ui {
             save_source: RefCell::new(None),
             owner,
             id,
-            revision: Cell::new(initial.revision),
-            restore_selection: Cell::new(None),
             detaching: Cell::new(false),
             backend: Rc::new(crate::client::backend::Backend::new(
                 ipc::Endpoint::local(),
@@ -277,10 +275,9 @@ impl Ui {
                 None,
             )),
             pending: RefCell::new(HashMap::new()),
-            command_count: Cell::new(0),
-            creation_serial: Cell::new(0),
-            pending_tab_creations: RefCell::new(HashMap::new()),
-            command_exits: RefCell::new(HashSet::new()),
+            controller: RefCell::new(crate::client::window::Controller::new(initial.revision)),
+            command_callbacks: RefCell::new(HashMap::new()),
+            presenting: Cell::new(false),
             keyboard,
             update_source: RefCell::new(None),
             deadline_source: RefCell::new(None),
@@ -512,8 +509,9 @@ impl Ui {
         if let Some(active) = session.active
             && !ui.tabs.borrow().iter().any(|t| t.id == active)
         {
-            ui.restore_selection
-                .set(Some((active, ui.active.get(), ui.filter.get())));
+            ui.controller
+                .borrow_mut()
+                .restore_selection(active, ui.active.get(), ui.filter.get());
         }
         let weak = Rc::downgrade(&ui);
         let source =
@@ -556,8 +554,8 @@ impl Ui {
                 let updates_git_changed = updates.values().any(|update| update.git_changed);
                 let mut status_tabs = HashSet::new();
                 for (id, update) in updates {
-                    if update.exited && ui.command_count.get() > 0 {
-                        ui.command_exits.borrow_mut().insert(id);
+                    if update.exited {
+                        ui.controller.borrow_mut().exited(id);
                     }
                     let pane = ui
                         .tabs
@@ -590,7 +588,10 @@ impl Ui {
                         && !pane
                             .program_status()
                             .is_some_and(|s| s.record.state.result())
-                        && let Err(error) = ui.close_pane(pane.id)
+                        && let Err(error) = {
+                            let _presenting = ui.presenting();
+                            ui.close_pane(pane.id)
+                        }
                     {
                         ui.message(&error.to_string());
                     }
@@ -798,7 +799,7 @@ impl Ui {
                         BackendReply::Value(_) => unreachable!(),
                     };
                     let state = ui.sessions.borrow_mut().project(raw)?;
-                    ui.apply_backend(state, false, backend::Selection::capture(ui))?;
+                    ui.apply_shared(state)?;
                     Ok(response)
                 });
                 let _ = reply.try_send(result.unwrap_or_else(|e| json!({"error":e.to_string()})));

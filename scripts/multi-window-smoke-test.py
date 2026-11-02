@@ -132,6 +132,25 @@ with AppFixture(dict(desktop_notifications=False), prefix="gmux-multi-window-", 
             fixture.rpc("close-tab", window=first, tab=created["tab"])
         wait_for(lambda: len(state(second)["tabs"]) == 1)
 
+    with scenario("navigation while a creation saves keeps the later window selection"):
+        # The second window confirms execution while the first defers its new row.
+        # Focusing the existing pane, even though it was already active, expresses
+        # a later user choice and must cancel the eventual creation reveal.
+        with lock_path.open("w") as lock, ThreadPoolExecutor(max_workers=1) as pool:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                pending = pool.submit(fixture.rpc, "new", window=first, name="Keep my selection")
+                wait_for(lambda: any(t["name"] == "Keep my selection" for t in state(second)["tabs"]))
+                assert not pending.done()
+                fixture.rpc("focus", window=first, pane=pane)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            created = pending.result(timeout=12)
+        wait_for(lambda: any(t["id"] == created["tab"] for t in state(first)["tabs"]))
+        assert state(first)["active_tab"] == tab, "A delayed creation stole focus after navigation"
+        fixture.rpc("close-tab", window=first, tab=created["tab"])
+        wait_for(lambda: len(state(second)["tabs"]) == 1)
+
     with scenario("a failed presentation save releases a successfully created execution"):
         desktop_path = fixture.config / "clients/gtk/state.json"
         saved = desktop_path.read_bytes()

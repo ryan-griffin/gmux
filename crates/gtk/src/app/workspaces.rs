@@ -210,6 +210,7 @@ impl Ui {
         }
     }
     pub(super) fn set_filter(self: &Rc<Self>, filter: TabFilter) {
+        self.navigated();
         self.apply_filter(filter);
         let selected = {
             let tabs = self.tabs.borrow();
