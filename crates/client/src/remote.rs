@@ -456,22 +456,52 @@ async fn read_packets(
             Ok(())
         })
         .await?;
-        if prefix == *transport::HEARTBEAT_REPLY {
+        if transport::Record::is_heartbeat(prefix)? {
             continue;
         }
-        let reservation = sender.reserve_decode().await?;
-        // Replay the prefix through the existing codec to keep framing and
-        // validation in one place, without allocating a second packet buffer.
-        let mut record = prefix.as_slice().chain(&mut reader).compat();
-        let packet = runtime::deadline(
-            Instant::now() + timeout,
-            Packet::read_message_async(&mut record),
-        )
+        let deadline = Instant::now() + timeout;
+        let mut framing = [0; transport::RECORD_PREFIX_BYTES];
+        framing[..4].copy_from_slice(&prefix);
+        runtime::deadline(deadline, async {
+            reader.read_exact(&mut framing[4..]).await?;
+            Ok(())
+        })
         .await?;
-        if let Some(packet) = packet {
-            sender.send_reserved(Ok(packet), Some(reservation)).await?;
-            wake.notify();
-        }
+        let record = transport::Record::decode(framing)?;
+        let reservation = sender.reserve_decode(record.decode_bytes()).await?;
+        let (packet, reservation, retained) = runtime::deadline(Instant::now() + timeout, async {
+            // read_buf initializes only bytes received. Avoid clearing large
+            // header allocations immediately before the socket overwrites them.
+            let mut bytes = Vec::with_capacity(record.header_size());
+            let mut header_reader = (&mut reader).take(record.header_size() as u64);
+            while bytes.len() < record.header_size() {
+                if header_reader.read_buf(&mut bytes).await? == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+            }
+            // The blocking closure owns the credit. Cancellation cannot release
+            // it while an uninterruptible parse still holds decoded allocations.
+            let parse_on_worker = bytes.len() > 8 * 1024
+                || (record.kind() == transport::RecordKind::Clipboard
+                    && record.decode_bytes() > 64 * 1024);
+            let (header, reservation) = if parse_on_worker {
+                runtime::blocking(move || (record.parse_header(&bytes), reservation)).await
+            } else {
+                (record.parse_header(&bytes), reservation)
+            };
+            let packet =
+                Packet::read_body_async(&mut (&mut reader).compat(), record, header?).await?;
+            let (result, packet, reservation) = if record.decode_bytes() > 64 * 1024 {
+                runtime::blocking(move || (record.validate_packet(&packet), packet, reservation))
+                    .await
+            } else {
+                (record.validate_packet(&packet), packet, reservation)
+            };
+            Ok((packet, reservation, result?))
+        })
+        .await?;
+        sender.send_decoded(packet, reservation, retained).await?;
+        wake.notify();
     }
 }
 
@@ -2851,12 +2881,11 @@ mod tests {
         packet.header.meta.title = "before oversized packet".into();
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
-        // Many empty strings fit on the wire, but their retained vector alone
-        // exceeds the frontend budget after deserialization.
-        packet.header.notifications =
-            vec![String::new(); incoming::MAX_BYTES / std::mem::size_of::<String>() + 1];
-        packet.header.meta.title = "oversized packet".into();
-        packet.encode_into(&mut bytes).unwrap();
+        // An untrusted declaration cannot allocate beyond the local ceiling.
+        // Only send the fixed framing, so rejection cannot depend on payload I/O.
+        let mut oversized = bytes[..transport::RECORD_PREFIX_BYTES].to_vec();
+        oversized[12..16].copy_from_slice(&((incoming::MAX_BYTES + 1) as u32).to_le_bytes());
+        bytes.extend_from_slice(&oversized);
         packet.header.notifications.clear();
         packet.header.meta.title = "after oversized packet".into();
         packet.encode_into(&mut bytes).unwrap();
@@ -2879,7 +2908,7 @@ mod tests {
                 .disconnect_error()
                 .unwrap()
                 .to_string()
-                .contains("memory budget")
+                .contains("decode allowance")
         );
         assert_eq!(session.borrow().meta.title, "before oversized packet");
         assert_eq!(notifications, ["earlier notification"]);
@@ -4362,3 +4391,8 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 }
+
+#[cfg(test)]
+mod admission_benchmark;
+#[cfg(test)]
+mod admission_tests;

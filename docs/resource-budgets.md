@@ -13,26 +13,59 @@ connections and GTK windows. These limits are internal defaults.
 | Small outgoing commands, including keys and clipboard read chunks | 4 MiB | 64 KiB of additional payload headroom per connection |
 
 Incoming packets preserve stream order, including clipboard, state, and viewport
-deltas. A full allowance suspends the reader asynchronously. FIFO admission gives
-waiting connections a turn as consumers release storage. Readers and writers run
-concurrently, so incoming backpressure does not stop outgoing input or heartbeats.
+deltas. A full allowance suspends the reader asynchronously. FIFO admission
+within each size class gives waiting connections a turn as consumers release
+storage. Readers and writers run concurrently, so incoming backpressure does not stop outgoing input or heartbeats.
 The last eight of a stream's 128 outgoing queue slots remain available to small
 commands when bulk work fills the queue. Outgoing admission failures are reported
 to the caller; accepted commands retain their order and reservations through the
 socket write. Input cannot bypass an earlier paste on the same stream.
 
-A reader consumes the fixed four-byte record prefix before requesting a 64 MiB
-decode reservation. Heartbeat acknowledgements need no reservation.
-At most two readers can hold these reservations at once. A stream can have one
-packet decoding or awaiting local admission in addition to its queued packets;
-both consume the process allowance. After decoding, the reservation shrinks to
-the packet's retained storage and transfers to the queue
-without acquiring shared storage a second time. The UI keeps that reservation
-until it finishes applying the packet. No shared allowance is acquired while
-holding stream-local byte permits. Consumers release permits without acquiring
-another allowance, so local admission cannot form a circular wait. Closing a
-receiver wakes admission waiters; task cancellation releases decode, queued-write,
-and in-flight-write reservations.
+Protocol 41 records start with five little-endian u32 values: the remaining
+wire length, JSON header length, record kind, JSON decode allowance, and cell
+count. Kinds distinguish updates, execution state, and atomic clipboard events.
+A four-byte zero remains a heartbeat acknowledgement and needs no reservation.
+Readers validate the fixed framing before allocating the header. JSON headers
+are limited to 16 MiB, clipboard headers to 16 KiB, and complete records to
+64 MiB on the wire and 64 MiB of decode credit.
+
+Admission charges each record for its validated JSON allowance, cell vector,
+overflow text and Arc counters, binary clipboard payload, and queue transfer
+storage. Encoded length alone does not bound decoded storage. Before typed JSON
+parsing, an allocation-free scan checks a conservative bound for the current
+header schema. It charges encoded strings, escape scratch, typed objects, vector
+growth, boxed trees, and temporary hash maps. Clipboard-read envelopes decode
+directly into fields instead of buffering an untyped JSON tree. The header
+deserializer checks clipboard descriptor lengths against the framed payload
+before allocating binary buffers, without a separate JSON traversal.
+Cell counts must match validated viewport rows before cell allocation. Changes
+to header types must preserve or revise the allocation-bound audit in
+`crates/protocol/src/transport/record.rs`.
+
+The process allowance has two independent FIFO pools. Records needing at most
+64 KiB use an 8 MiB pool; larger records use a 120 MiB pool. Bulk readers waiting
+for credit, slow bulk payloads, and paused bulk consumers cannot block small
+record admission. Exhausting the small pool still backpressures small readers.
+The reservation keeps its original pool when it shrinks, so transferring a bulk
+record to a queue never consumes small-record headroom.
+
+A stream has at most one record decoding or awaiting local admission beyond its
+queued packets. Headers larger than 8 KiB and clipboard records needing more
+than 64 KiB of decode credit parse on the existing application worker pool, with
+at most four workers across the process. Large packet storage accounting and clipboard content validation also use that pool. Waiting workers
+retain decode credit. Ordinary small headers parse directly. Cell decoding reads
+incrementally from the socket buffer, yielding at most every 8 KiB, without
+buffering or copying the complete binary record. Each stream awaits its own
+decode and enqueue before starting another record.
+
+After decoding, the reservation shrinks to retained capacity and transfers to
+the queue without acquiring shared storage again. The UI keeps it until it
+finishes applying the packet. No shared allowance is acquired while holding
+stream-local byte permits. Consumers release permits without acquiring another
+allowance, so local admission cannot form a circular wait. Receiver closure wakes
+admission waiters. Cancellation and deadlines release queued and in-flight
+reservations; a running blocking worker keeps its reservation until its work and
+result are destroyed. Blocking JSON parsing cannot be interrupted once started.
 
 The prediction pool evicts whole row caches from unfocused windows first, then
 least recently used caches at the same priority. Hidden tabs release their rows
@@ -49,15 +82,15 @@ synchronous eviction completes.
 
 These allowances are not an RSS cap. They exclude allocator bookkeeping and
 retained allocator arenas, queue bookkeeping, each socket reader's 8 KiB buffer,
-JSON decode scratch storage, canonical per-view viewport/state snapshots, UI-owned
-clipboard contents, and kernel socket buffers. A wire packet can expand during
-JSON decoding before its retained-size rejection;
-only two readers can do this concurrently. An admitted decoder has a 30 second
-read deadline. FIFO admission of full decode reservations can delay another
-connection behind a partial packet or paused consumer. Large synchronous JSON
-parses still run on the existing I/O thread and can delay executor scheduling.
-Separate outgoing budgets keep input and control work independent of that
-admission wait.
+canonical per-view viewport/state snapshots, UI-owned clipboard contents, and kernel socket buffers. Decode credit covers JSON input
+and scratch while a record is processing. An admitted record has a 30 second
+decode/read deadline. Waiting for admission or queue space suspends the reader;
+writers and heartbeats continue independently. Deadlines can cancel a worker's
+caller but do not interrupt a running parse. The bound limits that parse's input,
+nesting, and storage. Admission limits are conservative and can reject records
+whose eventual retained storage would fit. Small-pool saturation and per-stream
+ordering can still delay updates. These limits do not guarantee latency against
+unlimited connections or CPU saturation.
 
 GTK rendering scenes, glyph caches, terminal history, and daemon allocations also
 sit outside these client allowances. Each daemon applies its own limits below.
@@ -133,6 +166,26 @@ It fills 64 row caches and eight ordered queues, pauses consumers, measures
 retained bytes and Linux RSS, checks executor responsiveness, copies cached
 viewports, then drains every event in order. Producer-owned arguments awaiting
 admission in this synthetic probe are outside its queue-byte measurement.
+
+Measure packet admission and decode scheduling separately:
+
+```sh
+cargo test -p gmux-client --release packet_admission_pressure -- --ignored --nocapture
+cargo test -p gmux-client --release clipboard_decode_pressure -- --ignored --nocapture
+cargo test -p gmux-protocol --release header_decode_cost -- --ignored --nocapture
+```
+
+This uses the real client reader with bounded in-memory sockets. Two partial
+records compete with an interactive stream, followed by thirty-two 8 MiB JSON
+records alongside independent input and update traffic. It reports reserved
+bytes, input/update latency, executor wake latency, CPU time, wall time, and sampled
+Linux RSS. The clipboard variant uses thirty-two 4 MiB clipboard records.
+`header_decode_cost` separates allocation-bound scanning, typed deserialization,
+and complete header decoding for small, plain, escaped, and string-array headers.
+CPU in the socket probe includes the interactive probes and socket copies.
+Run alone for comparable measurements. It excludes daemon generation,
+GTK application time, and display presentation. The normal tests separately
+check bulk-pool saturation, worker cancellation, deadlines, and permit release.
 
 For the native workload, run:
 

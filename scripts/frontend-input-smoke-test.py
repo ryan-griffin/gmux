@@ -52,11 +52,11 @@ class Client:
             body = self.exact(size)
             self.reply_bytes += size + 4
             header_size, = struct.unpack("<I", body[:4])
-            header = json.loads(body[4:4 + header_size])
+            header = json.loads(body[16:16 + header_size])
             if header["meta"]["id"] == self.pane and header["frame"]:
                 self.viewport_rows += len(header["rows"])
                 self.cache_rows += len((header.get("cache") or {}).get("row_flags", []))
-            cells = body[4 + header_size:]
+            cells = body[16 + header_size:]
             text = "".join(cell[0] for cell in decode_cells(cells))
             if predicate(header, text):
                 return header

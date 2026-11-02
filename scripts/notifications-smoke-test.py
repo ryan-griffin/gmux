@@ -87,7 +87,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
                 size, = struct.unpack("<I", exact(4))
                 body = exact(size)
                 header_size, = struct.unpack("<I", body[:4])
-                header = json.loads(body[4:4 + header_size])
+                header = json.loads(body[16:16 + header_size])
                 if header["meta"]["id"] == pane:
                     return header
 
