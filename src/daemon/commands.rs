@@ -380,7 +380,7 @@ impl Daemon {
                     "scrollback_limits": self.limits,
                     "terminal_memory": self.sessions.values()
                         .map(TerminalSession::memory_usage).collect::<anyhow::Result<Vec<_>>>()?,
-                    "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && !frontend.git_panes.is_empty()).count(),
+                    "git_subscribers": self.frontends.values().filter(|frontend| frontend.attached && frontend.has_git_subscriptions()).count(),
                     "git": self.git.as_ref().map_or_else(crate::branch::Stats::default, crate::branch::Service::stats),
                 }))))
             }
@@ -428,7 +428,7 @@ impl Daemon {
                 let frontend = self
                     .frontends
                     .iter()
-                    .filter(|(_, f)| f.views.contains_key(&id))
+                    .filter(|(_, f)| f.view(id).is_some())
                     .max_by_key(|(client, f)| (f.focused, **client))
                     .map(|(&client, _)| client);
                 let content = if let Some(client) = frontend {
@@ -436,8 +436,7 @@ impl Daemon {
                         .frontends
                         .get_mut(&client)
                         .unwrap()
-                        .views
-                        .get_mut(&id)
+                        .view_mut(id)
                         .unwrap();
                     self.sessions
                         .get_mut(&id)

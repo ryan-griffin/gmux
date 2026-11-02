@@ -94,6 +94,17 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 - `mutation.rs`: typed mutation outcomes, live execution revision publication,
   save-before-apply scrollback settings, process-exit topology changes, and shutdown checkpoints.
 
+Each daemon `Frontend` owns one pane map of `PaneViewState`. A pane keeps its
+metadata baseline, requested size, Git subscription, pending error, and dirty
+flags with that owner. Presentation state is allocated only when used and owns
+the native engine view, selection/search baselines, and scroll/selection serials.
+The optional sent-screen cache has a separate lifetime. Hiding releases that
+cache while retaining view state; budget eviction releases regenerable storage
+but keeps generation identity for the next full resend. Closing removes the
+pane owner, and disconnecting drops the whole frontend. Socket framing, output
+reservations, paste assembly, clipboard capabilities/generations, and connection
+focus remain on the connection.
+
 `crates/protocol/src/model.rs` and `model/state.rs` define daemon identities, qualified references,
 `ExecutionSnapshot`, and pane topology. A snapshot contains only live tabs;
 `ExecutionTab` and `PaneTree` also describe the saved topology.

@@ -9,10 +9,10 @@ const MAX_REQUESTS_PER_TURN: usize = 64;
 const MAX_COMMAND: usize = 1_048_577;
 
 #[derive(Default)]
-pub(super) struct SentScreen {
-    pub(super) frame: Frame,
-    pub(super) cells: Vec<Cell>,
-    pub(super) row_flags: Vec<u8>,
+struct SentScreen {
+    frame: Frame,
+    cells: Vec<Cell>,
+    row_flags: Vec<u8>,
     source_revision: Option<u64>,
     generation: u64,
     history_generation: u64,
@@ -20,49 +20,123 @@ pub(super) struct SentScreen {
     cached: std::ops::Range<u64>,
     cache_active: bool,
     prefetch_at: Option<Instant>,
-    pub(super) hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
+    hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     cache_bytes: usize,
     last_used: Option<Instant>,
 }
-pub(super) struct SentSelection {
+struct SentSelection {
     range: Option<gmux_protocol::selection::Selection>,
     serial: u64,
 }
+/// One frontend's ownership of a pane. Metadata-only panes never allocate a
+/// presentation, native view, or screen baseline.
+#[derive(Default)]
+struct PaneViewState {
+    metadata: Option<Metadata>,
+    presentation: Option<Box<PanePresentation>>,
+    size: Option<TerminalSize>,
+    error: Option<String>,
+    git_sent: Option<Box<transport::GitMetadata>>,
+    git_subscribed: bool,
+    visible: bool,
+    changed: bool,
+    metadata_changed: bool,
+    terminal_changed: bool,
+}
+
+struct PanePresentation {
+    view: crate::engine::EngineView,
+    screen: Option<Box<SentScreen>>,
+    find: Option<gmux_protocol::search::FindState>,
+    selection: Option<SentSelection>,
+    scroll_serial: u64,
+    sent_scroll_serial: Option<u64>,
+    selection_serial: u64,
+}
+
+impl PanePresentation {
+    fn new(view: crate::engine::EngineView) -> Self {
+        Self {
+            view,
+            screen: None,
+            find: None,
+            selection: None,
+            scroll_serial: 0,
+            sent_scroll_serial: None,
+            selection_serial: 0,
+        }
+    }
+}
+
+impl PaneViewState {
+    fn set_visible(&mut self, visible: bool) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        self.changed |= visible;
+        if let Some(presentation) = &mut self.presentation {
+            // Reattachment always needs a full viewport. Keep per-view state.
+            presentation.screen = None;
+            presentation.view.set_active(visible);
+        }
+    }
+
+    fn presentation(&mut self, session: &TerminalSession) -> anyhow::Result<&mut PanePresentation> {
+        if self.presentation.is_none() {
+            let mut view = session.new_view()?;
+            view.set_active(self.visible);
+            self.presentation = Some(Box::new(PanePresentation::new(view)));
+        }
+        Ok(self.presentation.as_mut().unwrap())
+    }
+
+    fn screen(&self) -> Option<&SentScreen> {
+        self.presentation.as_ref()?.screen.as_deref()
+    }
+
+    fn find_pending(&self) -> bool {
+        self.presentation
+            .as_ref()
+            .map(|p| &p.view)
+            .is_some_and(crate::engine::EngineView::find_pending)
+    }
+
+    fn pending(&self) -> bool {
+        self.changed
+            || self.metadata_changed
+            || self.terminal_changed
+            || self.error.is_some()
+            || self.find_pending()
+    }
+
+    fn invalidate_cache(&mut self) {
+        if let Some(screen) = self.presentation.as_mut().and_then(|p| p.screen.as_mut()) {
+            screen.release_cache();
+        }
+    }
+}
+
 pub(super) struct Frontend {
     pub(super) socket: UnixStream,
+    panes: HashMap<u64, PaneViewState>,
     pub(super) input: Vec<u8>,
     read_buffer: Vec<u8>,
     read_offset: usize,
     pub(super) output: resources::Output,
     pub(super) attached: bool,
     pub(super) remote: bool,
-    pub(super) visible: HashSet<u64>,
-    pub(super) git_panes: HashSet<u64>,
-    pub(super) git_sent: HashMap<u64, transport::GitMetadata>,
     git_revision: Option<u64>,
-    pub(super) screens: HashMap<u64, SentScreen>,
-    pub(super) metadata: HashMap<u64, Metadata>,
-    pub(super) scroll_serials: HashMap<u64, u64>,
-    pub(super) sent_scroll_serials: HashMap<u64, u64>,
-    pub(super) find: HashMap<u64, gmux_protocol::search::FindState>,
-    pub(super) selections: HashMap<u64, SentSelection>,
-    pub(super) selection_serials: HashMap<u64, u64>,
     pub(super) discarding: bool,
     pub(super) paste: Option<Paste>,
-    pub(super) views: HashMap<u64, crate::engine::EngineView>,
     clipboard_writes: bool,
     pub(super) clipboard_reads: bool,
     pub(super) clipboard_epochs: [u64; 2],
     pub(super) paste_serial: u64,
     binary: Option<StreamRequest>,
     pub(super) binary_deadline: Option<Instant>,
-    pub(super) errors: HashMap<u64, String>,
     pub(super) state_revision: Option<u64>,
-    pub(super) sizes: HashMap<u64, TerminalSize>,
     pub(super) focused: bool,
-    pub(super) changed: HashSet<u64>,
-    pub(super) metadata_changed: HashSet<u64>,
-    terminal_changed: HashSet<u64>,
     frame_interval: Duration,
     next_frame: Instant,
 }
@@ -74,11 +148,63 @@ pub(super) struct Paste {
     user: Option<(u64, u64)>,
 }
 impl Frontend {
+    pub(super) fn is_visible(&self, pane: u64) -> bool {
+        self.panes.get(&pane).is_some_and(|pane| pane.visible)
+    }
+
+    pub(super) fn view(&self, pane: u64) -> Option<&crate::engine::EngineView> {
+        self.panes
+            .get(&pane)?
+            .presentation
+            .as_ref()
+            .map(|p| &p.view)
+    }
+
+    pub(super) fn view_mut(&mut self, pane: u64) -> Option<&mut crate::engine::EngineView> {
+        self.panes
+            .get_mut(&pane)?
+            .presentation
+            .as_mut()
+            .map(|p| &mut p.view)
+    }
+
+    pub(super) fn git_panes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.panes
+            .iter()
+            .filter_map(|(&id, pane)| pane.git_subscribed.then_some(id))
+    }
+
+    pub(super) fn has_git_subscriptions(&self) -> bool {
+        self.panes.values().any(|pane| pane.git_subscribed)
+    }
+
+    pub(super) fn pane_error(&mut self, pane: u64, error: String) {
+        self.panes.entry(pane).or_default().error = Some(error);
+    }
+
+    /// Dropping the owner releases native views and every pane-local cache and
+    /// subscription. Connection-level transfers need separate cancellation.
+    pub(super) fn close_pane(&mut self, pane: u64) {
+        self.panes.remove(&pane);
+        // Release bucket capacity too once the last pane closes. Avoid keeping
+        // a frontend's largest layout allocation for an empty connection.
+        if self.panes.is_empty() {
+            self.panes = HashMap::new();
+        }
+        if self.paste.as_ref().is_some_and(|paste| paste.pane == pane) {
+            self.paste = None;
+        }
+    }
+
     pub(super) fn retained_output(&self) -> usize {
         self.output.capacity()
     }
     pub(super) fn retained_screens(&self) -> usize {
-        self.screens.values().map(|screen| screen.cache_bytes).sum()
+        self.panes
+            .values()
+            .filter_map(PaneViewState::screen)
+            .map(|screen| screen.cache_bytes)
+            .sum()
     }
     fn queue_clipboard(
         &mut self,
@@ -106,33 +232,18 @@ impl Frontend {
             output: resources::Output::new(budget),
             attached: false,
             remote: false,
-            visible: HashSet::new(),
-            git_panes: HashSet::new(),
-            git_sent: HashMap::new(),
+            panes: HashMap::new(),
             git_revision: None,
-            screens: HashMap::new(),
-            metadata: HashMap::new(),
-            scroll_serials: HashMap::new(),
-            sent_scroll_serials: HashMap::new(),
-            find: HashMap::new(),
-            selections: HashMap::new(),
-            selection_serials: HashMap::new(),
             discarding: false,
             paste: None,
-            views: HashMap::new(),
             clipboard_writes: false,
             clipboard_reads: false,
             clipboard_epochs: [0; 2],
             paste_serial: 0,
             binary: None,
             binary_deadline: None,
-            errors: HashMap::new(),
             state_revision: None,
-            sizes: HashMap::new(),
             focused: false,
-            changed: HashSet::new(),
-            metadata_changed: HashSet::new(),
-            terminal_changed: HashSet::new(),
             frame_interval: transport::DEFAULT_FRAME_INTERVAL,
             next_frame: Instant::now(),
         }
@@ -283,8 +394,9 @@ fn trim_screen_caches(current: &mut Frontend, others: &mut HashMap<u64, Frontend
             .chain(others.iter().map(|(&id, frontend)| (Some(id), frontend)))
             .flat_map(|(id, frontend)| {
                 frontend
-                    .screens
+                    .panes
                     .iter()
+                    .filter_map(|(pane, state)| state.screen().map(|screen| (pane, screen)))
                     .filter(|(_, screen)| screen.cache_bytes != 0)
                     .map(move |(&pane, screen)| {
                         (
@@ -306,9 +418,9 @@ fn trim_screen_caches(current: &mut Frontend, others: &mut HashMap<u64, Frontend
             Some(id) => others.get_mut(&id).unwrap(),
             None => &mut *current,
         };
-        let screen = frontend.screens.get_mut(&pane).unwrap();
-        total -= screen.cache_bytes;
-        screen.release_cache();
+        let state = frontend.panes.get_mut(&pane).unwrap();
+        total -= state.screen().unwrap().cache_bytes;
+        state.invalidate_cache();
     }
 }
 
@@ -319,8 +431,10 @@ fn size_owner<'a>(
     frontends
         .filter(|(_, frontend)| {
             frontend.attached
-                && frontend.visible.contains(&pane)
-                && frontend.sizes.contains_key(&pane)
+                && frontend
+                    .panes
+                    .get(&pane)
+                    .is_some_and(|pane| pane.visible && pane.size.is_some())
         })
         // Without a focused subscriber, keep a stable owner to avoid contention.
         .min_by_key(|(id, frontend)| (!frontend.focused, *id))
@@ -331,7 +445,7 @@ fn requested_size<'a>(
     pane: u64,
     frontends: impl Iterator<Item = (u64, &'a Frontend)>,
 ) -> Option<TerminalSize> {
-    size_owner(pane, frontends).map(|frontend| frontend.sizes[&pane])
+    size_owner(pane, frontends).map(|frontend| frontend.panes[&pane].size.unwrap())
 }
 
 impl Daemon {
@@ -351,7 +465,7 @@ impl Daemon {
         self.frontends
             .iter()
             .filter(|(_, frontend)| {
-                frontend.attached && frontend.clipboard_writes && frontend.visible.contains(&pane)
+                frontend.attached && frontend.clipboard_writes && frontend.is_visible(pane)
             })
             .min_by_key(|(id, frontend)| (!frontend.focused, **id))
             .map(|(&id, _)| id)
@@ -396,13 +510,13 @@ impl Daemon {
         let Some(session) = self.sessions.get_mut(&pane) else {
             return;
         };
-        if let Some(view) = owner.views.get(&pane)
+        if let Some(view) = owner.view(pane)
             && let Err(error) = session.use_view_appearance(view)
         {
             self.errors.insert(pane, error.to_string());
             self.changed.insert(pane);
         }
-        let (cols, rows, cw, ch, width, height) = owner.sizes[&pane];
+        let (cols, rows, cw, ch, width, height) = owner.panes[&pane].size.unwrap();
         match session.resize(cols, rows, cw, ch, width, height) {
             Ok(true) => {
                 self.changed.insert(pane);
@@ -500,24 +614,29 @@ impl Daemon {
             return Ok(());
         }
         if let StreamCommand::Subscribe { panes } = command {
-            for id in &panes {
-                if !frontend.visible.contains(id) {
-                    frontend.screens.remove(id);
-                    frontend.changed.insert(*id);
+            for (&id, state) in &mut frontend.panes {
+                state.set_visible(panes.contains(&id));
+            }
+            for id in panes {
+                // Do not retain subscriptions to closed or unknown panes.
+                if self.sessions.contains_key(&id) {
+                    frontend.panes.entry(id).or_default().set_visible(true);
                 }
             }
-            frontend.screens.retain(|id, _| panes.contains(id));
-            for (id, view) in &mut frontend.views {
-                view.set_active(panes.contains(id));
-            }
-            frontend.visible = panes;
             self.resize_sessions(Some((frontend_id, frontend)));
             return Ok(());
         }
         if let StreamCommand::GitSubscribe { mut panes } = command {
             panes.retain(|id| self.sessions.contains_key(id));
-            frontend.git_sent.retain(|id, _| panes.contains(id));
-            frontend.git_panes = panes;
+            for (&id, state) in &mut frontend.panes {
+                state.git_subscribed = panes.contains(&id);
+                if !state.git_subscribed {
+                    state.git_sent = None;
+                }
+            }
+            for id in panes {
+                frontend.panes.entry(id).or_default().git_subscribed = true;
+            }
             frontend.git_revision = None;
             self.git_dirty = true;
             return Ok(());
@@ -552,9 +671,7 @@ impl Daemon {
                 gmux_protocol::viewport::valid(cols.into(), rows.into()),
                 "Invalid terminal size"
             );
-            frontend
-                .sizes
-                .insert(id, (cols, rows, cw, ch, width, height));
+            frontend.panes.entry(id).or_default().size = Some((cols, rows, cw, ch, width, height));
             self.resize_session(id, Some((frontend_id, frontend)));
             return Ok(());
         }
@@ -581,7 +698,7 @@ impl Daemon {
             } => {
                 anyhow::ensure!(
                     frontend.clipboard_reads
-                        && frontend.visible.contains(&id)
+                        && frontend.is_visible(id)
                         && size <= transport::MAX_PASTE,
                     "Invalid desktop paste transfer"
                 );
@@ -652,7 +769,7 @@ impl Daemon {
             StreamCommand::ClearScreen => {
                 self.sessions.get_mut(&id).unwrap().clear_screen()?;
                 for client in std::iter::once(&mut *frontend).chain(self.frontends.values_mut()) {
-                    if let Some(view) = client.views.get_mut(&id) {
+                    if let Some(view) = client.view_mut(id) {
                         view.restart_find();
                     }
                 }
@@ -670,18 +787,15 @@ impl Daemon {
             StreamCommand::Paste { text, .. } => !text.is_empty(),
             _ => false,
         };
-        if interaction && frontend.visible.contains(&id) && session.acknowledge_program_status() {
+        if interaction && frontend.is_visible(id) && session.acknowledge_program_status() {
             self.metadata_changed.insert(id);
         }
         if interaction && session.exited() {
             return Ok(());
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
-            let mut view = session.new_view()?;
-            view.set_active(frontend.visible.contains(&id));
-            entry.insert(view);
-        }
-        let view = frontend.views.get_mut(&id).unwrap();
+        let pane = frontend.panes.entry(id).or_default();
+        let presentation = pane.presentation(session)?;
+        let view = &mut presentation.view;
         let appearance_changed = matches!(
             command,
             StreamCommand::Theme { .. } | StreamCommand::Style { .. }
@@ -733,7 +847,7 @@ impl Daemon {
             }
             StreamCommand::Theme { theme } => {
                 view.set_theme(&theme);
-                if let Some(screen) = frontend.screens.get_mut(&id) {
+                if let Some(screen) = presentation.screen.as_mut() {
                     screen.source_revision = None;
                 }
             }
@@ -745,14 +859,14 @@ impl Daemon {
                 session.with_view(view, |engine| engine.scroll(delta, bottom));
             }
             StreamCommand::ScrollTo { row, serial } => {
-                let previous = frontend.scroll_serials.entry(id).or_default();
+                let previous = &mut presentation.scroll_serial;
                 if serial >= *previous {
                     session.with_view(view, |engine| engine.scroll_to(row));
                     *previous = serial;
                 }
             }
             StreamCommand::Prompt { previous, serial } => {
-                let old = frontend.scroll_serials.entry(id).or_default();
+                let old = &mut presentation.scroll_serial;
                 if serial >= *old {
                     *old = serial;
                     // A missing target is harmless, but still acknowledge the
@@ -779,7 +893,7 @@ impl Daemon {
                         copy: should_copy,
                         serial,
                     } => {
-                        frontend.selection_serials.insert(id, serial);
+                        presentation.selection_serial = serial;
                         if anchored {
                             engine.select_anchored_output()?;
                         } else {
@@ -798,11 +912,11 @@ impl Daemon {
                         mode,
                         serial,
                     } => {
-                        frontend.selection_serials.insert(id, serial);
+                        presentation.selection_serial = serial;
                         engine.select(start, end, mode)?
                     }
                     StreamCommand::ClearSelection { serial } => {
-                        frontend.selection_serials.insert(id, serial);
+                        presentation.selection_serial = serial;
                         engine.clear_selection();
                     }
                     _ => unreachable!(),
@@ -810,6 +924,7 @@ impl Daemon {
                 Ok(())
             })?,
         }
+        pane.changed = true;
         if let Some(content) = copy {
             frontend.queue_clipboard(
                 id,
@@ -819,7 +934,6 @@ impl Daemon {
                 },
             )?;
         }
-        frontend.changed.insert(id);
         if appearance_changed {
             self.resize_session(id, Some((frontend_id, frontend)));
         }
@@ -832,22 +946,17 @@ impl Daemon {
             .filter_map(|frontend| {
                 let pending = !self.changed.is_empty()
                     || !self.metadata_changed.is_empty()
-                    || !frontend.metadata_changed.is_empty()
                     || !self.notifications.is_empty()
                     || !self.errors.is_empty()
-                    || !frontend.changed.is_empty()
-                    || !frontend.terminal_changed.is_empty()
+                    || frontend.panes.values().any(PaneViewState::pending)
                     || frontend.state_revision != Some(self.revision)
-                    || (!frontend.git_panes.is_empty()
+                    || (frontend.has_git_subscriptions()
                         && frontend.git_revision
-                            != self.git.as_ref().map(crate::branch::Service::revision))
-                    || frontend
-                        .views
-                        .values()
-                        .any(crate::engine::EngineView::find_pending);
+                            != self.git.as_ref().map(crate::branch::Service::revision));
                 let prefetch = frontend
-                    .screens
+                    .panes
                     .values()
+                    .filter_map(PaneViewState::screen)
                     .filter_map(|screen| screen.prefetch_at)
                     .min()
                     .map(|at| at.max(frontend.next_frame));
@@ -873,15 +982,15 @@ impl Daemon {
             .values_mut()
             .filter(|frontend| frontend.attached)
         {
-            frontend
-                .terminal_changed
-                .extend(self.changed.iter().copied());
-            frontend
-                .metadata_changed
-                .extend(self.metadata_changed.iter().copied());
-            frontend
-                .errors
-                .extend(self.errors.iter().map(|(&id, error)| (id, error.clone())));
+            for &id in &self.changed {
+                frontend.panes.entry(id).or_default().terminal_changed = true;
+            }
+            for &id in &self.metadata_changed {
+                frontend.panes.entry(id).or_default().metadata_changed = true;
+            }
+            for (&id, error) in &self.errors {
+                frontend.pane_error(id, error.clone());
+            }
         }
         for id in ids {
             let mut frontend = self.frontends.remove(&id).unwrap();
@@ -960,21 +1069,20 @@ impl Daemon {
         if let Some(git) = &self.git
             && frontend.git_revision != Some(git.revision())
         {
-            let updates: Vec<_> = frontend
-                .git_panes
-                .iter()
-                .filter_map(|&pane| git.metadata(pane))
-                .filter(|meta| frontend.git_sent.get(&meta.id) != Some(meta))
-                .collect();
-            for meta in updates {
-                frontend.git_sent.insert(meta.id, meta.clone());
-                frontend.queue(Packet {
-                    header: Header {
-                        git: Some(meta),
-                        ..Header::default()
-                    },
-                    cells: Vec::new(),
-                })?;
+            for (&id, pane) in &mut frontend.panes {
+                if pane.git_subscribed
+                    && let Some(meta) = git.metadata(id)
+                    && pane.git_sent.as_deref() != Some(&meta)
+                {
+                    pane.git_sent = Some(Box::new(meta.clone()));
+                    frontend.output.queue(Packet {
+                        header: Header {
+                            git: Some(meta),
+                            ..Header::default()
+                        },
+                        cells: Vec::new(),
+                    })?;
+                }
             }
             frontend.git_revision = Some(git.revision());
         }
@@ -985,29 +1093,23 @@ impl Daemon {
                 .messages
                 .into_iter()
                 .collect();
-            let error = frontend
-                .errors
-                .remove(&id)
-                .or_else(|| self.errors.get(&id).cloned());
-            let terminal_changed = frontend.terminal_changed.contains(&id);
+            let pane = frontend.panes.entry(id).or_default();
+            let error = pane.error.take().or_else(|| self.errors.get(&id).cloned());
+            let terminal_changed = pane.terminal_changed;
             let changed = terminal_changed
-                || frontend.changed.contains(&id)
-                || frontend.screens.get(&id).is_some_and(|screen| {
+                || pane.changed
+                || pane.screen().is_some_and(|screen| {
                     screen.prefetch_at.is_some_and(|at| at <= Instant::now())
                 })
-                || frontend
-                    .views
-                    .get(&id)
-                    .is_some_and(crate::engine::EngineView::find_pending);
-            let screen =
-                frontend.visible.contains(&id) && (changed || !frontend.screens.contains_key(&id));
+                || pane.find_pending();
+            let screen = pane.visible && (changed || pane.screen().is_none());
             if !metadata_due
-                && !frontend.metadata_changed.contains(&id)
+                && !pane.metadata_changed
                 && !changed
                 && !screen
                 && notify.is_empty()
                 && error.is_none()
-                && frontend.metadata.contains_key(&id)
+                && pane.metadata.is_some()
             {
                 continue;
             }
@@ -1016,7 +1118,7 @@ impl Daemon {
                 && !changed
                 && notify.is_empty()
                 && error.is_none()
-                && frontend.metadata.get(&id) == Some(&meta)
+                && pane.metadata.as_ref() == Some(&meta)
             {
                 continue;
             }
@@ -1031,14 +1133,10 @@ impl Daemon {
             let mut cache_invalidated = false;
             let mut hyperlinks = None;
             let (frame, find, selection, selection_origin) = if screen
-                || frontend.views.contains_key(&id)
+                || pane.presentation.is_some()
             {
-                if let std::collections::hash_map::Entry::Vacant(entry) = frontend.views.entry(id) {
-                    let mut view = session.new_view()?;
-                    view.set_active(frontend.visible.contains(&id));
-                    entry.insert(view);
-                }
-                let view = frontend.views.get_mut(&id).unwrap();
+                let presentation = pane.presentation(session)?;
+                let view = &mut presentation.view;
                 if terminal_changed {
                     view.invalidate();
                 }
@@ -1057,7 +1155,7 @@ impl Daemon {
                         let cells_snapshot = &engine.cells;
                         self.snapshots += 1;
                         let cols = frame.cols as usize;
-                        let old = frontend.screens.entry(id).or_default();
+                        let old = presentation.screen.get_or_insert_with(Default::default);
                         let full = old.frame.cols != frame.cols
                             || old.frame.rows != frame.rows
                             || old.cells.len() != cells_snapshot.len();
@@ -1127,7 +1225,7 @@ impl Daemon {
                         }
                         self.sent_rows += rows.len() as u64;
                         // A client can discard every row while detached; attachment always resends a full viewport.
-                        let serial = frontend.scroll_serials.get(&id).copied().unwrap_or(0);
+                        let serial = presentation.scroll_serial;
                         // Immutable history remains useful during output. Only
                         // prefetch live screen rows after output has settled.
                         if !engine.mode(2026) {
@@ -1188,7 +1286,7 @@ impl Daemon {
                             || old.frame != frame
                             || cache.is_some()
                             || removed != 0
-                            || frontend.sent_scroll_serials.get(&id) != Some(&serial);
+                            || presentation.sent_scroll_serial != Some(serial);
                         old.frame = frame;
                         old.cache_bytes = old.memory_size();
                         old.last_used = Some(Instant::now());
@@ -1211,14 +1309,17 @@ impl Daemon {
                     None,
                 )
             };
-            if screen {
-                trim_screen_caches(frontend, &mut self.frontends, resources::MAX_SCREEN_CACHES);
-            }
-            let find_changed = frontend.find.get(&id) != Some(&find);
-            let selection_serial = frontend.selection_serials.get(&id).copied().unwrap_or(0);
-            let previous = frontend.selections.get(&id);
-            let selection_changed = previous.is_none_or(|sent| sent.range != selection);
-            let selection_ack_changed = previous.is_none_or(|sent| sent.serial != selection_serial);
+            let presentation = pane.presentation.as_mut();
+            let find_changed = presentation
+                .as_ref()
+                .map_or(pane.metadata.is_none(), |p| p.find.as_ref() != Some(&find));
+            let selection_serial = presentation.as_ref().map_or(0, |p| p.selection_serial);
+            let previous = presentation.as_ref().and_then(|p| p.selection.as_ref());
+            let selection_changed =
+                previous.map_or(pane.metadata.is_none(), |sent| sent.range != selection);
+            let selection_ack_changed = previous.map_or(pane.metadata.is_none(), |sent| {
+                sent.serial != selection_serial
+            });
             if frame.is_none()
                 && !cache_invalidated
                 && cache_valid_before.is_none()
@@ -1227,26 +1328,29 @@ impl Daemon {
                 && !selection_ack_changed
                 && notify.is_empty()
                 && error.is_none()
-                && frontend.metadata.get(&id) == Some(&meta)
+                && pane.metadata.as_ref() == Some(&meta)
             {
                 continue;
             }
-            frontend.find.insert(id, find.clone());
-            frontend.selections.insert(
-                id,
-                SentSelection {
+            let scroll_serial = if let Some(presentation) = presentation {
+                presentation.find = Some(find.clone());
+                presentation.selection = Some(SentSelection {
                     range: selection,
                     serial: selection_serial,
-                },
-            );
-            let status_changed = frontend.metadata.get(&id).is_some_and(|previous| {
+                });
+                presentation.sent_scroll_serial = Some(presentation.scroll_serial);
+                presentation.scroll_serial
+            } else {
+                0
+            };
+            let status_changed = pane.metadata.as_ref().is_some_and(|previous| {
                 previous.progress != meta.progress || previous.program_status != meta.program_status
             });
-            frontend.metadata.insert(id, meta.clone());
-            frontend
-                .sent_scroll_serials
-                .insert(id, frontend.scroll_serials.get(&id).copied().unwrap_or(0));
+            pane.metadata = Some(meta.clone());
             let viewport_changed = screen && (frame.is_some() || find_changed || selection_changed);
+            if screen {
+                trim_screen_caches(frontend, &mut self.frontends, resources::MAX_SCREEN_CACHES);
+            }
             frontend.queue(Packet {
                 header: Header {
                     git: None,
@@ -1254,7 +1358,7 @@ impl Daemon {
                     meta,
                     frame,
                     hyperlinks,
-                    scroll_serial: frontend.scroll_serials.get(&id).copied().unwrap_or(0),
+                    scroll_serial,
                     generation,
                     cache_origin,
                     cache_valid_before,
@@ -1279,9 +1383,11 @@ impl Daemon {
             })?;
             frame_activity |= viewport_changed || status_changed;
         }
-        frontend.changed.clear();
-        frontend.terminal_changed.clear();
-        frontend.metadata_changed.clear();
+        for pane in frontend.panes.values_mut() {
+            pane.changed = false;
+            pane.terminal_changed = false;
+            pane.metadata_changed = false;
+        }
         frontend.flush()?;
         Ok(frame_activity)
     }
@@ -1290,6 +1396,210 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn session(id: u64) -> TerminalSession {
+        TerminalSession::spawn(
+            id,
+            id,
+            PathBuf::from("/tmp"),
+            CursorStyle::default(),
+            &Theme::adwaita(true),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn deferred_pane_updates_keep_each_frontends_serials_errors_and_dirty_state() {
+        let mut daemon = Daemon::empty_for_test();
+        let mut session = session(1);
+        let mut seed = session.new_view().unwrap();
+        session.with_view(&mut seed, |engine| {
+            engine.feed(b"first row\r\nsecond row\r\n");
+        });
+        daemon.sessions.insert(1, session);
+        let (mut fast, fast_peer) = connection();
+        let (mut slow, slow_peer) = connection();
+        fast_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        slow_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut fast_peer = std::io::BufReader::new(fast_peer);
+        let mut slow_peer = std::io::BufReader::new(slow_peer);
+        for frontend in [&mut fast, &mut slow] {
+            frontend.attached = true;
+            frontend.state_revision = Some(0);
+            daemon
+                .input(
+                    1,
+                    frontend,
+                    StreamRequest::pane(
+                        1,
+                        StreamCommand::Subscribe {
+                            panes: HashSet::from([1]),
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        daemon.frontends = HashMap::from([(1, fast), (2, slow)]);
+        daemon.updates(true);
+        for peer in [&mut fast_peer, &mut slow_peer] {
+            assert!(Packet::read(peer).unwrap().header.frame.is_some());
+        }
+        let mut slow = daemon.frontends.remove(&2).unwrap();
+        slow.next_frame = Instant::now() + Duration::from_secs(60);
+        daemon
+            .input(
+                2,
+                &mut slow,
+                StreamRequest::pane(1, StreamCommand::ScrollTo { row: 0, serial: 7 }),
+            )
+            .unwrap();
+        daemon
+            .input(
+                2,
+                &mut slow,
+                StreamRequest::pane(
+                    1,
+                    StreamCommand::Select {
+                        start: (0, 0),
+                        end: (4, 0),
+                        mode: Default::default(),
+                        serial: 9,
+                    },
+                ),
+            )
+            .unwrap();
+        daemon.frontends.insert(2, slow);
+        daemon.frontends.get_mut(&1).unwrap().next_frame = Instant::now();
+        daemon.changed.insert(1);
+        daemon.metadata_changed.insert(1);
+        daemon.errors.insert(1, "pending error".into());
+        daemon.updates(false);
+        let fast = Packet::read(&mut fast_peer).unwrap().header;
+        assert_eq!(fast.scroll_serial, 0);
+        assert_eq!(fast.selection_serial, 0);
+        assert!(fast.selection.is_none());
+        assert_eq!(fast.error.as_deref(), Some("pending error"));
+        assert!(daemon.changed.is_empty() && daemon.errors.is_empty());
+        // Another broadcast may clear shared dirty state before the slow frame is due.
+        daemon.updates(false);
+        daemon.frontends.get_mut(&2).unwrap().next_frame = Instant::now();
+        daemon.updates(false);
+        let slow = Packet::read(&mut slow_peer).unwrap().header;
+        assert_eq!(slow.scroll_serial, 7);
+        assert_eq!(slow.selection_serial, 9);
+        assert!(slow.selection.is_some());
+        assert_eq!(slow.error.as_deref(), Some("pending error"));
+    }
+
+    #[test]
+    fn closing_a_pane_releases_visible_retained_and_metadata_only_owners() {
+        let mut daemon = Daemon::empty_for_test();
+        daemon.sessions.insert(1, session(1));
+        let mut peers = Vec::new();
+        for id in 1..=3 {
+            let (mut frontend, peer) = connection();
+            frontend.attached = true;
+            frontend.state_revision = Some(0);
+            if id != 3 {
+                daemon
+                    .input(
+                        id,
+                        &mut frontend,
+                        StreamRequest::pane(
+                            1,
+                            StreamCommand::Subscribe {
+                                panes: HashSet::from([1]),
+                            },
+                        ),
+                    )
+                    .unwrap();
+            }
+            daemon
+                .update_frontend(&mut frontend, true, &mut HashMap::new())
+                .unwrap();
+            if id == 2 {
+                daemon
+                    .input(
+                        id,
+                        &mut frontend,
+                        StreamRequest::pane(
+                            1,
+                            StreamCommand::Subscribe {
+                                panes: HashSet::new(),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                assert!(frontend.view(1).is_some());
+                assert_eq!(frontend.retained_screens(), 0);
+            } else if id == 3 {
+                assert!(frontend.view(1).is_none());
+                assert_eq!(frontend.retained_screens(), 0);
+            } else {
+                assert!(frontend.retained_screens() > 0);
+            }
+            daemon
+                .input(
+                    id,
+                    &mut frontend,
+                    StreamRequest::pane(
+                        1,
+                        StreamCommand::GitSubscribe {
+                            panes: HashSet::from([1]),
+                        },
+                    ),
+                )
+                .unwrap();
+            daemon
+                .input(
+                    id,
+                    &mut frontend,
+                    StreamRequest::pane(
+                        1,
+                        StreamCommand::PasteBegin {
+                            size: 100,
+                            options: Default::default(),
+                        },
+                    ),
+                )
+                .unwrap();
+            frontend.pane_error(1, "undelivered".into());
+            daemon.frontends.insert(id, frontend);
+            peers.push(peer);
+        }
+        daemon.close(1);
+        for frontend in daemon.frontends.values() {
+            assert!(!frontend.is_visible(1));
+            assert!(frontend.view(1).is_none());
+            assert!(!frontend.has_git_subscriptions());
+            assert_eq!(frontend.retained_screens(), 0);
+            assert!(frontend.paste.is_none());
+            assert!(frontend.panes.is_empty());
+            assert_eq!(frontend.panes.capacity(), 0);
+        }
+        assert!(daemon.next_update().is_none());
+        // A stale queued subscription cannot recreate a closed pane owner.
+        let mut frontend = daemon.frontends.remove(&1).unwrap();
+        daemon
+            .input(
+                1,
+                &mut frontend,
+                StreamRequest::pane(
+                    1,
+                    StreamCommand::Subscribe {
+                        panes: HashSet::from([1]),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(frontend.panes.is_empty());
+    }
 
     #[test]
     fn admission_counts_unattached_streams_and_releases_slots_on_disconnect() {
@@ -1328,13 +1638,16 @@ mod tests {
                 ..SentScreen::default()
             };
             screen.cache_bytes = screen.memory_size();
-            frontend.screens.insert(1, screen);
+            let engine = crate::engine::Engine::new().unwrap();
+            let mut presentation = PanePresentation::new(engine.new_view().unwrap());
+            presentation.screen = Some(Box::new(screen));
+            frontend.panes.entry(1).or_default().presentation = Some(Box::new(presentation));
         }
         let limit = focused.retained_screens();
         let mut others = HashMap::from([(2, hidden)]);
         trim_screen_caches(&mut focused, &mut others, limit);
         assert_eq!(focused.retained_screens(), limit);
-        let screen = &others[&2].screens[&1];
+        let screen = others[&2].panes[&1].screen().unwrap();
         assert_eq!(screen.memory_size(), 0);
         assert_eq!(screen.source_revision, None);
         assert_eq!(screen.generation, 7);
@@ -1342,7 +1655,7 @@ mod tests {
         assert_eq!(screen.cached, 10..20);
         trim_screen_caches(&mut focused, &mut others, 0);
         assert_eq!(focused.retained_screens(), 0);
-        assert_eq!(focused.screens[&1].memory_size(), 0);
+        assert_eq!(focused.panes[&1].screen().unwrap().memory_size(), 0);
     }
 
     #[test]
@@ -1388,24 +1701,41 @@ mod tests {
         daemon.frontends = HashMap::from([(1, fast), (2, slow)]);
         daemon.updates(false);
         assert!(daemon.metadata_changed.is_empty());
-        assert!(daemon.frontends[&1].metadata_changed.is_empty());
-        assert_eq!(daemon.frontends[&2].metadata_changed, HashSet::from([1]));
+        assert!(
+            !daemon.frontends[&1]
+                .panes
+                .values()
+                .any(|p| p.metadata_changed)
+        );
+        assert!(daemon.frontends[&2].panes[&1].metadata_changed);
         assert_eq!(daemon.next_update(), Some(slow_deadline));
         // Another connection's pass must not drain the slower pending value.
         daemon.updates(false);
-        assert_eq!(daemon.frontends[&2].metadata_changed, HashSet::from([1]));
+        assert!(daemon.frontends[&2].panes[&1].metadata_changed);
         daemon.frontends.get_mut(&2).unwrap().next_frame = Instant::now();
         daemon.updates(false);
-        assert!(daemon.frontends[&2].metadata_changed.is_empty());
+        assert!(
+            !daemon.frontends[&2]
+                .panes
+                .values()
+                .any(|p| p.metadata_changed)
+        );
         assert!(daemon.next_update().is_none());
         daemon
             .frontends
             .get_mut(&2)
             .unwrap()
-            .metadata_changed
-            .insert(1);
+            .panes
+            .entry(1)
+            .or_default()
+            .metadata_changed = true;
         daemon.close(1);
-        assert!(daemon.frontends[&2].metadata_changed.is_empty());
+        assert!(
+            !daemon.frontends[&2]
+                .panes
+                .values()
+                .any(|p| p.metadata_changed)
+        );
         assert_eq!((daemon.snapshots, daemon.sent_rows), (0, 0));
     }
 
@@ -1413,8 +1743,9 @@ mod tests {
         let (socket, peer) = UnixStream::pair().unwrap();
         let mut frontend = Frontend::new(socket, &resources::OutputBudget::default());
         frontend.attached = true;
-        frontend.visible.insert(1);
-        frontend.sizes.insert(1, size);
+        let pane = frontend.panes.entry(1).or_default();
+        pane.visible = true;
+        pane.size = Some(size);
         (frontend, peer)
     }
 
@@ -1492,7 +1823,7 @@ mod tests {
             ),
             Some(second_size)
         );
-        second.visible.clear();
+        second.panes.get_mut(&1).unwrap().set_visible(false);
         assert_eq!(
             requested_size(
                 1,
@@ -1510,18 +1841,18 @@ mod tests {
         let size = (70, 20, 10, 20, 700, 400);
         let (mut focused, _focused_peer) = client(size);
         focused.focused = true;
-        focused.sizes.clear();
+        focused.panes.get_mut(&1).unwrap().size = None;
         let (mut fallback, _fallback_peer) = client(size);
         assert_eq!(
             requested_size(1, [(1, &focused), (2, &fallback)].into_iter()),
             Some(size)
         );
-        fallback.visible.clear();
+        fallback.panes.get_mut(&1).unwrap().set_visible(false);
         assert_eq!(
             requested_size(1, [(1, &focused), (2, &fallback)].into_iter()),
             None
         );
-        fallback.visible.insert(1);
+        fallback.panes.get_mut(&1).unwrap().set_visible(true);
         fallback.attached = false;
         assert_eq!(
             requested_size(1, [(1, &focused), (2, &fallback)].into_iter()),
@@ -1701,3 +2032,7 @@ mod tests {
         assert!(!frontend.input_pending());
     }
 }
+
+#[cfg(test)]
+#[path = "frontend_benchmark.rs"]
+mod benchmark;
