@@ -55,6 +55,12 @@ connection's frame interval. Other metadata packets and passes without that
 work do not postpone the next visible response. Hidden
 panes keep parsing output without extracting viewports.
 
+The daemon shares [frontend resource budgets](resource-budgets.md#daemon-frontend-storage)
+across local and remote streams. Output pressure disconnects slow consumers;
+optional snapshot pressure releases delta caches and sends a full viewport on
+the next update. Engine views retain their scroll, selection, search, and
+synchronized-output state.
+
 Output preserves cached scrollback rows and invalidates the previously mutable
 screen rows. Pruning advances the history origin without discarding surviving
 rows. Clears, reflow, screen switches, and palette or theme changes reset the

@@ -1,4 +1,6 @@
-# Client resource budgets
+# Resource budgets
+
+## Client storage
 
 Every `gmux-client` process shares the following allowances across its daemon
 connections and GTK windows. These limits are internal defaults.
@@ -58,11 +60,66 @@ Separate outgoing budgets keep input and control work independent of that
 admission wait.
 
 GTK rendering scenes, glyph caches, terminal history, and daemon allocations also
-sit outside these client allowances. Each daemon frontend still has its own
-64 MiB pending-output limit and per-visible-view snapshots for delta generation.
-Slow frontend output can disconnect that frontend without blocking terminal
-execution. A client budget does not bound total daemon memory or the number of
-panes and snapshots a user opens.
+sit outside these client allowances. Each daemon applies its own limits below.
+
+## Daemon frontend storage
+
+Each daemon shares these internal allowances across local Unix streams and
+remote TCP streams forwarded through its Unix listener:
+
+| Resource | Daemon allowance | Per-stream ceiling |
+| --- | --- | --- |
+| Retained encoded output buffer capacity | 128 MiB | 64 MiB |
+| Optional sent-screen snapshots for delta generation | 32 MiB | Shared allowance |
+| Admitted frontend streams, including unattached peers | 64 | One slot |
+
+Output accounting charges allocated capacity, including consumed prefixes and
+spare space. A drained buffer retains at most 256 KiB for reuse. Larger drained
+buffers release their allocation. On aggregate exhaustion, the daemon first
+releases idle output allocations, then disconnects the stream with the largest
+unsent backlog. Capacity breaks ties. Local and remote streams use the same
+policy, regardless of focus. A rejected enqueue closes its stream and releases
+its output allocation, including capacity grown by a failed encoder. The daemon
+never skips an accepted packet to admit a later reply. Partial writes, viewport
+deltas, clipboard offers, clipboard clears, and heartbeat replies keep their
+stream order until disconnection. Clipboard reads from disconnected recipients
+are cancelled by the daemon's existing clipboard maintenance.
+
+The optional allowance includes sent-screen cell and row-flag vector capacity,
+cell overflow text, and hyperlink storage. Shared cell overflow text is charged
+for every retained reference. The daemon evicts whole snapshots from streams with
+observed socket backpressure first, then unfocused streams, then the least recently used view.
+Eviction frees allocations rather than clearing vectors. It preserves the engine
+view's scroll position, selection, search, appearance, and synchronized-output
+hold. On the next requested or terminal-driven update, the daemon sends all rows,
+advances the cache generation, invalidates previous prefetched rows, and sends the
+current hyperlink map, including an empty map. Eviction alone schedules no frame,
+so idle views do not repeatedly regenerate each other's caches. A viewport that
+cannot fit in the allowance uses full snapshots on subsequent updates.
+
+Excess stream connections close immediately, before frontend buffers or views are
+created. The listener still accepts at most eight connections per event-loop turn.
+The existing TCP listener separately allows 32 active connections, including
+handshakes and control channels. TCP terminal streams also consume a daemon
+frontend slot. The platform control server remains separate, with at most 64
+active handlers, a 32-request channel, and its existing request sizes and timeouts.
+Frontend pressure does not wait for storage, block PTY reads, or suspend terminal
+execution. Closing streams returns admission slots through normal teardown.
+
+`gmux status` reports `frontend_resources`, including current stream count,
+retained output capacity, optional screen-cache bytes, and their limits.
+
+These allowances are not an RSS cap. Output encoding can temporarily grow one
+buffer before synchronous capacity enforcement, and snapshot extraction can
+allocate one viewport before eviction. Packet construction, shared execution
+broadcast encoding, allocator overhead and arenas, kernel socket and TCP bridge
+buffers, frontend input and paste buffers, map entries, metadata, and semantic
+engine-view state are outside the storage allowances. Engine views retain search
+state and native snapshots required for synchronized output. Terminal engines,
+history, persistence, and control requests have separate lifetimes and limits.
+The number of panes and views per stream remains unrestricted. Cache pressure
+can increase full-frame bandwidth and encoding work, and reconnecting clients
+must reattach after slow-consumer disconnection.
 
 ## Measuring pressure
 
@@ -90,3 +147,21 @@ input-to-view latency, and scroll acknowledgements. The latency measurements
 include RPC overhead and 25 ms observation polling. They do not measure time to
 screen scanout. The native workload covers ordinary view lifecycles; use the
 storage probe to saturate the aggregate allowances.
+
+Measure daemon pressure without GTK:
+
+```sh
+python3 scripts/cargo_build.py --release --headless gmux
+python3 scripts/daemon-resource-benchmark.py --binary /path/reported/by/cargo/gmux \
+  --verify --output artifacts/daemon-resource.json
+```
+
+The benchmark runs twelve slow or nonreading 160×50 subscribers alongside local
+and TCP interactive readers, then twenty-four 512×128 views to exhaust optional
+storage. It reports retained capacities, Linux RSS and high-water memory,
+control round trips, and input-to-view latency. It also checks full viewport
+recovery, selection copying, Unicode text, hyperlink clearing, and teardown.
+Latency includes socket and Python observation overhead, not screen scanout.
+The same workload can measure a pre-budget binary with `--verify` omitted if
+that binary exposes the `frontend_resources` counters. The headless
+`daemon-resource` smoke suite also checks admission saturation and recovery.

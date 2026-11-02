@@ -108,7 +108,9 @@ Local and TCP control connections support these methods:
 
 - `status` reports identity, version, process ID, `hostname`, `bound_address`,
   attached Unix and TCP stream counts in `local_clients` and `remote_clients`,
-  and execution statistics. Connection display names are client-owned aliases; `hostname`
+  execution statistics, and `frontend_resources` with admitted stream count,
+  retained output capacity, optional screen-cache bytes, and their daemon limits.
+  Connection display names are client-owned aliases; `hostname`
   always identifies the daemon's host.
 - `scrollback` inspects or updates the daemon's saved per-terminal byte and
   physical-line limits. Optional `max_bytes` and `max_lines` fields accept an
@@ -296,8 +298,10 @@ Application admission has a stricter 4 MiB total limit, including aliases.
 Explicit user copy still omits HTML if generation or normalization fails or its
 control-JSON budget would be exceeded. Clipboard stream data is always binary.
 See [clipboard behavior](clipboard.md) for formatter limitations.
-A stalled frontend's output is bounded by the 64 MiB transport queue and is
-detached on overflow. The client reader separately bounds retained storage to
+A stalled frontend's output has a 64 MiB capacity ceiling within the daemon's
+128 MiB aggregate output allowance. Exhaustion can disconnect slow streams.
+See [daemon frontend storage](resource-budgets.md#daemon-frontend-storage).
+The client reader separately bounds retained storage to
 64 MiB and 64 packets, including representation capacities.
 
 Clipboard reads use a separate capability,

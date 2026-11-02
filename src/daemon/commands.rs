@@ -369,6 +369,14 @@ impl Daemon {
                     "uptime_seconds": self.started.elapsed().as_secs(),
                     "snapshots": self.snapshots,
                     "sent_rows": self.sent_rows,
+                    "frontend_resources": {
+                        "streams": self.frontends.len(),
+                        "output_capacity": self.frontends.values().map(Frontend::retained_output).sum::<usize>(),
+                        "screen_cache_bytes": self.frontends.values().map(Frontend::retained_screens).sum::<usize>(),
+                        "stream_limit": resources::MAX_FRONTENDS,
+                        "output_limit": resources::MAX_OUTPUT,
+                        "screen_cache_limit": resources::MAX_SCREEN_CACHES,
+                    },
                     "scrollback_limits": self.limits,
                     "terminal_memory": self.sessions.values()
                         .map(TerminalSession::memory_usage).collect::<anyhow::Result<Vec<_>>>()?,

@@ -21,6 +21,8 @@ pub(super) struct SentScreen {
     cache_active: bool,
     prefetch_at: Option<Instant>,
     pub(super) hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
+    cache_bytes: usize,
+    last_used: Option<Instant>,
 }
 pub(super) struct SentSelection {
     range: Option<gmux_protocol::selection::Selection>,
@@ -31,8 +33,7 @@ pub(super) struct Frontend {
     pub(super) input: Vec<u8>,
     read_buffer: Vec<u8>,
     read_offset: usize,
-    pub(super) output: Vec<u8>,
-    pub(super) offset: usize,
+    pub(super) output: resources::Output,
     pub(super) attached: bool,
     pub(super) remote: bool,
     pub(super) visible: HashSet<u64>,
@@ -73,6 +74,12 @@ pub(super) struct Paste {
     user: Option<(u64, u64)>,
 }
 impl Frontend {
+    pub(super) fn retained_output(&self) -> usize {
+        self.output.capacity()
+    }
+    pub(super) fn retained_screens(&self) -> usize {
+        self.screens.values().map(|screen| screen.cache_bytes).sum()
+    }
     fn queue_clipboard(
         &mut self,
         pane: u64,
@@ -90,14 +97,13 @@ impl Frontend {
             cells: Vec::new(),
         })
     }
-    pub(super) fn new(socket: UnixStream) -> Self {
+    pub(super) fn new(socket: UnixStream, budget: &resources::OutputBudget) -> Self {
         Self {
             socket,
             input: Vec::new(),
             read_buffer: Vec::new(),
             read_offset: 0,
-            output: Vec::new(),
-            offset: 0,
+            output: resources::Output::new(budget),
             attached: false,
             remote: false,
             visible: HashSet::new(),
@@ -131,51 +137,20 @@ impl Frontend {
             next_frame: Instant::now(),
         }
     }
-    fn compact_output(&mut self) {
-        // Compact after consuming at least half the buffer, rather than moving
-        // pending packets for every partial socket write.
-        if self.offset > 0
-            && (self.offset >= self.output.len() / 2 || self.output.len() >= MAX_PENDING)
-        {
-            self.output.drain(..self.offset);
-            self.offset = 0;
-        }
-    }
     pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
-        self.compact_output();
-        let start = self.output.len();
-        packet.encode_into_limit(&mut self.output, MAX_PENDING - (start - self.offset))?;
-        Ok(())
+        self.output.queue(packet)
     }
     pub(super) fn queue_encoded(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.compact_output();
-        anyhow::ensure!(
-            self.output.len() - self.offset + bytes.len() <= MAX_PENDING,
-            "Frontend is too slow"
-        );
-        self.output.extend_from_slice(bytes);
-        Ok(())
+        self.output.queue_encoded(bytes)
     }
     pub(super) fn flush(&mut self) -> anyhow::Result<()> {
-        while self.offset < self.output.len() {
-            match self.socket.write(&self.output[self.offset..]) {
-                Ok(0) => anyhow::bail!("Frontend disconnected"),
-                Ok(n) => self.offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if self.offset == self.output.len() {
-            self.output.clear();
-            self.offset = 0;
-        }
-        Ok(())
+        self.output.flush(&mut self.socket)
     }
     pub(super) fn input_pending(&self) -> bool {
         self.read_offset < self.read_buffer.len()
     }
     pub(super) fn requests(&mut self) -> anyhow::Result<Vec<StreamRequest>> {
+        anyhow::ensure!(!self.output.closed(), "Frontend output budget exhausted");
         // Keep the decoded batch small even for empty or invalid JSON lines.
         // The unread suffix survives the request limit and schedules another turn.
         let mut requests = Vec::new();
@@ -278,6 +253,65 @@ impl Frontend {
     }
 }
 
+impl SentScreen {
+    fn memory_size(&self) -> usize {
+        self.cells.capacity() * size_of::<Cell>()
+            + self.cells.iter().map(Cell::heap_bytes).sum::<usize>()
+            + self.row_flags.capacity()
+            + self.hyperlinks.memory_size()
+    }
+    fn release_cache(&mut self) {
+        self.cells = Vec::new();
+        self.row_flags = Vec::new();
+        self.hyperlinks = Default::default();
+        self.cache_bytes = 0;
+        self.source_revision = None;
+        self.prefetch_at = None;
+        // Keep generation and cache_active until the next full snapshot sends
+        // an invalidation. EngineView owns viewport, selection and appearance.
+    }
+}
+
+fn trim_screen_caches(current: &mut Frontend, others: &mut HashMap<u64, Frontend>, limit: usize) {
+    let mut total = current.retained_screens()
+        + others
+            .values()
+            .map(Frontend::retained_screens)
+            .sum::<usize>();
+    while total > limit {
+        let victim = std::iter::once((None, &*current))
+            .chain(others.iter().map(|(&id, frontend)| (Some(id), frontend)))
+            .flat_map(|(id, frontend)| {
+                frontend
+                    .screens
+                    .iter()
+                    .filter(|(_, screen)| screen.cache_bytes != 0)
+                    .map(move |(&pane, screen)| {
+                        (
+                            (
+                                !frontend.output.backlogged(),
+                                frontend.focused,
+                                screen.last_used,
+                                id,
+                                pane,
+                            ),
+                            id,
+                            pane,
+                        )
+                    })
+            })
+            .min_by_key(|(rank, _, _)| *rank);
+        let Some((_, id, pane)) = victim else { break };
+        let frontend = match id {
+            Some(id) => others.get_mut(&id).unwrap(),
+            None => &mut *current,
+        };
+        let screen = frontend.screens.get_mut(&pane).unwrap();
+        total -= screen.cache_bytes;
+        screen.release_cache();
+    }
+}
+
 fn size_owner<'a>(
     pane: u64,
     frontends: impl Iterator<Item = (u64, &'a Frontend)>,
@@ -301,6 +335,18 @@ fn requested_size<'a>(
 }
 
 impl Daemon {
+    pub(super) fn admit_frontend(&mut self, socket: UnixStream) -> anyhow::Result<bool> {
+        if self.frontends.len() >= resources::MAX_FRONTENDS {
+            return Ok(false);
+        }
+        socket.set_nonblocking(true)?;
+        self.next_frontend += 1;
+        self.frontends.insert(
+            self.next_frontend,
+            Frontend::new(socket, &self.output_budget),
+        );
+        Ok(true)
+    }
     pub(super) fn clipboard_recipient(&self, pane: u64) -> Option<u64> {
         self.frontends
             .iter()
@@ -875,6 +921,9 @@ impl Daemon {
             // Keep handoff changes pending even if survivors were already sent a frame.
             self.resize_sessions(None);
         }
+        // Another stream's enqueue may have evicted a frontend already visited
+        // by this broadcast. Release its view state and socket this turn.
+        self.flush_frontends();
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -1009,7 +1058,9 @@ impl Daemon {
                         self.snapshots += 1;
                         let cols = frame.cols as usize;
                         let old = frontend.screens.entry(id).or_default();
-                        let full = old.frame.cols != frame.cols || old.frame.rows != frame.rows;
+                        let full = old.frame.cols != frame.cols
+                            || old.frame.rows != frame.rows
+                            || old.cells.len() != cells_snapshot.len();
                         let same_content = old.source_revision == Some(engine.revision) && !full;
                         let reset = full
                             || old.source_revision.is_none()
@@ -1127,9 +1178,7 @@ impl Daemon {
                                 old.prefetch_at = None;
                             }
                         }
-                        if old.hyperlinks != engine.hyperlinks
-                            || (full && !engine.hyperlinks.spans.is_empty())
-                        {
+                        if old.hyperlinks != engine.hyperlinks || full {
                             old.hyperlinks.clone_from(&engine.hyperlinks);
                             hyperlinks = Some(engine.hyperlinks.clone());
                         }
@@ -1141,6 +1190,8 @@ impl Daemon {
                             || removed != 0
                             || frontend.sent_scroll_serials.get(&id) != Some(&serial);
                         old.frame = frame;
+                        old.cache_bytes = old.memory_size();
+                        old.last_used = Some(Instant::now());
                         send.then_some(frame)
                     } else {
                         None
@@ -1160,6 +1211,9 @@ impl Daemon {
                     None,
                 )
             };
+            if screen {
+                trim_screen_caches(frontend, &mut self.frontends, resources::MAX_SCREEN_CACHES);
+            }
             let find_changed = frontend.find.get(&id) != Some(&find);
             let selection_serial = frontend.selection_serials.get(&id).copied().unwrap_or(0);
             let previous = frontend.selections.get(&id);
@@ -1238,10 +1292,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn admission_counts_unattached_streams_and_releases_slots_on_disconnect() {
+        let mut daemon = Daemon::empty_for_test();
+        let mut peers = Vec::new();
+        for _ in 0..resources::MAX_FRONTENDS {
+            let (socket, peer) = UnixStream::pair().unwrap();
+            assert!(daemon.admit_frontend(socket).unwrap());
+            peers.push(peer);
+        }
+        let (socket, mut rejected) = UnixStream::pair().unwrap();
+        assert!(!daemon.admit_frontend(socket).unwrap());
+        assert_eq!(rejected.read(&mut [0]).unwrap(), 0);
+        drop(peers.pop());
+        // Input EOF, rather than a write, detects an idle peer's teardown.
+        daemon
+            .frontends
+            .retain(|_, frontend| frontend.requests().is_ok());
+        assert_eq!(daemon.frontends.len(), resources::MAX_FRONTENDS - 1);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        assert!(daemon.admit_frontend(socket).unwrap());
+    }
+
+    #[test]
+    fn cache_pressure_releases_capacity_and_keeps_delta_invalidation_identity() {
+        let (mut focused, _peer) = connection();
+        let (mut hidden, _other_peer) = connection();
+        focused.focused = true;
+        for frontend in [&mut focused, &mut hidden] {
+            let mut screen = SentScreen {
+                cells: Vec::with_capacity(1024),
+                source_revision: Some(9),
+                generation: 7,
+                cache_active: true,
+                cached: 10..20,
+                ..SentScreen::default()
+            };
+            screen.cache_bytes = screen.memory_size();
+            frontend.screens.insert(1, screen);
+        }
+        let limit = focused.retained_screens();
+        let mut others = HashMap::from([(2, hidden)]);
+        trim_screen_caches(&mut focused, &mut others, limit);
+        assert_eq!(focused.retained_screens(), limit);
+        let screen = &others[&2].screens[&1];
+        assert_eq!(screen.memory_size(), 0);
+        assert_eq!(screen.source_revision, None);
+        assert_eq!(screen.generation, 7);
+        assert!(screen.cache_active);
+        assert_eq!(screen.cached, 10..20);
+        trim_screen_caches(&mut focused, &mut others, 0);
+        assert_eq!(focused.retained_screens(), 0);
+        assert_eq!(focused.screens[&1].memory_size(), 0);
+    }
+
+    #[test]
     fn clipboard_binary_chunks_preserve_newlines_and_following_commands() {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
-        let mut frontend = Frontend::new(socket);
+        let mut frontend = Frontend::new(socket, &resources::OutputBudget::default());
         let mut header =
             serde_json::to_vec(&json!({"method":"clipboard-read-data","pane":1,"id":7,"size":6}))
                 .unwrap();
@@ -1303,7 +1411,7 @@ mod tests {
 
     fn client(size: TerminalSize) -> (Frontend, UnixStream) {
         let (socket, peer) = UnixStream::pair().unwrap();
-        let mut frontend = Frontend::new(socket);
+        let mut frontend = Frontend::new(socket, &resources::OutputBudget::default());
         frontend.attached = true;
         frontend.visible.insert(1);
         frontend.sizes.insert(1, size);
@@ -1311,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_clipboard_queue_rejects_overflow_without_losing_prior_offers_or_clear() {
+    fn rich_clipboard_queue_preserves_offers_and_clear_then_closes_on_overflow() {
         use gmux_protocol::clipboard::{Content, Destination, Write};
         let (mut frontend, _peer) = client((80, 24, 8, 16, 640, 384));
         let offer = |character: char| {
@@ -1325,10 +1433,6 @@ mod tests {
         for character in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
             frontend.queue_clipboard(1, offer(character)).unwrap();
         }
-        let previous = frontend.output.len();
-        assert!(frontend.queue_clipboard(1, offer('h')).is_err());
-        assert_eq!(frontend.output.len(), previous);
-        assert!(previous <= MAX_PENDING);
         frontend
             .queue_clipboard(
                 1,
@@ -1338,7 +1442,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut reader = frontend.output.as_slice();
+        let storage = frontend.output.inspect();
+        let mut reader = storage.bytes.as_slice();
         for character in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
             let packet = Packet::read(&mut reader).unwrap();
             let content = packet.header.copy.unwrap().content.unwrap();
@@ -1359,6 +1464,10 @@ mod tests {
                 .is_none()
         );
         assert!(reader.is_empty());
+        drop(storage);
+        assert!(frontend.queue_clipboard(1, offer('h')).is_err());
+        assert!(frontend.output.closed());
+        assert_eq!(frontend.retained_output(), 0);
     }
 
     #[test]
@@ -1427,7 +1536,10 @@ mod tests {
     fn connection() -> (Frontend, UnixStream) {
         let (socket, writer) = UnixStream::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
-        (Frontend::new(socket), writer)
+        (
+            Frontend::new(socket, &resources::OutputBudget::default()),
+            writer,
+        )
     }
 
     #[test]
