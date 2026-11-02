@@ -204,12 +204,9 @@ pub fn run() -> anyhow::Result<()> {
             for _ in 0..8 {
                 match listener.accept() {
                     Ok((socket, _)) => {
-                        socket.set_nonblocking(true)?;
-                        daemon.next_frontend += 1;
-                        daemon
-                            .frontends
-                            .insert(daemon.next_frontend, Frontend::new(socket));
-                        next_metadata = Instant::now();
+                        if daemon.admit_frontend(socket)? {
+                            next_metadata = Instant::now();
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(e.into()),
@@ -273,7 +270,7 @@ pub fn run() -> anyhow::Result<()> {
                                 | transport::StreamCommand::ClipboardReadEnd { .. }
                         );
                         if let Err(error) = daemon.input(id, &mut frontend, request) {
-                            if attach || clipboard_result {
+                            if attach || clipboard_result || frontend.output.closed() {
                                 connected = false;
                                 break;
                             }

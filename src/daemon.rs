@@ -35,13 +35,13 @@ mod mutation;
 mod network;
 mod prefetch;
 mod remote_access;
+mod resources;
 
 use commands::{ControlRequest, PendingControl};
 pub use event_loop::run;
 use frontend::Frontend;
 use mutation::{Completion, Effects, Mutation, PendingEffects, Progress};
 
-const MAX_PENDING: usize = 64 * 1024 * 1024;
 const MAX_NOTIFICATIONS: usize = 64;
 const MAX_NOTIFICATION_BYTES: usize = 512 * 1024;
 
@@ -99,6 +99,7 @@ struct Daemon {
     state: SavedExecution,
     limits: gmux_protocol::retention::ScrollbackLimits,
     frontends: HashMap<u64, Frontend>,
+    output_budget: resources::OutputBudget,
     clipboard: clipboard::Broker,
     next_frontend: u64,
     revision: u64,
@@ -166,6 +167,7 @@ impl Daemon {
                 ..Default::default()
             },
             frontends: HashMap::new(),
+            output_budget: Default::default(),
             clipboard: Default::default(),
             next_frontend: 0,
             revision: 0,
@@ -429,6 +431,7 @@ impl Daemon {
             remote_access: Default::default(),
             state: Default::default(),
             frontends: HashMap::new(),
+            output_budget: Default::default(),
             next_frontend: 0,
             revision: 0,
             changed: HashSet::new(),
@@ -578,7 +581,7 @@ mod tests {
             },
             0
         );
-        let mut frontend = Frontend::new(socket);
+        let mut frontend = Frontend::new(socket, &resources::OutputBudget::default());
         frontend.attached = true;
         let packet = |text| {
             let mut cell = Cell::default();
@@ -614,7 +617,10 @@ mod tests {
         packet(b'b').encode_into(&mut expected).unwrap();
         frontend.queue(packet(b'a')).unwrap();
         frontend.flush().unwrap();
-        assert!(frontend.offset > 0 && frontend.offset < frontend.output.len());
+        assert!(
+            frontend.output.inspect().offset > 0
+                && frontend.output.inspect().offset < frontend.output.inspect().bytes.len()
+        );
         let mut received = Vec::new();
         let mut buffer = [0; 16384];
         let mut queued_second = false;
@@ -628,11 +634,17 @@ mod tests {
                 }
                 result => panic!("Unexpected socket read: {result:?}"),
             }
-            if !queued_second && frontend.offset >= frontend.output.len() / 2 {
+            if !queued_second
+                && frontend.output.inspect().offset >= frontend.output.inspect().bytes.len() / 2
+            {
                 let mut bytes = Vec::new();
                 packet(b'b').encode_into(&mut bytes).unwrap();
                 frontend.queue_encoded(&bytes).unwrap();
-                assert_eq!(frontend.offset, 0, "Consumed bytes should be compacted");
+                assert_eq!(
+                    frontend.output.inspect().offset,
+                    0,
+                    "Consumed bytes should be compacted"
+                );
                 queued_second = true;
             }
             frontend.flush().unwrap();

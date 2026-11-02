@@ -53,8 +53,9 @@ changed cell synchronously using a single bounded stack buffer; native pointers
 never enter retained Rust cells or the wire format. Unchanged rows keep their
 owned text, including while synchronized output freezes a view.
 
-The stream uses explicit byte lengths and a 64 MiB record cap. Daemon output
-and client input queues each have a 64 MiB budget. These limits accommodate a
+The stream uses explicit byte lengths and a 64 MiB record cap. Each daemon output
+buffer and client input queue has a 64 MiB ceiling within its process-wide
+[resource budgets](resource-budgets.md). These limits accommodate a
 maximum-sized grid of maximum-length native clusters plus history prefetch.
 The client history cache retains at most 2 MiB including overflow text and row
 storage, evicting complete rows when needed. Shared text is charged separately
