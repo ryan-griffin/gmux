@@ -218,3 +218,20 @@ Latency includes socket and Python observation overhead, not screen scanout.
 The same workload can measure a pre-budget binary with `--verify` omitted if
 that binary exposes the `frontend_resources` counters. The headless
 `daemon-resource` smoke suite also checks admission saturation and recovery.
+
+Measure frontend pane ownership separately:
+
+```sh
+cargo test -p gmux-daemon --release frontend_pane_workload -- --ignored --nocapture --test-threads=1
+GMUX_BENCH_VISIBLE=0 cargo test -p gmux-daemon --release frontend_pane_workload -- --ignored --nocapture --test-threads=1
+```
+
+Run alone. This probe uses 32 panes and eight frontends. The default visits eight
+panes per frontend, then hides four. The zero-visible variant keeps all panes
+metadata-only. It counts retained Rust allocation sizes, including hash-table
+buckets and spare capacity, while excluding socket output capacity, native
+Ghostty allocations, and allocator overhead. It reports thread CPU time per
+update and pane-owner teardown time with PTYs and shared terminal engines kept
+alive outside the timed teardown. The default update alternates a row and
+generates a viewport delta; the metadata-only update compares pane metadata.
+Use the daemon pressure benchmark for native memory and disconnection behavior.

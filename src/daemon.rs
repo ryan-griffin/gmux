@@ -126,11 +126,11 @@ impl Daemon {
             .frontends
             .values()
             .filter(|frontend| frontend.attached)
-            .flat_map(|frontend| &frontend.git_panes)
+            .flat_map(Frontend::git_panes)
             .filter_map(|id| {
                 self.sessions
-                    .get(id)
-                    .map(|session| (*id, session.directory().to_path_buf()))
+                    .get(&id)
+                    .map(|session| (id, session.directory().to_path_buf()))
             })
             .collect();
         if wanted.is_empty() {
@@ -315,28 +315,7 @@ impl Daemon {
         self.changed.remove(&id);
         self.metadata_changed.remove(&id);
         for frontend in self.frontends.values_mut() {
-            frontend.metadata_changed.remove(&id);
-            frontend.git_panes.remove(&id);
-            frontend.git_sent.remove(&id);
-            frontend.visible.remove(&id);
-            frontend.views.remove(&id);
-            frontend.errors.remove(&id);
-            if frontend
-                .paste
-                .as_ref()
-                .is_some_and(|paste| paste.pane == id)
-            {
-                frontend.paste = None;
-            }
-            frontend.screens.remove(&id);
-            frontend.sizes.remove(&id);
-            frontend.changed.remove(&id);
-            frontend.metadata.remove(&id);
-            frontend.scroll_serials.remove(&id);
-            frontend.sent_scroll_serials.remove(&id);
-            frontend.find.remove(&id);
-            frontend.selections.remove(&id);
-            frontend.selection_serials.remove(&id);
+            frontend.close_pane(id);
         }
         self.state.tabs.retain_mut(|tab| {
             if !tab.layout.contains(id) {

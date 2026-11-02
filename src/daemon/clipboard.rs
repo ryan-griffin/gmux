@@ -75,7 +75,7 @@ impl Daemon {
     pub(super) fn read_recipient(&self, pane: u64) -> Option<u64> {
         self.frontends
             .iter()
-            .filter(|(_, f)| f.attached && f.clipboard_reads && f.visible.contains(&pane))
+            .filter(|(_, f)| f.attached && f.clipboard_reads && f.is_visible(pane))
             .min_by_key(|(id, f)| (!f.focused, **id))
             .map(|(&id, _)| id)
     }
@@ -287,7 +287,7 @@ impl Daemon {
             } => {
                 anyhow::ensure!(
                     frontend.clipboard_reads
-                        && frontend.visible.contains(&pane)
+                        && frontend.is_visible(pane)
                         && *serial > frontend.paste_serial,
                     "Invalid desktop paste intent"
                 );
@@ -579,7 +579,7 @@ impl Daemon {
                     || self
                         .frontends
                         .get(&p.frontend)
-                        .is_none_or(|f| !f.clipboard_reads || !f.visible.contains(pane))
+                        .is_none_or(|f| !f.clipboard_reads || !f.is_visible(**pane))
                     || self.read_recipient(**pane) != Some(p.frontend)
             })
             .map(|(&id, _)| id)
@@ -598,7 +598,7 @@ impl Daemon {
                         || self
                             .frontends
                             .get(&p.frontend)
-                            .is_none_or(|f| !f.clipboard_reads || !f.visible.contains(pane)))
+                            .is_none_or(|f| !f.clipboard_reads || !f.is_visible(**pane)))
             })
             .map(|(&id, _)| id)
             .collect();

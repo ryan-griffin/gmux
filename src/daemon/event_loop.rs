@@ -275,7 +275,7 @@ pub fn run() -> anyhow::Result<()> {
                                 break;
                             }
                             if let Some(pane) = pane {
-                                frontend.errors.insert(pane, error.to_string());
+                                frontend.pane_error(pane, error.to_string());
                                 daemon.changed.insert(pane);
                             } else {
                                 eprintln!("Frontend command failed: {error}");
