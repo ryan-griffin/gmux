@@ -43,18 +43,16 @@ entry.terminal-find > button:active { opacity: 0.8; }
   entry.terminal-find > button:hover { opacity: 1; }
   entry.terminal-find > button:active { opacity: 0.9; }
 }
+/* Match AdwTabOverview's inset thumbnail outline. */
 .terminal-pane {
   background: var(--terminal-bg);
   color: var(--terminal-fg);
+  border-radius: 9px;
+  outline: 1px solid rgb(255 255 255 / 7%);
+  outline-offset: -1px;
 }
-/* Use a lighter shadow while retaining the native high-contrast card styling. */
-@media (prefers-contrast: no-preference) {
-  .terminal-pane {
-    box-shadow: 0 0 0 1px rgb(0 0 6 / 3%), 0 1px 3px rgb(0 0 6 / 5%);
-  }
-}
-@media (prefers-color-scheme: dark) and (prefers-contrast: no-preference) {
-  .terminal-pane { box-shadow: none; }
+@media (prefers-contrast: more) {
+  .terminal-pane { outline-color: rgb(255 255 255 / 30%); }
 }
 .terminal-canvas { margin: 3px; }
 /* Clip only the contents, allowing the card shadow to extend outside the pane. */

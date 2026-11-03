@@ -165,7 +165,8 @@ impl Terminal {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("card");
         root.add_css_class("terminal-pane");
-        root.set_widget_name(&format!("terminal-pane-{id}"));
+        // PaneRef's daemon:id display form contains a CSS pseudo-class separator.
+        root.set_widget_name(&format!("terminal-pane-{}-{}", id.daemon, id.id));
         let desktop = Rc::downgrade(&clipboard);
         root.connect_unmap(move |_| {
             if let Some(desktop) = desktop.upgrade() {
@@ -721,8 +722,8 @@ impl Terminal {
         let [br, bg, bb] = frame.background;
         let [fr, fg, fb] = frame.foreground;
         self.chrome_css.load_from_string(&format!(
-            "#terminal-pane-{} {{ --terminal-bg: rgb({br}, {bg}, {bb}); --terminal-fg: rgb({fr}, {fg}, {fb}); }}",
-            self.id
+            "#{} {{ --terminal-bg: rgb({br}, {bg}, {bb}); --terminal-fg: rgb({fr}, {fg}, {fb}); }}",
+            self.root.widget_name()
         ));
     }
     pub fn directory(&self) -> PathBuf {
