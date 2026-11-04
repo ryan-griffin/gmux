@@ -506,6 +506,7 @@ mod tests {
                 let listener = tokio::net::UnixListener::bind(&control).unwrap();
                 let cancellation = Cancellation::default();
                 let pending = cancellation.clone();
+                let (finished, request_finished) = tokio::sync::oneshot::channel();
                 let server = runtime::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     crate::io::read_json(&mut tokio::io::BufReader::new(&mut stream), 4096)
@@ -513,6 +514,9 @@ mod tests {
                         .unwrap();
                     if cancel {
                         pending.cancel();
+                        // Keep EOF from racing cancellation while the client is
+                        // still polling its reply on another runtime thread.
+                        let _ = request_finished.await;
                     }
                     // Close the connected socket without a reply.
                 });
@@ -523,6 +527,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_err();
+                let _ = finished.send(());
                 if cancel {
                     assert_eq!(error.to_string(), "Request canceled");
                 }
