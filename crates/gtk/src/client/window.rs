@@ -254,6 +254,12 @@ impl Controller {
             }
         }
         preserve_window_state(&mut reply.session, &reply.catalog, &current);
+        if let Some((_, fallback, filter)) = &mut self.restore {
+            // Reconciliation can select a fallback before the saved connection
+            // arrives. Only navigation should cancel the pending restoration.
+            *fallback = reply.session.active;
+            *filter = reply.session.filter;
+        }
         Update {
             result: reply.result,
             state: Some((reply.session, reply.catalog)),

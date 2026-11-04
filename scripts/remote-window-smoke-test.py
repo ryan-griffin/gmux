@@ -257,6 +257,38 @@ with scenario("a standalone GTK client aggregates remotes and owns workspaces wi
     assert (receiver.config / "clients/gtk/state.json").exists()
 
 
+with scenario("the saved tab restores when its connection arrives after a startup fallback"), \
+        (artifacts / "tab-selection-restore-smoke.log").open("w") as log, \
+        AppFixture(dict(desktop_notifications=False), env={"GTK_A11Y": "none"}) as receiver, \
+        AppFixture() as server:
+    server_process = start(server, log)
+    remote = server.rpc("new", name="Saved selection")
+    command(receiver, "connection", "add", server.rpc("status")["bound_address"],
+            "--name", "server", "--auth", "none")
+    app = receiver.start_app(cli, stdout=log, stderr=log)
+    local = receiver.rpc("new", name="Startup fallback")
+    wait_for(lambda: len(receiver.rpc("list")["tabs"]) == 2)
+    receiver.rpc("focus", connection="server", pane=remote["pane"])
+    expected = dict(daemon=remote["daemon"], id=remote["tab"])
+    receiver.rpc("detach")
+    assert app.wait(timeout=8) == 0
+    saved = json.loads((receiver.config / "clients/gtk/state.json").read_text())
+    assert saved["desktop"]["active"] == expected
+    os.kill(server_process.pid, signal.SIGSTOP)
+    try:
+        app = receiver.start_app(cli, stdout=log, stderr=log)
+        wait_for(lambda: receiver.rpc("list")["active_reference"]
+                 == dict(daemon=local["daemon"], id=local["tab"]))
+        # Publish another snapshot while the saved connection is still pending.
+        receiver.rpc("rename", tab=local["tab"], name="Fallback updated")
+    finally:
+        os.kill(server_process.pid, signal.SIGCONT)
+    wait_for(lambda: receiver.rpc("list")["active_reference"] == expected,
+             message="The startup fallback replaced the saved tab selection")
+    receiver.rpc("detach")
+    assert app.wait(timeout=8) == 0
+
+
 with scenario("initial directories wait for the enabled local daemon while remotes connect"), \
         (artifacts / "remote-startup-routing-smoke.log").open("w") as log, \
         AppFixture(dict(desktop_notifications=False), env={"GTK_A11Y": "none"}) as receiver, \

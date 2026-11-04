@@ -326,6 +326,54 @@ fn cached_selection_restores_after_reconnection_until_the_user_navigates() {
 }
 
 #[test]
+fn startup_selection_survives_fallback_tabs_arriving_before_the_saved_tab() {
+    for navigated in [false, true] {
+        let mut c = Controller::new(0);
+        c.restore_selection(tab(2, 1), None, TabFilter::All);
+        let state = c
+            .shared(done(1, vec![]), selection(&[], None))
+            .unwrap()
+            .state
+            .unwrap()
+            .0;
+        let state = c
+            .shared(
+                done(2, vec![saved(1, 1)]),
+                selection(&state.tabs, state.active),
+            )
+            .unwrap()
+            .state
+            .unwrap()
+            .0;
+        assert_eq!(state.active, Some(tab(1, 1)));
+        // A later snapshot of the fallback must not cancel the pending restore.
+        let state = c
+            .shared(
+                done(3, state.tabs.clone()),
+                selection(&state.tabs, state.active),
+            )
+            .unwrap()
+            .state
+            .unwrap()
+            .0;
+        if navigated {
+            c.navigated();
+        }
+        let restored = c
+            .shared(
+                done(4, vec![saved(1, 1), saved(2, 1)]),
+                selection(&state.tabs, state.active),
+            )
+            .unwrap()
+            .state
+            .unwrap()
+            .0;
+        assert_eq!(restored.active, Some(tab(if navigated { 1 } else { 2 }, 1)));
+        assert!(c.restore.is_none());
+    }
+}
+
+#[test]
 fn window_close_discards_both_phases_and_ignores_late_events() {
     let mut c = Controller::new(0);
     let current = || selection(&[], None);

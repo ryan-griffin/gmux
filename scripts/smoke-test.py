@@ -86,9 +86,11 @@ def pty_workflow(fixture, log):
 def reconnect_and_empty_restore(fixture, log):
     app = fixture.start_app(binary, "--directory", root, cwd=root, stdout=log, stderr=log)
     first = fixture.rpc("list")["tabs"][0]
-    fixture.rpc("split", pane=first["active_pane"], down=True)
+    split = fixture.rpc("split", pane=first["active_pane"], down=True)
     fixture.rpc("new", name="Saved tab", directory=str(fixture.path))
+    fixture.rpc("focus", pane=split["pane"])
     expected = fixture.rpc("list")
+    assert expected["active_tab"] == first["id"] != expected["tabs"][0]["id"]
     daemon_pid = fixture.rpc("status")["pid"]
     fixture.rpc("detach")
     assert app.wait(timeout=8) == 0

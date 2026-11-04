@@ -53,7 +53,8 @@ Shortcuts dialog to find other actions.
 | Previous / next prompt | Ctrl+Shift+Up / Ctrl+Shift+Down |
 | Command palette | Ctrl+Shift+P |
 
-Closing a window leaves its terminals running. Reopen Gmux to reconnect.
+Closing a window leaves its terminals running. Reopen Gmux to reconnect and
+return to the selected tab.
 
 **Quit Gmux** or Ctrl+Shift+Q stops the app's connected local daemon and its
 terminals. Remote terminals keep running. After a daemon restart, Gmux restores
