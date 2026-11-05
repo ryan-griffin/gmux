@@ -812,7 +812,16 @@ Path(done).touch()
                     time.sleep(.025)
 
             def copied(expected):
+                # Text equality can match the preceding copy of the same rectangle.
+                # Wait for a new compositor offer before reading either MIME type.
+                context = GLib.MainContext.default()
+                while context.pending():
+                    context.iteration(False)
+                native.clipboard_formats = None
                 rpc("action", name="copy")
+                wait_for(lambda: native.clipboard_formats is not None, context=context,
+                         message="Copy must publish a new clipboard offer")
+                assert "text/html" in native.clipboard_formats, native.clipboard_formats
                 wait_for(lambda: native.clipboard_text() == expected,
                          message=f"Selection must copy {expected!r}")
                 check_html(dict(text=expected, html=native.clipboard_text("text/html")), expected)
