@@ -88,7 +88,7 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 
 `src/daemon.rs` owns live sessions and execution state. Its submodules handle:
 
-- `event_loop.rs`: PTYs, sockets, signals, and disk-worker completions.
+- `event_loop.rs`: PTYs, sockets, signals, disk-worker completions, and fair ready queues.
 - `frontend.rs`: stream input, paste assembly, subscriptions, and viewport output.
 - `commands.rs`: layout and control handlers, ordered command replies, and save warnings.
 - `mutation.rs`: typed mutation outcomes, live execution revision publication,
@@ -96,7 +96,8 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 
 Each daemon `Frontend` owns one pane map of `PaneViewState`. A pane keeps its
 metadata baseline, requested size, Git subscription, pending error, and dirty
-flags with that owner. Presentation state is allocated only when used and owns
+flags with that owner. A resumable pane pass retains unvisited work across turns
+and advances frame pacing only after completion. Presentation state is allocated only when used and owns
 the native engine view, selection/search baselines, and scroll/selection serials.
 The optional sent-screen cache has a separate lifetime. Hiding releases that
 cache while retaining view state; budget eviction releases regenerable storage

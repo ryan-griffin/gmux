@@ -43,17 +43,28 @@ layout topology or other live windows' choices.
 
 ## Ownership and scheduling
 
-The daemon reads nonblocking PTYs in one `ppoll` loop, with a 512 KiB read budget
-per ready pane and an 8 MiB pending-input limit per pane. An idle detached daemon
-blocks in `ppoll`. Signals, sockets, disk-worker completions, and the nearest
-active progress expiry deadline wake it. Each connection paces viewport batches
+The daemon owns PTYs and terminal engines in one nonblocking `ppoll` loop.
+Each turn gives frontend commands, PTY work, and viewport publication separate
+2 ms budgets. The stages also cap work at eight command connections, 32 PTYs,
+and 64 pane views respectively. Ordered control requests have their own shared
+2 ms, 32-item budget, including mutations waiting for a save. A command connection
+decodes up to eight requests per visit. PTY reads yield after 500 microseconds or 512 KiB, checking
+time between 16 KiB reads. Pending input remains limited to 8 MiB per pane.
+Ready queues retain deferred work ahead of newly discovered readiness.
+An idle detached daemon blocks in `ppoll`. Signals, sockets, disk-worker
+completions, and the nearest active progress expiry deadline wake it. Each connection paces viewport batches
 independently. GTK reports its display's refresh interval; other clients default
 to 16 ms. Submillisecond deadlines retain their precision, and metadata is
 refreshed once a second. Dirty viewport extraction, visible presentation changes,
 incremental history-search batches, and changed progress reports restart the
 connection's frame interval. Other metadata packets and passes without that
 work do not postpone the next visible response. Hidden
-panes keep parsing output without extracting viewports.
+panes keep parsing output without extracting viewports. A frontend pass can
+continue across turns; only visited panes consume their dirty flags. Its frame
+interval starts with the pass, and continuations do not wait for another frame.
+Frontends rotate between turns, including background clients. Socket flushes
+write at most 256 KiB per visit. When no publication is due, flushing has a
+separate 1 ms, 16-connection budget.
 
 The daemon shares [frontend resource budgets](resource-budgets.md#daemon-frontend-storage)
 across local and remote streams. Output pressure disconnects slow consumers;
@@ -68,8 +79,20 @@ cache. Immutable history can be prefetched during output; live screen prefetch
 waits for 100 ms of quiet.
 
 GTK owns rendering, fonts, the clipboard, and accessible text. An `eventfd` wakes
-the frontend when packets or requests arrive. Both sides process bounded batches
-to keep input and other panes responsive.
+the frontend when packets or requests arrive. All windows queue work through
+one idle-priority dispatcher with a shared 2 ms, 64-item budget, allowing input
+and frame-clock sources between batches. Connections rotate within a window;
+each applies at most 16 FIFO packets per visit. Clipboard effects run at their
+position in that stream, and viewport deltas apply in order. Windows coalesce
+wakeups while queued and return to the queue's tail when more work arrives.
+
+These are cooperative limits, not hard deadlines. A packet, native snapshot,
+command handler, or GTK presentation update completes before yielding. Readiness
+scans, dirty-state fan-out, control mutations, and persistence bookkeeping also
+run on the owner thread. Pending userspace work requests another turn explicitly;
+blocked sockets wait for readiness. Read batches that yield before observing
+WouldBlock request another turn even after their process exits. Drained queues
+remove their continuation source, without an idle polling timer.
 
 A disk worker writes daemon state outside the PTY owner thread. Explicit layout,
 settings, and Stop mutations wait for earlier command saves; read-only requests,

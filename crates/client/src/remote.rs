@@ -912,8 +912,21 @@ impl SessionManager {
     }
     pub fn poll_with_clipboard_events(
         &mut self,
+        clipboard: impl FnMut(gmux_protocol::clipboard::Event),
+    ) -> HashMap<u64, SessionUpdate> {
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 256);
+        self.poll_with_budget(&mut budget, clipboard)
+    }
+    /// Apply ordered packets within the caller's event-loop budget. A connection
+    /// yields after 16 packets even when the shared budget has time left.
+    pub fn poll_with_budget(
+        &mut self,
+        budget: &mut gmux_platform::work::Budget,
         mut clipboard: impl FnMut(gmux_protocol::clipboard::Event),
     ) -> HashMap<u64, SessionUpdate> {
+        // Reserve the first packet before maintenance. Even a large set of
+        // scroll targets must not spend every turn's time before applying data.
+        let first = budget.take();
         // A full command queue must not lose a tab's viewport subscription.
         let _ = self.subscribe();
         self.flush_reads();
@@ -925,7 +938,10 @@ impl SessionManager {
             session.flush_scroll();
         }
         let mut updates: HashMap<u64, SessionUpdate> = HashMap::new();
-        for _ in 0..256 {
+        for index in 0..16 {
+            if !(if index == 0 { first } else { budget.take() }) {
+                break;
+            }
             let (received, _reservation) = match self.receiver.try_recv_reserved() {
                 Ok((item, reservation)) => (Ok(item), Some(reservation)),
                 Err(error) => (Err(error), None),
@@ -1176,7 +1192,9 @@ impl SessionManager {
                 }
             }
         }
-        self.wake.notify();
+        if !self.disconnected && self.receiver.pending() {
+            self.wake.notify();
+        }
         updates
     }
     pub fn disconnected(&self) -> bool {
@@ -2465,6 +2483,7 @@ mod tests {
     #[test]
     fn clipboard_packets_keep_cross_pane_wire_order_without_mutating_selection_or_replay() {
         use gmux_protocol::clipboard::{Destination, Write};
+        use std::os::fd::AsRawFd;
         let (mut manager, sender, handle) = manager();
         handle.borrow_mut().selection = Some(Selection::linear(0, 1));
         for (pane, destination, text) in [
@@ -2510,11 +2529,36 @@ mod tests {
                 .unwrap();
         }
         let mut writes = vec![];
+        // No packet may be consumed when another connection used the budget.
+        let mut exhausted = gmux_platform::work::Budget::new(Duration::from_secs(60), 0);
         assert!(
             manager
-                .poll_with_clipboard(|write| writes.push(write))
+                .poll_with_budget(&mut exhausted, |_| panic!("budget exhausted"))
                 .is_empty()
         );
+        for count in 1..=4 {
+            manager.wake.drain();
+            let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+            assert!(
+                manager
+                    .poll_with_budget(&mut budget, |event| {
+                        if let gmux_protocol::clipboard::Event::Write(write) = event {
+                            writes.push(write);
+                        }
+                    })
+                    .is_empty()
+            );
+            assert_eq!(writes.len(), count);
+            let mut ready = libc::pollfd {
+                fd: manager.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut ready, 1, 0) },
+                i32::from(count != 4)
+            );
+        }
         assert_eq!(
             writes
                 .iter()
@@ -3327,6 +3371,54 @@ mod tests {
                 cells,
             }))
             .unwrap();
+    }
+
+    #[test]
+    fn deferred_row_shifts_apply_in_order_before_disconnect() {
+        let (mut manager, sender, session) = manager();
+        let cells = |text: &str| {
+            text.chars()
+                .map(|c| {
+                    let mut cell = Cell::default();
+                    cell.set_text(&c.to_string()).unwrap();
+                    cell
+                })
+                .collect()
+        };
+        let frame = session.borrow().frame;
+        send_frame(&sender, &session, frame, vec![0, 1], cells("aabb"), None);
+        for text in ["cc", "dd"] {
+            sender
+                .send(Ok(Packet {
+                    header: Header {
+                        meta: session.borrow().meta.clone(),
+                        frame: Some(frame),
+                        row_shift: 1,
+                        rows: vec![1],
+                        ..Header::default()
+                    },
+                    cells: cells(text),
+                }))
+                .unwrap();
+        }
+        drop(sender);
+        for expected in ["aabb", "bbcc", "ccdd"] {
+            let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+            manager.poll_with_budget(&mut budget, |_| panic!("unexpected side effect"));
+            assert_eq!(
+                session
+                    .borrow()
+                    .cells
+                    .iter()
+                    .map(Cell::text)
+                    .collect::<String>(),
+                expected
+            );
+            assert!(!manager.disconnected());
+        }
+        // Channel closure must request a turn even with no packet left to wake it.
+        manager.poll();
+        assert!(manager.disconnected());
     }
 
     #[test]

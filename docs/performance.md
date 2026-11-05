@@ -4,6 +4,83 @@ Benchmarks write local reports under `artifacts/`, which Git ignores. Keep sourc
 revisions and matching frontend/daemon binaries with reports when comparing
 builds. Results depend on the compositor, driver, font, and machine.
 
+## Event-loop scheduling
+
+Measure concurrent output and real input with a matching release frontend and
+daemon. Use the same command against preserved baseline binaries, run one build
+at a time, and interleave revisions when repeating the comparison:
+
+```sh
+python3 scripts/cargo_build.py --release gmux gmux-gtk
+python3 scripts/performance-benchmark.py --binary target/release/gmux-gtk \
+  --renderer gl --windows 4 --background-panes 9 \
+  --batch-lines 100 --batch-interval .001 --seconds 3 --samples 200 \
+  --output artifacts/scheduling.json
+```
+
+This creates twelve noisy PTYs and a raw-input probe, with four GTK windows and
+four independent local stream connections on one GTK main thread. Each writer
+sends colored Unicode rows until PTY backpressure slows it. Visible and hidden
+scenarios move the probe between a four-pane tab and its own tab. Other windows
+retain their local selections. The report includes input-to-composited-view
+p95/p99, daemon Status and GTK renderer-info RPC p95, per-writer and aggregate
+output throughput, process/main-thread CPU, RSS, and main-thread context switches.
+Idle and detached samples check continuation cleanup. See the script's recorded
+latency and resource methods for included costs.
+
+On an i7-13700H with GTK 4.24.1, Mutter 51.1 and OpenGL, two release runs per
+revision produced these ranges of per-run quantiles. The baseline was
+`4bfdd91`; reports retain binary hashes. All runs used the workload above,
+without competing builds or tests. CPU affinity was not pinned.
+
+| Latency, ms | Baseline | Budgeted |
+| --- | ---: | ---: |
+| Visible input p95 | 84.1–85.6 | 81.7–89.9 |
+| Visible input p99 | 90.9–94.2 | 90.4–94.3 |
+| Hidden input p95 | 65.5–72.4 | 64.0–78.6 |
+| Hidden input p99 | 74.6–76.9 | 69.4–81.6 |
+| Visible daemon Status p95 | 11.1–11.6 | 6.1–6.1 |
+| Hidden daemon Status p95 | 11.1–11.8 | 6.1–6.3 |
+| Visible GTK renderer-info p95 | 5.2–6.1 | 1.1–2.9 |
+| Hidden GTK renderer-info p95 | 4.3–5.8 | 1.1–3.8 |
+
+Control responsiveness improved in both runs. Composited input tails did not
+improve consistently. Idle input p95 stayed near 33–34 ms.
+
+| Resource or throughput | Baseline | Budgeted |
+| --- | ---: | ---: |
+| Visible output, MiB/s | 38.3–59.8 | 48.6–52.8 |
+| Hidden output, MiB/s | 39.8–41.0 | 39.1 |
+| Detached output, MiB/s | 49.1–49.3 | 49.6–49.8 |
+| Visible frontend CPU, % of one core | 53.8–65.7 | 55.8–60.4 |
+| Hidden frontend CPU, % of one core | 47.1–50.4 | 50.8–52.4 |
+| Busy frontend median RSS, MiB | 221.0–223.5 | 220.7–221.9 |
+| Busy daemon median RSS, MiB | 116.0–116.8 | 116.5–117.3 |
+
+The busy daemon used about 98–99% of one core in both revisions. Visible frontend
+main-thread CPU was 44–53% before and 45–48% after; hidden main-thread CPU was
+38–40% and 40–42%. Daemon main-thread context switches under attached output
+were 111–217/s before and 178–297/s after. These counts include preemption and
+IPC, not just scheduler continuations. Every writer progressed in every busy
+sample. The slowest detached writer increased from about 2.2 to 3.6 MiB/s.
+Detached idle recorded zero CPU ticks and context switches in both revisions.
+Attached idle recorded zero daemon ticks, and zero or one frontend tick per
+three-second interval. Smaller batches improve control responsiveness with a
+small hidden-output throughput/CPU cost in this fixture; the visible throughput
+variation prevents a stronger claim.
+
+The budgets are cooperative. Single packets, native snapshots, commands, GTK
+presentation updates, readiness scans and dirty-state fan-out can exceed a slice.
+The RPC measurements are responsiveness proxies, including worker and socket
+costs, rather than direct event-loop instrumentation. PipeWire capture includes
+compositor/observer latency and excludes physical display scanout. Two runs with
+200 input samples per scenario do not establish a stable p99 or a general
+throughput bound. Three-second CPU/RSS samples include caches and allocator
+arenas; CPU resolution is about 0.33% of one core. These runs cover local streams
+and multiple windows, not noisy remote networks or several daemons per window.
+The remote-window suite separately checks routing, stalls, reconnection and
+independent window selections.
+
 ## GTK snapshot projection
 
 ```sh

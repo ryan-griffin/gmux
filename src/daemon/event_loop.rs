@@ -65,13 +65,17 @@ pub fn run() -> anyhow::Result<()> {
     persistence.submit(Save::Prune, SaveMode::Explicit)?;
     let mut saving: Option<PendingControl> = None;
     let mut controls = VecDeque::new();
+    let mut control_pending = false;
     let mut next_metadata = Instant::now();
+    let mut next_held = Instant::now();
     let mut quit_at = None;
     let mut fds = Vec::new();
     let mut pane_indices = Vec::new();
     let mut frontend_indices = Vec::new();
-    let mut ready = HashSet::new();
+    let mut ready = gmux_platform::work::Queue::default();
+    let mut frontend_ready = gmux_platform::work::Queue::default();
     let mut exited = Vec::new();
+    let mut metadata_pending = HashSet::new();
     let mut compression_budget = crate::compression::CompressionBudget::new(Instant::now());
     loop {
         daemon.maintain_clipboard();
@@ -149,10 +153,11 @@ pub fn run() -> anyhow::Result<()> {
         let mut deadline = quit_at;
         for next in [
             daemon.clipboard_deadline(),
+            (!ready.is_empty() || !frontend_ready.is_empty() || control_pending).then_some(now),
             daemon
                 .sessions
                 .values()
-                .any(TerminalSession::has_output_tail)
+                .any(TerminalSession::needs_output_poll)
                 .then_some(now),
             (saving.is_none() && !controls.is_empty()).then_some(now),
             // Socket readiness cannot report commands already read into userspace.
@@ -171,7 +176,7 @@ pub fn run() -> anyhow::Result<()> {
                 .values()
                 .filter_map(TerminalSession::progress_deadline)
                 .min(),
-            held.then_some(now + Duration::from_millis(100)),
+            held.then_some(next_held),
             daemon
                 .git
                 .as_ref()
@@ -223,12 +228,6 @@ pub fn run() -> anyhow::Result<()> {
                 eprintln!("Could not save layout: {error}");
             }
         }
-        while saving.is_none() {
-            let Some(request) = controls.pop_front() else {
-                break;
-            };
-            saving = PendingControl::start(request, &mut daemon, &persistence);
-        }
         let mut child_event = false;
         if fds[2].revents & libc::POLLIN != 0 {
             loop {
@@ -251,9 +250,13 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         for &(id, index) in &frontend_indices {
-            if fds[index].revents == 0 && !daemon.frontends[&id].input_pending() {
-                continue;
+            if fds[index].revents != 0 || daemon.frontends[&id].input_pending() {
+                frontend_ready.push(id);
             }
+        }
+        let mut commands_budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 8);
+        while !frontend_ready.is_empty() && commands_budget.take() {
+            let id = frontend_ready.pop().unwrap();
             let Some(mut frontend) = daemon.frontends.remove(&id) else {
                 continue;
             };
@@ -293,8 +296,21 @@ pub fn run() -> anyhow::Result<()> {
                 daemon.resize_sessions(None);
             }
         }
-        for _ in 0..32 {
+        let mut control_budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 32);
+        while saving.is_none() && control_budget.take() {
+            let Some(request) = controls.pop_front() else {
+                break;
+            };
+            saving = PendingControl::start(request, &mut daemon, &persistence);
+        }
+        loop {
+            if !control_budget.take() {
+                // The wake may already be drained while requests remain in userspace.
+                control_pending = true;
+                break;
+            }
             let Ok(request) = server.receiver.try_recv() else {
+                control_pending = false;
                 break;
             };
             let method = request.body["method"].as_str().unwrap_or("");
@@ -316,41 +332,38 @@ pub fn run() -> anyhow::Result<()> {
         }
         let metadata_due =
             daemon.frontends.values().any(|f| f.attached) && Instant::now() >= next_metadata;
-        ready.clear();
-        ready.extend(
-            pane_indices
-                .iter()
-                .filter(|(_, index)| fds[*index].revents != 0)
-                .map(|(id, _)| *id),
-        );
-        if child_event || metadata_due {
-            ready.extend(daemon.sessions.keys().copied());
+        for &(id, index) in &pane_indices {
+            if fds[index].revents != 0 {
+                ready.push(id);
+            }
         }
-        ready.extend(
-            daemon
-                .sessions
-                .iter()
-                .filter_map(|(&id, session)| session.render_held().then_some(id)),
-        );
-        // Flush queued input immediately, including terminal protocol replies.
-        ready.extend(daemon.sessions.iter().filter_map(|(&id, s)| {
-            s.poll_fd()
-                .filter(|(_, events)| events & libc::POLLOUT != 0)
-                .map(|_| id)
-        }));
-        ready.extend(daemon.sessions.iter().filter_map(|(&id, s)| {
-            s.progress_deadline()
-                .is_some_and(|at| Instant::now() >= at)
-                .then_some(id)
-        }));
-        ready.extend(
-            daemon
-                .sessions
-                .iter()
-                .filter_map(|(&id, s)| s.has_output_tail().then_some(id)),
-        );
+        if metadata_due {
+            metadata_pending.extend(daemon.sessions.keys().copied());
+        }
+        if child_event || metadata_due {
+            for &id in daemon.sessions.keys() {
+                ready.push(id);
+            }
+        }
+        let held_due = Instant::now() >= next_held;
+        for (&id, session) in &daemon.sessions {
+            if (held_due && session.render_held())
+                || session
+                    .progress_deadline()
+                    .is_some_and(|at| Instant::now() >= at)
+                || session.needs_output_poll()
+            {
+                ready.push(id);
+            }
+        }
+        if held_due {
+            next_held = Instant::now() + Duration::from_millis(100);
+        }
         exited.clear();
-        for id in ready.drain() {
+        let mut pty_budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 32);
+        while !ready.is_empty() && pty_budget.take() {
+            let id = ready.pop().unwrap();
+            let refresh_metadata = metadata_pending.remove(&id);
             let recipient = daemon.clipboard_recipient(id);
             let read_recipient = daemon.read_recipient(id);
             let Some(session) = daemon.sessions.get_mut(&id) else {
@@ -370,8 +383,12 @@ pub fn run() -> anyhow::Result<()> {
             if let Some(error) = update.error {
                 daemon.errors.insert(id, error);
             }
-            if metadata_due {
+            if refresh_metadata {
                 session.refresh_directory();
+                // This pane's periodic refresh may have yielded past the
+                // broadcast that first marked its frontend metadata dirty.
+                daemon.metadata_changed.insert(id);
+                daemon.git_dirty |= daemon.git.is_some();
             }
             if session.exited() && !session.retain_exited() {
                 exited.push(id);
@@ -405,9 +422,11 @@ pub fn run() -> anyhow::Result<()> {
             || metadata_due
             || !exited.is_empty()
         {
-            daemon.updates(metadata_due);
+            let mut budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 64);
+            daemon.updates_budgeted(metadata_due, &mut budget);
         } else {
-            daemon.flush_frontends();
+            let mut budget = gmux_platform::work::Budget::new(Duration::from_millis(1), 16);
+            daemon.flush_frontends_budgeted(&mut budget);
         }
         let mutation = daemon.process_exits(exited.drain(..));
         if let Progress::Complete(Completion::SaveFailed(error)) =

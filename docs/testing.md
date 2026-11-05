@@ -297,3 +297,10 @@ Counting on substitutes a render-state allocator and reports allocation calls,
 requested bytes, and live bytes after warmup. These counts exclude terminal,
 Rust, transport, and GTK allocations. This benchmark measures the native engine;
 it does not measure complete daemon or desktop frame latency.
+
+The `frontend-input` suite also keeps forty synchronized-output holds active to
+check that deferred PTYs drain their ready queue and return to timed waits.
+Scheduling unit checks cover fair deferred IDs and frontend passes, dirty changes
+arriving during a pass, ordered viewport shifts and clipboard effects across
+packet budgets, continuation wakeups, and a yielded process-exit drain with no
+kernel readiness. GTK dispatcher checks share one budget across queued windows.

@@ -53,6 +53,7 @@ impl Fixture {
             store: Arc::clone(&store),
             client_revision: 0,
             origins,
+            poll_cursor: None,
             revision: 0,
             desktop: DesktopState::default(),
             organization: store.snapshot().0,

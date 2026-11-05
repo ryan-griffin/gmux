@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 import socket
@@ -445,6 +446,32 @@ with scenario("buffered attach and fragmented 4 MiB UTF-8 paste"), AppFixture() 
     finally:
         if client is not None:
             client.close()
+
+with scenario("many synchronized-output holds yield without busy polling"), AppFixture(prefix="gmux-held-budget-") as fixture:
+    shell = fixture.path / "held-shell"
+    gate = fixture.path / "hold-start"
+    shell.write_text(
+        "#!/bin/sh\n"
+        f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep .02; done\n"
+        "printf '\\033[?2026hHELD'\n"
+        f": > {shlex.quote(str(fixture.path))}/held-ready-$$\n"
+        "exec sleep 5\n")
+    shell.chmod(0o700)
+    fixture.env["SHELL"] = str(shell)
+    process = fixture.start(args.binary or cargo_binary("gmux"), "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for(lambda: fixture.rpc("status"))
+    for _ in range(40):
+        fixture.rpc("new")
+    gate.touch()
+    wait_for(lambda: len(list(fixture.path.glob("held-ready-*"))) == 40)
+
+    def ticks():
+        fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    before = ticks()
+    time.sleep(.3)
+    used = ticks() - before
+    assert used <= os.sysconf("SC_CLK_TCK") * .1, f"Held panes busy-polled: {used} CPU ticks"
 
 if args.report:
     args.report.parent.mkdir(parents=True, exist_ok=True)
