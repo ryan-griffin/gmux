@@ -4,8 +4,8 @@ use gmux_protocol::transport::{KeyAction, PasteOptions, StreamCommand, StreamReq
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
 const READ_CHUNK: usize = 16 * 1024;
-const MAX_INPUT_PER_TURN: usize = 512 * 1024;
-const MAX_REQUESTS_PER_TURN: usize = 64;
+const MAX_INPUT_PER_VISIT: usize = 512 * 1024;
+const MAX_REQUESTS_PER_VISIT: usize = 8;
 const MAX_COMMAND: usize = 1_048_577;
 
 #[derive(Default)]
@@ -139,6 +139,10 @@ pub(super) struct Frontend {
     pub(super) focused: bool,
     frame_interval: Duration,
     next_frame: Instant,
+    frame_panes: VecDeque<u64>,
+    frame_started: Option<Instant>,
+    frame_activity: bool,
+    frame_git_revision: Option<u64>,
 }
 pub(super) struct Paste {
     pub(super) pane: u64,
@@ -246,6 +250,10 @@ impl Frontend {
             focused: false,
             frame_interval: transport::DEFAULT_FRAME_INTERVAL,
             next_frame: Instant::now(),
+            frame_panes: VecDeque::new(),
+            frame_started: None,
+            frame_activity: false,
+            frame_git_revision: None,
         }
     }
     pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
@@ -265,9 +273,9 @@ impl Frontend {
         // Keep the decoded batch small even for empty or invalid JSON lines.
         // The unread suffix survives the request limit and schedules another turn.
         let mut requests = Vec::new();
-        let mut budget = MAX_INPUT_PER_TURN;
+        let mut budget = MAX_INPUT_PER_VISIT;
         let mut reads = 0;
-        while budget > 0 && requests.len() < MAX_REQUESTS_PER_TURN {
+        while budget > 0 && requests.len() < MAX_REQUESTS_PER_VISIT {
             if !self.input_pending() {
                 if reads == 32 {
                     break;
@@ -308,7 +316,7 @@ impl Frontend {
             }
             let end = self.read_buffer.len().min(self.read_offset + budget);
             for part in self.read_buffer[self.read_offset..end].split_inclusive(|c| *c == b'\n') {
-                if requests.len() == MAX_REQUESTS_PER_TURN {
+                if requests.len() == MAX_REQUESTS_PER_VISIT {
                     break;
                 }
                 self.read_offset += part.len();
@@ -529,10 +537,24 @@ impl Daemon {
         }
     }
 
-    pub(super) fn flush_frontends(&mut self) {
+    pub(super) fn flush_frontends_budgeted(&mut self, budget: &mut gmux_platform::work::Budget) {
         let before = self.frontends.len();
         self.frontends
-            .retain(|_, frontend| frontend.flush().is_ok());
+            .retain(|_, frontend| !frontend.output.closed());
+        let mut ids: Vec<_> = self.frontends.keys().copied().collect();
+        ids.sort_unstable();
+        let start = ids.partition_point(|id| *id <= self.flush_cursor);
+        let count = ids.len();
+        ids.rotate_left(if start == count { 0 } else { start });
+        for id in ids {
+            if !budget.take() {
+                break;
+            }
+            self.flush_cursor = id;
+            if self.frontends.get_mut(&id).unwrap().flush().is_err() {
+                self.frontends.remove(&id);
+            }
+        }
         if self.frontends.len() != before {
             self.git_dirty = true;
             self.resize_sessions(None);
@@ -944,6 +966,9 @@ impl Daemon {
             .values()
             .filter(|frontend| frontend.attached)
             .filter_map(|frontend| {
+                if !frontend.frame_panes.is_empty() {
+                    return Some(Instant::now());
+                }
                 let pending = !self.changed.is_empty()
                     || !self.metadata_changed.is_empty()
                     || !self.notifications.is_empty()
@@ -969,10 +994,33 @@ impl Daemon {
             .min()
     }
     /// Publish each connection's due updates without coupling display intervals.
+    #[cfg(test)]
     pub(super) fn updates(&mut self, metadata_due: bool) {
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), usize::MAX);
+        self.updates_budgeted(metadata_due, &mut budget);
+    }
+    pub(super) fn updates_budgeted(
+        &mut self,
+        metadata_due: bool,
+        budget: &mut gmux_platform::work::Budget,
+    ) {
         let before = self.frontends.len();
         let mut ids: Vec<_> = self.frontends.keys().copied().collect();
-        ids.sort_by_key(|id| (!self.frontends[id].focused, *id));
+        ids.sort_unstable();
+        let recipient = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                let frontend = &self.frontends[id];
+                frontend.attached
+                    && (metadata_due
+                        || !frontend.frame_panes.is_empty()
+                        || Instant::now() >= frontend.next_frame)
+            })
+            .min_by_key(|id| (!self.frontends[id].focused, *id));
+        let start = ids.partition_point(|id| *id <= self.update_cursor);
+        let count = ids.len();
+        ids.rotate_left(if start == count { 0 } else { start });
         // Every client receives the same execution revision. Serialize each transport snapshot once per broadcast.
         let mut state = None;
         // Deliver each alert once, preferring a focused client. All clients receive unread state.
@@ -985,6 +1033,11 @@ impl Daemon {
             for &id in &self.changed {
                 frontend.panes.entry(id).or_default().terminal_changed = true;
             }
+            if metadata_due {
+                for &id in self.sessions.keys() {
+                    frontend.panes.entry(id).or_default().metadata_changed = true;
+                }
+            }
             for &id in &self.metadata_changed {
                 frontend.panes.entry(id).or_default().metadata_changed = true;
             }
@@ -993,12 +1046,19 @@ impl Daemon {
             }
         }
         for id in ids {
+            if budget.expired() {
+                break;
+            }
             let mut frontend = self.frontends.remove(&id).unwrap();
-            if !frontend.attached || (!metadata_due && Instant::now() < frontend.next_frame) {
+            if !frontend.attached
+                || (frontend.frame_panes.is_empty()
+                    && !metadata_due
+                    && Instant::now() < frontend.next_frame)
+            {
                 self.frontends.insert(id, frontend);
                 continue;
             }
-            let started = Instant::now();
+            self.update_cursor = id;
             let result = (|| {
                 if frontend.state_revision != Some(self.revision) {
                     let bytes = state
@@ -1007,14 +1067,25 @@ impl Daemon {
                         .map_err(|error| anyhow::anyhow!("{error}"))?;
                     frontend.queue_encoded(bytes)?;
                     frontend.state_revision = Some(self.revision);
+                    for &id in self.sessions.keys() {
+                        if !frontend.panes.contains_key(&id) {
+                            frontend.panes.entry(id).or_default().metadata_changed = true;
+                        }
+                    }
                 }
-                self.update_frontend(&mut frontend, metadata_due, &mut notifications)
+                let mut none = HashMap::new();
+                self.update_frontend_budgeted(
+                    &mut frontend,
+                    if Some(id) == recipient {
+                        &mut notifications
+                    } else {
+                        &mut none
+                    },
+                    budget,
+                )
             })();
             match result {
-                Ok(active) => {
-                    if active {
-                        frontend.next_frame = started + frontend.frame_interval;
-                    }
+                Ok(()) => {
                     self.frontends.insert(id, frontend);
                 }
                 Err(error) => eprintln!("Detaching frontend: {error}"),
@@ -1032,7 +1103,7 @@ impl Daemon {
         }
         // Another stream's enqueue may have evicted a frontend already visited
         // by this broadcast. Release its view state and socket this turn.
-        self.flush_frontends();
+        self.flush_frontends_budgeted(budget);
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -1059,17 +1130,54 @@ impl Daemon {
         .encode_into(&mut bytes)?;
         Ok(bytes)
     }
+    #[cfg(test)]
     fn update_frontend(
         &mut self,
         frontend: &mut Frontend,
         metadata_due: bool,
         notifications: &mut HashMap<u64, NotificationQueue>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
+        if metadata_due {
+            for &id in self.sessions.keys() {
+                frontend.panes.entry(id).or_default().metadata_changed = true;
+            }
+        }
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), usize::MAX);
+        self.update_frontend_budgeted(frontend, notifications, &mut budget)
+    }
+    fn update_frontend_budgeted(
+        &mut self,
+        frontend: &mut Frontend,
+        notifications: &mut HashMap<u64, NotificationQueue>,
+        budget: &mut gmux_platform::work::Budget,
+    ) -> anyhow::Result<()> {
         let mut frame_activity = false;
-        if let Some(git) = &self.git
-            && frontend.git_revision != Some(git.revision())
-        {
-            for (&id, pane) in &mut frontend.panes {
+        if frontend.frame_panes.is_empty() {
+            let mut ids: Vec<_> = self
+                .sessions
+                .keys()
+                .chain(frontend.panes.keys())
+                .copied()
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            frontend.frame_panes.extend(ids);
+            frontend.frame_git_revision = self.git.as_ref().map(crate::branch::Service::revision);
+            frontend.frame_started = Some(Instant::now());
+        }
+        while !frontend.frame_panes.is_empty() && budget.take() {
+            let id = frontend.frame_panes.pop_front().unwrap();
+            let Some(session) = self.sessions.get_mut(&id) else {
+                if let Some(pane) = frontend.panes.get_mut(&id) {
+                    pane.changed = false;
+                    pane.terminal_changed = false;
+                    pane.metadata_changed = false;
+                    pane.error = None;
+                }
+                continue;
+            };
+            if let Some(git) = &self.git {
+                let pane = frontend.panes.entry(id).or_default();
                 if pane.git_subscribed
                     && let Some(meta) = git.metadata(id)
                     && pane.git_sent.as_deref() != Some(&meta)
@@ -1084,9 +1192,6 @@ impl Daemon {
                     })?;
                 }
             }
-            frontend.git_revision = Some(git.revision());
-        }
-        for (&id, session) in &mut self.sessions {
             let notify: Vec<_> = notifications
                 .remove(&id)
                 .unwrap_or_default()
@@ -1095,16 +1200,17 @@ impl Daemon {
                 .collect();
             let pane = frontend.panes.entry(id).or_default();
             let error = pane.error.take().or_else(|| self.errors.get(&id).cloned());
-            let terminal_changed = pane.terminal_changed;
+            let terminal_changed = std::mem::take(&mut pane.terminal_changed);
+            let requested = std::mem::take(&mut pane.changed);
+            let metadata_changed = std::mem::take(&mut pane.metadata_changed);
             let changed = terminal_changed
-                || pane.changed
+                || requested
                 || pane.screen().is_some_and(|screen| {
                     screen.prefetch_at.is_some_and(|at| at <= Instant::now())
                 })
                 || pane.find_pending();
             let screen = pane.visible && (changed || pane.screen().is_none());
-            if !metadata_due
-                && !pane.metadata_changed
+            if !metadata_changed
                 && !changed
                 && !screen
                 && notify.is_empty()
@@ -1383,19 +1489,80 @@ impl Daemon {
             })?;
             frame_activity |= viewport_changed || status_changed;
         }
-        for pane in frontend.panes.values_mut() {
-            pane.changed = false;
-            pane.terminal_changed = false;
-            pane.metadata_changed = false;
+        frontend.frame_activity |= frame_activity;
+        if frontend.frame_panes.is_empty() {
+            if std::mem::take(&mut frontend.frame_activity) {
+                frontend.next_frame = frontend.frame_started.unwrap() + frontend.frame_interval;
+            }
+            frontend.frame_started = None;
+            frontend.git_revision = frontend.frame_git_revision;
         }
-        frontend.flush()?;
-        Ok(frame_activity)
+        frontend.flush()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_frontends_rotate_and_keep_unvisited_dirty_panes() {
+        let mut daemon = Daemon::empty_for_test();
+        for id in 1..=3 {
+            daemon.sessions.insert(id, session(id));
+            daemon.changed.insert(id);
+        }
+        let mut peers = Vec::new();
+        for id in 1..=2 {
+            let (mut frontend, peer) = connection();
+            frontend.attached = true;
+            frontend.state_revision = Some(0);
+            daemon.frontends.insert(id, frontend);
+            peers.push(peer);
+        }
+        for turn in 1..=6 {
+            let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+            daemon.updates_budgeted(false, &mut budget);
+            let serviced = daemon
+                .frontends
+                .values()
+                .flat_map(|f| f.panes.values())
+                .filter(|p| p.metadata.is_some())
+                .count();
+            assert_eq!(serviced, turn);
+            assert!(daemon.changed.is_empty());
+            if turn < 6 {
+                assert!(daemon.next_update().is_some_and(|at| at <= Instant::now()));
+            }
+            if turn == 3 {
+                // A pane already visited in this pass changes again.
+                daemon.changed.insert(1);
+            }
+            if turn == 2 {
+                assert!(
+                    daemon
+                        .frontends
+                        .values()
+                        .all(|f| f.panes[&1].metadata.is_some())
+                );
+                assert!(
+                    daemon
+                        .frontends
+                        .values()
+                        .all(|f| f.panes[&3].terminal_changed)
+                );
+            }
+        }
+        assert!(
+            daemon
+                .frontends
+                .values()
+                .all(|f| f.panes[&1].terminal_changed)
+        );
+        assert!(daemon.next_update().is_some());
+        daemon.updates(false);
+        assert!(daemon.next_update().is_none());
+    }
 
     pub(super) fn session(id: u64) -> TerminalSession {
         TerminalSession::spawn(
@@ -1452,6 +1619,7 @@ mod tests {
         }
         let mut slow = daemon.frontends.remove(&2).unwrap();
         slow.next_frame = Instant::now() + Duration::from_secs(60);
+        slow.focused = true;
         daemon
             .input(
                 2,
@@ -1479,12 +1647,14 @@ mod tests {
         daemon.changed.insert(1);
         daemon.metadata_changed.insert(1);
         daemon.errors.insert(1, "pending error".into());
+        daemon.queue_notifications(1, ["paced-alert".to_string()]);
         daemon.updates(false);
         let fast = Packet::read(&mut fast_peer).unwrap().header;
         assert_eq!(fast.scroll_serial, 0);
         assert_eq!(fast.selection_serial, 0);
         assert!(fast.selection.is_none());
         assert_eq!(fast.error.as_deref(), Some("pending error"));
+        assert_eq!(fast.notifications, ["paced-alert"]);
         assert!(daemon.changed.is_empty() && daemon.errors.is_empty());
         // Another broadcast may clear shared dirty state before the slow frame is due.
         daemon.updates(false);
@@ -1876,7 +2046,7 @@ mod tests {
     #[test]
     fn request_limit_preserves_order_and_buffered_work_without_socket_readiness() {
         let (mut frontend, mut writer) = connection();
-        let count = MAX_REQUESTS_PER_TURN * 3 + 1;
+        let count = MAX_REQUESTS_PER_VISIT * 3 + 1;
         let mut wire = Vec::new();
         for serial in 0..count {
             writeln!(
@@ -1887,7 +2057,7 @@ mod tests {
         }
         writer.write_all(&wire).unwrap();
         let first = frontend.requests().unwrap();
-        assert_eq!(first.len(), MAX_REQUESTS_PER_TURN);
+        assert_eq!(first.len(), MAX_REQUESTS_PER_VISIT);
         assert!(frontend.input_pending());
         let mut fd = libc::pollfd {
             fd: frontend.socket.as_raw_fd(),
@@ -1898,7 +2068,7 @@ mod tests {
         let mut received = first;
         while frontend.input_pending() {
             let batch = frontend.requests().unwrap();
-            assert!(batch.len() <= MAX_REQUESTS_PER_TURN);
+            assert!(batch.len() <= MAX_REQUESTS_PER_VISIT);
             received.extend(batch);
         }
         assert_eq!(received.len(), count);
@@ -1920,7 +2090,7 @@ mod tests {
         assert!(!frontend.input_pending());
         let sender = std::thread::spawn(move || {
             writer
-                .write_all(&vec![b' '; MAX_INPUT_PER_TURN + 1])
+                .write_all(&vec![b' '; MAX_INPUT_PER_VISIT + 1])
                 .unwrap();
             writer
                 .write_all(b"{\"method\":\"attach\",\"version\":9,\"daemon\":\"00000000000000000000000000000001\"}\n")
@@ -1934,7 +2104,7 @@ mod tests {
             let before = frontend.input.len();
             requests = frontend.requests().unwrap();
             if requests.is_empty() {
-                assert!(frontend.input.len() - before <= MAX_INPUT_PER_TURN);
+                assert!(frontend.input.len() - before <= MAX_INPUT_PER_VISIT);
                 assert!(!frontend.input_pending());
             }
             std::thread::yield_now();
@@ -1952,10 +2122,10 @@ mod tests {
     fn invalid_lines_also_count_toward_the_request_limit() {
         let (mut frontend, mut writer) = connection();
         writer
-            .write_all(&[b'\n'; MAX_REQUESTS_PER_TURN + 1])
+            .write_all(&[b'\n'; MAX_REQUESTS_PER_VISIT + 1])
             .unwrap();
         let batch = frontend.requests().unwrap();
-        assert_eq!(batch.len(), MAX_REQUESTS_PER_TURN);
+        assert_eq!(batch.len(), MAX_REQUESTS_PER_VISIT);
         assert!(
             batch
                 .iter()
@@ -1969,10 +2139,10 @@ mod tests {
     #[test]
     fn fragmented_utf8_and_paste_commands_survive_request_and_byte_limits() {
         let (mut frontend, mut writer) = connection();
-        writer.write_all(&[b'\n'; MAX_REQUESTS_PER_TURN]).unwrap();
+        writer.write_all(&[b'\n'; MAX_REQUESTS_PER_VISIT]).unwrap();
         writer.write_all(b"{\"method\":\"attach\",\"version\":9,\"daemon\":\"00000000000000000000000000000001\"}\n{\"method\":\"paste-begin\",\"size\":6}\n{\"method\":\"paste-data\",\"text\":\"").unwrap();
         writer.write_all(&[0xc3]).unwrap();
-        assert_eq!(frontend.requests().unwrap().len(), MAX_REQUESTS_PER_TURN);
+        assert_eq!(frontend.requests().unwrap().len(), MAX_REQUESTS_PER_VISIT);
         let batch = frontend.requests().unwrap();
         assert_eq!(batch.len(), 2);
         assert!(matches!(
@@ -2000,7 +2170,7 @@ mod tests {
         let (mut frontend, mut writer) = connection();
         let sender = std::thread::spawn(move || {
             writer
-                .write_all(&vec![b'x'; MAX_COMMAND + MAX_INPUT_PER_TURN * 2])
+                .write_all(&vec![b'x'; MAX_COMMAND + MAX_INPUT_PER_VISIT * 2])
                 .unwrap();
             writer
                 .write_all(b"\n{\"method\":\"attach\",\"version\":9,\"daemon\":\"00000000000000000000000000000001\"}\n")

@@ -67,6 +67,7 @@ pub struct Connections {
     client_revision: u64,
     _subscription: Subscription,
     origins: HashMap<DaemonId, Origin>,
+    poll_cursor: Option<DaemonId>,
     revision: u64,
     desktop: DesktopState,
     organization: Arc<Snapshot>,
@@ -132,6 +133,7 @@ impl Connections {
             client_revision,
             _subscription: subscription,
             origins,
+            poll_cursor: None,
             revision: 0,
             desktop: organization.desktop.clone(),
             organization,
@@ -680,8 +682,17 @@ impl Connections {
             }
         })
     }
+    #[cfg(test)]
     pub fn poll_with_clipboard_events(
         &mut self,
+        clipboard: impl FnMut(ClipboardEvent, Option<String>),
+    ) -> HashMap<PaneRef, SessionUpdate> {
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 64);
+        self.poll_with_budget(&mut budget, clipboard)
+    }
+    pub fn poll_with_budget(
+        &mut self,
+        budget: &mut gmux_platform::work::Budget,
         mut clipboard: impl FnMut(ClipboardEvent, Option<String>),
     ) -> HashMap<PaneRef, SessionUpdate> {
         if self.watcher.changed()
@@ -693,10 +704,23 @@ impl Connections {
         let mut updates = HashMap::new();
         let mut lost = Vec::new();
         let now = Instant::now();
-        for (&daemon, origin) in &mut self.origins {
+        let mut ids: Vec<_> = self.origins.keys().copied().collect();
+        ids.sort_unstable();
+        let start = self
+            .poll_cursor
+            .map_or(0, |last| ids.partition_point(|id| *id <= last));
+        let count = ids.len();
+        ids.rotate_left(if start == count { 0 } else { start });
+        for daemon in ids {
+            if !budget.take() {
+                self.wake.notify();
+                break;
+            }
+            self.poll_cursor = Some(daemon);
+            let origin = self.origins.get_mut(&daemon).unwrap();
             let was_connected = origin.link.status() == ConnectionStatus::Connected;
             let label = (Some(daemon) != self.local).then(|| origin.machine.name.clone());
-            let update = origin.link.poll_at_with_clipboard_events(now, |event| {
+            let update = origin.link.poll_with_budget(now, budget, |event| {
                 let event = match event {
                     gmux_protocol::clipboard::Event::Write(write) => ClipboardEvent::Write(write),
                     gmux_protocol::clipboard::Event::Read { pane, event } => ClipboardEvent::Read {

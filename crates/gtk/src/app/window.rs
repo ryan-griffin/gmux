@@ -280,6 +280,7 @@ impl Ui {
             presenting: Cell::new(false),
             keyboard,
             update_source: RefCell::new(None),
+            poll_pending: std::cell::Cell::new(false),
             deadline_source: RefCell::new(None),
             theme_handler: RefCell::new(None),
             frame_clock_handler: RefCell::new(None),
@@ -520,121 +521,140 @@ impl Ui {
                 let Some(ui) = weak.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
-                let replies = ui.backend.replies();
-                for (id, result) in replies {
-                    let callback = ui.pending.borrow_mut().remove(&id);
-                    if let Some(callback) = callback {
-                        callback(&ui, result);
-                    } else if let Err(error) = result {
-                        ui.message(&error.to_string());
-                    }
+                if ui.poll_pending.replace(true) {
+                    return glib::ControlFlow::Continue;
                 }
-                let updates = ui.sessions.borrow_mut().poll_with_clipboard_events(
-                    |event, remote| match event {
-                        connections::ClipboardEvent::Write(write) => {
-                            let clipboard = ui.clipboard.clipboard(write.destination);
-                            if let Err(error) = crate::clipboard::publish(&clipboard, write.content)
-                            {
-                                eprintln!("Could not publish clipboard offer: {error}");
-                            }
-                        }
-                        connections::ClipboardEvent::Read { pane, event } => {
-                            if let Ok(terminal) = ui.pane(Some(pane)) {
-                                ui.clipboard.handle(
-                                    &terminal,
-                                    event,
-                                    remote.as_deref(),
-                                    ui.window.is_active(),
-                                );
-                            }
-                        }
-                    },
-                );
-                let directory_changed = updates.values().any(|update| update.directory_changed);
-                let updates_git_changed = updates.values().any(|update| update.git_changed);
-                let mut status_tabs = HashSet::new();
-                for (id, update) in updates {
-                    if update.exited {
-                        ui.controller.borrow_mut().exited(id);
-                    }
-                    let pane = ui
-                        .tabs
-                        .borrow()
-                        .iter()
-                        .find_map(|tab| tab.panes.get(&id).map(|pane| (tab.id, pane.clone())));
-                    let Some((tab, pane)) = pane else {
-                        for message in update.notifications {
-                            ui.notify(None, id, message);
-                        }
-                        continue;
+                let wake = wake.clone();
+                let weak = Rc::downgrade(&ui);
+                super::scheduling::enqueue(move |budget| {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
                     };
-                    if update.program_status_changed
-                        || (update.progress_changed && pane.program_status().is_none())
-                    {
-                        status_tabs.insert(tab);
-                    }
-                    if update.directory_changed {
-                        ui.mark_dirty();
-                    }
-                    pane.tick(&update);
-                    ui.refresh_tab_title(tab);
-                    if let Some(unread) = update.unread {
-                        ui.set_unread(pane.id, unread);
-                    }
-                    for message in update.notifications {
-                        ui.notify(Some(tab), pane.id, message);
-                    }
-                    if (update.exited || pane.exited())
-                        && !pane
-                            .program_status()
-                            .is_some_and(|s| s.record.state.result())
-                        && let Err(error) = {
-                            let _presenting = ui.presenting();
-                            ui.close_pane(pane.id)
-                        }
-                    {
-                        ui.message(&error.to_string());
-                    }
-                }
-                let status_changed = ui.sessions.borrow_mut().take_status_changed();
-                if directory_changed || status_changed {
-                    ui.refresh_metadata();
-                } else if !status_tabs.is_empty() {
-                    ui.refresh_activity(
-                        ui.tabs
-                            .borrow()
-                            .iter()
-                            .filter(|tab| status_tabs.contains(&tab.id)),
-                    );
-                }
-                if status_changed {
-                    ui.refresh_empty();
-                    ui.refresh_connections_ui();
-                    ui.connection_menu
-                        .refresh_availability(&ui.sessions.borrow());
-                    if let Some(owner) = ui.owner.upgrade() {
-                        owner.recover_local();
-                    }
-                }
-                if updates_git_changed {
-                    ui.update_branches();
-                }
-                let state = ui.sessions.borrow_mut().take_state();
-                if let Some(state) = state
-                    && let Err(error) = ui.apply_shared(state)
-                {
-                    ui.message(&error.to_string());
-                }
-                ui.open_initial_directory();
-                if ui.search.is_search_mode() {
-                    ui.update_search_count();
-                }
-                ui.schedule_deadlines(&wake);
+                    ui.poll_pending.set(false);
+                    ui.poll_updates(&wake, budget);
+                });
                 glib::ControlFlow::Continue
             });
         *ui.update_source.borrow_mut() = Some(source);
         ui.sessions.borrow_mut().connect_remotes();
         Ok(ui)
+    }
+    fn poll_updates(
+        self: &Rc<Self>,
+        wake: &gmux_platform::unix::ipc::Wake,
+        budget: &mut gmux_platform::work::Budget,
+    ) {
+        let ui = self;
+        let replies = ui.backend.replies();
+        for (id, result) in replies {
+            let callback = ui.pending.borrow_mut().remove(&id);
+            if let Some(callback) = callback {
+                callback(ui, result);
+            } else if let Err(error) = result {
+                ui.message(&error.to_string());
+            }
+        }
+        let updates =
+            ui.sessions
+                .borrow_mut()
+                .poll_with_budget(budget, |event, remote| match event {
+                    connections::ClipboardEvent::Write(write) => {
+                        let clipboard = ui.clipboard.clipboard(write.destination);
+                        if let Err(error) = crate::clipboard::publish(&clipboard, write.content) {
+                            eprintln!("Could not publish clipboard offer: {error}");
+                        }
+                    }
+                    connections::ClipboardEvent::Read { pane, event } => {
+                        if let Ok(terminal) = ui.pane(Some(pane)) {
+                            ui.clipboard.handle(
+                                &terminal,
+                                event,
+                                remote.as_deref(),
+                                ui.window.is_active(),
+                            );
+                        }
+                    }
+                });
+        let directory_changed = updates.values().any(|update| update.directory_changed);
+        let updates_git_changed = updates.values().any(|update| update.git_changed);
+        let mut status_tabs = HashSet::new();
+        for (id, update) in updates {
+            if update.exited {
+                ui.controller.borrow_mut().exited(id);
+            }
+            let pane = ui
+                .tabs
+                .borrow()
+                .iter()
+                .find_map(|tab| tab.panes.get(&id).map(|pane| (tab.id, pane.clone())));
+            let Some((tab, pane)) = pane else {
+                for message in update.notifications {
+                    ui.notify(None, id, message);
+                }
+                continue;
+            };
+            if update.program_status_changed
+                || (update.progress_changed && pane.program_status().is_none())
+            {
+                status_tabs.insert(tab);
+            }
+            if update.directory_changed {
+                ui.mark_dirty();
+            }
+            pane.tick(&update);
+            ui.refresh_tab_title(tab);
+            if let Some(unread) = update.unread {
+                ui.set_unread(pane.id, unread);
+            }
+            for message in update.notifications {
+                ui.notify(Some(tab), pane.id, message);
+            }
+            if (update.exited || pane.exited())
+                && !pane
+                    .program_status()
+                    .is_some_and(|s| s.record.state.result())
+                && let Err(error) = {
+                    let _presenting = ui.presenting();
+                    ui.close_pane(pane.id)
+                }
+            {
+                ui.message(&error.to_string());
+            }
+        }
+        let status_changed = ui.sessions.borrow_mut().take_status_changed();
+        if directory_changed || status_changed {
+            ui.refresh_metadata();
+        } else if !status_tabs.is_empty() {
+            ui.refresh_activity(
+                ui.tabs
+                    .borrow()
+                    .iter()
+                    .filter(|tab| status_tabs.contains(&tab.id)),
+            );
+        }
+        if status_changed {
+            ui.refresh_empty();
+            ui.refresh_connections_ui();
+            ui.connection_menu
+                .refresh_availability(&ui.sessions.borrow());
+            if let Some(owner) = ui.owner.upgrade() {
+                owner.recover_local();
+            }
+        }
+        if updates_git_changed {
+            ui.update_branches();
+        }
+        let state = ui.sessions.borrow_mut().take_state();
+        if let Some(state) = state
+            && let Err(error) = ui.apply_shared(state)
+        {
+            ui.message(&error.to_string());
+        }
+        ui.open_initial_directory();
+        if ui.search.is_search_mode() {
+            ui.update_search_count();
+        }
+        ui.schedule_deadlines(wake);
     }
     /// Wake for connection retries and coalesced scroll releases. Waiting
     /// creates no permanent worker; deadlines are rescheduled on every poll.

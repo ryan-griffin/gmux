@@ -184,6 +184,11 @@ impl Sender {
     }
 }
 impl Receiver {
+    pub fn pending(&self) -> bool {
+        let receiver = self.receiver.borrow();
+        !receiver.is_empty() || receiver.is_closed()
+    }
+
     #[cfg(test)]
     pub fn retained_bytes(&self) -> usize {
         self.budget.limit - self.budget.ready.available_permits()

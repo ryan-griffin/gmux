@@ -20,7 +20,7 @@ import tempfile
 import time
 
 from daemon_test_support import stop_daemon
-from test_support import rpc as socket_rpc
+from test_support import rpc as socket_rpc, create_tab_when_connected
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -30,8 +30,13 @@ parser.add_argument("--seconds", type=float, default=5)
 parser.add_argument("--samples", type=int, default=40)
 parser.add_argument("--renderer", choices=["vulkan", "gl", "cairo"], default="vulkan")
 parser.add_argument("--workload", choices=["cells", "program-status", "program-status-mixed"], default="cells")
+parser.add_argument("--windows", type=int, default=1)
+parser.add_argument("--background-panes", type=int, default=0)
+parser.add_argument("--batch-lines", type=int, default=20)
+parser.add_argument("--batch-interval", type=float, default=1 / 60)
 args = parser.parse_args()
 assert args.seconds >= 1 and args.samples >= 5
+assert args.windows >= 1 and args.background_panes >= 0 and args.batch_lines > 0 and args.batch_interval >= 0
 ensure_wayland_session()
 args.binary = args.binary.resolve() if args.binary else cargo_binary("gmux-gtk", profile="release")
 args.output = args.output.resolve()
@@ -53,15 +58,17 @@ def wait_for(predicate, timeout=12):
 
 def process_sample(pid):
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    main_fields = Path(f"/proc/{pid}/task/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     status = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
-    return dict(ticks=int(fields[11]) + int(fields[12]),
+    return dict(ticks=int(fields[11]) + int(fields[12]), main_ticks=int(main_fields[11]) + int(main_fields[12]),
                 rss_mib=int(status["VmRSS"].split()[0]) / 1024,
                 main_switches=int(status["voluntary_ctxt_switches"]) + int(status["nonvoluntary_ctxt_switches"]))
 
 
 worker_source = r'''
 import base64, os, pathlib, select, sys, time, tty
-role, control, ready, workload = sys.argv[1:]
+role, control, ready, workload, batch_lines, batch_interval = sys.argv[1:]
+batch_lines, batch_interval = int(batch_lines), float(batch_interval)
 control, ready = pathlib.Path(control), pathlib.Path(ready)
 if role == "probe":
     tty.setraw(0)
@@ -89,14 +96,14 @@ else:
         previous = mode
         if mode == "busy":
             if workload == "program-status":
-                text = "".join(f"\x1b]7501;state=working:id=task00:app=benchmark:progress={(lines+i)%101}:msg={message}\x07" for i in range(20))
+                text = "".join(f"\x1b]7501;state=working:id=task00:app=benchmark:progress={(lines+i)%101}:msg={message}\x07" for i in range(batch_lines))
             elif workload == "program-status-mixed":
-                text = "".join(f"\x1b]9;4;1;{(lines+i)%101}\x07" for i in range(20))
+                text = "".join(f"\x1b]9;4;1;{(lines+i)%101}\x07" for i in range(batch_lines))
             else:
-                text = "".join(f"\x1b[38;5;{(lines+i)%216+16}mrow {lines+i:08d} " + "abc界🙂 " * 12 + "\x1b[0m\r\n" for i in range(20))
+                text = "".join(f"\x1b[38;5;{(lines+i)%216+16}mrow {lines+i:08d} " + "abc界🙂 " * 12 + "\x1b[0m\r\n" for i in range(batch_lines))
             os.write(1, text.encode())
-            lines += 20
-        time.sleep(1/60)
+            lines += batch_lines
+        time.sleep(batch_interval)
 '''
 
 app = None
@@ -129,7 +136,7 @@ try:
             wait_for(lambda: rpc("status")["local_clients"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
             daemon_pid = rpc("status")["pid"]
-            first = rpc("new", name="Benchmark", directory=str(temp))
+            first = create_tab_when_connected(env["GMUX_SOCKET"], name="Benchmark", directory=str(temp))
             right = rpc("split", pane=first["pane"])["pane"]
             lower_left = rpc("split", pane=first["pane"], down=True)["pane"]
             lower_right = rpc("split", pane=right, down=True)["pane"]
@@ -138,7 +145,7 @@ try:
             def run_worker(pane, role):
                 wait_for(lambda: "GMUX_BENCH>" in rpc("read", pane=pane)["text"])
                 ready = temp / f"ready-{pane}"
-                command = shlex.join(["python3", str(worker), role, str(control), str(ready), args.workload])
+                command = shlex.join(["python3", str(worker), role, str(control), str(ready), args.workload, str(args.batch_lines), str(args.batch_interval)])
                 rpc("send", pane=pane, text=command, paste=True, enter=True)
                 wait_for(ready.exists)
 
@@ -147,6 +154,15 @@ try:
             for pane in panes[1:]:
                 run_worker(pane, "output")
                 output_pids.append(int((temp / f"ready-{pane}").read_text()))
+            for _ in range(args.background_panes):
+                pane = rpc("new", name="Background output", directory=str(temp))["pane"]
+                run_worker(pane, "output")
+                output_pids.append(int((temp / f"ready-{pane}").read_text()))
+            for _ in range(args.windows - 1):
+                rpc("action", name="new-window")
+            wait_for(lambda: len(rpc("windows")["windows"]) == args.windows)
+            wait_for(lambda: rpc("status")["local_clients"] == args.windows)
+            wait_for(lambda: "error" not in socket_rpc(env["GMUX_SOCKET"], "focus", pane=first["pane"], check=False))
             rpc("focus", pane=first["pane"])
             native.click_color((230, 30, 45))
             wait_for(lambda: rpc("renderer-info", pane=first["pane"])["viewport"]["focused"])
@@ -162,27 +178,27 @@ try:
                 renderer=renderer, gtk_debug=env.get("GDK_DEBUG", ""),
                 compositor=subprocess.check_output(["mutter", "--version"], text=True, stderr=subprocess.STDOUT).strip(),
                 monitor=native.parameters, capture="PipeWire / GStreamer RGBA appsink", xwayland=False,
-                samples=args.samples, seconds_per_cpu_sample=args.seconds,
-                workload=("Three programs with 64 OSC 7501 records each, sending 20 OSC 9;4 reports per batch beneath a retained status, at up to 60 batches/s, plus an interactive probe."
+                samples=args.samples, seconds_per_cpu_sample=args.seconds, windows=args.windows,
+                background_panes=args.background_panes, batch_lines=args.batch_lines, batch_interval=args.batch_interval,
+                output_processes=len(output_pids),
+                workload=(f"{len(output_pids)} programs with 64 OSC 7501 records each, sending {args.batch_lines} OSC 9;4 reports per batch beneath a retained status, with a {args.batch_interval:g}s sleep, plus an interactive probe."
                           if args.workload == "program-status-mixed" else
-                          "Three programs with 64 records each, sending 20 OSC 7501 reports with 2048-byte messages at up to 60 batches/s, plus an interactive probe."
+                          f"{len(output_pids)} programs with 64 records each, sending {args.batch_lines} OSC 7501 reports with 2048-byte messages per batch with a {args.batch_interval:g}s sleep, plus an interactive probe."
                           if args.workload == "program-status" else
-                          "Three output processes, each sending 20 colored Unicode lines at up to 60 batches/s, plus an interactive probe."),
+                          f"{len(output_pids)} output processes, each sending {args.batch_lines} colored Unicode lines per batch with a {args.batch_interval:g}s sleep, plus an interactive probe."),
                 latency_method="Mutter native keysym q press/release to changed first-cell pixel in a composited PipeWire frame on a 1280x960@60 headless Wayland monitor. Normal GTK frame pacing. Includes input delivery, PTY, daemon transport, GTK rendering, compositor presentation, capture and observer readback; excludes physical display scanout.",
                 resource_method="Frontend and daemon process CPU as percent of one core; sampled resident memory and main-thread context switches. Workload child processes, compositor, PipeWire, WirePlumber and benchmark observer excluded.", scenarios=[])
 
             def measure_resources(name, attached):
-                def workload_bytes():
-                    total = 0
-                    for pid in output_pids:
-                        values = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines())
-                        total += int(values["wchar"])
-                    return total
+                def writer_bytes():
+                    return [int(dict(line.split(":", 1) for line in
+                                     Path(f"/proc/{pid}/io").read_text().splitlines())["wchar"])
+                            for pid in output_pids]
                 pids = {"daemon": daemon_pid}
                 if attached:
                     pids["frontend"] = app.pid
                 before = {role: process_sample(pid) for role, pid in pids.items()}
-                bytes_before = workload_bytes()
+                writers_before = writer_bytes()
                 memory = {role: [] for role in pids}
                 start = time.monotonic()
                 while time.monotonic() - start < args.seconds:
@@ -191,7 +207,12 @@ try:
                     time.sleep(0.1)
                 elapsed = time.monotonic() - start
                 after = {role: process_sample(pid) for role, pid in pids.items()}
-                return dict(name=name, elapsed_seconds=elapsed, workload_kib_per_second=(workload_bytes() - bytes_before) / 1024 / elapsed, resources={role: dict(
+                writer_rates = [(last - first) / 1024 / elapsed
+                                for first, last in zip(writers_before, writer_bytes())]
+                return dict(name=name, elapsed_seconds=elapsed,
+                    workload_kib_per_second=sum(writer_rates), writer_kib_per_second=writer_rates,
+                    resources={role: dict(
+                    main_cpu_percent=(after[role]["main_ticks"] - before[role]["main_ticks"]) / clock_ticks / elapsed * 100,
                     cpu_percent=(after[role]["ticks"] - before[role]["ticks"]) / clock_ticks / elapsed * 100,
                     rss_median_mib=statistics.median(memory[role]), rss_peak_mib=max(memory[role]),
                     main_context_switches_per_second=(after[role]["main_switches"] - before[role]["main_switches"]) / elapsed,
@@ -220,6 +241,8 @@ try:
                     print("Probe readiness:", rpc("renderer-info", pane=pane), flush=True)
                     raise
                 samples = []
+                controls = []
+                ui_controls = []
                 for index in range(args.samples + 5):
                     assert rpc("renderer-info")["window_active"], "Benchmark window lost input focus"
                     native.drain_frames()
@@ -238,12 +261,18 @@ try:
                     green = expected
                     if index >= 5:
                         samples.append(elapsed_ms)
+                    control_start = time.perf_counter()
+                    rpc("status", client=False)
+                    controls.append((time.perf_counter() - control_start) * 1000)
+                    control_start = time.perf_counter()
+                    rpc("renderer-info")
+                    ui_controls.append((time.perf_counter() - control_start) * 1000)
                     # Vary phase relative to GTK and compositor frame deadlines.
                     time.sleep(0.013 + index % 7 * 0.001)
                 ordered = sorted(samples)
-                return dict(median_ms=statistics.median(samples), p95_ms=ordered[math.ceil(len(ordered) * .95) - 1], samples_ms=samples)
+                return dict(median_ms=statistics.median(samples), p95_ms=ordered[math.ceil(len(ordered) * .95) - 1], p99_ms=ordered[math.ceil(len(ordered) * .99) - 1], samples_ms=samples, control_p95_ms=sorted(controls)[math.ceil(len(controls) * .95) - 1], ui_control_p95_ms=sorted(ui_controls)[math.ceil(len(ui_controls) * .95) - 1])
 
-            idle = measure_resources("attached_idle_four_panes", True)
+            idle = measure_resources("attached_idle", True)
             idle["latency"] = measure_latency(first["pane"])
             report["scenarios"].append(idle)
             if args.workload != "cells":
@@ -252,13 +281,13 @@ try:
                 report["scenarios"].append(measure_resources("attached_indeterminate_visible_panes", True))
             control.write_text("busy")
             time.sleep(1)
-            busy = measure_resources("attached_three_busy_visible_panes", True)
+            busy = measure_resources("attached_busy_visible_panes", True)
             busy["latency"] = measure_latency(first["pane"])
             report["scenarios"].append(busy)
             hidden_probe = rpc("new", name="Hidden workload probe", directory=str(temp))["pane"]
             run_worker(hidden_probe, "probe")
             time.sleep(1)
-            hidden = measure_resources("attached_three_busy_hidden_panes", True)
+            hidden = measure_resources("attached_busy_hidden_panes", True)
             hidden["latency"] = measure_latency(hidden_probe)
             report["scenarios"].append(hidden)
             if args.workload != "cells":
@@ -267,11 +296,12 @@ try:
                 report["scenarios"].append(measure_resources("attached_indeterminate_hidden_panes", True))
                 control.write_text("busy")
                 time.sleep(1)
-            rpc("detach")
+            for window in rpc("windows")["windows"]:
+                rpc("detach", window=window["id"])
             assert app.wait(timeout=8) == 0
             app = None
             wait_for(lambda: not rpc("status")["local_clients"])
-            report["scenarios"].append(measure_resources("detached_three_busy_panes", False))
+            report["scenarios"].append(measure_resources("detached_busy_panes", False))
             control.write_text("idle")
             time.sleep(1)
             report["scenarios"].append(measure_resources("detached_idle", False))

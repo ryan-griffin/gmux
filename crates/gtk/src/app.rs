@@ -39,6 +39,7 @@ mod local;
 mod machine;
 mod management;
 mod preferences;
+mod scheduling;
 mod split;
 mod storage;
 mod tabs;
@@ -131,6 +132,7 @@ pub struct Ui {
     presenting: Cell<bool>,
     keyboard: Rc<RefCell<crate::terminal::KeyboardState>>,
     update_source: RefCell<Option<glib::SourceId>>,
+    poll_pending: std::cell::Cell<bool>,
     deadline_source: RefCell<Option<(std::time::Instant, glib::SourceId)>>,
     theme_handler: RefCell<Option<glib::SignalHandlerId>>,
     frame_clock_handler: RefCell<Option<(gtk::gdk::FrameClock, glib::SignalHandlerId)>>,

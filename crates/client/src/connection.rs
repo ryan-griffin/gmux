@@ -299,6 +299,15 @@ impl Connection {
         now: Instant,
         clipboard: impl FnMut(gmux_protocol::clipboard::Event),
     ) -> Update {
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 256);
+        self.poll_with_budget(now, &mut budget, clipboard)
+    }
+    pub fn poll_with_budget(
+        &mut self,
+        now: Instant,
+        budget: &mut gmux_platform::work::Budget,
+        clipboard: impl FnMut(gmux_protocol::clipboard::Event),
+    ) -> Update {
         let mut update = Update::default();
         if self.next_retry().is_some_and(|at| at <= now) {
             self.connect();
@@ -330,7 +339,7 @@ impl Connection {
             }
         }
         if let State::Connected(manager) = &mut self.state {
-            update.panes = manager.poll_with_clipboard_events(clipboard);
+            update.panes = manager.poll_with_budget(budget, clipboard);
             if let Some(state) = manager.take_state() {
                 manager.install_metadata(&state.metadata, state.revision);
                 update.state = Some(state);

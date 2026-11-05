@@ -171,8 +171,9 @@ impl Output {
     pub(super) fn flush(&mut self, socket: &mut UnixStream) -> anyhow::Result<()> {
         let mut storage = self.storage.borrow_mut();
         anyhow::ensure!(!storage.closed, "Frontend output budget exhausted");
-        while storage.offset < storage.bytes.len() {
-            match socket.write(&storage.bytes[storage.offset..]) {
+        let end = storage.bytes.len().min(storage.offset + 256 * 1024);
+        while storage.offset < end {
+            match socket.write(&storage.bytes[storage.offset..end]) {
                 Ok(0) => anyhow::bail!("Frontend disconnected"),
                 Ok(n) => storage.offset += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

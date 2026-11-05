@@ -95,6 +95,16 @@ unlimited connections or CPU saturation.
 GTK rendering scenes, glyph caches, terminal history, and daemon allocations also
 sit outside these client allowances. Each daemon applies its own limits below.
 
+## Event-loop work
+
+Cooperative time and item limits bound work shared by ready panes and streams.
+The [scheduling rules](terminal-sessions.md#ownership-and-scheduling) describe
+per-stage daemon budgets, the shared GTK dispatcher, frame continuations, and
+FIFO delivery. These limits do not preempt individual native operations or cap
+readiness scans and dirty-state fan-out. Ready queues retain IDs rather than
+copying terminal data. Each active frontend pass retains one pane-ID queue;
+GTK retains at most one queued callback per window.
+
 ## Daemon frontend storage
 
 Each daemon shares these internal allowances across local Unix streams and

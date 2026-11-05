@@ -64,6 +64,7 @@ pub(crate) struct TerminalSession {
     title: PaneTitle,
     title_polled: Instant,
     output_tail: Vec<u8>,
+    read_yielded: bool,
     read_responding: bool,
     read_reservation: Cell<usize>,
     clipboard_queued: Cell<usize>,
@@ -258,6 +259,7 @@ impl TerminalSession {
             title: PaneTitle::default(),
             title_polled: Instant::now(),
             output_tail: Vec::new(),
+            read_yielded: false,
             read_responding: false,
             read_reservation: Cell::new(0),
             clipboard_queued: Cell::new(0),
@@ -343,8 +345,8 @@ impl TerminalSession {
     pub(crate) fn clear_grants(&mut self) {
         self.engine.clear_grants();
     }
-    pub(crate) fn has_output_tail(&self) -> bool {
-        !self.output_tail.is_empty() && self.read_pending() == 0
+    pub(crate) fn needs_output_poll(&self) -> bool {
+        (self.read_yielded || !self.output_tail.is_empty()) && self.read_pending() == 0
     }
     pub(crate) fn complete_read(
         &mut self,
@@ -445,6 +447,9 @@ impl TerminalSession {
         (update, self.engine.take_clipboard_writes())
     }
     pub(crate) fn poll(&mut self) -> SessionUpdate {
+        self.poll_until(Instant::now() + Duration::from_micros(500))
+    }
+    fn poll_until(&mut self, read_deadline: Instant) -> SessionUpdate {
         let mut update = SessionUpdate {
             changed: self.engine.expire_render_hold(),
             ..SessionUpdate::default()
@@ -508,7 +513,10 @@ impl TerminalSession {
             // Bound work per session so a noisy process cannot block its owner.
             let mut buffer = [0u8; 16384];
             read_budget_exhausted = !pty.eof;
-            for _ in 0..32 {
+            for batch in 0..32 {
+                if batch != 0 && Instant::now() >= read_deadline {
+                    break;
+                }
                 if pty.eof
                     || self.engine.read_pending() != 0
                     || !self.output_tail.is_empty()
@@ -540,6 +548,7 @@ impl TerminalSession {
                 }
             }
         }
+        self.read_yielded = read_budget_exhausted;
         let (replies, notifications) = self.engine.take_events();
         update.notifications = notifications;
         if !replies.is_empty()
@@ -868,6 +877,37 @@ mod tests {
         let update = session.poll();
         assert!(update.error.is_none(), "{:?}", update.error);
         update.notifications.iter().any(|message| message == text)
+    }
+
+    #[test]
+    fn a_yielded_exit_drain_resumes_without_kernel_readiness() {
+        let directory = TestDirectory::new();
+        let mut session = start(1, &directory.0, "trap '' HUP; sleep 5 & printf FINAL");
+        wait_for(|| {
+            session
+                .pty
+                .as_mut()
+                .unwrap()
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some()
+        });
+        // An expired deadline forces a yield after the first read, before EAGAIN.
+        assert!(!session.poll_until(Instant::now()).exited);
+        assert!(session.needs_output_poll());
+        let (fd, events) = session.poll_fd().unwrap();
+        let mut ready = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 0) }, 0);
+        assert!(session.poll_until(Instant::now()).exited);
+        assert!(!session.needs_output_poll());
+        assert!(session.text().unwrap().contains("FINAL"));
     }
 
     #[test]
