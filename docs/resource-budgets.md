@@ -21,7 +21,7 @@ commands when bulk work fills the queue. Outgoing admission failures are reporte
 to the caller; accepted commands retain their order and reservations through the
 socket write. Input cannot bypass an earlier paste on the same stream.
 
-Protocol 41 records start with five little-endian u32 values: the remaining
+Protocol 42 records start with five little-endian u32 values: the remaining
 wire length, JSON header length, record kind, JSON decode allowance, and cell
 count. Kinds distinguish updates, execution state, and atomic clipboard events.
 A four-byte zero remains a heartbeat acknowledgement and needs no reservation.
@@ -156,13 +156,111 @@ These allowances are not an RSS cap. Output encoding can temporarily grow one
 buffer before synchronous capacity enforcement, and snapshot extraction can
 allocate one viewport before eviction. Packet construction, shared execution
 broadcast encoding, allocator overhead and arenas, kernel socket and TCP bridge
-buffers, frontend input and paste buffers, map entries, metadata, and semantic
-engine-view state are outside the storage allowances. Engine views retain search
-state and native snapshots required for synchronized output. Terminal engines,
-history, persistence, and control requests have separate lifetimes and limits.
-The number of panes and views per stream remains unrestricted. Cache pressure
+buffers, frontend input and paste buffers, map entries, and metadata are outside
+the output and optional-screen allowances. Retained presentation state has the
+separate policy below. Terminal engines, history, persistence,
+and control requests have separate lifetimes and limits. Metadata-only panes
+do not consume a view slot. Pane counts remain unrestricted. Cache pressure
 can increase full-frame bandwidth and encoding work, and reconnecting clients
 must reattach after slow-consumer disconnection.
+
+## Retained views and searches
+
+Each daemon shares these internal limits across its frontend streams and windows:
+
+| Resource | Daemon allowance | Per view or query |
+| --- | --- | --- |
+| Retained presentation views, including hidden views | 256 views | One slot per stream/pane pair |
+| Search index, query, and matcher storage | 64 MiB | 8 MiB |
+| Native synchronized-output render allocations and hyperlink reservations | 128 MiB | Shared allowance |
+| Search query input | Counted above after normalization | 4 KiB of UTF-8 before normalization |
+
+Views acquire a slot before allocating the native view or Rust presentation.
+Hiding a view keeps its slot, scroll, selection, and search state. It releases
+only disposable sent-screen state and native render snapshots, following the
+existing synchronized-output visibility rules. Closing a pane or disconnecting
+its stream releases all of its view slots and storage. Admission never waits for
+another view to release memory and never prunes terminal history.
+
+Searches retain every match for navigation in both directions. The index uses
+4 KiB pages of unsigned start-position deltas and range lengths. Typical short
+matches need two or three bytes each, rather than two machine-sized offsets.
+The encoding preserves full-width positions, overlapping cell ranges, and
+separate matches within one Unicode grapheme. Page metadata supports ordinal
+navigation and viewport lookup without decoding earlier pages. A lookup decodes
+at most one preceding page plus the visible matches; it does not scan the whole
+history.
+
+Accounting includes allocated page capacity, directory capacity, normalized query
+capacity, matcher text, and byte-to-cell mappings. Each page obtains credit
+before allocation and is never resized. Only the small directory and matcher
+vectors need geometric growth; they reserve replacement storage while the old
+allocation remains charged. A rescan charges both the previous complete index
+and the replacement under construction. It frees the old index and matcher
+scratch when it completes. Query changes, cancellation, and failed admission free
+index and scratch capacities immediately. Native row extraction scratch retains
+one terminal row plus vector spare capacity per scanning view and is freed when
+scanning stops. Row width and grapheme length have protocol limits; the view-count
+limit bounds its aggregate retained size. Page slack, directory growth, and
+simultaneous old/new indexes can still cause conservative admission failures.
+
+If admission fails, the search releases both indexes and reports
+`resource_limited: true`, `pending: false`, zero counts, and no highlights.
+This is an explicit failure, never a truncated or completed search. GTK displays
+"Search memory limit reached" beside the query and disables navigation. A more
+specific or resubmitted query retries; terminal output does not retry a failed
+search indefinitely. While an admitted rescan runs, navigation continues to use
+the previous complete index. Search still scans at most 64 rows per paced visit.
+Adjacent and overlapping visual highlight ranges merge, with the selected match
+painted over their union. Counts and navigation still include every text match,
+including separate matches in one grapheme. Highlight vector growth is capped
+before allocation at the viewport cell count, so duplicate grapheme matches
+cannot multiply highlight storage. The daemon retains only the sent count/status
+summary, not another copy of the viewport highlight vector.
+
+Native render states use a pointer-stable shared allocator with admission before
+every allocation. Old and replacement allocations remain charged during growth.
+Before capturing each view's synchronized-output hyperlink map, the daemon also
+reserves its packed-array ceiling, 704 KiB on supported 64-bit targets, against
+the native allowance. After each capture it shrinks to actual packed-array
+capacity, including spare capacity, so link-free views return the entire
+reservation immediately. This avoids reserving every view's worst-case map
+throughout the hold. Remaining map credit returns at hold completion, hiding,
+or teardown. Actual hyperlink capacity also appears within `view_bytes`, so
+these counters overlap.
+
+A required snapshot that cannot allocate marks its view failed. Its next frontend
+visit disconnects that stream before publishing a viewport. View-slot exhaustion
+also disconnects the requesting stream. Existing views on other streams and PTY
+execution continue. Native capture itself remains one nonpreemptible operation,
+as in the scheduling policy.
+
+`gmux status` adds these `frontend_resources` counters:
+
+| Counter | Meaning |
+| --- | --- |
+| `views`, `view_limit` | All retained view slots and the admission limit |
+| `view_bytes` | Rust presentation/view objects, search and row scratch capacity, native view objects and actual per-view hyperlink capacity |
+| `search_bytes`, `search_limit`, `search_view_limit` | Search storage, aggregate limit, and local limit; search bytes are a subset of `view_bytes` |
+| `view_render_bytes` | Actual native per-view render allocations |
+| `view_native_reserved`, `view_native_limit` | Render bytes plus hyperlink credit, and their aggregate limit |
+
+The allowances are not an RSS cap. Object storage and row scratch are bounded
+by view count and existing row/grapheme limits, rather than reserved against the
+search-byte pool. Temporary viewport highlights belong to packet construction
+and then the output budget. Normalizing a query uses a bounded temporary string.
+Allocator metadata, retained arenas, frontend pane-map capacity, and shared
+terminal engines are excluded. A native view can own at most eight tracked grid
+references for viewport, selection, output anchor, and history. Their fixed-size
+Ghostty reference objects, page-list pins, and shared terminal reference-table
+capacity use the terminal allocator and are excluded from `view_bytes`; view
+admission bounds their count. Reference-table capacity can outlive a view until
+its terminal dies. Shared terminal history, ordinary render state, held Rust
+cell scratch, and hyperlink capture scratch are engine-owned, excluded from the
+per-view counters, and never charged once per frontend. Row-scratch overflow
+text includes its Arc header and is conservatively charged per retained cell
+reference. Per-view search indexes are independent and charged once each. These
+limits do not change actual scrollback retention.
 
 ## Measuring pressure
 
@@ -245,3 +343,30 @@ update and pane-owner teardown time with PTYs and shared terminal engines kept
 alive outside the timed teardown. The default update alternates a row and
 generates a viewport delta; the metadata-only update compares pane metadata.
 Use the daemon pressure benchmark for native memory and disconnection behavior.
+
+Measure dense searches and ordinary complete navigation separately:
+
+```sh
+python3 scripts/view-search-benchmark.py --binary /path/to/release/gmux \
+  --output artifacts/view-search-dense.json
+python3 scripts/view-search-benchmark.py --binary /path/to/release/gmux \
+  --rows 600 --output artifacts/view-search-complete.json
+cargo test -p gmux-protocol --release dense_search_storage -- --ignored --nocapture
+GMUX_SEARCH_ROWS=600 cargo test -p gmux-protocol --release dense_search_storage -- --ignored --nocapture
+```
+
+The daemon probe uses four independent frontend views, dense history, a rescan,
+a native synchronized-output hold, hidden views, disconnection, and pane teardown.
+It records resource counters, Linux RSS/high-water memory, search wall time,
+control latency, input-to-view latency on an unrelated PTY, and navigation
+round trips. Use `--navigation-rounds` for more navigation samples. Python socket
+decoding and observation are included; GTK and physical scanout are excluded.
+Both workloads support complete results with the default four views. Add
+`--assert-complete` to verify complete initial scans and rescans, or use
+`--case sparse` for one match per generated row. Larger view counts and denser
+retained histories can reach the explicit search limit. Existing scrollback
+retention determines how much of the generated history survives. Run benchmarks
+alone against matching release binaries; use `--protocol-version` when measuring a preserved older binary.
+The protocol-only probe isolates allocated search capacities and excludes native
+storage, allocator overhead, and process RSS. Use the native multi-window probe
+above for GTK rendering and window-lifecycle measurements.

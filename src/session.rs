@@ -146,8 +146,15 @@ impl TerminalSession {
             hyperlinks: self.engine.hyperlinks.clone(),
         })
     }
+    #[cfg(test)]
     pub(crate) fn new_view(&self) -> anyhow::Result<crate::engine::EngineView> {
         self.engine.new_view()
+    }
+    pub(crate) fn new_view_in(
+        &self,
+        resources: &std::rc::Rc<crate::engine::ViewResources>,
+    ) -> anyhow::Result<crate::engine::EngineView> {
+        self.engine.new_view_in(resources)
     }
     pub(crate) fn with_view<T>(
         &mut self,

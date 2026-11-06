@@ -61,8 +61,16 @@ with ExitStack() as stack:
     for index in range(2):
         receiver.rpc("new", window=first, connection=f"remote{index}", name=f"remote{index}")
     windows = [first] + [receiver.rpc("new-window")["window"] for _ in range(3)]
+    # New windows finish catalog loading and terminal attachment asynchronously.
+    def focus(window):
+        reply = receiver.rpc("focus", window=window, connection="local", pane=tabs[0][0], check=False)
+        if "error" in reply:
+            assert reply["error"] in ("Local execution is not enabled", "Daemon is disconnected or connecting",
+                                    f"Pane {tabs[0][0]} does not exist on the selected connection"), reply
+            return False
+        return True
     for window in windows:
-        receiver.rpc("focus", window=window, connection="local", pane=tabs[0][0])
+        wait_for(lambda: focus(window))
     # Fill history in all 16 local panes, including tabs hidden in every window.
     code = "import os;os.write(1,(''.join(str(i)+' '+('x'*180)+'\\n' for i in range(3000))).encode())"
     for panes in tabs:
@@ -79,7 +87,8 @@ with ExitStack() as stack:
                     text="python3 -c " + shlex.quote("import os;os.write(1,b'pressure '*1000000+b'\\n')"), paste=True, enter=True)
     time.sleep(2)
     pressure = resources(app.pid)
-    daemon_resources = [resources(f.rpc("status")["pid"]) for f in fixtures]
+    daemon_status = [f.rpc("status") for f in fixtures]
+    daemon_resources = [resources(status["pid"]) for status in daemon_status]
     cache_bytes = dict(visible=0, hidden=0)
     for window in windows:
         for tab_index, panes in enumerate(tabs):
@@ -107,7 +116,9 @@ with ExitStack() as stack:
     time.sleep(.5)
     result = dict(windows=4, daemons=3, streams=12, panes=18, views=72, slow_consumers=3,
                   before=before, pressure=pressure, after_close=resources(app.pid), daemon_pressure=daemon_resources,
+                  daemon_frontend_resources=[status["frontend_resources"] for status in daemon_status],
+                  after_close_frontend_resources=[f.rpc("status")["frontend_resources"] for f in fixtures],
                   cache_bytes=cache_bytes, control=summary(control), input_to_view=summary(inputs),
-                  scroll_ack=summary(scroll), latency_scope="RPC round trip and view observation; 25 ms polling, debug build")
+                  scroll_ack=summary(scroll), latency_scope="RPC round trip and view observation; 25 ms polling; use the recorded binary build")
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))

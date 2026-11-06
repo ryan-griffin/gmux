@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
     size_t iterations = strtoul(argv[3], NULL, 10), count = visible + hidden;
     assert(visible && iterations && count < 10000);
     count_allocations = atoi(argv[4]) != 0;
+    GmuxViewBudget *view_budget=gmux_engine_view_budget_new(128 * 1024 * 1024, 10000);
     GmuxEngine *engine = gmux_engine_new(NULL, event);
     assert(engine);
     assert(!gmux_engine_resize(engine, 160, 48, 8, 16));
@@ -100,7 +101,7 @@ int main(int argc, char **argv) {
         write_text(engine, text);
     }
     for (size_t i = 0; i < count; i++) {
-        views[i] = gmux_engine_view_new(engine);
+        views[i] = gmux_engine_view_new(engine, view_budget);
         assert(views[i]);
         // Both visible clients use the same theme to exercise dirty consumption.
         snapshot(engine, views[i], cells, 'A');
@@ -138,6 +139,7 @@ int main(int argc, char **argv) {
         visible, hidden, iterations, count_allocations, seconds * 1000, allocations, allocated_bytes, live_bytes);
     gmux_engine_free(engine);
     for (size_t i = 0; i < count; i++) gmux_engine_view_free(views[i]);
+    gmux_engine_view_budget_free(view_budget);
     assert(live_bytes == 0);
     free(views);
     free(cells);
