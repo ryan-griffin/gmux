@@ -344,6 +344,9 @@ impl HistorySearch {
         Some((self.matches.get(self.current).unwrap().start / self.cols) as u64)
     }
     fn highlights(&self, base: usize, cells: usize) -> Vec<(usize, usize, u8)> {
+        if cells == 0 {
+            return Vec::new();
+        }
         let limit = base.saturating_add(cells);
         let mut highlights: Vec<(usize, usize, u8)> = Vec::new();
         for (_, range) in self
@@ -546,6 +549,26 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(pool.used(), 0);
+
+        let pool = SearchBudget::new(12 * 1024);
+        let mut first = HistorySearch::with_budget(pool.clone());
+        first.set_query("a");
+        scan(&mut first, 1, &row(160));
+        let mut second = HistorySearch::with_budget(pool.clone());
+        second.set_query("a");
+        scan(&mut second, 1, &row(160));
+        assert!(second.state(0, 160).resource_limited);
+        drop(first);
+        // Releasing another view lets an explicit retry of the same query
+        // complete; output alone must not restart the rejected search.
+        second.invalidate();
+        assert!(!second.dirty);
+        second.set_query("a");
+        scan(&mut second, 1, &row(160));
+        assert!(!second.state(0, 160).resource_limited);
+        assert_eq!(second.state(0, 160).total, 160);
+        second.set_query("");
+        assert_eq!(pool.used(), 0);
     }
     #[test]
     fn complete_rescans_keep_navigation_and_duplicate_grapheme_matches() {
@@ -598,6 +621,16 @@ mod tests {
             [(0, 500, 1), (500, 501, 2), (501, 1000, 1)]
         );
         assert_eq!(search.state(0, 0).highlights, []);
+
+        // An empty viewport can start inside a match spanning wrapped rows.
+        search.set_query("aa");
+        search.begin(2, 1);
+        search.feed(&row(1), true);
+        search.feed(&row(1), false);
+        let state = search.state(1, 0);
+        assert_eq!(state.total, 1);
+        assert!(state.highlights.is_empty());
+        assert_eq!(state.highlights.capacity(), 0);
     }
 
     #[test]

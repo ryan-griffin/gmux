@@ -630,7 +630,7 @@ impl Ui {
             format!("{current} of {total}")
         });
         self.search_count.set_tooltip_text(Some(if limited {
-            "Use a more specific query. Search stopped without complete results."
+            "Search stopped without complete results. Use a more specific query or press Enter to retry."
         } else {
             "Current Match and Total Matches"
         }));
