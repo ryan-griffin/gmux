@@ -81,12 +81,13 @@ int main(int argc, char **argv) {
     size_t commands = strtoul(argv[2], NULL, 10);
     retained_lines = strtoul(argv[3], NULL, 10);
     counting = atoi(argv[4]) != 0;
+    GmuxViewBudget *view_budget=gmux_engine_view_budget_new(128 * 1024 * 1024, 10000);
     GmuxEngine *e = gmux_engine_new(NULL, event);
     assert(e && !gmux_engine_resize(e, 80, 24, 0, 0));
     // Hidden clients must not require viewport extraction for shell events.
     GmuxView *hidden[24];
     for (size_t i = 0; i < 24; i++) {
-        hidden[i] = gmux_engine_view_new(e);
+        hidden[i] = gmux_engine_view_new(e, view_budget);
         assert(hidden[i]);
         gmux_engine_view_set_active(hidden[i], false);
     }
@@ -119,6 +120,7 @@ int main(int argc, char **argv) {
     size_t after_prune_refs = refs;
     for (size_t i = 0; i < 24; i++) gmux_engine_view_free(hidden[i]);
     gmux_engine_free(e);
+    gmux_engine_view_budget_free(view_budget);
     assert(!refs && !live_bytes);
     assert(!render_updates);
     if (gmux_engine_prompt) assert(peak_refs <= 2052);

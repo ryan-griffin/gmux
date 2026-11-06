@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 40:
+handshake. The current protocol version is 42:
 
 ```json
-{"version":41,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":42,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":41,"daemon":"returned-identity"}
+{"method":"attach","version":42,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -218,6 +218,17 @@ Legacy modes encode repeats as ordinary key presses and omit releases.
 `frame-interval` sets this connection's viewport, search, progress, and program status pacing with a
 `micros` integer from 1,000 to 1,000,000. It defaults to 16,000. GTK updates it
 from the display frame clock; one client's interval does not pace another client.
+
+Search replies include `resource_limited`. When true, the scan stopped without
+complete results: `pending` is false, counts are zero, and highlights are empty.
+Highlight ranges are visual decorations and can merge adjacent or overlapping
+matches; use `total` and `current` for result counts and navigation.
+Do not interpret a resource limit as a successful search with no matches.
+Editing or resubmitting the query retries admission. Queries are limited to 4 KiB of UTF-8.
+The [view and search allowances](resource-budgets.md#retained-views-and-searches)
+apply across all streams and windows. A refused view or required native snapshot
+disconnects the affected stream; PTYs continue running.
+
 `scroll`, `scroll-to`, `find`, `find-advance`, `select`, `clear-selection`,
 `copy`, and `mark-read` operate on an explicit `pane`. `git-subscribe` chooses
 panes whose Git metadata the client needs. The Rust `transport::StreamCommand`

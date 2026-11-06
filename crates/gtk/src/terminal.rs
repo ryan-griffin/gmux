@@ -870,10 +870,8 @@ impl Terminal {
             self.report_error("Could not navigate search results", &error.to_string());
         }
     }
-    pub fn search_status(&self) -> (usize, usize, bool) {
-        let session = self.session.borrow();
-        let state = session.find_state();
-        (state.current, state.total, state.pending)
+    pub fn search_status(&self) -> gmux_protocol::search::FindStatus {
+        self.session.borrow().find_state().status()
     }
     pub fn zoom(&self, delta: f64) {
         self.render_font.borrow_mut().take();

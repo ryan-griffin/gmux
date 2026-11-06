@@ -117,7 +117,7 @@ pub struct Ui {
     search_count: gtk::Label,
     search_previous: gtk::Button,
     search_next: gtk::Button,
-    search_status: Cell<Option<(bool, usize, usize, bool)>>,
+    search_status: Cell<Option<(bool, gmux_protocol::search::FindStatus)>>,
     active: Cell<Option<TabRef>>,
     changing: Cell<bool>,
     dirty: Cell<bool>,
@@ -608,21 +608,34 @@ impl Ui {
         self.update_search_count();
     }
     pub(super) fn update_search_count(&self) {
-        let (current, total, pending) = self
+        let find_status = self
             .active_pane()
-            .map_or((0, 0, false), |pane| pane.search_status());
+            .map_or_else(Default::default, |pane| pane.search_status());
+        let gmux_protocol::search::FindStatus {
+            current,
+            total,
+            pending,
+            resource_limited: limited,
+        } = find_status;
         let has_query = !self.search_entry.text().is_empty();
-        let status = Some((has_query, current, total, pending));
+        let status = Some((has_query, find_status));
         if self.search_status.replace(status) == status {
             return;
         }
-        self.search_count.set_text(&if pending && total == 0 {
+        self.search_count.set_text(&if limited {
+            "Search memory limit reached".to_owned()
+        } else if pending && total == 0 {
             "Searching…".to_owned()
         } else {
             format!("{current} of {total}")
         });
+        self.search_count.set_tooltip_text(Some(if limited {
+            "Use a more specific query. Search stopped without complete results."
+        } else {
+            "Current Match and Total Matches"
+        }));
         self.search_count
-            .set_visible(has_query && (total > 0 || pending));
+            .set_visible(has_query && (total > 0 || pending || limited));
         if has_query && total == 0 && !pending {
             self.search_field.add_css_class("error");
         } else {

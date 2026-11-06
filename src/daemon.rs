@@ -100,6 +100,7 @@ struct Daemon {
     limits: gmux_protocol::retention::ScrollbackLimits,
     frontends: HashMap<u64, Frontend>,
     output_budget: resources::OutputBudget,
+    view_resources: std::rc::Rc<crate::engine::ViewResources>,
     clipboard: clipboard::Broker,
     next_frontend: u64,
     update_cursor: u64,
@@ -170,6 +171,7 @@ impl Daemon {
             },
             frontends: HashMap::new(),
             output_budget: Default::default(),
+            view_resources: Default::default(),
             clipboard: Default::default(),
             next_frontend: 0,
             update_cursor: 0,
@@ -415,6 +417,7 @@ impl Daemon {
             state: Default::default(),
             frontends: HashMap::new(),
             output_budget: Default::default(),
+            view_resources: Default::default(),
             next_frontend: 0,
             update_cursor: 0,
             flush_cursor: 0,
@@ -521,6 +524,7 @@ mod tests {
                     current: 1,
                     total: gmux_protocol::viewport::MAX_CELLS,
                     pending: false,
+                    resource_limited: false,
                     highlights: (0..gmux_protocol::viewport::MAX_CELLS)
                         .map(|i| (i, i + 1, 1))
                         .collect(),

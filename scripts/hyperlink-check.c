@@ -22,9 +22,10 @@ static size_t storage(const Links *links) {
     return links->spans_cap*sizeof(LinkSpan)+links->targets_cap*sizeof(LinkTarget)+links->bytes_cap;
 }
 int main(void) {
+    GmuxViewBudget *view_budget=gmux_engine_view_budget_new(128 * 1024 * 1024, 10000);
     GmuxEngine *e=gmux_engine_new(NULL,event);
     assert(e);
-    GmuxView *a=gmux_engine_view_new(e), *b=gmux_engine_view_new(e);
+    GmuxView *a=gmux_engine_view_new(e, view_budget), *b=gmux_engine_view_new(e, view_budget);
     assert(a && b);
     write_text(e,"\x1b]8;;test:held\x07visible\x1b]8;;\x07");
     snapshot(e);
@@ -46,5 +47,6 @@ int main(void) {
         assert(!storage(&e->held_links) && !storage(&a->links) && !storage(&b->links));
     }
     gmux_engine_view_free(a); gmux_engine_view_free(b); gmux_engine_free(e);
+    gmux_engine_view_budget_free(view_budget);
     puts("PASS: held OSC 8 targets release on expiry, explicit release and clear");
 }

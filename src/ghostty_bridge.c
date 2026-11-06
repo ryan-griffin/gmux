@@ -170,7 +170,58 @@ struct GmuxEngine {
     bool auxiliary_prompt, output_open, prompt_executed;
 };
 
+static const GhosttyAllocatorVtable view_vtable;
+struct GmuxViewBudget {
+    size_t used, links_reserved, limit, count, count_limit;
+    GhosttyAllocator allocator;
+};
+GmuxViewBudget *gmux_engine_view_budget_new(size_t bytes, size_t views) {
+    GmuxViewBudget *b = calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    b->limit=bytes;
+    b->count_limit=views;
+    // Ghostty retains this allocator's address, not just its ctx and vtable.
+    b->allocator=(GhosttyAllocator){.ctx=b, .vtable=&view_vtable};
+    return b;
+}
+void gmux_engine_view_budget_free(GmuxViewBudget *b) { free(b); }
+size_t gmux_engine_view_budget_bytes(GmuxViewBudget *b) { return b->used-b->links_reserved; }
+size_t gmux_engine_view_budget_reserved(GmuxViewBudget *b) { return b->used; }
+size_t gmux_engine_view_budget_count(GmuxViewBudget *b) { return b->count; }
+static void *view_alloc(void *ctx, size_t len, uint8_t alignment, uintptr_t ra) {
+    (void)ra;
+    GmuxViewBudget *b = ctx;
+    if (len > b->limit-b->used || alignment >= sizeof(size_t)*8) return NULL;
+    size_t align = (size_t)1 << alignment;
+    if (align < sizeof(void *)) align=sizeof(void *);
+    void *ptr=NULL;
+    if (posix_memalign(&ptr, align, len)) return NULL;
+    b->used += len;
+    return ptr;
+}
+// Refuse in-place resize/remap so replacement storage is admitted while the
+// original allocation is still charged. Ghostty then allocates/copies/frees.
+static bool view_resize(void *ctx, void *ptr, size_t len, uint8_t alignment, size_t next, uintptr_t ra) {
+    (void)ctx; (void)ptr; (void)len; (void)alignment; (void)next; (void)ra;
+    return false;
+}
+static void *view_remap(void *ctx, void *ptr, size_t len, uint8_t alignment, size_t next, uintptr_t ra) {
+    (void)ctx; (void)ptr; (void)len; (void)alignment; (void)next; (void)ra;
+    return NULL;
+}
+static void view_free(void *ctx, void *ptr, size_t len, uint8_t alignment, uintptr_t ra) {
+    (void)alignment; (void)ra;
+    ((GmuxViewBudget *)ctx)->used -= len;
+    free(ptr);
+}
+static const GhosttyAllocatorVtable view_vtable = {
+    .alloc=view_alloc, .resize=view_resize, .remap=view_remap, .free=view_free,
+};
+
 struct GmuxView {
+    GmuxViewBudget *budget;
+    bool failed;
+    size_t links_reserved;
     GmuxEngine *owner;
     GmuxView *next;
     GhosttyRenderState render;
@@ -238,13 +289,26 @@ static void swap_view(GmuxEngine *e, GmuxView *v) {
 #undef SWAP
 }
 
-GmuxView *gmux_engine_view_new(GmuxEngine *e) {
+static size_t view_link_bytes(GmuxView *v) {
+    return v->links.spans_cap*sizeof(LinkSpan) + v->links.targets_cap*sizeof(LinkTarget) + v->links.bytes_cap;
+}
+size_t gmux_engine_view_memory(GmuxView *v) { return sizeof(*v) + view_link_bytes(v); }
+bool gmux_engine_view_failed(GmuxView *v) { return v->failed; }
+GmuxView *gmux_engine_view_new(GmuxEngine *e, GmuxViewBudget *budget) {
+    if (budget->count >= budget->count_limit) return NULL;
     GmuxView *v = calloc(1, sizeof(*v));
     if (!v) return NULL;
+    v->budget=budget; budget->count++;
     v->owner=e; v->next=e->views; e->views=v;
     v->appearance=e->appearance;
     v->active=true;
     return v;
+}
+static void view_links_free(GmuxView *v) {
+    links_free(&v->links);
+    v->budget->used -= v->links_reserved;
+    v->budget->links_reserved -= v->links_reserved;
+    v->links_reserved=0;
 }
 void gmux_engine_view_set_active(GmuxView *v, bool active) {
     v->active=active;
@@ -254,7 +318,7 @@ void gmux_engine_view_set_active(GmuxView *v, bool active) {
         ghostty_tracked_grid_ref_free(v->history.anchor); v->history.anchor=NULL;
         ghostty_tracked_grid_ref_free(v->history.previous); v->history.previous=NULL;
         v->history.state.generation=0;
-        links_free(&v->links);
+        view_links_free(v);
     }
 }
 void gmux_engine_view_free(GmuxView *v) {
@@ -272,7 +336,8 @@ void gmux_engine_view_free(GmuxView *v) {
     ghostty_tracked_grid_ref_free(v->history.anchor);
     ghostty_tracked_grid_ref_free(v->history.previous);
     ghostty_render_state_free(v->render);
-    links_free(&v->links);
+    view_links_free(v);
+    v->budget->count--;
     free(v);
 }
 void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
@@ -329,7 +394,9 @@ static void end_render_hold(GmuxEngine *e) {
     e->links.valid=false;
     links_free(&e->link_scratch.spare);
     links_free(&e->held_links);
-    for (GmuxView *v=e->views; v; v=v->next) links_free(&v->links);
+    for (GmuxView *v=e->views; v; v=v->next) {
+        view_links_free(v);
+    }
 }
 
 static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
@@ -342,10 +409,21 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
         links_capture(terminal, e->render, e->iterator, &e->held_links, &e->link_scratch, ++e->link_revision, false);
         for (GmuxView *v=e->views; v; v=v->next) {
-            if (!v->active) continue;
+            if (!v->active || v->failed) continue;
+            // Links use the bridge's bounded packed arrays. Reserve their full
+            // ceiling before capture; shared engine scratch remains engine-owned.
+            size_t links_max=LINK_SPANS_MAX*(sizeof(LinkSpan)+sizeof(LinkTarget))+LINK_BYTES_MAX;
+            size_t additional=links_max-v->links_reserved;
+            if (additional > v->budget->limit-v->budget->used) {
+                v->failed=true;
+                continue;
+            }
+            v->links_reserved=links_max;
+            v->budget->links_reserved += additional;
+            v->budget->used += additional;
             gmux_engine_view_enter(e, v);
             v->captured=false;
-            if (!v->render) ghostty_render_state_new(NULL, &v->render);
+            if (!v->render) ghostty_render_state_new(&v->budget->allocator, &v->render);
             // Reapplying the current default dirties Ghostty's terminal
             // palette without changing OSC overrides. DIRTY_FULL on a render
             // cache only controls extraction; other caches consumed the rows.
@@ -358,10 +436,18 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
                 links_capture(terminal, v->render, e->iterator, &v->links, &e->link_scratch, ++e->link_revision, false);
                 v->captured=true;
             } else {
+                v->failed=true;
                 // An unsuccessful update may leave an incomplete cache.
                 ghostty_render_state_free(v->render); v->render=NULL;
             }
             gmux_engine_view_leave(e, v);
+            // Keep the ceiling only during capture. A link-free view must not
+            // consume 704 KiB of shared admission until the hold ends.
+            size_t actual=view_link_bytes(v);
+            size_t released=v->links_reserved-actual;
+            v->links_reserved=actual;
+            v->budget->used -= released;
+            v->budget->links_reserved -= released;
         }
         e->hold_started_ms = now_ms();
     }

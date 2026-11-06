@@ -47,7 +47,7 @@ struct PaneViewState {
 struct PanePresentation {
     view: crate::engine::EngineView,
     screen: Option<Box<SentScreen>>,
-    find: Option<gmux_protocol::search::FindState>,
+    find: Option<gmux_protocol::search::FindStatus>,
     selection: Option<SentSelection>,
     scroll_serial: u64,
     sent_scroll_serial: Option<u64>,
@@ -82,12 +82,17 @@ impl PaneViewState {
         }
     }
 
-    fn presentation(&mut self, session: &TerminalSession) -> anyhow::Result<&mut PanePresentation> {
+    fn presentation(
+        &mut self,
+        session: &TerminalSession,
+        resources: &std::rc::Rc<crate::engine::ViewResources>,
+    ) -> anyhow::Result<&mut PanePresentation> {
         if self.presentation.is_none() {
-            let mut view = session.new_view()?;
+            let mut view = session.new_view_in(resources)?;
             view.set_active(self.visible);
             self.presentation = Some(Box::new(PanePresentation::new(view)));
         }
+        self.presentation.as_ref().unwrap().view.check_resources()?;
         Ok(self.presentation.as_mut().unwrap())
     }
 
@@ -208,6 +213,16 @@ impl Frontend {
             .values()
             .filter_map(PaneViewState::screen)
             .map(|screen| screen.cache_bytes)
+            .sum()
+    }
+    pub(super) fn retained_views(&self) -> usize {
+        self.panes
+            .values()
+            .filter_map(|p| p.presentation.as_ref())
+            .map(|p| {
+                size_of::<PanePresentation>() - size_of::<crate::engine::EngineView>()
+                    + p.view.memory_size()
+            })
             .sum()
     }
     fn queue_clipboard(
@@ -816,7 +831,12 @@ impl Daemon {
             return Ok(());
         }
         let pane = frontend.panes.entry(id).or_default();
-        let presentation = pane.presentation(session)?;
+        let presentation = pane.presentation(session, &self.view_resources)?;
+        if matches!(command, StreamCommand::Find { .. }) {
+            // A new query can finish in one batch with identical counts but
+            // different highlights. Its scalar summary cannot detect that.
+            presentation.find = None;
+        }
         let view = &mut presentation.view;
         let appearance_changed = matches!(
             command,
@@ -1241,7 +1261,7 @@ impl Daemon {
             let (frame, find, selection, selection_origin) = if screen
                 || pane.presentation.is_some()
             {
-                let presentation = pane.presentation(session)?;
+                let presentation = pane.presentation(session, &self.view_resources)?;
                 let view = &mut presentation.view;
                 if terminal_changed {
                     view.invalidate();
@@ -1416,9 +1436,13 @@ impl Daemon {
                 )
             };
             let presentation = pane.presentation.as_mut();
-            let find_changed = presentation
-                .as_ref()
-                .map_or(pane.metadata.is_none(), |p| p.find.as_ref() != Some(&find));
+            // Highlights travel with viewport changes. Retain only the scalar
+            // summary, rather than a second viewport-sized match vector.
+            let find_summary = find.status();
+            let find_changed = (frame.is_some() && find.total != 0)
+                || presentation.as_ref().map_or(pane.metadata.is_none(), |p| {
+                    p.find.as_ref() != Some(&find_summary)
+                });
             let selection_serial = presentation.as_ref().map_or(0, |p| p.selection_serial);
             let previous = presentation.as_ref().and_then(|p| p.selection.as_ref());
             let selection_changed =
@@ -1439,7 +1463,7 @@ impl Daemon {
                 continue;
             }
             let scroll_serial = if let Some(presentation) = presentation {
-                presentation.find = Some(find.clone());
+                presentation.find = Some(find_summary);
                 presentation.selection = Some(SentSelection {
                     range: selection,
                     serial: selection_serial,
@@ -1852,6 +1876,85 @@ mod tests {
         );
         assert!(matches!(requests[1].command, StreamCommand::Ping));
         assert!(frontend.binary_deadline.is_none());
+    }
+
+    #[test]
+    fn same_count_query_changes_send_new_highlights_without_terminal_output() {
+        let mut daemon = Daemon::empty_for_test();
+        let mut session = session(1);
+        let mut seed = session.new_view().unwrap();
+        session.with_view(&mut seed, |e| e.feed(b"one two one two"));
+        daemon.sessions.insert(1, session);
+        let (mut frontend, peer) = client((80, 24, 8, 16, 640, 384));
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut peer = std::io::BufReader::new(peer);
+        for (query, start) in [("one", 0), ("two", 4)] {
+            daemon
+                .input(
+                    1,
+                    &mut frontend,
+                    StreamRequest::pane(
+                        1,
+                        StreamCommand::Find {
+                            query: query.into(),
+                        },
+                    ),
+                )
+                .unwrap();
+            daemon
+                .update_frontend(&mut frontend, false, &mut HashMap::new())
+                .unwrap();
+            let state = Packet::read(&mut peer).unwrap().header.find.unwrap();
+            assert_eq!(state.total, 2);
+            assert_eq!(
+                state.highlights,
+                [(start, start + 3, 2), (start + 8, start + 11, 1)]
+            );
+        }
+    }
+
+    #[test]
+    fn search_limit_is_sent_as_an_outcome_and_hidden_views_keep_admission() {
+        let mut daemon = Daemon::empty_for_test();
+        std::rc::Rc::get_mut(&mut daemon.view_resources)
+            .unwrap()
+            .search = gmux_protocol::search::SearchBudget::new(32 * 1024);
+        let mut session = session(1);
+        let mut seed = session.new_view().unwrap();
+        session.with_view(&mut seed, |e| e.feed(&vec![b'a'; 16000]));
+        daemon.sessions.insert(1, session);
+        let (mut frontend, _peer) = client((80, 24, 8, 16, 640, 384));
+        daemon
+            .input(
+                1,
+                &mut frontend,
+                StreamRequest::pane(1, StreamCommand::Find { query: "a".into() }),
+            )
+            .unwrap();
+        for _ in 0..10 {
+            daemon
+                .update_frontend(&mut frontend, false, &mut HashMap::new())
+                .unwrap();
+            if !frontend.panes[&1].find_pending() {
+                break;
+            }
+        }
+        assert!(
+            frontend.panes[&1]
+                .presentation
+                .as_ref()
+                .unwrap()
+                .find
+                .as_ref()
+                .unwrap()
+                .resource_limited
+        );
+        assert_eq!(daemon.view_resources.search.used(), 0);
+        frontend.panes.get_mut(&1).unwrap().set_visible(false);
+        assert_eq!(daemon.view_resources.count(), 1);
+        frontend.close_pane(1);
+        assert_eq!(daemon.view_resources.count(), 0);
+        assert_eq!(daemon.view_resources.native_reserved(), 0);
     }
 
     #[test]

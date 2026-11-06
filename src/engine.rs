@@ -7,6 +7,7 @@ use gmux_protocol::{
 use std::{
     ffi::{CString, c_void},
     ptr::NonNull,
+    rc::Rc,
 };
 
 // Generated declarations and compile-time layout checks for our C shim.
@@ -45,6 +46,10 @@ const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_protocol::cells::
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
 mod selection_tests;
+
+#[cfg(test)]
+#[path = "engine/view_resource_tests.rs"]
+mod view_resource_tests;
 
 #[cfg(test)]
 #[path = "engine/retention_tests.rs"]
@@ -520,8 +525,45 @@ pub struct Engine {
     retention_revision: u64,
 }
 
+pub(crate) const MAX_VIEWS: usize = 256;
+pub(crate) const MAX_VIEW_NATIVE_BYTES: usize = 128 * 1024 * 1024;
+/// The Rc outlives every native allocator and view registered in this pool.
+pub(crate) struct ViewResources {
+    raw: NonNull<GmuxViewBudget>,
+    pub(crate) search: gmux_protocol::search::SearchBudget,
+}
+impl Default for ViewResources {
+    fn default() -> Self {
+        Self::new(MAX_VIEW_NATIVE_BYTES, MAX_VIEWS)
+    }
+}
+impl ViewResources {
+    fn new(bytes: usize, views: usize) -> Self {
+        Self {
+            raw: NonNull::new(unsafe { gmux_engine_view_budget_new(bytes, views) })
+                .expect("view budget"),
+            search: Default::default(),
+        }
+    }
+    pub(crate) fn render_bytes(&self) -> usize {
+        unsafe { gmux_engine_view_budget_bytes(self.raw.as_ptr()) }
+    }
+    pub(crate) fn native_reserved(&self) -> usize {
+        unsafe { gmux_engine_view_budget_reserved(self.raw.as_ptr()) }
+    }
+    pub(crate) fn count(&self) -> usize {
+        unsafe { gmux_engine_view_budget_count(self.raw.as_ptr()) }
+    }
+}
+impl Drop for ViewResources {
+    fn drop(&mut self) {
+        unsafe { gmux_engine_view_budget_free(self.raw.as_ptr()) }
+    }
+}
+
 /// Presentation state for one client, independent of the PTY and terminal modes.
 pub(crate) struct EngineView {
+    _resources: Rc<ViewResources>,
     raw: NonNull<GmuxView>,
     held_frame: Frame,
     find: gmux_protocol::search::HistorySearch,
@@ -529,6 +571,21 @@ pub(crate) struct EngineView {
     retention_revision: u64,
 }
 impl EngineView {
+    pub(crate) fn check_resources(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !unsafe { gmux_engine_view_failed(self.raw.as_ptr()) },
+            "Terminal view snapshot memory limit reached"
+        );
+        Ok(())
+    }
+    pub(crate) fn memory_size(&self) -> usize {
+        size_of::<Self>()
+            + self.find.memory_size()
+            + self.find_row.capacity() * size_of::<Cell>()
+            + self.find_row.iter().map(Cell::heap_bytes).sum::<usize>()
+            + unsafe { gmux_engine_view_memory(self.raw.as_ptr()) }
+    }
+
     pub(crate) fn set_active(&mut self, active: bool) {
         unsafe { gmux_engine_view_set_active(self.raw.as_ptr(), active) }
     }
@@ -795,11 +852,18 @@ impl Engine {
         );
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn new_view(&self) -> anyhow::Result<EngineView> {
+        self.new_view_in(&Rc::default())
+    }
+    pub(crate) fn new_view_in(&self, resources: &Rc<ViewResources>) -> anyhow::Result<EngineView> {
         Ok(EngineView {
-            raw: NonNull::new(unsafe { gmux_engine_view_new(self.raw.as_ptr()) })
-                .ok_or_else(|| anyhow::anyhow!("Could not create terminal view"))?,
-            find: gmux_protocol::search::HistorySearch::default(),
+            _resources: resources.clone(),
+            raw: NonNull::new(unsafe {
+                gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
+            })
+            .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?,
+            find: gmux_protocol::search::HistorySearch::with_budget(resources.search.clone()),
             find_row: Vec::new(),
             retention_revision: 0,
             held_frame: Frame::default(),
@@ -1137,6 +1201,9 @@ impl Engine {
     }
     pub fn find(&mut self, query: &str) {
         self.find.set_query(query);
+        if !self.find_pending() {
+            self.find_row = Vec::new();
+        }
     }
     pub fn find_pending(&self) -> bool {
         self.find.pending || self.find.dirty
@@ -1174,11 +1241,13 @@ impl Engine {
                 )
             } != 0
             {
-                self.find.finish();
-                self.find.invalidate();
+                self.find.restart();
                 break;
             }
             self.find.feed(&self.find_row, wrapped);
+        }
+        if !self.find_pending() {
+            self.find_row = Vec::new();
         }
         true
     }

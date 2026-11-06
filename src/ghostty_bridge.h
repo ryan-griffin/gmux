@@ -141,7 +141,15 @@ typedef struct {
     uint64_t origin;
 } GmuxHistory;
 // Per-frontend rendering, scroll anchors, and selections over one terminal.
-GmuxView *gmux_engine_view_new(GmuxEngine *engine);
+typedef struct GmuxViewBudget GmuxViewBudget;
+GmuxViewBudget *gmux_engine_view_budget_new(size_t bytes, size_t views);
+void gmux_engine_view_budget_free(GmuxViewBudget *budget);
+size_t gmux_engine_view_budget_bytes(GmuxViewBudget *budget);
+size_t gmux_engine_view_budget_reserved(GmuxViewBudget *budget);
+size_t gmux_engine_view_budget_count(GmuxViewBudget *budget);
+size_t gmux_engine_view_memory(GmuxView *view);
+bool gmux_engine_view_failed(GmuxView *view);
+GmuxView *gmux_engine_view_new(GmuxEngine *engine, GmuxViewBudget *budget);
 void gmux_engine_view_free(GmuxView *view);
 // Inactive subscribers retain presentation state without a frozen render cache.
 // Call outside view_enter/view_leave, while the view owns its render cache.
