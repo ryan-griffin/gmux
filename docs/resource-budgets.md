@@ -207,16 +207,18 @@ simultaneous old/new indexes can still cause conservative admission failures.
 If admission fails, the search releases both indexes and reports
 `resource_limited: true`, `pending: false`, zero counts, and no highlights.
 This is an explicit failure, never a truncated or completed search. GTK displays
-"Search memory limit reached" beside the query and disables navigation. A more
-specific or resubmitted query retries; terminal output does not retry a failed
-search indefinitely. While an admitted rescan runs, navigation continues to use
-the previous complete index. Search still scans at most 64 rows per paced visit.
+"Search memory limit reached" beside the query and disables navigation. Edit the
+query or press Enter to retry. Terminal output and routine UI refreshes do not
+retry a failed search indefinitely. While an admitted rescan runs, navigation
+continues to use the previous complete index. Search still scans at most 64 rows
+per paced visit.
 Adjacent and overlapping visual highlight ranges merge, with the selected match
 painted over their union. Counts and navigation still include every text match,
 including separate matches in one grapheme. Highlight vector growth is capped
 before allocation at the viewport cell count, so duplicate grapheme matches
 cannot multiply highlight storage. The daemon retains only the sent count/status
-summary, not another copy of the viewport highlight vector.
+summary, not another copy of the viewport highlight vector. Completed rescans
+send fresh highlights even when visible cells and counts stay unchanged.
 
 Native render states use a pointer-stable shared allocator with admission before
 every allocation. Old and replacement allocations remain charged during growth.

@@ -866,7 +866,15 @@ impl Terminal {
         *self.search_query.borrow_mut() = query.to_owned();
     }
     pub fn search_advance(&self, previous: bool) {
-        if let Err(error) = self.session.borrow().find_advance(previous) {
+        let session = self.session.borrow();
+        let result = if session.find_state().resource_limited {
+            // Explicit navigation retries a failed query. Routine refreshes
+            // still suppress unchanged queries instead of retrying under load.
+            session.find(&self.search_query.borrow())
+        } else {
+            session.find_advance(previous)
+        };
+        if let Err(error) = result {
             self.report_error("Could not navigate search results", &error.to_string());
         }
     }

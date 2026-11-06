@@ -1270,7 +1270,11 @@ impl Daemon {
                     // Search scans bounded batches even when its visible state
                     // is unchanged. Keep those batches paced instead of spinning.
                     frame_activity |= engine.find_pending();
-                    engine.poll_find();
+                    if engine.poll_find() && !engine.find_pending() {
+                        // A rescan can move highlights without changing visible
+                        // cells or counts, including when it fits in one batch.
+                        presentation.find = None;
+                    }
                     if screen {
                         // Repeated output can dirty and extract rows without
                         // changing their final cells. Coalesce that work too.
@@ -1436,8 +1440,8 @@ impl Daemon {
                 )
             };
             let presentation = pane.presentation.as_mut();
-            // Highlights travel with viewport changes. Retain only the scalar
-            // summary, rather than a second viewport-sized match vector.
+            // Highlights travel with viewport changes and completed rescans.
+            // Retain only the scalar summary, not another highlight vector.
             let find_summary = find.status();
             let find_changed = (frame.is_some() && find.total != 0)
                 || presentation.as_ref().map_or(pane.metadata.is_none(), |p| {
@@ -1911,6 +1915,59 @@ mod tests {
                 [(start, start + 3, 2), (start + 8, start + 11, 1)]
             );
         }
+    }
+
+    #[test]
+    fn same_count_rescans_send_highlights_without_a_viewport_change() {
+        let mut daemon = Daemon::empty_for_test();
+        let mut session = session(1);
+        session.resize(10, 4, 8, 16, 80, 64).unwrap();
+        let mut seed = session.new_view().unwrap();
+        session.with_view(&mut seed, |e| {
+            e.feed(b"zero\r\nfirst\r\nsecond\r\nthird\r\n         abc");
+        });
+        daemon.sessions.insert(1, session);
+        let (mut frontend, peer) = client((10, 4, 8, 16, 80, 64));
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut peer = std::io::BufReader::new(peer);
+        for command in [
+            StreamCommand::ScrollTo { row: 1, serial: 1 },
+            StreamCommand::Find {
+                query: "abc".into(),
+            },
+        ] {
+            daemon
+                .input(1, &mut frontend, StreamRequest::pane(1, command))
+                .unwrap();
+        }
+        daemon
+            .update_frontend(&mut frontend, false, &mut HashMap::new())
+            .unwrap();
+        let first = Packet::read(&mut peer).unwrap().header.find.unwrap();
+        assert_eq!(first.highlights, [(39, 40, 2)]);
+        assert_eq!(first.total, 1);
+        assert!(!first.pending);
+
+        // Move the wrapped match wholly below the viewport, preserving the
+        // visible cells, cursor, count, and selected ordinal. This scan fits
+        // in one batch, so the client never sees an intermediate pending state.
+        daemon
+            .sessions
+            .get_mut(&1)
+            .unwrap()
+            .with_view(&mut seed, |e| {
+                e.feed(b"\x1b[4;1Hzzabc\x1b[4;3H");
+            });
+        frontend.panes.get_mut(&1).unwrap().terminal_changed = true;
+        daemon
+            .update_frontend(&mut frontend, false, &mut HashMap::new())
+            .unwrap();
+        let header = Packet::read(&mut peer).unwrap().header;
+        assert!(header.frame.is_none());
+        assert!(header.rows.is_empty());
+        let second = header.find.unwrap();
+        assert!(second.status() == first.status());
+        assert!(second.highlights.is_empty());
     }
 
     #[test]

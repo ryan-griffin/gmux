@@ -74,8 +74,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
     pane = None
     observed_keys = None
     observed_layouts = None
+    observed_search = None
 
     def observe_request(request):
+        if observed_search is not None and request.get("method") in {"find", "find-advance"}:
+            observed_search.append(request)
         if observed_layouts is not None and request.get("method") == "key":
             observed_layouts.append(request)
         if observed_keys is not None and request.get("method") == "key":
@@ -1360,9 +1363,34 @@ finally:
                 native.key(symbol, False)
             expected_hash = hashlib.sha256(b"\x1b[200~" + encoded + b"\x1b[201~").hexdigest()
             wait_for(lambda: expected_hash in rpc("read", pane=pane)["text"], context=GLib.MainContext.default())
+            # A failed query retries only on explicit submission, even when the
+            # text is unchanged. The query-size ceiling gives a cheap, stable
+            # resource-limit outcome without filling the shared search pool.
+            rpc("action", name="find")
+            observed_search = []
+            search_entry = wait_for(lambda: next((obj for obj in descendants(Atspi.get_desktop(0))
+                if obj.get_process_id() == app.pid and obj.get_name() == "Find in terminal"
+                and obj.get_state_set().contains(Atspi.StateType.SHOWING)
+                and obj.get_editable_text_iface() is not None), None))
+            query = "a" * 4097
+            assert Atspi.EditableText.set_text_contents(search_entry.get_editable_text_iface(), query)
+            wait_for(lambda: any(obj.get_process_id() == app.pid
+                and obj.get_name() == "Search memory limit reached"
+                and obj.get_state_set().contains(Atspi.StateType.SHOWING)
+                for obj in descendants(Atspi.get_desktop(0))))
+            assert_stays(lambda: len(observed_search) == 1, .2,
+                         message="A failed search retried without user input")
+            native.key(Gdk.KEY_Return, True)
+            native.key(Gdk.KEY_Return, False)
+            wait_for(lambda: len(observed_search) >= 2)
+            assert [(request["method"], request.get("query")) for request in observed_search] == [
+                ("find", query), ("find", query)], observed_search
+            observed_search = None
+            rpc("action", name="find")
             assert rpc("status")["local_clients"] and app.poll() is None
             print("PASS: native Wayland keyboard input, Kitty press/repeat/release and focus resets, composition and shortcut holds, Kitty modifier presses/releases with both sides, Caps Lock and focus-entry Num Lock, active/inactive keypad input and shifted punctuation/ISO identity, "
                   "OSC 8 hover/copy/Ctrl-click through an isolated URI handler with held and delayed frames, "
+                  "unchanged-query search retries after resource limits, "
                   "accessible terminal text, caret and selection, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
                   "wide-glyph geometry, double/triple-click selection, rectangular Unicode/blank/soft-wrap copy with accessible row ranges, "
