@@ -67,8 +67,9 @@ the same connection selection and queued directory handling. Its submodules hand
 appearance settings or GNOME icon names.
 
 `crates/gtk/src/terminal.rs` builds pane widgets. `terminal/input.rs` handles keyboard,
-pointer, clipboard, and scroll input. `crates/client/src/remote.rs` queues terminal commands
-and applies viewport packets from the daemon.
+pointer, clipboard, and scroll input. `crates/client/src/remote.rs` queues terminal
+commands and dispatches daemon packets. Its private `remote/viewport.rs` module
+reconciles each pane.
 
 See [UI behavior](ui.md) for interaction details.
 
@@ -197,8 +198,33 @@ check their layout against the C bridge.
 
 `connections.rs` owns saved destinations, identity pins, and client configuration
 commands. `connection.rs` owns one daemon's asynchronous setup, retries, status,
-and typed state updates. `remote.rs` maintains cached viewports and bounded
-input/output queues. `scroll_cache.rs` owns prediction-row storage, retention,
+and typed state updates. `remote.rs` owns stream I/O, bounded input/output queues,
+packet dispatch, and manager maintenance. `RemoteSession` adapts frontend calls to
+its private `Viewport` in `remote/viewport.rs`. The viewport owns pane metadata,
+canonical cells and row flags, Find and selection acknowledgements, hyperlinks,
+and scroll targets and predictions. Ordered pane updates and local scrolling
+return presentation changes and an optional scroll command. The manager coalesces
+presentation changes within each poll, after applying every delta in order.
+Canonical cells update in place even while a prediction is displayed. Snapshots
+borrow the displayed cells;
+display, text, and hyperlink revisions remain independent.
+
+The viewport also handles local scroll targets, read acknowledgements, accepted
+selection and prompt commands, and cache invalidation after accepted appearance,
+clear, or geometry changes. Scroll effects contain only a row and serial. The
+adapter reports enqueue acceptance or rejection before the next event. Acceptance
+commits the sent serial and timestamp; rejection preserves the coalesced target
+and suppresses its timer until manager maintenance retries. Writer progress wakes
+the manager. Deferred targets release at the display cadence without waiting for
+an entire round trip; fully cached scrolling can wait for the cache settle period.
+Viewport-dependent commands force the latest target ahead of themselves and stop
+on enqueue failure. Selection and prompt serials commit only after their own
+commands enter the queue. The viewport neither owns sockets nor sends wakeups.
+Incoming decode reservations stay with manager dispatch through reconciliation;
+outgoing reservations stay with queued and in-flight writes. Connection errors
+and clipboard, execution, and Git dispatch remain in `remote.rs`.
+
+`scroll_cache.rs` owns prediction-row storage, retention,
 overflow-text accounting, and eviction. The daemon chooses supplemental rows in
 `src/daemon/prefetch.rs`; the engine bounds extraction by the protocol limits.
 Process-wide [resource budgets](resource-budgets.md) cover incoming packets,

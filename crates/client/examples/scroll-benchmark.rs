@@ -13,6 +13,38 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Count only the calling frontend thread. The simulated daemon and shared I/O
+// executor allocate independently and are excluded from reconciliation costs.
+struct Counted;
+thread_local! {
+    static ALLOCATIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[global_allocator]
+static ALLOCATOR: Counted = Counted;
+fn count_allocation(bytes: usize) {
+    let _ = ALLOCATIONS.try_with(|count| {
+        let (allocations, allocated_bytes) = count.get();
+        count.set((allocations + 1, allocated_bytes + bytes));
+    });
+}
+unsafe impl std::alloc::GlobalAlloc for Counted {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        count_allocation(size);
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+}
+
 fn cells(start: u64, rows: usize, long: bool) -> Vec<Cell> {
     (start..start + rows as u64)
         .flat_map(|row| {
@@ -133,7 +165,10 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
         std::thread::sleep(Duration::from_micros(100));
     }
     let cache_retained_bytes = session.borrow().scroll_cache_bytes();
-    let mut timings = Vec::new();
+    // Keep assertion fixtures outside the measured allocation interval.
+    let expected = [row_text(80, long), row_text(81, long)];
+    let mut timings = Vec::with_capacity(40);
+    let (allocations_before, bytes_before) = ALLOCATIONS.with(|count| count.get());
     for index in 1..=40 {
         let target = 80 + (index % 2) as u64;
         let start = Instant::now();
@@ -146,9 +181,12 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
         timings.push(start.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(
             session.borrow().snapshot().cells[0].text(),
-            row_text(target, long)
+            expected[index % 2].as_str()
         );
     }
+    let (allocations, allocated_bytes) = ALLOCATIONS.with(|count| count.get());
+    let allocations = allocations - allocations_before;
+    let allocated_bytes = allocated_bytes - bytes_before;
     timings.sort_by(f64::total_cmp);
     drop(manager);
     worker.join().expect("Scroll responder panicked")?;
@@ -156,6 +194,7 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
         serde_json::json!({ "cached": cached, "samples": timings.len(),
         "median_ms": timings[timings.len()/2], "p95_ms": timings[timings.len()*95/100],
         "cache_retained_bytes": cache_retained_bytes,
+        "frontend_allocations": allocations, "frontend_allocated_bytes": allocated_bytes,
         "prefetched_rows": if cached { 120 } else { 0 } }),
     )
 }
