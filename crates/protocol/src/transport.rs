@@ -1244,7 +1244,11 @@ mod tests {
         for capacity in [1, 3, 79, 65536] {
             let decoded =
                 Packet::read(&mut BufReader::with_capacity(capacity, bytes.as_slice())).unwrap();
-            assert_eq!(clipboard_header(&decoded), clipboard_header(&packet));
+            let (Packet::Clipboard(decoded), Packet::Clipboard(expected)) = (&decoded, &packet)
+            else {
+                panic!("expected clipboard events");
+            };
+            assert_eq!(decoded, expected);
         }
         let packet = offer(&[(
             "image/png",

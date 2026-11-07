@@ -78,7 +78,7 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 42:
+handshake. The current protocol version is 43:
 
 ```json
 {"version":43,"channel":"control","token":"shared-token","daemon":"expected-identity"}
