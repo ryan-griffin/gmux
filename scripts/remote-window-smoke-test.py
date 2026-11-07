@@ -15,7 +15,7 @@ import time
 from clipboard_test_support import check_html
 from progress_test_support import ProgressProbe
 from cargo_test_support import cargo_binary
-from test_support import AppFixture, scenario, wait_for
+from test_support import AppFixture, create_tab_when_connected, scenario, wait_for
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
@@ -266,7 +266,7 @@ with scenario("the saved tab restores when its connection arrives after a startu
     command(receiver, "connection", "add", server.rpc("status")["bound_address"],
             "--name", "server", "--auth", "none")
     app = receiver.start_app(cli, stdout=log, stderr=log)
-    local = receiver.rpc("new", name="Startup fallback")
+    local = create_tab_when_connected(receiver.env["GMUX_SOCKET"], name="Startup fallback")
     wait_for(lambda: len(receiver.rpc("list")["tabs"]) == 2)
     receiver.rpc("focus", connection="server", pane=remote["pane"])
     expected = dict(daemon=remote["daemon"], id=remote["tab"])

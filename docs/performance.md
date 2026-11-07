@@ -798,3 +798,37 @@ process, samples after 250 ms, and samples again 250 ms after dropping the
 managers. Peer sockets remain open until process exit. These totals include
 allocator retention and the shared I/O runtime; they do not represent the full
 GTK application or active terminal rendering. One I/O thread serves all streams.
+
+## Direct remote transport dispatch
+
+```sh
+python3 scripts/cargo_build.py --release --headless gmux
+python3 scripts/remote-transport-benchmark.py --binary /path/to/release/gmux \
+  --runs 3 --samples 100 --output artifacts/remote-transport.json
+python3 scripts/daemon-resource-benchmark.py --binary /path/to/release/gmux \
+  --verify --output artifacts/remote-transport-resources.json
+```
+
+Run these probes alone against matching release binaries and the same pinned
+native library. Preserve a baseline executable before building another revision.
+The transport probe hashes its executable and records Linux/kernel information
+and CPU affinity. It runs a Unix reader and TCP reader with four additional
+active TCP frontends. Its pressure case adds twelve slow/nonreading TCP peers
+and paced 160×50 terminal output. It reports heartbeat and input-to-view median,
+p95, p99 and maximum latency for each transport, ordered heartbeat throughput,
+drained stream bytes, generated snapshots/rows, CPU time, context switches,
+thread/FD counts, RSS and high-water memory. It also times one-shot Unix and
+persistent TCP control calls outside the CPU/context-switch measurement interval.
+
+Timings include Python framing, scheduling, shell input, and viewport application
+in the fixture; they exclude GTK and physical scanout. Input-to-view latency
+includes the daemon's frame interval. Paced output throughput measures delivered
+work under this load, not maximum terminal or network throughput. The 2,000-reply
+heartbeat batches also include Python receive overhead. `/proc` CPU time has
+clock-tick resolution; context switches sum surviving daemon threads and can
+miss exited threads. RSS includes allocator retention and output buffers but
+excludes kernel socket memory. Loopback results do not predict WAN latency or
+loss recovery. Compare repeated distributions rather than inferring lower
+interactive latency from fewer socket hops. Use the resource probe for longer
+backpressure, eviction, and cache-recovery checks, and the native remote-window,
+terminal-input, and clipboard suites for GTK behavior.

@@ -29,6 +29,7 @@ use std::{
 
 mod clipboard;
 mod commands;
+mod connection;
 mod event_loop;
 mod frontend;
 mod mutation;

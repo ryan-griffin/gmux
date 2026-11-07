@@ -111,7 +111,7 @@ GTK retains at most one queued callback per window.
 ## Daemon frontend storage
 
 Each daemon shares these internal allowances across local Unix streams and
-remote TCP streams forwarded through its Unix listener:
+authenticated TCP streams serviced directly by its frontend loop:
 
 | Resource | Daemon allowance | Per-stream ceiling |
 | --- | --- | --- |
@@ -125,8 +125,11 @@ buffers release their allocation. On aggregate exhaustion, the daemon first
 releases idle output allocations, then disconnects the stream with the largest
 unsent backlog. Capacity breaks ties. Local and remote streams use the same
 policy, regardless of focus. A rejected enqueue closes its stream and releases
-its output allocation, including capacity grown by a failed encoder. The daemon
-never skips an accepted packet to admit a later reply. Partial writes, viewport
+its output allocation, including capacity grown by a failed encoder. Each flush
+writes at most 256 KiB to a Unix frontend or 64 KiB to a TCP frontend. The smaller
+TCP slice bounds send work now performed on the terminal owner. Both transports
+use the same fair flush cursor and ordered output buffers. The daemon never skips
+an accepted packet to admit a later reply. Partial writes, viewport
 deltas, clipboard offers, clipboard clears, and heartbeat replies keep their
 stream order until disconnection. Clipboard reads from disconnected recipients
 are cancelled by the daemon's existing clipboard maintenance.
@@ -145,10 +148,20 @@ cannot fit in the allowance uses full snapshots on subsequent updates.
 
 Excess stream connections close immediately, before frontend buffers or views are
 created. The listener still accepts at most eight connections per event-loop turn.
-The existing TCP listener separately allows 32 active connections, including
-handshakes and control channels. TCP terminal streams also consume a daemon
-frontend slot. The platform control server remains separate, with at most 64
-active handlers, a 32-request channel, and its existing request sizes and timeouts.
+The TCP listener separately allows 32 active connections across unauthenticated
+setup, authenticated control, queued handoffs, and active streams. A connection
+retains one slot throughout those phases. Authentication and Attach run on
+short-lived workers. The 32-entry owner dispatch queue rejects excess work
+without waiting. TCP streams acquire the same aggregate frontend slots at owner
+handoff; rejection closes the socket and returns its TCP slot. Typed control
+requests share the existing command/save ordering and fair control work budget.
+One nonblocking reactor services all remote control sockets, with one outstanding
+request and at most 16 MiB of encoded reply per connection. After parsing a
+request, it releases oversized input storage and retains at most 16 KiB of
+read-ahead capacity. It never waits for a completion or a slow socket. Local
+handlers and active remote control requests share a 64-slot allowance. A remote slot lasts through completion and reply
+writing. Idle authenticated controls retain only their TCP slot. Local control
+keeps its separate 32-request channel and existing request sizes and timeouts.
 Frontend pressure does not wait for storage, block PTY reads, or suspend terminal
 execution. Closing streams returns admission slots through normal teardown.
 
@@ -158,9 +171,9 @@ retained output capacity, optional screen-cache bytes, and their limits.
 These allowances are not an RSS cap. Output encoding can temporarily grow one
 buffer before synchronous capacity enforcement, and snapshot extraction can
 allocate one viewport before eviction. Packet construction, shared execution
-broadcast encoding, allocator overhead and arenas, kernel socket and TCP bridge
-buffers, frontend input and paste buffers, map entries, and metadata are outside
-the output and optional-screen allowances. Retained presentation state has the
+broadcast encoding, allocator overhead and arenas, kernel socket buffers,
+remote control replies, frontend input and paste buffers, map entries, and metadata
+are outside the output and optional-screen allowances. Retained presentation state has the
 separate policy below. Terminal engines, history, persistence,
 and control requests have separate lifetimes and limits. Metadata-only panes
 do not consume a view slot. Pane counts remain unrestricted. Cache pressure

@@ -168,10 +168,10 @@ impl Output {
             Ok(())
         })
     }
-    pub(super) fn flush(&mut self, socket: &mut UnixStream) -> anyhow::Result<()> {
+    pub(super) fn flush(&mut self, socket: &mut impl Write, limit: usize) -> anyhow::Result<()> {
         let mut storage = self.storage.borrow_mut();
         anyhow::ensure!(!storage.closed, "Frontend output budget exhausted");
-        let end = storage.bytes.len().min(storage.offset + 256 * 1024);
+        let end = storage.bytes.len().min(storage.offset + limit);
         while storage.offset < end {
             match socket.write(&storage.bytes[storage.offset..end]) {
                 Ok(0) => anyhow::bail!("Frontend disconnected"),
@@ -244,7 +244,7 @@ mod tests {
         let mut active = Output::new(&budget);
         let (mut socket, mut peer) = UnixStream::pair().unwrap();
         idle.queue_encoded(&vec![1; 16 * 1024]).unwrap();
-        idle.flush(&mut socket).unwrap();
+        idle.flush(&mut socket, 256 * 1024).unwrap();
         peer.read_exact(&mut vec![0; 16 * 1024]).unwrap();
         assert_eq!(used(&budget), idle.capacity());
         assert!(used(&budget) >= 16 * 1024);
@@ -332,7 +332,7 @@ mod tests {
         peer.set_nonblocking(true).unwrap();
         output.queue_encoded(&vec![3; IDLE_OUTPUT * 2]).unwrap();
         assert!(!output.backlogged());
-        output.flush(&mut socket).unwrap();
+        output.flush(&mut socket, 256 * 1024).unwrap();
         assert!(output.backlogged());
         assert!(!output.is_empty());
         assert!(used(&budget) >= IDLE_OUTPUT * 2);
@@ -341,7 +341,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             let mut bytes = [0; 65536];
             let _ = peer.read(&mut bytes);
-            output.flush(&mut socket).unwrap();
+            output.flush(&mut socket, 256 * 1024).unwrap();
         }
         assert_eq!(used(&budget), 0);
         assert!(!output.backlogged());

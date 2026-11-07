@@ -202,5 +202,23 @@ the saved settings and restore the previous listener and its connected clients.
 cannot start, local execution remains available and `gmux connection list` reports
 the error so the settings can be corrected.
 
+Authenticated streams use the daemon's frontend readiness loop directly. Unix
+and TCP frontends share output backpressure, view/cache limits, and work budgets.
+Remote commands go directly to the same execution and durable-save handlers as
+local commands. No extra Unix connection or forwarding thread remains per remote
+client. Authentication and initial attachment stay off the terminal owner thread.
+
+The listener admits at most 32 connections across setup, control, and streams.
+TCP streams also count toward the daemon's 64 frontend limit, including Unix
+streams. Handshake and Attach each have a five-second absolute deadline. Partial
+control requests and reply writes have five-second deadlines; idle authenticated
+connections have no application idle timeout. Control completions have a bounded
+twenty-second server wait, while client helpers retain their shorter end-to-end
+deadline. Streams retain TCP keepalive and user-timeout settings. On write
+half-close, the daemon processes complete buffered commands and drains accepted
+replies before closing, bounded by five seconds for stream output. Revocation
+cancels setup, queued handoffs, and commands that have not started. A command
+already executing or saving completes its effects even if its client disconnects.
+
 See [daemon API](daemon-api.md) for protocol details and
 [client library](code-organization.md#client-library) for Rust integration.
