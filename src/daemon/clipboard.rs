@@ -58,17 +58,9 @@ pub(super) struct Broker {
 
 impl Frontend {
     fn queue_read(&mut self, pane: u64, event: ReadEvent) -> anyhow::Result<()> {
-        self.queue(Packet {
-            header: Header {
-                meta: Metadata {
-                    id: pane,
-                    ..Default::default()
-                },
-                clipboard_read: Some(event),
-                ..Default::default()
-            },
-            cells: vec![],
-        })
+        self.queue(Packet::ClipboardRead(
+            gmux_protocol::transport::ClipboardRead { pane, event },
+        ))
     }
 }
 impl Daemon {

@@ -30,10 +30,14 @@ def decode_cells(data):
 
 def decode_packet(body):
     """Decode a stream body into its header and cell bytes."""
-    header_size, = struct.unpack("<I", body[:4])
+    header_size, kind, allowance, count = struct.unpack("<IIII", body[:16])
+    assert kind in (1, 2, 3, 4, 5)
+    assert header_size <= len(body) - 16
     header = json.loads(body[16:16 + header_size])
-    if (write := header.get("copy")) is not None:
-        assert header["frame"] is None and not header["rows"], header
+    header["event_type"] = {1: "pane", 2: "execution", 3: "clipboard", 4: "git", 5: "clipboard_read"}[kind]
+    if kind == 3:
+        assert count == 0
+        write = header
         offset = 16 + header_size
         if write["content"] is not None:
             representations = {}
@@ -54,7 +58,16 @@ def decode_packet(body):
                     write["content"][mime] = data
         assert offset == len(body), (offset, len(body))
         return header, b""
+    if kind != 1:
+        assert count == 0 and len(body) == 16 + header_size
     return header, body[16 + header_size:]
+
+
+def clipboard_value(event):
+    """Return write fields for clipboard assertions, or None for another kind."""
+    if event.get("event_type") == "clipboard":
+        return {key: event[key] for key in ("destination", "content")}
+    return None
 
 
 class Client:
@@ -121,10 +134,10 @@ class Client:
             assert 4 <= size <= 64 * 1024 * 1024
             body = self.exact(size)
             header, cells = decode_packet(body)
-            if value := header.get("git"):
-                self.git[value["id"]] = value
-            if header["meta"]["id"] == self.pane and header["frame"]:
-                frame = header["frame"]
+            if header["event_type"] == "git":
+                self.git[header["id"]] = {k: v for k, v in header.items() if k != "event_type"}
+            if header.get("meta", {}).get("id") == self.pane and header.get("frame"):
+                frame = header.get("frame")
                 if self.frame is None or (frame["cols"], frame["rows"]) != (self.frame["cols"], self.frame["rows"]):
                     self.cells.clear()
                     self.cell_values.clear()
@@ -154,16 +167,16 @@ class Client:
                          for row in range(self.frame["rows"]))
 
     def output(self, marker):
-        return self.until(lambda h: h["meta"]["id"] == self.pane and h["frame"] and marker in self.text())
+        return self.until(lambda h: h.get("meta", {}).get("id") == self.pane and h.get("frame") and marker in self.text())
 
     def state(self, revision):
-        return self.until(lambda h: h.get("state", {}).get("revision", -1) >= revision)["state"]
+        return self.until(lambda h: h["event_type"] == "execution" and h["revision"] >= revision)
 
     def barrier(self, serial):
         # A rejected request acknowledges prior commands even for hidden panes.
         method = f"test-barrier-{serial}"
         self.send(method)
-        self.until(lambda h: h["meta"]["id"] == self.pane and h["error"] and method in h["error"])
+        self.until(lambda h: h.get("meta", {}).get("id") == self.pane and h.get("error") and method in h.get("error"))
 
     def close(self):
         self.socket.close()

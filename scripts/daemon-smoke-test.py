@@ -11,7 +11,7 @@ from test_support import rpc as shared_rpc, wait_for as shared_wait_for
 import os
 from pathlib import Path
 from cargo_test_support import cargo_binary
-from stream_test_support import PROTOCOL_VERSION, decode_packet, decode_cells
+from stream_test_support import clipboard_value, PROTOCOL_VERSION, decode_packet, decode_cells
 import select
 import shlex
 import socket
@@ -89,8 +89,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert size <= 64 * 1024 * 1024
         body = exact(size)
         header, cells = decode_packet(body)
-        if header["frame"]:
-            assert len(decode_cells(cells)) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header["frame"]["cols"]
+        if header.get("frame"):
+            assert len(decode_cells(cells)) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header.get("frame")["cols"]
         else:
             assert not cells
         return header, cells
@@ -99,7 +99,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             header, cells = packet()
-            if header["meta"]["id"] == pane and header["frame"] and predicate(header, cells):
+            if header.get("meta", {}).get("id") == pane and header.get("frame") and predicate(header, cells):
                 return header, cells
         raise AssertionError("No matching viewport packet")
 
@@ -107,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             header, _ = packet()
-            if header["meta"]["id"] == pane and predicate(header):
+            if (header.get("event_type") == "clipboard" or header.get("meta", {}).get("id") == pane) and predicate(header):
                 return header
         raise AssertionError("No matching copy reply")
 
@@ -161,7 +161,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         command("attach", version=PROTOCOL_VERSION, daemon=rpc("_hello")["daemon"])
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
-        assert header["rows"] == list(range(header["frame"]["rows"])), header
+        assert header["rows"] == list(range(header.get("frame")["rows"])), header
         assert b"H" in cells
         # Selection commands and Copy share the frontend's ordered stream.
         # A missing selection must produce an error, never an empty copy packet.
@@ -171,16 +171,16 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             else:
                 command("clear-selection", pane=pane)
             command("copy", pane=pane)
-            reply = copy_reply(lambda header: header["copy"] is not None or header["error"] is not None)
+            reply = copy_reply(lambda header: header.get("event_type") == "clipboard" or header.get("error") is not None)
             if selected:
-                assert reply["copy"] == dict(destination="clipboard", content=dict(text="HEADL")) and reply["error"] is None, reply
+                assert clipboard_value(reply) == dict(destination="clipboard", content=dict(text="HEADL")) and reply.get("error") is None, reply
             else:
-                assert reply["error"] == "Select terminal text to copy it" and reply["copy"] is None, reply
+                assert reply.get("error") == "Select terminal text to copy it" and clipboard_value(reply) is None, reply
         # Selected whitespace is still a selection and may copy an empty string.
         command("select", pane=pane, start=[0, 1], end=[0, 1])
         command("copy", pane=pane)
-        reply = copy_reply(lambda header: header["copy"] is not None or header["error"] is not None)
-        assert reply["copy"] == dict(destination="clipboard", content=dict(text="")) and reply["error"] is None, reply
+        reply = copy_reply(lambda header: header.get("event_type") == "clipboard" or header.get("error") is not None)
+        assert clipboard_value(reply) == dict(destination="clipboard", content=dict(text="")) and reply.get("error") is None, reply
         command("clear-selection", pane=pane)
         while select.select([stream], [], [], 0.1)[0]:
             packet()
@@ -192,7 +192,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         # visible pane must not be mistaken for extraction of the hidden pane.
         command("subscribe", panes=[])
         command("test-hidden-ready", pane=pane)
-        copy_reply(lambda header: header["error"] and "test-hidden-ready" in header["error"])
+        copy_reply(lambda header: header.get("error") and "test-hidden-ready" in header.get("error"))
         hidden = rpc("split", pane=pane)["pane"]
         count = rpc("status")["snapshots"]
         send(hidden, "for i in $(seq 1 300); do printf 'hidden %s\\n' \"$i\"; done")
@@ -201,16 +201,16 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert rpc("status")["snapshots"] == count, "Hidden output must not extract a render snapshot"
         command("subscribe", panes=[hidden])
         header, cells = screen(hidden)
-        assert len(header["rows"]) == header["frame"]["rows"], "New subscription must resync every row"
+        assert len(header["rows"]) == header.get("frame")["rows"], "New subscription must resync every row"
         command("scroll", pane=hidden, delta=-10000, bottom=False)
         header, cells = screen(hidden, lambda header, cells: len(header["rows"]) > 0)
         text = "".join(cell[0] for cell in decode_cells(cells)).encode()
         assert b"hidden 1" in text, "Daemon must retain scrollback while hidden"
-        assert header["frame"]["scrollback"]["offset"] == 0
-        assert header["frame"]["scrollback"]["total"] > header["frame"]["rows"]
+        assert header.get("frame")["scrollback"]["offset"] == 0
+        assert header.get("frame")["scrollback"]["total"] > header.get("frame")["rows"]
         command("scroll-to", pane=hidden, row=12, serial=42)
         header, cells = screen(hidden, lambda header, cells: header["scroll_serial"] == 42)
-        assert header["frame"]["scrollback"]["offset"] == 12
+        assert header.get("frame")["scrollback"]["offset"] == 12
         stream.close()
         stream = None
         wait_for(lambda: not rpc("status")["local_clients"])
@@ -313,7 +313,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         text = "".join(cell[0] for cell in decode_cells(cells)).encode()
         assert b"hidden 1" in text, "Daemon restart must restore primary-screen history"
         command("scroll", pane=hidden, delta=0, bottom=True)
-        screen(hidden, lambda header, cells: header["frame"]["scrollback"]["offset"] > 0)
+        screen(hidden, lambda header, cells: header.get("frame")["scrollback"]["offset"] > 0)
         stream.close()
         stream = None
         restored_split = rpc("split", pane=pane)["pane"]

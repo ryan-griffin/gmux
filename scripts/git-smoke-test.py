@@ -27,7 +27,7 @@ def branch(client, name, *, pane=None, directory=None):
             and (directory is None or value["directory"] == str(directory))
     if matches(client.git.get(pane)):
         return client.git[pane]
-    return client.until(lambda header: matches(header.get("git")))["git"]
+    return client.until(lambda header: header.get("event_type") == "git" and matches(header))
 
 
 def stats(fixture):

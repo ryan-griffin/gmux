@@ -4,7 +4,7 @@ use gmux_client::{ipc, remote::SessionManager};
 use gmux_protocol::{
     Cell, Frame, Scrollback,
     theme::Theme,
-    transport::{CachedRows, Header, Metadata, Packet},
+    transport::{CachedRows, Metadata, Packet, PaneHeader},
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -66,8 +66,8 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
         if cached {
             initial.extend(cells(32, 120, long));
         }
-        let packet = Packet {
-            header: Header {
+        let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+            header: PaneHeader {
                 meta: initial_meta.clone(),
                 frame: Some(frame),
                 rows: (0..24).collect(),
@@ -76,10 +76,10 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
                     start: 32,
                     row_flags: vec![0; 120],
                 }),
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: initial,
-        };
+        });
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes)?;
         server.write_all(&bytes)?;
@@ -92,8 +92,8 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
             }
             std::thread::sleep(rtt);
             let row = command["row"].as_u64().unwrap();
-            let packet = Packet {
-                header: Header {
+            let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: initial_meta.clone(),
                     frame: Some(Frame {
                         scrollback: Scrollback {
@@ -105,10 +105,10 @@ fn run(cached: bool, rtt: Duration, tcp: bool, long: bool) -> anyhow::Result<ser
                     generation: 1,
                     scroll_serial: command["serial"].as_u64().unwrap(),
                     rows: (0..24).collect(),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: cells(row, 24, long),
-            };
+            });
             bytes.clear();
             packet.encode_into(&mut bytes)?;
             if server.write_all(&bytes).is_err() {

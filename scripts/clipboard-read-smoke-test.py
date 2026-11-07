@@ -14,7 +14,7 @@ from clipboard_test_support import ReadProbe as Probe
 
 
 def request(peer):
-    return peer.until(lambda h: h.get("clipboard_read", {}).get("kind") == "request")["clipboard_read"]["request"]
+    return peer.until(lambda h: h.get("event", {}).get("kind") == "request")["event"]["request"]
 
 
 def reply(peer, req, values=(), *, status="success", epoch=1, available=()):
@@ -70,8 +70,8 @@ with (artifacts / "clipboard-read-smoke.log").open("w") as log, AppFixture() as 
                     peer.pane = b.pane
                     peer.send("user-paste", serial=serial, destination="clipboard", epoch=1, mimes=["text/plain"])
                     wait_for(lambda: a.bytes()[before:] == b"\x1b]52;c;\x07\x1b[0n", timeout=3)
-                    peer.until(lambda h: h["meta"]["id"] == a.pane
-                               and h.get("clipboard_read") == dict(kind="cancel", id=old["id"]))
+                    peer.until(lambda h: h.get("pane") == a.pane
+                               and h.get("event") == dict(kind="cancel", id=old["id"]))
                     if rich:
                         event = wait_for(lambda: b.bytes() if b"status=DONE" in b.bytes() else None)
                         password = event.split(b":pw=", 1)[1].split(b"\x1b", 1)[0].decode()
@@ -80,7 +80,7 @@ with (artifacts / "clipboard-read-smoke.log").open("w") as log, AppFixture() as 
                         reply(peer, granted, [("text/plain", b"RICH_SPLIT_PASTE")])
                         wait_for(lambda: base64.b64encode(b"RICH_SPLIT_PASTE") in b.bytes())
                     else:
-                        peer.until(lambda h: h.get("clipboard_read") == dict(kind="paste_text", serial=serial,
+                        peer.until(lambda h: h.get("event") == dict(kind="paste_text", serial=serial,
                                    destination="clipboard", epoch=1))
                         peer.send("user-paste-text", serial=serial, epoch=1, text="PLAIN_SPLIT_PASTE")
                         wait_for(lambda: b.bytes() == b"PLAIN_SPLIT_PASTE")

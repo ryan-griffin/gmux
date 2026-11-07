@@ -18,7 +18,7 @@ daemon = cargo_binary("gmux")
 
 
 def receive(client, expected):
-    header = client.until(lambda h: h["meta"]["id"] == client.pane and h["meta"]["progress"] == expected)
+    header = client.until(lambda h: h.get("meta", {}).get("id") == client.pane and h.get("meta", {}).get("progress") == expected)
     assert header["frame"] is None and not header["rows"], header
     assert not header["notifications"], header
     assert header["meta"]["unread_sequence"] == 0, header
@@ -43,7 +43,7 @@ with scenario("standalone progress and expiry respect independent frontend inter
 
         def collect(index, expected):
             def received(header):
-                if header["meta"]["id"] != pane or header.get("error"):
+                if header.get("meta", {}).get("id") != pane or header.get("error"):
                     return False
                 assert header["frame"] is None and not header["rows"], header
                 reports[index].append((time.monotonic(), header["meta"]["progress"]))
@@ -109,7 +109,7 @@ with (artifacts / "progress-smoke.log").open("w") as log, AppFixture() as owner,
     clients = [Client(owner, pane), Client(receiver, pane, connection="owner")]
     try:
         for client in clients:
-            client.until(lambda h: h["meta"]["id"] == pane and h["frame"])
+            client.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame"))
             client.barrier(0)
         with scenario("every transition is metadata-only for local and remote frontends"):
             for code, value, state, percentage in [(1, 42, "determinate", 42), (2, None, "error", 42),
@@ -130,7 +130,7 @@ with (artifacts / "progress-smoke.log").open("w") as log, AppFixture() as owner,
             active = ProgressProbe(owner, second)
             view = Client(owner, second)
             clients.append(view)
-            view.until(lambda h: h["meta"]["id"] == second and h["frame"])
+            view.until(lambda h: h.get("meta", {}).get("id") == second and h.get("frame"))
             for client in clients:
                 client.barrier("burst-start")
             before = owner.rpc("status")
@@ -166,8 +166,8 @@ with (artifacts / "progress-smoke.log").open("w") as log, AppFixture() as owner,
                 seen = []
                 method = "progress-keepalive-barrier"
                 client.send(method)
-                client.until(lambda h: seen.append(h) or (h.get("error") and method in h["error"]))
-                assert not [h for h in seen if h["meta"]["id"] == pane and not h.get("error")], seen
+                client.until(lambda h: seen.append(h) or (h.get("error") and method in h.get("error")))
+                assert not [h for h in seen if h.get("meta", {}).get("id") == pane and not h.get("error")], seen
             assert owner.rpc("status")["sent_rows"] == before["sent_rows"]
             probe.report(2, 7)
             expected = probe.expect("error", 7)
@@ -177,14 +177,14 @@ with (artifacts / "progress-smoke.log").open("w") as log, AppFixture() as owner,
         with scenario("reconnects read the latest report and full reset clears it"):
             clients[1].close()
             clients[1] = Client(receiver, pane, connection="owner")
-            header = clients[1].until(lambda h: h["meta"]["id"] == pane)
+            header = clients[1].until(lambda h: h.get("meta", {}).get("id") == pane)
             assert header["meta"]["progress"] == expected
             clients[1].barrier(3)
             probe.write("\x1bc")
             expected = probe.expect("inactive", 0)
             # RIS can legitimately change the viewport; its progress must clear too.
             for client in clients:
-                client.until(lambda h: h["meta"]["id"] == pane and h["meta"]["progress"] == expected)
+                client.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("meta", {}).get("progress") == expected)
 
         with scenario("detached execution expires without any attached frontends"):
             for client in clients:
@@ -198,7 +198,7 @@ with (artifacts / "progress-smoke.log").open("w") as log, AppFixture() as owner,
             assert probe.progress() == dict(state="inactive", percentage=0)
             fresh = Client(owner, pane)
             clients.append(fresh)
-            header = fresh.until(lambda h: h["meta"]["id"] == pane)
+            header = fresh.until(lambda h: h.get("meta", {}).get("id") == pane)
             assert header["meta"]["progress"] == dict(state="inactive", percentage=0)
 
         with scenario("pane removal discards progress and replacement execution starts inactive"):

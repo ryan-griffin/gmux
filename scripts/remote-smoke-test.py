@@ -10,7 +10,7 @@ import subprocess
 import time
 
 from cargo_test_support import cargo_binary
-from stream_test_support import Client, PROTOCOL_VERSION
+from stream_test_support import clipboard_value, Client, PROTOCOL_VERSION
 from test_support import AppFixture, scenario, wait_for, rpc
 
 binary = cargo_binary("gmux")
@@ -212,7 +212,7 @@ Path(output).write_bytes(data)
                 try:
                     stream.send("paste", text="python3 " + " ".join(map(shlex.quote,
                         map(str, [probe, flags, output, output.name, len(expected)]))), enter=True)
-                    stream.until(lambda h: h["meta"]["title"] == output.name)
+                    stream.until(lambda h: h.get("meta", {}).get("title") == output.name)
                     for action in ("press", "repeat", "repeat", "release"):
                         stream.send("key", name="a", unshifted=97, mods=0, action=action,
                                     text="" if action == "release" else "a")
@@ -231,14 +231,14 @@ Path(output).write_bytes(data)
 
     with scenario("any client can consume viewport packets and send input over direct TCP"):
         stream = Client(client, pane, connection="server")
-        stream.until(lambda header: header["frame"] is not None)
+        stream.until(lambda header: header.get("frame") is not None)
         assert server.rpc("status")["remote_clients"] == 1
         assert not server.rpc("status")["local_clients"]
         # A sole pane is still not an implicit target for a remote stream.
         for target in ({}, {"pane": None}):
             request = dict(method="paste", text="printf 'MISSING_REMOTE_PANE\\n'", enter=True, **target)
             stream.socket.sendall((json.dumps(request) + "\n").encode())
-            rejected = stream.until(lambda header: header["error"] and "explicit pane" in header["error"])
+            rejected = stream.until(lambda header: header.get("error") and "explicit pane" in header.get("error"))
             assert rejected["meta"]["id"] == pane
         stream.send("paste", text="printf '%s%s\\n' VIEWPORT_CLIENT_ OK", clipboard=False, enter=True)
         # The independent protocol client uses the same daemon execution as the CLI.
@@ -253,12 +253,12 @@ Path(output).write_bytes(data)
         stream.output("HEARTBEAT_PASTE_OK")
         assert stream.heartbeats == 1, "A connection heartbeat did not receive its own reply"
         stream.send("paste", text="printf '\\033[3J\\033[2J\\033[H01界éZ\\r\\nabcdef\\r\\n'", enter=True)
-        stream.until(lambda h: h["frame"] is not None and stream.text().startswith("01界éZ"))
+        stream.until(lambda h: h.get("frame") is not None and stream.text().startswith("01界éZ"))
         stream.send("select", start=[4, 1], end=[3, 0], mode="rectangle", serial=19)
-        selected = stream.until(lambda h: h["selection_serial"] == 19)
+        selected = stream.until(lambda h: h.get("selection_serial") == 19)
         assert selected["selection"] == dict(start=3, end=stream.frame["cols"] + 4, shape="rectangle"), selected
         stream.send("copy")
-        assert stream.until(lambda h: h["copy"] is not None)["copy"] == dict(
+        assert clipboard_value(stream.until(lambda h: h.get("event_type") == "clipboard")) == dict(
             destination="clipboard", content=dict(text="界é\nde"))
         stream.close()
         wait_for(lambda: server.rpc("status")["remote_clients"] == 0)
@@ -317,7 +317,7 @@ Path(output).write_bytes(data)
     with scenario("local remote access persists separately and shuts down existing remote streams"):
         command(client, "connection", "add", address, "--name", "server", "--auth", "token", "--token-file", token_file)
         stream = Client(client, pane, connection="server")
-        stream.until(lambda header: header["frame"] is not None)
+        stream.until(lambda header: header.get("frame") is not None)
         command(server, "connection", "edit", "local", "--remote-access", "false")
         wait_for(lambda: server.rpc("status")["remote_clients"] == 0)
         assert server.rpc("status")["bound_address"] is None

@@ -1,5 +1,5 @@
 //! Admission metadata is checked before allocating the JSON header or payload.
-use super::{CELL_PREFIX_BYTES, Header, MAX_PACKET, Packet};
+use super::{CELL_PREFIX_BYTES, MAX_PACKET, Packet, PaneHeader, PaneUpdate};
 
 pub const RECORD_PREFIX_BYTES: usize = 20;
 pub(super) const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
@@ -8,18 +8,17 @@ pub const MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RecordKind {
-    Update = 1,
-    State = 2,
+    Pane = 1,
+    Execution = 2,
     Clipboard = 3,
+    Git = 4,
+    ClipboardRead = 5,
 }
 impl RecordKind {
-    pub(super) fn of(header: &Header) -> Self {
-        if header.copy.is_some() || header.clipboard_read.is_some() {
-            Self::Clipboard
-        } else if header.state.is_some() {
-            Self::State
-        } else {
-            Self::Update
+    pub(super) fn header_limit(self) -> usize {
+        match self {
+            Self::Clipboard | Self::ClipboardRead => crate::clipboard::MAX_HEADER_BYTES,
+            Self::Pane | Self::Execution | Self::Git => MAX_HEADER_BYTES,
         }
     }
 }
@@ -63,9 +62,11 @@ impl Record {
             u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize
         });
         let kind = match values[2] {
-            1 => RecordKind::Update,
-            2 => RecordKind::State,
+            1 => RecordKind::Pane,
+            2 => RecordKind::Execution,
             3 => RecordKind::Clipboard,
+            4 => RecordKind::Git,
+            5 => RecordKind::ClipboardRead,
             _ => anyhow::bail!("Unknown record kind"),
         };
         Self::new(values[0], values[1], kind, values[3], values[4])
@@ -89,7 +90,8 @@ impl Record {
             "Invalid record size"
         );
         anyhow::ensure!(
-            self.header <= MAX_HEADER_BYTES && self.header <= self.size - (RECORD_PREFIX_BYTES - 4),
+            self.header <= self.kind.header_limit()
+                && self.header <= self.size - (RECORD_PREFIX_BYTES - 4),
             "Invalid record header size"
         );
         anyhow::ensure!(
@@ -102,16 +104,14 @@ impl Record {
         );
         match self.kind {
             RecordKind::Clipboard => anyhow::ensure!(
-                self.cells == 0
-                    && self.header <= crate::clipboard::MAX_HEADER_BYTES
-                    && self.payload_size() <= crate::clipboard::MAX_OFFER_BYTES,
+                self.cells == 0 && self.payload_size() <= crate::clipboard::MAX_OFFER_BYTES,
                 "Invalid clipboard record"
             ),
-            RecordKind::State => anyhow::ensure!(
+            RecordKind::ClipboardRead | RecordKind::Git | RecordKind::Execution => anyhow::ensure!(
                 self.cells == 0 && self.payload_size() == 0,
-                "Invalid state record"
+                "Unexpected binary payload"
             ),
-            RecordKind::Update => {}
+            RecordKind::Pane => {}
         }
         anyhow::ensure!(
             self.decode_bytes() <= MAX_DECODE_BYTES,
@@ -125,13 +125,10 @@ impl Record {
     pub fn header_size(self) -> usize {
         self.header
     }
-    pub(super) fn size(self) -> usize {
-        self.size
-    }
     pub(super) fn cell_count(self) -> usize {
         self.cells
     }
-    fn payload_size(self) -> usize {
+    pub(super) fn payload_size(self) -> usize {
         self.size - (RECORD_PREFIX_BYTES - 4) - self.header
     }
     /// Includes JSON input and scratch, all typed header allocations, exact cell
@@ -141,52 +138,56 @@ impl Record {
             + self.payload_size()
             + self.cells * (size_of::<crate::Cell>() + 2 * size_of::<usize>())
     }
-    pub fn parse_header(self, bytes: &[u8]) -> anyhow::Result<Header> {
+    /// Decode event metadata using the framed kind. Pane cells remain empty
+    /// until read_body; clipboard buffers are allocated only after descriptors
+    /// match framing. No untyped JSON tree or trial enum decoding is involved.
+    pub fn parse_header(self, bytes: &[u8]) -> anyhow::Result<Packet> {
         anyhow::ensure!(
             bytes.len() == self.header && json_budget(bytes)? <= self.json,
             "JSON exceeds declared decode allowance"
         );
-        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-        let header = serde::de::DeserializeSeed::deserialize(
-            super::header::HeaderSeed {
-                copy_payload: Some(if self.kind == RecordKind::Clipboard {
-                    self.payload_size()
-                } else {
-                    0
-                }),
-            },
-            &mut deserializer,
-        )?;
-        deserializer.end()?;
-        anyhow::ensure!(
-            self.kind != RecordKind::Clipboard || header.copy.is_some() || self.payload_size() == 0,
-            "Missing clipboard offer"
-        );
-        anyhow::ensure!(
-            RecordKind::of(&header) == self.kind,
-            "Incorrect record kind"
-        );
-        anyhow::ensure!(
-            self.kind != RecordKind::State
-                || (header.frame.is_none() && header.rows.is_empty() && header.cache.is_none()),
-            "Mixed state record"
-        );
-        Ok(header)
+        let mut de = serde_json::Deserializer::from_slice(bytes);
+        use serde::{Deserialize, de::DeserializeSeed};
+        let packet = match self.kind {
+            RecordKind::Pane => Packet::Pane(PaneUpdate {
+                header: PaneHeader::deserialize(&mut de)?,
+                cells: Vec::new(),
+            }),
+            RecordKind::Execution => {
+                Packet::Execution(crate::control::CommandReply::deserialize(&mut de)?)
+            }
+            RecordKind::Git => Packet::Git(super::GitMetadata::deserialize(&mut de)?),
+            RecordKind::Clipboard => Packet::Clipboard(
+                crate::clipboard::wire::WriteSeed {
+                    payload: self.payload_size(),
+                }
+                .deserialize(&mut de)?,
+            ),
+            RecordKind::ClipboardRead => {
+                let read = super::ClipboardRead::deserialize(&mut de)?;
+                read.event.validate()?;
+                Packet::ClipboardRead(read)
+            }
+        };
+        de.end()?;
+        Ok(packet)
     }
     pub fn validate_packet(self, packet: &Packet) -> anyhow::Result<usize> {
         let bytes = packet.memory_size();
         anyhow::ensure!(
-            packet.cells.len() == self.cells && bytes + 256 <= self.decode_bytes(),
+            packet.kind() == self.kind
+                && packet.as_pane().map_or(0, |p| p.cells.len()) == self.cells
+                && bytes + 256 <= self.decode_bytes(),
             "Decoded record exceeds allowance"
         );
-        if let Some(copy) = &packet.header.copy {
+        if let Packet::Clipboard(copy) = packet {
             copy.validate()?;
         }
         Ok(bytes)
     }
 }
 
-/// Allocation bound for the current Header schema, computed without allocating
+/// Allocation bound for the stream payload schemas, computed without allocating
 /// or decoding strings. Numeric values never control allocation, except clipboard
 /// lengths checked separately above. Strings use at most their encoded length.
 /// Four times the input covers the input itself, serde's geometrically grown
@@ -196,7 +197,7 @@ impl Record {
 /// and String vectors. Object commas get 256 bytes for both hash tables in
 /// pane_directories, including rounding, keys and temporary storage.
 /// The largest vector struct, Metadata, is charged at its object opener instead.
-/// These constants must be audited when Header or its reachable types change.
+/// These constants must be audited when stream payloads or their reachable types change.
 /// Duplicate/unknown fields still count. Limit nesting before serde recursion.
 pub(super) fn json_budget(bytes: &[u8]) -> anyhow::Result<usize> {
     let mut budget = 4096 + 4 * bytes.len();
@@ -269,7 +270,7 @@ mod tests {
     }
     #[test]
     fn untrusted_framing_and_json_expansion_fail_before_payload_allocation() {
-        let header = serde_json::to_vec(&Header::default()).unwrap();
+        let header = serde_json::to_vec(&PaneHeader::default()).unwrap();
         let budget = json_budget(&header).unwrap();
         for (payload, cells, json) in [
             (0, usize::MAX, budget),
@@ -277,7 +278,7 @@ mod tests {
             (MAX_PACKET, 0, budget),
             (0, 0, 4096),
         ] {
-            let bytes = wire(&header, RecordKind::Update, payload, cells, json);
+            let bytes = wire(&header, RecordKind::Pane, payload, cells, json);
             let mut cursor = Cursor::new(bytes);
             assert!(Packet::read(&mut cursor).is_err());
             assert_eq!(
@@ -289,23 +290,23 @@ mod tests {
                 }
             );
         }
-        let mut value = serde_json::to_value(Header::default()).unwrap();
+        let mut value = serde_json::to_value(PaneHeader::default()).unwrap();
         value["notifications"] = serde_json::json!(vec![""; 1000]);
         let header = serde_json::to_vec(&value).unwrap();
         // Enough credit for input bytes, but not for Vec<String> expansion.
-        let bytes = wire(&header, RecordKind::Update, 0, 0, 4096 + 4 * header.len());
+        let bytes = wire(&header, RecordKind::Pane, 0, 0, 4096 + 4 * header.len());
         let error = Packet::read(&mut bytes.as_slice()).err().unwrap();
         assert!(error.to_string().contains("decode allowance"));
         value["copy"] = serde_json::json!({"destination":"clipboard", "content":[{"mime":"text/plain", "len":usize::MAX}]});
         let header = serde_json::to_vec(&value).unwrap();
-        for kind in [RecordKind::Update, RecordKind::Clipboard] {
+        for kind in [RecordKind::Pane, RecordKind::Clipboard] {
             let bytes = wire(&header, kind, 0, 0, json_budget(&header).unwrap());
             assert!(Packet::read(&mut bytes.as_slice()).is_err());
         }
         // Under-reporting cells cannot shrink admission below the allocation
         // required by the actual frame, even with a valid JSON allowance.
-        let packet = Packet {
-            header: Header {
+        let packet = Packet::Pane(PaneUpdate {
+            header: PaneHeader {
                 frame: Some(crate::Frame {
                     cols: 1,
                     rows: 1,
@@ -315,7 +316,7 @@ mod tests {
                 ..Default::default()
             },
             cells: vec![crate::Cell::default()],
-        };
+        });
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         bytes[16..20].copy_from_slice(&0u32.to_le_bytes());
@@ -323,14 +324,17 @@ mod tests {
         assert!(Packet::read(&mut reader).is_err());
         assert_eq!(
             reader.position(),
-            (RECORD_PREFIX_BYTES + serde_json::to_vec(&packet.header).unwrap().len()) as u64
+            (RECORD_PREFIX_BYTES
+                + serde_json::to_vec(&packet.as_pane().unwrap().header)
+                    .unwrap()
+                    .len()) as u64
         );
         // Even a huge escape/unknown subtree cannot bypass the scanner.
         assert!(json_budget(format!("{}0{}", "[".repeat(65), "]".repeat(65)).as_bytes()).is_err());
     }
     #[test]
     fn strings_cannot_change_the_structural_allocation_bound() {
-        let mut header = Header::default();
+        let mut header = PaneHeader::default();
         let empty = serde_json::to_vec(&header).unwrap();
         let structural = json_budget(&empty).unwrap() - 4 * empty.len();
         // Exercise even/odd backslash runs, adjacent escaped quotes, all JSON
@@ -347,18 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn header_seed_checks_escaped_copy_keys_lengths_and_required_fields() {
-        let value = serde_json::to_value(Header::default()).unwrap();
-        for field in ["meta", "scroll_serial", "rows", "notifications"] {
-            let mut missing = value.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(serde_json::from_value::<Header>(missing).is_err());
-        }
-        let mut value = value;
-        value["copy"] = serde_json::json!({"destination":"clipboard", "content":[{"mime":"text/plain", "len":super::super::MAX_PASTE}]});
-        let json = serde_json::to_string(&value)
-            .unwrap()
-            .replace("\"copy\"", r#""\u0063\u006f\u0070\u0079""#);
+    fn clipboard_seed_checks_escaped_keys_lengths_and_duplicate_fields() {
+        let json =
+            r#"{"destination":"clipboard","\u0063ontent":[{"mime":"text/plain","len":4194304}]}"#;
         let bytes = wire(
             json.as_bytes(),
             RecordKind::Clipboard,
@@ -366,28 +361,40 @@ mod tests {
             0,
             json_budget(json.as_bytes()).unwrap(),
         );
-        let mut reader = Cursor::new(&bytes);
-        let error = Packet::read(&mut reader).err().unwrap().to_string();
-        assert!(error.contains("clipboard payload length"));
+        let error = Packet::read(&mut bytes.as_slice())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("clipboard payload length"), "{error}");
         #[cfg(feature = "async")]
-        {
-            let mut reader = bytes.as_slice();
-            let error = futures_lite::future::block_on(Packet::read_message_async(&mut reader))
+        assert!(
+            futures_lite::future::block_on(Packet::read_message_async(&mut bytes.as_slice()))
                 .err()
                 .unwrap()
-                .to_string();
-            assert!(error.contains("clipboard payload length"));
-        }
-        let mut json = serde_json::to_string(&Header::default()).unwrap();
-        json.pop();
-        json.push_str(r#", "\u0063opy":null}"#);
+                .to_string()
+                .contains("clipboard payload length")
+        );
+        let json = br#"{"destination":"clipboard","content":null,"\u0063ontent":null}"#;
+        let bytes = wire(
+            json,
+            RecordKind::Clipboard,
+            0,
+            0,
+            json_budget(json).unwrap(),
+        );
         assert!(
-            serde_json::from_str::<Header>(&json)
+            Packet::read(&mut bytes.as_slice())
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("duplicate field")
         );
+        let value = serde_json::to_value(PaneHeader::default()).unwrap();
+        for field in ["meta", "scroll_serial", "rows", "notifications"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<PaneHeader>(missing).is_err());
+        }
     }
 
     #[test]
@@ -397,8 +404,8 @@ mod tests {
         assert!(2 * size_of::<crate::model::ExecutionTab>() < 2048);
         assert!(4 * size_of::<crate::model::PaneTree>() < 2048);
         for count in [0, 1, 4, 5, 127, 128, 129, 1025] {
-            let packet = Packet {
-                header: Header {
+            let packet = Packet::Pane(PaneUpdate {
+                header: PaneHeader {
                     notifications: vec![String::new(); count],
                     find: Some(crate::search::FindState {
                         highlights: vec![(1, 2, 0); count],
@@ -407,7 +414,7 @@ mod tests {
                     ..Default::default()
                 },
                 cells: vec![],
-            };
+            });
             let mut bytes = Vec::new();
             packet.encode_into(&mut bytes).unwrap();
             let record = Record::decode(bytes[..RECORD_PREFIX_BYTES].try_into().unwrap()).unwrap();
@@ -431,7 +438,7 @@ mod benchmark {
             ("escaped", "\\\"".repeat(2 * 1024 * 1024), 1, 32),
             ("strings", String::new(), 20000, 100),
         ] {
-            let header = Header {
+            let header = PaneHeader {
                 notifications: vec![text; count],
                 ..Default::default()
             };
@@ -439,7 +446,7 @@ mod benchmark {
             let record = Record::new(
                 RECORD_PREFIX_BYTES - 4 + bytes.len(),
                 bytes.len(),
-                RecordKind::Update,
+                RecordKind::Pane,
                 json_budget(&bytes).unwrap(),
                 0,
             )
@@ -451,7 +458,7 @@ mod benchmark {
             let scan = start.elapsed().as_nanos() / iterations;
             let start = Instant::now();
             for _ in 0..iterations {
-                black_box(serde_json::from_slice::<Header>(black_box(&bytes)).unwrap());
+                black_box(serde_json::from_slice::<PaneHeader>(black_box(&bytes)).unwrap());
             }
             let typed = start.elapsed().as_nanos() / iterations;
             let start = Instant::now();

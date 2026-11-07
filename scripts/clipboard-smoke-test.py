@@ -11,7 +11,7 @@ import time
 from clipboard_test_support import PNG, check_html, kitty_write
 from cargo_test_support import cargo_binary
 from progress_test_support import ProgressProbe
-from stream_test_support import Client
+from stream_test_support import clipboard_value, Client
 from test_support import AppFixture, scenario, wait_for
 
 root = Path(__file__).resolve().parent.parent
@@ -52,9 +52,9 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
 
     def collect(peer, predicate):
         def inspect(header):
-            if header.get("copy") is not None:
-                assert header["frame"] is None and not header["rows"], header
-                received[peer].append(header["copy"])
+            if header.get("event_type") == "clipboard":
+                assert "frame" not in header and "rows" not in header, header
+                received[peer].append(clipboard_value(header))
             return predicate(header)
         return peer.until(inspect)
 
@@ -76,7 +76,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
         return writes
 
     def expect(peer, text, destination="clipboard"):
-        collect(peer, lambda h: h.get("copy") == dict(destination=destination, content=None if text is None else dict(text=text)))
+        collect(peer, lambda h: clipboard_value(h) == dict(destination=destination, content=None if text is None else dict(text=text)))
         assert take(peer) == [dict(destination=destination, content=None if text is None else dict(text=text))]
 
     try:
@@ -130,7 +130,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
                 emit(kitty_write(formats, commit=False))
                 assert not take(peer), "Uncommitted alternatives escaped"
                 emit("\x1b]5522;type=wdata\x1b\\")
-                collect(peer, lambda h: h.get("copy") == expected)
+                collect(peer, lambda h: clipboard_value(h) == expected)
                 assert take(peer) == [expected]
                 assert not take(other) and not take(observer)
                 emit(kitty_write([("text/plain", b"")], destination="primary"))
@@ -179,7 +179,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
                     peer.send("clear-selection", serial=1)
                     peer.send("select", start=start, end=end, mode=mode, serial=2)
                     peer.send("copy", formats="text-html")
-                    collect(peer, lambda h: h.get("copy") is not None)
+                    collect(peer, lambda h: h.get("event_type") == "clipboard")
                     writes = take(peer)
                     assert len(writes) == 1, writes
                     parsed = check_html(writes[0]["content"], expected)
@@ -194,7 +194,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
                 peer.send("clear-selection", serial=3)
                 peer.send("select", start=[start, 0], end=[end, 0], serial=4)
                 peer.send("copy", formats="text-html")
-                collect(peer, lambda h: h.get("copy") is not None)
+                collect(peer, lambda h: h.get("event_type") == "clipboard")
                 content = take(peer)[0]["content"]
                 check_html(content, expected)
                 assert "color: #abcdef" in content["html"] and "color:#123456" in content["html"]
@@ -212,7 +212,7 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
                 peer.send("clear-selection", serial=5)
                 peer.send("select", start=[0, 0], end=[999, 99], serial=6)
                 peer.send("copy", formats="text-html")
-                collect(peer, lambda h: h.get("copy") is not None)
+                collect(peer, lambda h: h.get("event_type") == "clipboard")
                 content = take(peer)[0]["content"]
                 assert content == dict(text="x" * 100_000), (content.keys(), len(content["text"]))
             for peer in [first, second]:

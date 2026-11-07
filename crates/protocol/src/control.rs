@@ -384,6 +384,7 @@ impl From<CommandOutput> for CommandResult {
     }
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandReply {
     pub daemon: crate::model::DaemonId,
     pub home_directory: PathBuf,

@@ -6,7 +6,7 @@ use execution::SavedExecution;
 use gmux_protocol::{
     control::{CommandOutput, CommandReply, ExecutionRequest},
     model::{DaemonId, ExecutionTab, MachineKind, PaneTree},
-    transport::{Header, Packet},
+    transport::Packet,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -131,26 +131,23 @@ fn run(tabs: u64, checkpoints: bool) -> anyhow::Result<serde_json::Value> {
     let allocations = ALLOCATIONS.load(Relaxed) / iterations;
     let allocated_bytes = BYTES.load(Relaxed) / iterations;
     timings.sort_unstable();
-    let packet = Packet {
-        header: Header {
-            state: Some(CommandReply {
-                daemon: DaemonId::from_bytes([1; 16]),
-                home_directory: "/home/test".into(),
-                machine_kind: MachineKind::Server,
-                hostname: "benchmark".into(),
-                revision: 1,
-                result: CommandOutput::Done { ok: true }.into(),
-                execution: saved.snapshot(),
-                metadata: vec![],
-            }),
-            ..Header::default()
-        },
-        cells: vec![],
-    };
+    let packet = Packet::Execution(CommandReply {
+        daemon: DaemonId::from_bytes([1; 16]),
+        home_directory: "/home/test".into(),
+        machine_kind: MachineKind::Server,
+        hostname: "benchmark".into(),
+        revision: 1,
+        result: CommandOutput::Done { ok: true }.into(),
+        execution: saved.snapshot(),
+        metadata: vec![],
+    });
     let mut wire = Vec::new();
     packet.encode_into(&mut wire)?;
     let decoded = Packet::read(&mut wire.as_slice())?;
-    let reply_bytes = serde_json::to_vec(packet.header.state.as_ref().unwrap())?;
+    let Packet::Execution(reply) = &packet else {
+        unreachable!()
+    };
+    let reply_bytes = serde_json::to_vec(reply)?;
     let json_decode = measure_decode(&reply_bytes, false)?;
     let typed_decode = measure_decode(&reply_bytes, true)?;
     Ok(serde_json::json!({

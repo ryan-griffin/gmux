@@ -11,20 +11,30 @@ impl Packet {
     /// Hash tables include a conservative allowance for spare buckets and controls;
     /// allocator bookkeeping is excluded, as it is for the other allocations.
     pub fn memory_size(&self) -> usize {
-        let header = &self.header;
+        let update = match self {
+            Self::Execution(state) => return size_of::<Self>() + state_size(state),
+            Self::Git(git) => {
+                return size_of::<Self>() + git.directory.capacity() + git.branch.capacity();
+            }
+            Self::Clipboard(write) => {
+                return size_of::<Self>()
+                    + write
+                        .content
+                        .as_ref()
+                        .map_or(0, crate::clipboard::Offer::memory_size);
+            }
+            Self::ClipboardRead(read) => return size_of::<Self>() + read.event.memory_size(),
+            Self::Pane(update) => update,
+        };
+        let header = &update.header;
         size_of::<Self>()
-            + header.state.as_ref().map_or(0, state_size)
-            + self.cells.capacity() * size_of::<crate::Cell>()
-            + self
+            + update.cells.capacity() * size_of::<crate::Cell>()
+            + update
                 .cells
                 .iter()
                 .map(crate::Cell::heap_bytes)
                 .sum::<usize>()
             + metadata_size(&header.meta)
-            + header
-                .git
-                .as_ref()
-                .map_or(0, |git| git.directory.capacity() + git.branch.capacity())
             + header.rows.capacity() * size_of::<u16>()
             + header
                 .hyperlinks
@@ -42,15 +52,6 @@ impl Packet {
                 .map(String::capacity)
                 .sum::<usize>()
             + header.error.as_ref().map_or(0, String::capacity)
-            + header
-                .copy
-                .as_ref()
-                .and_then(|write| write.content.as_ref())
-                .map_or(0, crate::clipboard::Offer::memory_size)
-            + header
-                .clipboard_read
-                .as_ref()
-                .map_or(0, crate::clipboard::ReadEvent::memory_size)
             + header.find.as_ref().map_or(0, |find| {
                 find.highlights.capacity() * size_of::<(usize, usize, u8)>()
             })

@@ -164,7 +164,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
     with scenario("remote access saves leave status and terminal streams responsive under a held file lock"):
         pane = fixture.rpc("list")["tabs"][0]["panes"][0]["id"]
         stream = Client(fixture, pane)
-        stream.until(lambda header: header["frame"] is not None)
+        stream.until(lambda header: header.get("frame") is not None)
         current = fixture.rpc("remote-access-get")
         settings = dict(current["remote_access"], enabled=False)
         latencies = []
@@ -200,7 +200,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
             assert fixture.rpc("status")["bound_address"] == destination
             assert fixture.rpc("remote-access-get")["remote_access"]["listen_address"] == destination
             connected = Client(fixture, pane, address=address)
-            connected.until(lambda header: header["frame"] is not None)
+            connected.until(lambda header: header.get("frame") is not None)
             connected.close()
 
     with scenario("the daemon validates saved execution and reports startup failure in its log"):

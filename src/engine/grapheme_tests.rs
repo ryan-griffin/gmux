@@ -1,5 +1,5 @@
 use super::*;
-use gmux_protocol::transport::{Header, Packet};
+use gmux_protocol::transport::{Packet, PaneHeader};
 use std::{hint::black_box, time::Instant};
 
 #[test]
@@ -22,14 +22,14 @@ fn grapheme_measurements() {
             black_box(engine.snapshot().unwrap());
         }
         let snapshot_us = start.elapsed().as_secs_f64() * 1e6 / n as f64;
-        let packet = Packet {
-            header: Header {
+        let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+            header: PaneHeader {
                 frame: Some(engine.frame),
                 rows: (0..40).collect(),
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: engine.cells.clone(),
-        };
+        });
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         let wire_bytes = bytes.len();
@@ -114,22 +114,22 @@ fn complete_native_clusters_survive_views_history_transport_copy_search_and_refl
         engine.scroll_to(0);
         engine.snapshot().unwrap();
         assert!(engine.cells[..8] == original);
-        let packet = Packet {
-            header: Header {
+        let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+            header: PaneHeader {
                 frame: Some(engine.frame),
                 rows: (0..3).collect(),
                 cache: Some(gmux_protocol::transport::CachedRows {
                     start: 0,
                     row_flags: flags,
                 }),
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: engine.cells.iter().chain(&history).cloned().collect(),
-        };
+        });
         let mut wire = Vec::new();
         packet.encode_into(&mut wire).unwrap();
         let decoded = Packet::read(&mut wire.as_slice()).unwrap();
-        assert!(decoded.cells == packet.cells);
+        assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
         engine.select((0, 0), (0, 0), SelectionMode::Cell).unwrap();
         let content = engine
             .copy_content(gmux_protocol::clipboard::Formats::TextHtml)

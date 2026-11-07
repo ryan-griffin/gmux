@@ -191,7 +191,7 @@ fn connection_names_remain_routable_independently_of_live_status() {
 
 #[test]
 fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_stale_metadata() {
-    use gmux_protocol::transport::{Header, Metadata, Packet};
+    use gmux_protocol::transport::{Metadata, Packet};
     use std::{
         io::Write,
         time::{Duration, Instant},
@@ -233,13 +233,7 @@ fn control_and_stream_snapshots_allow_immediate_attachment_without_accepting_sta
             .unwrap();
         assert_eq!(handle.borrow().title(), "control");
 
-        let packet = Packet {
-            header: Header {
-                state: Some(with_metadata(f.execution(host, 2, 3), "stream")),
-                ..Default::default()
-            },
-            cells: Vec::new(),
-        };
+        let packet = Packet::Execution(with_metadata(f.execution(host, 2, 3), "stream"));
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         peer.write_all(&bytes).unwrap();
@@ -303,7 +297,7 @@ fn stream_loss_updates_local_and_remote_status_without_discarding_cached_executi
 
 #[test]
 fn rejected_stream_state_preserves_cached_views_and_the_disconnect_reason() {
-    use gmux_protocol::transport::{Header, Metadata, Packet};
+    use gmux_protocol::transport::{Metadata, Packet};
     use std::{
         io::Write,
         time::{Duration, Instant},
@@ -327,13 +321,7 @@ fn rejected_stream_state_preserves_cached_views_and_the_disconnect_reason() {
     f.hub.project_execution(snapshot).unwrap();
     let pane = PaneRef { daemon, id: 2 };
     let view = f.hub.attach(pane, &Theme::adwaita(true)).unwrap();
-    let packet = Packet {
-        header: Header {
-            state: Some(f.execution(0, 1, 2)),
-            ..Default::default()
-        },
-        cells: vec![],
-    };
+    let packet = Packet::Execution(f.execution(0, 1, 2));
     let mut bytes = Vec::new();
     packet.encode_into(&mut bytes).unwrap();
     peer.write_all(&bytes).unwrap();

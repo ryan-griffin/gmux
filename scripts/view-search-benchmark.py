@@ -19,7 +19,7 @@ class SearchClient(Client):
 
     def until(self, predicate):
         def observe(header):
-            if header['find'] is not None:
+            if header.get('find') is not None:
                 self.find_state = header['find']
             return predicate(header)
         return super().until(observe)
@@ -27,7 +27,7 @@ class SearchClient(Client):
     def settled_output(self, marker):
         self.output(marker)
         if self.find_state is not None and self.find_state['pending']:
-            self.until(lambda h: h['find'] is not None and not h['find']['pending'])
+            self.until(lambda h: h.get('find') is not None and not h['find']['pending'])
         return self.find_state
 
 
@@ -65,7 +65,7 @@ def run(args):
             at = time.monotonic()
             peer.send('find', query=query)
             def completed():
-                state = peer.until(lambda h: h['find'] is not None and not h['find']['pending']
+                state = peer.until(lambda h: h.get('find') is not None and not h['find']['pending']
                     and (h['find']['total'] or h['find'].get('resource_limited')))['find']
                 return dict(ms=(time.monotonic()-at)*1000, state=state | dict(highlights=[]))
             with ThreadPoolExecutor(max_workers=1) as worker:
@@ -102,7 +102,7 @@ def run(args):
                     expected = total if previous else 1
                     start = time.monotonic()
                     peer.send('find-advance', previous=previous)
-                    state = peer.until(lambda h: h['find'] is not None and h['find']['current'] == expected)['find']
+                    state = peer.until(lambda h: h.get('find') is not None and h['find']['current'] == expected)['find']
                     report['navigation_ms'].append((time.monotonic()-start)*1000)
                     assert state['total'] == total
         # A second scan keeps the old complete index while building the new one.
@@ -111,7 +111,7 @@ def run(args):
         peers[0].output('RESCAN_READY')
         sample('rescan')
         if peers[0].find_state['pending']:
-            peers[0].until(lambda h: h['find'] is not None and not h['find']['pending'])
+            peers[0].until(lambda h: h.get('find') is not None and not h['find']['pending'])
         report['rescan_ms'] = (time.monotonic() - rescan_started) * 1000
         sample('rescan_complete')
         fixture.rpc('send', pane=pane, text="printf '\\033[?2026hHOLD_READY'; sleep .5; printf '\\033[?2026l'", paste=True, enter=True)
@@ -130,7 +130,7 @@ def run(args):
             assert report['samples']['hidden']['resources']['search_bytes'] == report['samples']['settled']['resources']['search_bytes']
         for peer in peers:
             peer.send('find', query='')
-            peer.until(lambda h: h['find'] is not None and not h['find']['pending']
+            peer.until(lambda h: h.get('find') is not None and not h['find']['pending']
                        and h['find']['total'] == 0 and not h['find'].get('resource_limited'))
         sample('cancelled')
         fixture.rpc('close', pane=pane)
