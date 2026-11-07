@@ -646,7 +646,12 @@ The client benchmark compares cached and uncached viewport updates with a
 simulated reply delay, defaulting to 100 ms. Arguments select delay, transport
 `unix` or `tcp`, and text `ascii` or `long`. For example, `-- 0 tcp long` uses
 loopback TCP without an added delay and 260-byte cell text. TCP disables Nagle
-on both ends. Reports include retained prediction-cache bytes after the initial
+on both ends. Reports include combined allocation/reallocation counts and
+cumulative allocated bytes on the calling frontend thread during the 40 scroll
+samples, excluding the simulated daemon and shared I/O executor. The timing vector
+and assertion strings are allocated before counting; poll results, command
+encoding, and first-use prediction storage are included.
+Reports also include retained prediction-cache bytes after the initial
 120-row prefetch; shared overflow text is charged per owning cell. Long text can
 evict part of that window within the client's 2 MiB budget. The benchmark measures
 the session snapshot, excluding GTK and display presentation. The frontend-input

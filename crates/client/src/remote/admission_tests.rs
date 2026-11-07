@@ -1,4 +1,5 @@
 use super::*;
+use gmux_protocol::Cell;
 use gmux_protocol::transport::{PaneHeader, RECORD_PREFIX_BYTES, Record};
 use tokio::io::AsyncWriteExt;
 
