@@ -123,7 +123,9 @@ impl PaneViewState {
 }
 
 pub(super) struct Frontend {
-    pub(super) socket: UnixStream,
+    pub(super) socket: super::connection::Socket,
+    read_closed: bool,
+    pub(super) drain_deadline: Option<Instant>,
     panes: HashMap<u64, PaneViewState>,
     pub(super) input: Vec<u8>,
     read_buffer: Vec<u8>,
@@ -228,9 +230,14 @@ impl Frontend {
     fn queue_clipboard(&mut self, write: gmux_protocol::clipboard::Write) -> anyhow::Result<()> {
         self.queue(Packet::Clipboard(write))
     }
-    pub(super) fn new(socket: UnixStream, budget: &resources::OutputBudget) -> Self {
+    pub(super) fn new(
+        socket: impl Into<super::connection::Socket>,
+        budget: &resources::OutputBudget,
+    ) -> Self {
         Self {
-            socket,
+            socket: socket.into(),
+            read_closed: false,
+            drain_deadline: None,
             input: Vec::new(),
             read_buffer: Vec::new(),
             read_offset: 0,
@@ -264,12 +271,46 @@ impl Frontend {
         self.output.queue_encoded(bytes)
     }
     pub(super) fn flush(&mut self) -> anyhow::Result<()> {
-        self.output.flush(&mut self.socket)
+        anyhow::ensure!(!self.socket.cancelled(), "Frontend cancelled");
+        // TCP send work runs on the owner now. Bound the send work between
+        // unrelated input turns, even with a large writable TCP window.
+        let bytes = if matches!(self.socket, super::connection::Socket::Remote(_)) {
+            64 * 1024
+        } else {
+            256 * 1024
+        };
+        self.output.flush(&mut self.socket, bytes)?;
+        // Flush accepted replies before releasing a write-half-closed channel.
+        anyhow::ensure!(
+            !(self.read_closed && self.output.is_empty()),
+            "Frontend drained"
+        );
+        Ok(())
+    }
+    pub(super) fn poll_events(&self) -> i16 {
+        (if self.read_closed { 0 } else { libc::POLLIN })
+            | if self.output.is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            }
+            | if self.drain_deadline.is_none() {
+                libc::POLLRDHUP
+            } else {
+                0
+            }
+    }
+    pub(super) fn note_events(&mut self, events: i16) {
+        if events & (libc::POLLRDHUP | libc::POLLHUP) != 0 {
+            self.drain_deadline
+                .get_or_insert_with(|| Instant::now() + gmux_protocol::network::TIMEOUT);
+        }
     }
     pub(super) fn input_pending(&self) -> bool {
         self.read_offset < self.read_buffer.len()
     }
     pub(super) fn requests(&mut self) -> anyhow::Result<Vec<StreamRequest>> {
+        anyhow::ensure!(!self.socket.cancelled(), "Frontend cancelled");
         anyhow::ensure!(!self.output.closed(), "Frontend output budget exhausted");
         // Keep the decoded batch small even for empty or invalid JSON lines.
         // The unread suffix survives the request limit and schedules another turn.
@@ -278,6 +319,9 @@ impl Frontend {
         let mut reads = 0;
         while budget > 0 && requests.len() < MAX_REQUESTS_PER_VISIT {
             if !self.input_pending() {
+                if self.read_closed {
+                    break;
+                }
                 if reads == 32 {
                     break;
                 }
@@ -289,7 +333,12 @@ impl Frontend {
                     self.read_buffer.clear();
                 }
                 match result {
-                    Ok(0) => anyhow::bail!("Frontend disconnected"),
+                    Ok(0) => {
+                        self.read_closed = true;
+                        self.read_buffer.clear();
+                        self.note_events(libc::POLLRDHUP);
+                        break;
+                    }
                     Ok(n) => self.read_buffer.truncate(n),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -470,6 +519,21 @@ impl Daemon {
         );
         Ok(true)
     }
+    pub(super) fn admit_remote(&mut self, stream: super::network::Stream) -> anyhow::Result<bool> {
+        if self.frontends.len() >= resources::MAX_FRONTENDS || stream.connection.cancelled() {
+            return Ok(false);
+        }
+        self.next_frontend += 1;
+        let id = self.next_frontend;
+        let mut frontend = Frontend::new(
+            super::connection::Socket::Remote(stream.connection),
+            &self.output_budget,
+        );
+        frontend.read_buffer = stream.prefix;
+        self.input(id, &mut frontend, stream.attach)?;
+        self.frontends.insert(id, frontend);
+        Ok(true)
+    }
     pub(super) fn clipboard_recipient(&self, pane: u64) -> Option<u64> {
         self.frontends
             .iter()
@@ -539,8 +603,13 @@ impl Daemon {
 
     pub(super) fn flush_frontends_budgeted(&mut self, budget: &mut gmux_platform::work::Budget) {
         let before = self.frontends.len();
-        self.frontends
-            .retain(|_, frontend| !frontend.output.closed());
+        self.frontends.retain(|_, frontend| {
+            !frontend.output.closed()
+                && !frontend.socket.cancelled()
+                && !frontend
+                    .drain_deadline
+                    .is_some_and(|at| Instant::now() >= at)
+        });
         let mut ids: Vec<_> = self.frontends.keys().copied().collect();
         ids.sort_unstable();
         let start = ids.partition_point(|id| *id <= self.flush_cursor);
@@ -581,7 +650,8 @@ impl Daemon {
                 );
                 anyhow::ensure!(daemon == self.id, "Frontend attached to a different daemon");
                 frontend.attached = true;
-                frontend.remote = remote;
+                frontend.remote =
+                    remote || matches!(frontend.socket, super::connection::Socket::Remote(_));
                 return Ok(());
             }
             StreamCommand::Invalid { message, .. } => {
@@ -1783,7 +1853,7 @@ mod tests {
         // Input EOF, rather than a write, detects an idle peer's teardown.
         daemon
             .frontends
-            .retain(|_, frontend| frontend.requests().is_ok());
+            .retain(|_, frontend| frontend.requests().is_ok() && frontend.flush().is_ok());
         assert_eq!(daemon.frontends.len(), resources::MAX_FRONTENDS - 1);
         let (socket, _peer) = UnixStream::pair().unwrap();
         assert!(daemon.admit_frontend(socket).unwrap());

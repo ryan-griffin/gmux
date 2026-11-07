@@ -59,13 +59,15 @@ pub fn run() -> anyhow::Result<()> {
     }
     let _cleanup = SocketCleanup(stream_path);
     let mut daemon = Daemon::new()?;
-    daemon.remote_access = remote_access::RemoteAccess::start(daemon.id)?;
+    let (dispatch, incoming) = network::Dispatch::new(wake.clone(), server.admission.clone());
+    daemon.remote_access = remote_access::RemoteAccess::start(daemon.id, dispatch)?;
     let mut persistence = Worker::new(wake.clone());
     // Optional cache cleanup must not rewrite execution.json during startup.
     persistence.submit(Save::Prune, SaveMode::Explicit)?;
     let mut saving: Option<PendingControl> = None;
     let mut controls = VecDeque::new();
     let mut control_pending = false;
+    let mut remote_turn = false;
     let mut next_metadata = Instant::now();
     let mut next_held = Instant::now();
     let mut quit_at = None;
@@ -121,13 +123,12 @@ pub fn run() -> anyhow::Result<()> {
         for (&id, frontend) in &daemon.frontends {
             let index = fds.len();
             fds.push(libc::pollfd {
-                fd: frontend.socket.as_raw_fd(),
-                events: libc::POLLIN
-                    | if frontend.output.is_empty() {
-                        0
-                    } else {
-                        libc::POLLOUT
-                    },
+                fd: if frontend.poll_events() == 0 {
+                    -1
+                } else {
+                    frontend.socket.as_raw_fd()
+                },
+                events: frontend.poll_events(),
                 revents: 0,
             });
             frontend_indices.push((id, index));
@@ -153,6 +154,11 @@ pub fn run() -> anyhow::Result<()> {
         let mut deadline = quit_at;
         for next in [
             daemon.clipboard_deadline(),
+            daemon
+                .frontends
+                .values()
+                .filter_map(|f| f.drain_deadline)
+                .min(),
             (!ready.is_empty() || !frontend_ready.is_empty() || control_pending).then_some(now),
             daemon
                 .sessions
@@ -250,6 +256,11 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         for &(id, index) in &frontend_indices {
+            daemon
+                .frontends
+                .get_mut(&id)
+                .unwrap()
+                .note_events(fds[index].revents);
             if fds[index].revents != 0 || daemon.frontends[&id].input_pending() {
                 frontend_ready.push(id);
             }
@@ -296,6 +307,9 @@ pub fn run() -> anyhow::Result<()> {
                 daemon.resize_sessions(None);
             }
         }
+        // Revoked or timed-out remote requests release their payloads even
+        // while a preceding durable save is still pending.
+        controls.retain(|request: &ControlRequest| !request.cancelled());
         let mut control_budget = gmux_platform::work::Budget::new(Duration::from_millis(2), 32);
         while saving.is_none() && control_budget.take() {
             let Some(request) = controls.pop_front() else {
@@ -309,17 +323,49 @@ pub fn run() -> anyhow::Result<()> {
                 control_pending = true;
                 break;
             }
-            let Ok(request) = server.receiver.try_recv() else {
+            // Alternate sources so a saturated remote dispatch queue cannot
+            // starve Unix control, or vice versa. Handoffs share this work budget.
+            remote_turn = !remote_turn;
+            let remote = if remote_turn {
+                incoming.try_recv().ok()
+            } else {
+                None
+            };
+            let local = if remote.is_none() {
+                server.receiver.try_recv().ok()
+            } else {
+                None
+            };
+            let remote = remote.or_else(|| {
+                if local.is_none() {
+                    incoming.try_recv().ok()
+                } else {
+                    None
+                }
+            });
+            let request = if let Some(incoming) = remote {
+                match incoming {
+                    network::Incoming::Stream(stream) => {
+                        if daemon.admit_remote(stream).unwrap_or(false) {
+                            next_metadata = Instant::now();
+                        }
+                        continue;
+                    }
+                    network::Incoming::Control(request) => request,
+                }
+            } else if let Some(request) = local {
+                let method = request.body["method"].as_str().unwrap_or("");
+                if remote_access::RemoteAccess::handles(method) {
+                    daemon.remote_access.handle(daemon.id, request);
+                    continue;
+                }
+                let Some(request) = ControlRequest::decode(request) else {
+                    continue;
+                };
+                request
+            } else {
                 control_pending = false;
                 break;
-            };
-            let method = request.body["method"].as_str().unwrap_or("");
-            if remote_access::RemoteAccess::handles(method) {
-                daemon.remote_access.handle(daemon.id, request);
-                continue;
-            }
-            let Some(request) = ControlRequest::decode(request) else {
-                continue;
             };
             if saving.is_some() && request.body.mutates_state() && !daemon.quitting {
                 controls.push_back(request);

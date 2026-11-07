@@ -162,10 +162,28 @@ packets and stream commands. `crates/protocol/src/network.rs` defines handshakes
 and bounded JSON framing. `crates/client/src/network.rs` authenticates outgoing
 TCP connections. The client uses async socket I/O and deadlines; the daemon uses
 `gmux-platform::tcp` for deadline-aware blocking handshakes.
-`src/daemon/network.rs` accepts incoming TCP connections and
-forwards execution requests and streams. `src/daemon/remote_access.rs` owns
-listener configuration and lifecycle. There is no outgoing connection registry
-or proxy in the daemon.
+`src/daemon/network.rs` admits up to 32 TCP connections across setup, control,
+and stream channels. Short-lived workers authenticate and validate Attach with
+absolute deadlines. A bounded, wakeable dispatch queue transfers the socket,
+typed Attach, and any read-ahead bytes to the existing frontend owner loop.
+`src/daemon/connection.rs` provides Unix/TCP socket I/O for the same frontend
+parser, output budget, viewport encoder, and fair work queues.
+
+`src/daemon/network/control.rs` runs one nonblocking control reactor per enabled
+listener. It deserializes public execution requests and submits them directly to
+`PendingControl`, the same command and persistence path as Unix control requests.
+Each connection waits for its previous completion and reply write before admitting
+the next command. Remote requests and Unix handlers share the platform's 64-slot
+control admission allowance. Completion notifications wake the reactor; the PTY owner never
+waits for socket I/O or storage. The accept thread and control reactor remain
+separate so pausing/rebinding a listener can retain clients during rollback.
+
+`src/daemon/remote_access.rs` owns listener configuration and lifecycle. A shared
+connection owns its descriptor and admission slot through setup, handoff, and
+service. The listener registry holds weak references. Revocation shuts down the
+socket, marks queued commands cancelled, and wakes both loops. Setup workers are
+cancelled and joined on listener teardown. There is no Unix self-proxy or outgoing
+connection registry in the daemon.
 
 See [background sessions](terminal-sessions.md) for lifecycle and protocol limits.
 

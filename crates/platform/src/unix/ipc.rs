@@ -68,12 +68,34 @@ impl AsRawFd for Wake {
     }
 }
 
+/// Shared admission for local handlers and directly dispatched remote controls.
+#[derive(Clone, Default)]
+pub struct ControlAdmission(Arc<std::sync::atomic::AtomicUsize>);
+pub struct ControlSlot(ControlAdmission);
+impl ControlAdmission {
+    pub fn acquire(&self) -> Option<ControlSlot> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                (active < 64).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| ControlSlot(self.clone()))
+    }
+}
+impl Drop for ControlSlot {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct Request {
     pub body: Value,
     pub reply: mpsc::SyncSender<Value>,
 }
 pub struct Server {
     pub receiver: mpsc::Receiver<Request>,
+    pub admission: ControlAdmission,
     path: PathBuf,
     stop: Wake,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -117,7 +139,8 @@ impl Server {
         let stop = Wake::new()?;
         let stopping = stop.clone();
         let (sender, receiver) = mpsc::sync_channel(32);
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = ControlAdmission::default();
+        let slots = admission.clone();
         let thread = std::thread::spawn(move || {
             let mut fds = [
                 libc::pollfd {
@@ -151,15 +174,13 @@ impl Server {
                     }
                     Err(_) => break,
                 };
-                use std::sync::atomic::Ordering;
-                if active.fetch_add(1, Ordering::Relaxed) >= 64 {
-                    active.fetch_sub(1, Ordering::Relaxed);
+                let Some(slot) = slots.acquire() else {
                     continue;
-                }
-                let active = active.clone();
+                };
                 let sender = sender.clone();
                 let wake = wake.clone();
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                     let mut line = String::new();
@@ -187,12 +208,12 @@ impl Server {
                             serde_json::json!({"error": "Invalid JSON request"})
                         };
                     let _ = writeln!(stream, "{response}");
-                    active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
         });
         Ok(Self {
             receiver,
+            admission,
             path,
             stop,
             thread: Some(thread),
@@ -354,6 +375,36 @@ pub fn companion_at(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_handlers_reserve_the_shared_control_allowance_until_reply() {
+        let path = std::env::temp_dir().join(format!(
+            "gmux-admission-{}.sock",
+            crate::unix::identity::daemon_id().unwrap()
+        ));
+        let server = Server::start_at(path.clone(), Wake::new().unwrap()).unwrap();
+        let _occupied: Vec<_> = (0..63)
+            .map(|_| server.admission.acquire().unwrap())
+            .collect();
+        let client = std::thread::spawn(move || {
+            call_at(&path, serde_json::json!({"method":"hello"})).unwrap()
+        });
+        let request = server
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(server.admission.acquire().is_none());
+        request.reply.send(serde_json::json!({"ok":true})).unwrap();
+        assert_eq!(client.join().unwrap()["ok"], true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while server.admission.acquire().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Local handler retained admission"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     #[test]
     fn client_probe_falls_back_only_before_sending_a_request() {

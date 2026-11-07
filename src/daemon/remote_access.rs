@@ -23,6 +23,7 @@ struct State {
     config: gmux_protocol::network::RemoteAccess,
     server: Option<server::Server>,
     error: Option<String>,
+    dispatch: Option<server::Dispatch>,
 }
 struct Update {
     config: gmux_protocol::network::RemoteAccess,
@@ -53,9 +54,10 @@ impl RemoteAccess {
             worker: None,
         }
     }
-    pub fn start(daemon: DaemonId) -> anyhow::Result<Self> {
+    pub fn start(daemon: DaemonId, dispatch: server::Dispatch) -> anyhow::Result<Self> {
         let mut state = State {
             config: storage::load("remote-access.json")?,
+            dispatch: Some(dispatch.clone()),
             ..Default::default()
         };
         if state.config.enabled {
@@ -63,8 +65,7 @@ impl RemoteAccess {
                 .and_then(|token| server::Server::prepare(state.config.listen_address, token));
             match result {
                 Ok(prepared) => {
-                    state.server =
-                        Some(prepared.start(gmux_platform::unix::ipc::socket_path(), daemon))
+                    state.server = Some(prepared.start(state.dispatch.clone().unwrap(), daemon))
                 }
                 Err(error) => state.error = Some(error.to_string()),
             }
@@ -176,13 +177,7 @@ impl State {
             Ok(prepared) => prepared,
             Err(error) => {
                 // The failed replacement has dropped its socket before rebinding.
-                if paused
-                    && let Err(restore) = self
-                        .server
-                        .as_mut()
-                        .unwrap()
-                        .resume(gmux_platform::unix::ipc::socket_path(), daemon)
-                {
+                if paused && let Err(restore) = self.server.as_mut().unwrap().resume(daemon) {
                     self.error = Some(format!("Could not restore TCP listener: {restore}"));
                     anyhow::bail!("{error}; {}", self.error.as_ref().unwrap());
                 }
@@ -190,7 +185,7 @@ impl State {
             }
         };
         if let Some(prepared) = prepared {
-            self.server = Some(prepared.start(gmux_platform::unix::ipc::socket_path(), daemon));
+            self.server = Some(prepared.start(self.dispatch.clone().unwrap(), daemon));
         } else if !config.enabled {
             self.server = None;
         } else if let Some(server) = &self.server
@@ -242,7 +237,14 @@ mod tests {
     #[test]
     fn overlapping_listener_edits_commit_or_restore_the_listener_and_its_clients() {
         let daemon = gmux_platform::unix::identity::daemon_id().unwrap();
-        let mut state = State::default();
+        let (dispatch, _incoming) = server::Dispatch::new(
+            gmux_platform::unix::ipc::Wake::new().unwrap(),
+            Default::default(),
+        );
+        let mut state = State {
+            dispatch: Some(dispatch),
+            ..Default::default()
+        };
         state
             .set(
                 gmux_protocol::network::RemoteAccess {

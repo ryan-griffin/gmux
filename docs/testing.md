@@ -304,3 +304,9 @@ Scheduling unit checks cover fair deferred IDs and frontend passes, dirty change
 arriving during a pass, ordered viewport shifts and clipboard effects across
 packet budgets, continuation wakeups, and a yielded process-exit drain with no
 kernel readiness. GTK dispatcher checks share one budget across queued windows.
+
+The headless `remote-transport` suite checks TCP operation while both Unix socket
+paths are unavailable, pipelined Attach/command ordering through half-close,
+and shared Unix/TCP frontend admission and teardown. Network unit tests cover
+setup deadlines, binary read-ahead, cancellation before command execution,
+ordered control completions, and listener rollback.

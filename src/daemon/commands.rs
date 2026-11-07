@@ -5,14 +5,16 @@ use gmux_protocol::control::*;
 
 pub(super) struct ControlRequest {
     pub(super) body: Request,
-    reply: std::sync::mpsc::SyncSender<Value>,
+    reply: Reply,
+    cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 impl ControlRequest {
     pub(super) fn decode(request: gmux_platform::unix::ipc::Request) -> Option<Self> {
         match Request::decode(request.body) {
             Ok(body) => Some(Self {
                 body,
-                reply: request.reply,
+                reply: Reply::local(request.reply),
+                cancelled: None,
             }),
             Err(error) => {
                 let _ = request.reply.try_send(json!({"error": error.to_string()}));
@@ -21,13 +23,56 @@ impl ControlRequest {
         }
     }
 }
+/// A completion never waits for socket I/O. Remote replies wake their I/O reactor.
+pub(super) struct Reply {
+    sender: std::sync::mpsc::SyncSender<Value>,
+    wake: Option<gmux_platform::unix::ipc::Wake>,
+}
+impl Reply {
+    fn local(sender: std::sync::mpsc::SyncSender<Value>) -> Self {
+        Self { sender, wake: None }
+    }
+    pub(super) fn remote(
+        sender: std::sync::mpsc::SyncSender<Value>,
+        wake: gmux_platform::unix::ipc::Wake,
+    ) -> Self {
+        Self {
+            sender,
+            wake: Some(wake),
+        }
+    }
+    fn send(self, value: Value) {
+        let _ = self.sender.try_send(value);
+        if let Some(wake) = self.wake {
+            wake.notify();
+        }
+    }
+}
+impl ControlRequest {
+    pub(super) fn remote(
+        request: ExecutionRequest,
+        reply: Reply,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            body: Request::Internal(InternalRequest::Execution { request }),
+            reply,
+            cancelled: Some(cancelled),
+        }
+    }
+    pub(super) fn cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
 enum ControlValue {
     Execution(ExecutionReply),
     Command(CommandResult),
     Hello(Value),
 }
 struct ControlReply {
-    sender: std::sync::mpsc::SyncSender<Value>,
+    sender: Reply,
     result: anyhow::Result<ControlValue>,
     output_only: bool,
 }
@@ -41,10 +86,13 @@ impl PendingControl {
         daemon: &mut Daemon,
         worker: &Worker,
     ) -> Option<Self> {
+        if request.cancelled() {
+            return None;
+        }
         if daemon.quitting && request.body.mutates_state() {
-            let _ = request
+            request
                 .reply
-                .try_send(json!({"error":"Daemon is shutting down"}));
+                .send(json!({"error":"Daemon is shutting down"}));
             return None;
         }
         let mut output_only = false;
@@ -130,7 +178,7 @@ impl ControlReply {
                 })
             })
             .unwrap_or_else(|error| json!({"error":error.to_string()}));
-        let _ = self.sender.try_send(value);
+        self.sender.send(value);
     }
 }
 impl Daemon {
@@ -511,7 +559,8 @@ mod tests {
         let (reply, receiver) = mpsc::sync_channel(1);
         let request = ControlRequest {
             body: Request::decode(body).unwrap(),
-            reply,
+            reply: Reply::local(reply),
+            cancelled: None,
         };
         (request, receiver)
     }
