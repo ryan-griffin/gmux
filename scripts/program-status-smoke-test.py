@@ -53,13 +53,13 @@ with (artifacts / "program-status-smoke.log").open("w") as log, AppFixture() as 
 
     def receive(status):
         for peer in clients:
-            header = peer.until(lambda h: h["meta"]["id"] == pane and h["meta"]["program_status"] == status)
+            header = peer.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("meta", {}).get("program_status") == status)
             assert header["frame"] is None and not header["rows"], header
             assert not header["notifications"] and header["meta"]["unread_sequence"] == 0, header
 
     try:
         for peer in clients:
-            peer.until(lambda h: h["meta"]["id"] == pane and h["frame"])
+            peer.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame"))
             peer.barrier("ready")
         with scenario("actionable children, replacement, inherited app and local/remote source metadata"):
             snapshots = owner.rpc("status")["snapshots"]
@@ -120,8 +120,8 @@ with (artifacts / "program-status-smoke.log").open("w") as log, AppFixture() as 
                 seen = []
                 method = "test-barrier-coalesced"
                 peer.send(method)
-                peer.until(lambda h: (seen.append(h) or bool(h["error"] and method in h["error"])))
-                assert not [h for h in seen if h["meta"]["id"] == pane and not h["error"]], seen
+                peer.until(lambda h: (seen.append(h) or bool(h.get("error") and method in h.get("error"))))
+                assert not [h for h in seen if h.get("meta", {}).get("id") == pane and not h.get("error")], seen
             for peer in clients:
                 peer.close()
             clients.clear()
@@ -130,7 +130,7 @@ with (artifacts / "program-status-smoke.log").open("w") as log, AppFixture() as 
             for remote in [False, True]:
                 peer = Client(receiver if remote else owner, pane, **(dict(connection="owner") if remote else {}))
                 clients.append(peer)
-                header = peer.until(lambda h: h["meta"]["id"] == pane and h["meta"]["program_status"] == status)
+                header = peer.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("meta", {}).get("program_status") == status)
                 assert not header["notifications"]
                 peer.send("subscribe", panes=[])
                 peer.barrier("reconnected-hidden")
@@ -217,7 +217,7 @@ os._exit(0)
             owner.rpc("send", pane=dead, text=command, enter=True)
             wait_for(lambda: (m := owner.rpc("metadata", pane=dead)["meta"])["exited"] and m["program_status"])
             peer = Client(owner, dead)
-            peer.until(lambda h: h["meta"]["id"] == dead and h["meta"]["exited"])
+            peer.until(lambda h: h.get("meta", {}).get("id") == dead and h.get("meta", {}).get("exited"))
             peer.send("key", name="Return", unshifted=13, mods=0, action="press", text="\r")
             wait_for(lambda: "error" in owner.rpc("metadata", pane=dead, check=False))
             peer.close()

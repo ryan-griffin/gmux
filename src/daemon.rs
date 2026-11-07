@@ -9,7 +9,7 @@ use gmux_protocol::{
     control::{CommandOutput, CommandResult},
     model::{CursorStyle, DaemonId, ExecutionTab, PaneRef, PaneTree, TabRef},
     theme::Theme,
-    transport::{self, Header, Metadata, Packet},
+    transport::{self, Metadata, Packet, PaneHeader},
 };
 use serde_json::{Value, json};
 use std::{
@@ -498,8 +498,8 @@ mod tests {
     fn escaped_alerts_fit_alongside_a_maximum_viewport_and_find_highlights() {
         let mut queue = NotificationQueue::default();
         queue.push("\x01".repeat(MAX_NOTIFICATION_BYTES));
-        let packet = Packet {
-            header: Header {
+        let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+            header: PaneHeader {
                 meta: Metadata {
                     id: 1,
                     directory: PathBuf::from("/tmp"),
@@ -529,10 +529,10 @@ mod tests {
                         .map(|i| (i, i + 1, 1))
                         .collect(),
                 }),
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: vec![Cell::default(); gmux_protocol::viewport::MAX_CELLS],
-        };
+        });
         packet.encode_into(&mut Vec::new()).unwrap();
     }
 
@@ -575,8 +575,8 @@ mod tests {
         let packet = |text| {
             let mut cell = Cell::default();
             cell.set_text_bytes(&[text]).unwrap();
-            Packet {
-                header: Header {
+            Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: Metadata {
                         id: 1,
                         directory: PathBuf::from("/tmp"),
@@ -596,10 +596,10 @@ mod tests {
                         ..Frame::default()
                     }),
                     rows: (0..24).collect(),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: vec![cell; 80 * 24],
-            }
+            })
         };
         let mut expected = Vec::new();
         packet(b'a').encode_into(&mut expected).unwrap();

@@ -400,7 +400,7 @@ pub fn run() -> anyhow::Result<()> {
             if !clipboard.is_empty()
                 && let Some(recipient) = recipient
             {
-                daemon.deliver_clipboard(recipient, id, clipboard);
+                daemon.deliver_clipboard(recipient, clipboard);
             }
             if let Some(request) = read {
                 daemon.admit_read(id, read_recipient, request);

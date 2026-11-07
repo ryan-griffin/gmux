@@ -37,7 +37,7 @@ def generate(fixture, panes, generation=1):
 
 def scroll(client, row, serial):
     client.send("scroll-to", row=row, serial=serial)
-    return client.until(lambda h: h["scroll_serial"] == serial and h["frame"])
+    return client.until(lambda h: h.get("scroll_serial") == serial and h.get("frame"))
 
 
 def correctness(binary, report):
@@ -117,20 +117,20 @@ def correctness(binary, report):
             address = fixture.rpc("status")["bound_address"]
             command(binary, remote, "connection", "add", address, "--name", "server", "--auth", "none")
             other = Client(remote, pane, connection="server")
-            other.until(lambda h: h["frame"] is not None)
+            other.until(lambda h: h.get("frame") is not None)
             before = scroll(other, 1000, 10)
             # Leave a cached viewport reply queued on the remote transport.
             other.send("scroll-to", row=1001, serial=11)
             other.send("find", query="module_")
             current = scroll(local, 0, 4)
             local.send("select", start=[0, 0], end=[8, 0], serial=1)
-            local.until(lambda h: h["selection_serial"] == 1)
+            local.until(lambda h: h.get("selection_serial") == 1)
             start = time.perf_counter()
             updated = command(binary, remote, "--connection", "server", "scrollback", "--max-lines", 100)
             update_ms = (time.perf_counter() - start) * 1000
             assert updated["saved"] and updated["applied"]
-            new = local.until(lambda h: h["frame"] and h["frame"]["scrollback"]["total"] < 1024)
-            delayed = other.until(lambda h: h["frame"] and h["frame"]["scrollback"]["total"] < 1024)
+            new = local.until(lambda h: h.get("frame") and h.get("frame")["scrollback"]["total"] < 1024)
+            delayed = other.until(lambda h: h.get("frame") and h.get("frame")["scrollback"]["total"] < 1024)
             assert new["selection"] is None
             assert new["frame"]["scrollback"]["offset"] == 0
             for old, fresh in ((current, new), (before, delayed)):

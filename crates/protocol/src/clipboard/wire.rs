@@ -6,6 +6,7 @@ use serde::{
 };
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Descriptor {
     mime: String,
     len: usize,
@@ -38,14 +39,19 @@ impl Serialize for DescriptorsRef<'_> {
     }
 }
 
-pub fn serialize<S: Serializer>(write: &Option<Write>, serializer: S) -> Result<S::Ok, S::Error> {
-    write
-        .as_ref()
-        .map(|write| WriteHeader {
-            destination: write.destination,
-            content: write.content.as_ref().map(|offer| DescriptorsRef(&offer.0)),
-        })
+pub(crate) struct WriteRef<'a>(pub &'a Write);
+impl Serialize for WriteRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        WriteHeader {
+            destination: self.0.destination,
+            content: self
+                .0
+                .content
+                .as_ref()
+                .map(|offer| DescriptorsRef(&offer.0)),
+        }
         .serialize(serializer)
+    }
 }
 
 struct Descriptors(Vec<Descriptor>);
@@ -82,29 +88,27 @@ impl<'de> Deserialize<'de> for Descriptors {
 }
 
 /// Validate framed payload length before allocating binary representation data.
-/// Standalone Header deserialization has no frame, so it uses only MIME limits.
 pub(crate) struct WriteSeed {
-    pub payload: Option<usize>,
+    pub payload: usize,
 }
 impl<'de> DeserializeSeed<'de> for WriteSeed {
-    type Value = Option<Write>;
+    type Value = Write;
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Incoming {
             destination: Destination,
             content: Option<Descriptors>,
         }
-        let write = Option::<Incoming>::deserialize(deserializer)?;
-        if let Some(payload) = self.payload {
-            let declared = write
-                .as_ref()
-                .and_then(|w| w.content.as_ref())
-                .map_or(0, |d| d.0.iter().map(|r| r.len).sum());
-            if declared != payload {
-                return Err(de::Error::custom("Invalid clipboard payload length"));
-            }
+        let write = Incoming::deserialize(deserializer)?;
+        let declared = write
+            .content
+            .as_ref()
+            .map_or(0, |d| d.0.iter().map(|r| r.len).sum());
+        if declared != self.payload {
+            return Err(de::Error::custom("Invalid clipboard payload length"));
         }
-        Ok(write.map(|write| Write {
+        Ok(Write {
             destination: write.destination,
             content: write.content.map(|d| {
                 Offer(
@@ -116,6 +120,6 @@ impl<'de> DeserializeSeed<'de> for WriteSeed {
                         .collect(),
                 )
             }),
-        }))
+        })
     }
 }

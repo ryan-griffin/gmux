@@ -21,9 +21,10 @@ commands when bulk work fills the queue. Outgoing admission failures are reporte
 to the caller; accepted commands retain their order and reservations through the
 socket write. Input cannot bypass an earlier paste on the same stream.
 
-Protocol 42 records start with five little-endian u32 values: the remaining
+Protocol 43 records start with five little-endian u32 values: the remaining
 wire length, JSON header length, record kind, JSON decode allowance, and cell
-count. Kinds distinguish updates, execution state, and atomic clipboard events.
+count. Kinds distinguish pane updates, execution snapshots, Git metadata, clipboard
+writes/clears, and clipboard reads.
 A four-byte zero remains a heartbeat acknowledgement and needs no reservation.
 Readers validate the fixed framing before allocating the header. JSON headers
 are limited to 16 MiB, clipboard headers to 16 KiB, and complete records to
@@ -33,13 +34,15 @@ Admission charges each record for its validated JSON allowance, cell vector,
 overflow text and Arc counters, binary clipboard payload, and queue transfer
 storage. Encoded length alone does not bound decoded storage. Before typed JSON
 parsing, an allocation-free scan checks a conservative bound for the current
-header schema. It charges encoded strings, escape scratch, typed objects, vector
-growth, boxed trees, and temporary hash maps. Clipboard-read envelopes decode
-directly into fields instead of buffering an untyped JSON tree. The header
-deserializer checks clipboard descriptor lengths against the framed payload
-before allocating binary buffers, without a separate JSON traversal.
+stream payload schemas. It charges encoded strings, escape scratch, typed
+objects, vector growth, boxed trees, and temporary hash maps. The record kind
+selects a concrete payload before JSON decoding, without an untyped enum buffer.
+Clipboard-read envelopes also decode directly into typed fields. Unknown
+cross-kind fields are rejected. The clipboard deserializer checks descriptor
+lengths against the framed payload before allocating binary buffers, without a
+separate JSON traversal.
 Cell counts must match validated viewport rows before cell allocation. Changes
-to header types must preserve or revise the allocation-bound audit in
+to payload types must preserve or revise the allocation-bound audit in
 `crates/protocol/src/transport/record.rs`.
 
 The process allowance has two independent FIFO pools. Records needing at most
@@ -296,6 +299,25 @@ CPU in the socket probe includes the interactive probes and socket copies.
 Run alone for comparable measurements. It excludes daemon generation,
 GTK application time, and display presentation. The normal tests separately
 check bulk-pool saturation, worker cancellation, deadlines, and permit release.
+
+For individual stream events, run:
+
+```sh
+cargo run --release -p gmux-protocol --example stream-codec
+```
+
+This standalone probe uses the counting allocator from `clipboard-benchmark`.
+It reports separate encode/blocking-decode elapsed timings, Linux thread CPU time,
+allocation/reallocation counts, cumulative allocated bytes, wire size, and
+source/decoded retained-size estimates. Cases include metadata, one-row and
+full-pane updates, execution snapshots with zero/one/eight tabs, Git metadata,
+clipboard reads, clears, and offers up to 4 MiB. Buffers are reused after warmup. Retained estimates
+include spare capacity and the full inline `Packet` enum size for every variant;
+allocator bookkeeping is excluded. Keeping pane metadata inline avoids an extra
+allocation per decoded pane update, but small events also occupy the largest
+variant's inline size. These measurements exclude socket I/O, worker scheduling,
+daemon generation, GTK application, and rendering. Run matching release builds
+with the same dependencies, CPU affinity, and workloads to compare versions.
 
 For the native workload, run:
 

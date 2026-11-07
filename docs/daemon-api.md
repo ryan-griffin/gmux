@@ -81,7 +81,7 @@ TCP listening is opt-in. The connection begins with one newline-terminated JSON
 handshake. The current protocol version is 42:
 
 ```json
-{"version":42,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":43,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":42,"daemon":"returned-identity"}
+{"method":"attach","version":43,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -276,30 +276,39 @@ must also subscribe to the pane. The last focused eligible connection wins,
 with connection order as the fallback. Detached writes are dropped immediately.
 
 Replies are binary records. Each starts with five little-endian `u32` values:
-remaining record length, JSON header length, kind (`1` update, `2` execution state,
-`3` clipboard event), JSON decode allowance, and cell count. The remaining length
-includes the last four prefix fields. The prefix is followed by UTF-8 JSON and
-incremental cell bytes or a dedicated clipboard payload. Execution state records
-have no binary payload. The allowance bounds JSON input, parsing scratch, and
-storage expansion; it is validated before typed parsing. See
-[resource budgets](resource-budgets.md) for admission limits and the schema audit.
-The header contains pane `meta`, an optional `frame`, changed `rows`, and optional execution
-`state`, Git metadata, notifications, search results, selection, clipboard offers, or
-errors. A full viewport arrives on subscription; later packets contain changed
+remaining record length, JSON header length, event kind, JSON decode allowance,
+and cell count. The remaining length includes the last four prefix fields. The
+prefix is followed by UTF-8 JSON and binary cell or clipboard bytes.
+
+| Kind | Rust payload | JSON header | Binary payload |
+| --- | --- | --- | --- |
+| `1` pane update | `PaneUpdate` | `PaneHeader` with `meta`, optional `frame`, changed `rows`, notifications, Find state, selection, errors, and cache information | Changed viewport cells followed by supplemental cache cells |
+| `2` execution | `CommandReply` | Execution reply directly, including `revision`, `execution`, and `metadata` | None |
+| `3` clipboard write/clear | `clipboard::Write` | `destination` and `content` descriptors | Representation bytes in descriptor order |
+| `4` Git metadata | `GitMetadata` | `id`, `directory`, and `branch` | None |
+| `5` clipboard read | `ClipboardRead` | `pane` and `event` | None |
+
+`transport::Packet` is an enum of these payloads. Readers select the concrete JSON
+schema from the record kind before decoding. Unknown kinds, fields from another
+kind, duplicate fields, and binary payloads on metadata-only kinds are invalid.
+There is no optional-field dispatch order. The allowance bounds JSON input,
+parsing scratch, and storage expansion; readers validate it before typed parsing.
+See [resource budgets](resource-budgets.md) for admission limits and the schema audit.
+
+A full viewport arrives on subscription; later packets contain changed
 rows. Before applying changed rows, shift the previous viewport by `row_shift`
 rows, positive toward smaller viewport indices. Newly exposed rows are always
 included in `rows`. Apply the same shift to soft-wrap flags. Metadata-only
 packets have no cell data.
 
-Clipboard packets are dedicated transient events. Their `copy` field is an
-object with `destination` (`"clipboard"` or `"primary"`) and `content`.
+Clipboard packets are dedicated transient events. Their JSON header contains `destination` (`"clipboard"` or `"primary"`) and `content`.
 A null `content` clears that destination. Otherwise `content` is a nonempty list
 of descriptors, for example `[{"mime":"image/png","len":70},
 {"mime":"text/plain","len":5}]`. The bytes for each representation follow the
 JSON header in descriptor order, without separators or padding. The record
 contains exactly the sum of these lengths and no cell data. A descriptor with
 `len: 0` offers an empty value; an empty descriptor list is invalid. Apply each
-event in wire order across all panes, without applying its default viewport or
+event in wire order across all panes. These events contain no viewport or
 selection metadata. Both explicit `copy` replies and unsolicited writes use
 these packets. `SessionManager::poll_with_clipboard` delivers them in order.
 They are neither coalesced into pane updates nor saved or replayed on reconnect.
@@ -327,12 +336,15 @@ reports each destination's monotonically increasing clipboard `epoch` using
 older epochs are invalid. Capabilities and epochs belong to this stream
 connection and must be advertised again after reconnect.
 
-Read events are dedicated metadata-only packets with `meta.id` identifying the
-pane and `clipboard_read` containing one of these objects:
+Read events use kind `5` with a header `{"pane":2,"event":{...}}`.
+The `event` contains one of these objects:
 
 - `{"kind":"request","request":{"id":42,"destination":"clipboard","mimes":["text/plain"],"list":false,"name":"","granted":false,"epoch":null}}`.
 - `{"kind":"cancel","id":42}`.
 - `{"kind":"paste_text","serial":1,"destination":"primary","epoch":3}`.
+
+An event accepts only the fields for its selected kind. Extra fields are invalid
+even when their value is null.
 
 Request IDs identify a transient native request, independently of the program's
 Kitty `id`. A true `granted` is a hint, not desktop authority. The frontend must
@@ -489,7 +501,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 40; clients must match
+cell data are rejected. This is stream protocol version 43; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.
@@ -506,8 +518,10 @@ the previous shape intact. Pointer changes remain live during synchronized-outpu
 holds. The `style` stream command takes `style` and `blink`
 to configure per-view cursor defaults. Explicit program changes take precedence
 until a program reset selects these defaults again.
-The Rust `transport::Header` and `Packet::read` expose the complete header and
-validate packet dimensions and row indices before decoding cells.
+The Rust `transport::Packet::read` and async reader share the same validation.
+`PaneHeader` dimensions, row indices, shifts, and cache boundaries are checked
+before allocating cells. Clipboard descriptor lengths must equal the framed
+binary byte count before allocating representation buffers.
 
 Handshakes are limited to 4 KiB; control and stream commands to 1 MiB; replies
 and viewport packets to 64 MiB. Pastes use UTF-8 chunks with a 4 MiB total limit.

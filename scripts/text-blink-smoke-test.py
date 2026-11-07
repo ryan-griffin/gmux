@@ -34,7 +34,7 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
         title = f"BLINK_{serial}"
         probe.write(text + f"\x1b]2;{title}\x07")
         for peer in peers:
-            peer.until(lambda h: h["meta"]["title"] == title)
+            peer.until(lambda h: h.get("meta", {}).get("title") == title)
 
     def check_flags(peer, row=0):
         flags = [peer.cell_values[row, x][3] for x in range(6)]
@@ -61,18 +61,18 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
                 f"\x1b[{'5' if row % 2 else '25'}mrow{row}\x1b[0m\r\n" for row in range(1, 20)))
             for peer in peers:
                 peer.send("scroll-to", row=0, serial=1)
-                peer.until(lambda h: h.get("scroll_serial") == 1 and h["frame"])
+                peer.until(lambda h: h.get("scroll_serial") == 1 and h.get("frame"))
                 check_flags(peer)
                 assert peer.cached_cells, "Expected history prefetch"
                 assert any(cell[3] & 8 for cell in peer.cached_cells)
                 peer.send("scroll-to", row=1, serial=2)
-                peer.until(lambda h: h.get("scroll_serial") == 2 and h["frame"])
+                peer.until(lambda h: h.get("scroll_serial") == 2 and h.get("frame"))
                 assert peer.cell_values[0, 0][3] & 8
                 assert not peer.cell_values[1, 0][3] & 8
             peers[1].close()
             peers[1] = Client(fixture, pane, address=address)
             peers[1].send("scroll-to", row=0, serial=3)
-            peers[1].until(lambda h: h.get("scroll_serial") == 3 and h["frame"])
+            peers[1].until(lambda h: h.get("scroll_serial") == 3 and h.get("frame"))
             check_flags(peers[1])
         with scenario("screen switches and clear discard obsolete blinking rows"):
             emit("\x1b[?1049h\x1b[H\x1b[5mX\x1b[25mY")
@@ -82,7 +82,7 @@ with AppFixture(prefix="gmux-text-blink-") as fixture:
             emit("\x1b[?1049l")
             for index, peer in enumerate(peers):
                 peer.send("scroll-to", row=0, serial=4 + index)
-                peer.until(lambda h: h.get("scroll_serial") == 4 + index and h["frame"])
+                peer.until(lambda h: h.get("scroll_serial") == 4 + index and h.get("frame"))
                 check_flags(peer)
             peers[0].send("clear-screen")
             for peer in peers:

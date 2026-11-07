@@ -154,7 +154,7 @@ def shell_fixture(shell, array=False, no_history=False, relative_resources=False
                 assert not meta()["command"]["at_prompt"]
                 # Zsh can echo this marker inside the command before printf
                 # writes it. Wait for the actual output row, not that echo.
-                client.until(lambda h: h["meta"]["id"] == pane and h["frame"]
+                client.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame")
                              and any(line.rstrip() == "BUILTIN_VISIBLE" for line in client.text().splitlines()))
                 output = f.rpc("command-output", pane=pane)["text"]
                 assert output == "BUILTIN_VISIBLE", (output, meta(), client.text())
@@ -163,7 +163,7 @@ def shell_fixture(shell, array=False, no_history=False, relative_resources=False
             with scenario(f"{shell} reconnect retains command status, restart starts a fresh shell"):
                 client.close()
                 client = Client(f, pane)
-                state = client.until(lambda h: h["meta"]["id"] == pane)["meta"]
+                state = client.until(lambda h: h.get("meta", {}).get("id") == pane)["meta"]
                 assert state["command"]["phase"] == "input", state
                 # CLI reads the same metadata and plain command output contract.
                 result = subprocess.check_output([str(binary), "metadata", "--pane", str(pane)], env=f.env)
@@ -202,19 +202,19 @@ with AppFixture(prefix="gmux-semantic-") as f:
             client.output("result7")
         with scenario("external OSC markers, independent views and command-output copy"):
             first.send("scroll-to", row=0, serial=1)
-            first.until(lambda h: h["frame"] and h["scroll_serial"] == 1)
+            first.until(lambda h: h.get("frame") and h.get("scroll_serial") == 1)
             first.send("prompt", previous=False, serial=2)
-            h = first.until(lambda h: h["frame"] and h["scroll_serial"] == 2)
-            assert h["frame"]["scrollback"]["offset"] == 2, h
+            h = first.until(lambda h: h.get("frame") and h.get("scroll_serial") == 2)
+            assert h.get("frame")["scrollback"]["offset"] == 2, h
             first.send("select-output", point=[0, 3], copy="text-html", serial=1)
-            h = first.until(lambda h: h.get("copy") is not None)
-            check_html(h["copy"]["content"], "result1")
+            h = first.until(lambda h: h.get("event_type") == "clipboard")
+            check_html(h["content"], "result1")
             second.send("copy")
             h = second.until(lambda h: h.get("error") is not None)
-            assert "Select terminal text" in h["error"], h
+            assert "Select terminal text" in h.get("error"), h
             second.send("select-output", point=None, copy="text-html", serial=1)
-            h = second.until(lambda h: h.get("copy") is not None)
-            check_html(h["copy"]["content"], "result7")
+            h = second.until(lambda h: h.get("event_type") == "clipboard")
+            check_html(h["content"], "result7")
             rich = json.loads(subprocess.check_output([str(binary), "command-output", "--pane", str(pane), "--html"], env=f.env, text=True))
             check_html(rich, "result7")
             result = subprocess.check_output([str(binary), "command-output", "--pane", str(pane)], env=f.env, text=True)
@@ -230,10 +230,10 @@ with AppFixture(prefix="gmux-semantic-") as f:
                         "\x1b]133;C\x07new output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
             first.send("select-output", point=None, anchored=True, copy="text", serial=2)
             h = first.until(lambda h: h.get("error") == "No command output available")
-            assert h["selection_serial"] == 2 and h.get("copy") is None, h
+            assert h.get("selection_serial") == 2 and h.get("event_type") != "clipboard", h
             second.send("select-output", point=None, copy="text", serial=2)
-            h = second.until(lambda h: h.get("copy") is not None)
-            assert h["copy"]["content"]["text"] == "new output", h
+            h = second.until(lambda h: h.get("event_type") == "clipboard")
+            assert h["content"]["text"] == "new output", h
         with scenario("captured output rejects erasure inside a later command"):
             probe.write("\x1bc\x1b]133;A\x07$ \x1b]133;B\x07old\r\n"
                         "\x1b]133;C\x07old output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
@@ -243,19 +243,19 @@ with AppFixture(prefix="gmux-semantic-") as f:
                         "\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07")
             first.send("select-output", point=None, anchored=True, copy="text", serial=3)
             h = first.until(lambda h: h.get("error") == "No command output available")
-            assert h["selection_serial"] == 3 and h.get("copy") is None, h
+            assert h.get("selection_serial") == 3 and h.get("event_type") != "clipboard", h
             second.send("anchor-output", point=[0, 0])
             second.barrier(5)
             second.send("select-output", point=None, anchored=True, copy="text", serial=3)
-            h = second.until(lambda h: h.get("copy") is not None)
-            assert h["copy"]["content"]["text"] == "new first\nnew second", h
+            h = second.until(lambda h: h.get("event_type") == "clipboard")
+            assert h["content"]["text"] == "new first\nnew second", h
         with scenario("partial events, alternate screen, reset and process fallback"):
             probe.burst(["\x1b]133;C;cmdline_", "url=partial%20command", "\x07"], .01)
             wait_for(lambda: f.rpc("metadata", pane=pane)["meta"]["command"]["command"] == "partial command")
             probe.write("\x1b[?1049h\x1b]133;D;99\x07\x1b]133;A\x07")
             first.send("select-output", point=None, copy=None, serial=4)
             h = first.until(lambda h: h.get("error") == "No command output available")
-            assert h["selection_serial"] == 4, h
+            assert h.get("selection_serial") == 4, h
             assert f.rpc("metadata", pane=pane)["meta"]["command"]["phase"] == "running"
             probe.write("\x1b[?1049l\x1bc")
             wait_for(lambda: f.rpc("metadata", pane=pane)["meta"]["command"]["phase"] == "unknown")

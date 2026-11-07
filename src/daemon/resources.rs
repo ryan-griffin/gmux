@@ -260,13 +260,13 @@ mod tests {
         let budget = OutputBudget::default();
         let mut output = Output::new(&budget);
         output.queue_encoded(transport::HEARTBEAT_REPLY).unwrap();
-        let packet = Packet {
-            header: Header {
+        let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+            header: PaneHeader {
                 error: Some("x".repeat(8192)),
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: Vec::new(),
-        };
+        });
         assert!(
             output
                 .enqueue(0, |bytes, _| packet.encode_into_limit(bytes, 1024))
@@ -283,13 +283,13 @@ mod tests {
         for preencoded in [true, false] {
             let budget = OutputBudget::default();
             let mut output = Output::new(&budget);
-            let packet = Packet {
-                header: Header {
+            let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     error: Some("x".repeat(8 * MIB)),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: Vec::new(),
-            };
+            });
             let mut encoded = Vec::new();
             packet.encode_into(&mut encoded).unwrap();
             output.queue_encoded(&vec![1; 60 * MIB]).unwrap();

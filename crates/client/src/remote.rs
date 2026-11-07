@@ -482,15 +482,17 @@ async fn read_packets(
             // The blocking closure owns the credit. Cancellation cannot release
             // it while an uninterruptible parse still holds decoded allocations.
             let parse_on_worker = bytes.len() > 8 * 1024
-                || (record.kind() == transport::RecordKind::Clipboard
-                    && record.decode_bytes() > 64 * 1024);
-            let (header, reservation) = if parse_on_worker {
+                || (matches!(
+                    record.kind(),
+                    transport::RecordKind::Clipboard | transport::RecordKind::ClipboardRead
+                ) && record.decode_bytes() > 64 * 1024);
+            let (decoded, reservation) = if parse_on_worker {
                 runtime::blocking(move || (record.parse_header(&bytes), reservation)).await
             } else {
                 (record.parse_header(&bytes), reservation)
             };
             let packet =
-                Packet::read_body_async(&mut (&mut reader).compat(), record, header?).await?;
+                Packet::read_body_async(&mut (&mut reader).compat(), record, decoded?).await?;
             let (result, packet, reservation) = if record.decode_bytes() > 64 * 1024 {
                 runtime::blocking(move || (record.validate_packet(&packet), packet, reservation))
                     .await
@@ -947,47 +949,50 @@ impl SessionManager {
                 Err(error) => (Err(error), None),
             };
             match received {
-                Ok(Ok(mut packet)) => {
-                    if let Some(write) = packet.header.copy.take() {
-                        clipboard(gmux_protocol::clipboard::Event::Write(write));
-                        continue;
-                    }
-                    if let Some(event) = packet.header.clipboard_read.take() {
-                        clipboard(gmux_protocol::clipboard::Event::Read {
-                            pane: packet.header.meta.id,
-                            event,
-                        });
-                        continue;
-                    }
-                    if let Some(git) = packet.header.git.take() {
-                        if self.git_panes.contains(&git.id) {
-                            if let Some(session) = self.sessions.get(&git.id) {
-                                let mut session = session.borrow_mut();
-                                if session.git.as_ref() != Some(&git) {
-                                    updates.entry(git.id).or_default().git_changed = true;
-                                    session.git = Some(git);
+                Ok(Ok(packet)) => {
+                    let packet = match packet {
+                        Packet::Clipboard(write) => {
+                            clipboard(gmux_protocol::clipboard::Event::Write(write));
+                            continue;
+                        }
+                        Packet::ClipboardRead(read) => {
+                            clipboard(gmux_protocol::clipboard::Event::Read {
+                                pane: read.pane,
+                                event: read.event,
+                            });
+                            continue;
+                        }
+                        Packet::Git(git) => {
+                            if self.git_panes.contains(&git.id) {
+                                if let Some(session) = self.sessions.get(&git.id) {
+                                    let mut session = session.borrow_mut();
+                                    if session.git.as_ref() != Some(&git) {
+                                        updates.entry(git.id).or_default().git_changed = true;
+                                        session.git = Some(git);
+                                    }
+                                } else {
+                                    self.git.insert(git.id, git);
                                 }
-                            } else {
-                                self.git.insert(git.id, git);
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                    if let Some(state) = packet.header.state.take() {
-                        if let Err(error) = self.validate_state(&state) {
-                            self.disconnected = true;
-                            for &id in self.sessions.keys() {
-                                updates.entry(id).or_default().error = Some(error.to_string());
+                        Packet::Execution(state) => {
+                            if let Err(error) = self.validate_state(&state) {
+                                self.disconnected = true;
+                                for &id in self.sessions.keys() {
+                                    updates.entry(id).or_default().error = Some(error.to_string());
+                                }
+                                self.disconnect_error = Some(error);
+                                let _ = self.connection.socket.shutdown(std::net::Shutdown::Both);
+                                break;
                             }
-                            self.disconnect_error = Some(error);
-                            let _ = self.connection.socket.shutdown(std::net::Shutdown::Both);
-                            break;
+                            if state.revision >= self.metadata_revision {
+                                self.state = Some(state);
+                            }
+                            continue;
                         }
-                        if state.revision >= self.metadata_revision {
-                            self.state = Some(state);
-                        }
-                        continue;
-                    }
+                        Packet::Pane(update) => update,
+                    };
                     let id = packet.header.meta.id;
                     if packet.header.meta.exited || !packet.header.notifications.is_empty() {
                         let update = updates.entry(id).or_default();
@@ -1806,13 +1811,13 @@ mod tests {
             // acknowledgements without losing its replayed prefix or header.
             drop(held);
             let mut bytes = Vec::new();
-            Packet {
-                header: gmux_protocol::transport::Header {
+            Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: gmux_protocol::transport::PaneHeader {
                     notifications: vec!["after heartbeats".into()],
                     ..Default::default()
                 },
                 cells: Vec::new(),
-            }
+            })
             .encode_into(&mut bytes)
             .unwrap();
             tokio::time::timeout(Duration::from_secs(1), peer.write_all(&bytes))
@@ -1823,7 +1828,10 @@ mod tests {
         drop(peer);
         assert!(runtime::block_on(task).unwrap().is_err());
         let packet = receiver.try_recv().unwrap().unwrap();
-        assert_eq!(packet.header.notifications, ["after heartbeats"]);
+        assert_eq!(
+            packet.as_pane().unwrap().header.notifications,
+            ["after heartbeats"]
+        );
         assert_eq!(shared.available_permits(), 64 * 1024);
     }
 
@@ -2062,31 +2070,31 @@ mod tests {
             session.cache.evict();
         }
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: session.borrow().meta.clone(),
                     frame: Some(frame),
                     generation: 7,
                     cache_origin: 100,
                     cache: Some(Default::default()),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: Vec::new(),
-            }))
+            })))
             .unwrap();
         manager.poll();
         assert!(session.borrow().prediction.is_some());
         assert_eq!(session.borrow().snapshot().cells[0].text(), "p");
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: session.borrow().meta.clone(),
                     generation: 8,
                     cache_origin: 100,
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: Vec::new(),
-            }))
+            })))
             .unwrap();
         manager.poll();
         assert!(session.borrow().prediction.is_none());
@@ -2302,7 +2310,7 @@ mod tests {
         assert_eq!(connection.pending_bytes.load(Ordering::Relaxed), before);
         assert_eq!(std::iter::from_fn(|| receiver.try_recv().ok()).count(), 5);
     }
-    use gmux_protocol::transport::Header;
+    use gmux_protocol::transport::PaneHeader;
     use std::path::PathBuf;
 
     fn manager() -> (SessionManager, incoming::Sender, SessionHandle) {
@@ -2481,17 +2489,20 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_packets_keep_cross_pane_wire_order_without_mutating_selection_or_replay() {
+    fn clipboard_events_keep_wire_order_without_mutating_selection_or_replay() {
         use gmux_protocol::clipboard::{Destination, Write};
         use std::os::fd::AsRawFd;
         let (mut manager, sender, handle) = manager();
         handle.borrow_mut().selection = Some(Selection::linear(0, 1));
-        for (pane, destination, text) in [
-            (1, Destination::Clipboard, Some("first 界🙂")),
-            (2, Destination::Primary, Some("")),
-            (1, Destination::Clipboard, None),
-            (2, Destination::Clipboard, Some("last")),
-        ] {
+        for (index, (destination, text)) in [
+            (Destination::Clipboard, Some("first 界🙂")),
+            (Destination::Primary, Some("")),
+            (Destination::Clipboard, None),
+            (Destination::Clipboard, Some("last")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let content = text.map(|text| {
                 let mut offer: gmux_protocol::clipboard::Offer =
                     gmux_protocol::clipboard::Content {
@@ -2507,28 +2518,27 @@ mod tests {
                 }
                 offer
             });
-            let packet = Packet {
-                header: Header {
-                    meta: Metadata {
-                        id: pane,
-                        ..Metadata::default()
-                    },
-                    copy: Some(Write {
-                        destination,
-                        content,
-                    }),
-                    ..Header::default()
-                },
-                cells: vec![],
-            };
+            let packet = Packet::Clipboard(Write {
+                destination,
+                content,
+            });
             // Include actual encoding, decoding, and retained-byte admission.
             let mut bytes = vec![];
             packet.encode_into(&mut bytes).unwrap();
             sender
                 .send(Ok(Packet::read(&mut &bytes[..]).unwrap()))
                 .unwrap();
+            if index == 0 {
+                sender
+                    .send(Ok(Packet::ClipboardRead(transport::ClipboardRead {
+                        pane: 2,
+                        event: gmux_protocol::clipboard::ReadEvent::Cancel { id: 9 },
+                    })))
+                    .unwrap();
+            }
         }
         let mut writes = vec![];
+        let mut events_seen = vec![];
         // No packet may be consumed when another connection used the budget.
         let mut exhausted = gmux_platform::work::Budget::new(Duration::from_secs(60), 0);
         assert!(
@@ -2536,19 +2546,30 @@ mod tests {
                 .poll_with_budget(&mut exhausted, |_| panic!("budget exhausted"))
                 .is_empty()
         );
-        for count in 1..=4 {
+        for count in 1..=5 {
             manager.wake.drain();
             let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
             assert!(
                 manager
                     .poll_with_budget(&mut budget, |event| {
-                        if let gmux_protocol::clipboard::Event::Write(write) = event {
-                            writes.push(write);
+                        match event {
+                            gmux_protocol::clipboard::Event::Write(write) => {
+                                writes.push(write);
+                                events_seen.push("write");
+                            }
+                            gmux_protocol::clipboard::Event::Read { pane, event } => {
+                                assert_eq!(pane, 2);
+                                assert!(matches!(
+                                    event,
+                                    gmux_protocol::clipboard::ReadEvent::Cancel { id: 9 }
+                                ));
+                                events_seen.push("read");
+                            }
                         }
                     })
                     .is_empty()
             );
-            assert_eq!(writes.len(), count);
+            assert_eq!(events_seen.len(), count);
             let mut ready = libc::pollfd {
                 fd: manager.wake.as_raw_fd(),
                 events: libc::POLLIN,
@@ -2556,9 +2577,10 @@ mod tests {
             };
             assert_eq!(
                 unsafe { libc::poll(&mut ready, 1, 0) },
-                i32::from(count != 4)
+                i32::from(count != 5)
             );
         }
+        assert_eq!(events_seen, ["write", "read", "write", "write", "write"]);
         assert_eq!(
             writes
                 .iter()
@@ -2595,8 +2617,8 @@ mod tests {
             let mut frame = handle.borrow().frame;
             frame.scrollback.offset = serial;
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: handle.borrow().meta.clone(),
                         frame: Some(frame),
                         scroll_serial: serial,
@@ -2604,10 +2626,10 @@ mod tests {
                             targets: vec![uri.into()],
                             spans: vec![[0, 2, 0]],
                         }),
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
         };
         send(&sender, &session, 2, "test:newer-scroll");
@@ -2632,15 +2654,15 @@ mod tests {
         );
         drop(screen);
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: session.borrow().meta.clone(),
                     frame: Some(session.borrow().frame),
                     hyperlinks: Some(Hyperlinks::default()),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: vec![],
-            }))
+            })))
             .unwrap();
         first.poll();
         assert_eq!(session.borrow().snapshot().hyperlinks.memory_size(), 0);
@@ -2650,14 +2672,14 @@ mod tests {
         let mut resized = session.borrow().frame;
         resized.cols = 3;
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: session.borrow().meta.clone(),
                     frame: Some(resized),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: vec![],
-            }))
+            })))
             .unwrap();
         assert!(first.poll()[&1].changed);
         {
@@ -2699,7 +2721,7 @@ mod tests {
             },
             ..Frame::default()
         };
-        let header = |offset, serial| Header {
+        let header = |offset, serial| PaneHeader {
             frame: Some(Frame {
                 scrollback: gmux_protocol::Scrollback {
                     offset,
@@ -2709,7 +2731,7 @@ mod tests {
             }),
             scroll_serial: serial,
             generation: 1,
-            ..Header::default()
+            ..PaneHeader::default()
         };
         let row = |value| {
             let mut cell = Cell::default();
@@ -2728,13 +2750,18 @@ mod tests {
                 row_flags: vec![0; 10],
             })
         };
-        let send = |mut header: Header, cells| {
+        let send = |mut header: PaneHeader, cells| {
             header.meta = handle.borrow().meta.clone();
-            sender.send(Ok(Packet { header, cells })).unwrap();
+            sender
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header,
+                    cells,
+                })))
+                .unwrap();
         };
         let initial = || [row(b'e'), row(b'f'), (b'a'..=b'j').flat_map(row).collect()].concat();
         send(
-            Header {
+            PaneHeader {
                 rows: vec![0, 1],
                 cache: cache(),
                 hyperlinks: links("test:initial"),
@@ -2752,7 +2779,7 @@ mod tests {
         // Older canonical deltas and map-only replies cannot lend targets to
         // the retained prediction, including shifted rows with new targets.
         send(
-            Header {
+            PaneHeader {
                 row_shift: -1,
                 rows: vec![0],
                 hyperlinks: links("test:shifted"),
@@ -2763,7 +2790,7 @@ mod tests {
         manager.poll();
         let cells = handle.borrow().snapshot().cells.to_vec();
         send(
-            Header {
+            PaneHeader {
                 hyperlinks: links("test:map-only"),
                 ..header(3, 0)
             },
@@ -2781,7 +2808,7 @@ mod tests {
             assert_eq!(session.hyperlinks.target_at(0), Some("test:map-only"));
         }
         send(
-            Header {
+            PaneHeader {
                 rows: vec![0, 1],
                 hyperlinks: links("test:matched"),
                 ..header(5, 1)
@@ -2802,7 +2829,7 @@ mod tests {
         // Completion without a new map still changes displayed map identity.
         handle.borrow_mut().scroll_to(4);
         send(
-            Header {
+            PaneHeader {
                 rows: vec![0, 1],
                 hyperlinks: links("test:four"),
                 ..header(4, 1)
@@ -2826,9 +2853,9 @@ mod tests {
         handle.borrow_mut().scroll_to(3);
         assert_eq!(handle.borrow().snapshot().hyperlinks.memory_size(), 0);
         send(
-            Header {
+            PaneHeader {
                 generation: 2,
-                ..Header::default()
+                ..PaneHeader::default()
             },
             vec![],
         );
@@ -2844,7 +2871,7 @@ mod tests {
         );
         for resize in [false, true] {
             send(
-                Header {
+                PaneHeader {
                     generation: 2,
                     cache: cache(),
                     ..header(4, 3)
@@ -2860,10 +2887,10 @@ mod tests {
                 handle.borrow_mut().resize(3, 2, 0, 0, 0, 0).unwrap();
             } else {
                 send(
-                    Header {
+                    PaneHeader {
                         generation: 2,
                         cache_valid_before: Some(4),
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     vec![],
                 );
@@ -2877,7 +2904,7 @@ mod tests {
             assert_eq!(screen.hyperlinks.target_at(0), Some("test:four"));
         }
         send(
-            Header {
+            PaneHeader {
                 generation: 3,
                 frame: Some(Frame { cols: 3, ..frame }),
                 rows: vec![0, 1],
@@ -2914,15 +2941,15 @@ mod tests {
         };
         manager.install_metadata(std::slice::from_ref(&meta), 1);
         let session = manager.attach(1, &Theme::adwaita(true)).unwrap();
-        let mut packet = Packet {
-            header: Header {
+        let mut packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+            header: PaneHeader {
                 meta,
                 notifications: vec!["earlier notification".into()],
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: vec![],
-        };
-        packet.header.meta.title = "before oversized packet".into();
+        });
+        packet.as_pane_mut().unwrap().header.meta.title = "before oversized packet".into();
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         // An untrusted declaration cannot allocate beyond the local ceiling.
@@ -2930,8 +2957,8 @@ mod tests {
         let mut oversized = bytes[..transport::RECORD_PREFIX_BYTES].to_vec();
         oversized[12..16].copy_from_slice(&((incoming::MAX_BYTES + 1) as u32).to_le_bytes());
         bytes.extend_from_slice(&oversized);
-        packet.header.notifications.clear();
-        packet.header.meta.title = "after oversized packet".into();
+        packet.as_pane_mut().unwrap().header.notifications.clear();
+        packet.as_pane_mut().unwrap().header.meta.title = "after oversized packet".into();
         packet.encode_into(&mut bytes).unwrap();
         drop(packet);
         daemon_socket.write_all(&bytes).unwrap();
@@ -2972,15 +2999,7 @@ mod tests {
             "daemon":manager.daemon,"home_directory":"/tmp","machine_kind":"unknown","hostname":"host", "revision":1,
             "result":{"ok":true},"execution":{"tabs":[]},"metadata":[current]
         })).unwrap();
-        sender
-            .send(Ok(Packet {
-                header: Header {
-                    state: Some(state),
-                    ..Header::default()
-                },
-                cells: Vec::new(),
-            }))
-            .unwrap();
+        sender.send(Ok(Packet::Execution(state))).unwrap();
         manager.poll();
         assert!(
             manager.take_state().is_none(),
@@ -2999,17 +3018,11 @@ mod tests {
         let (mut remote, remote_sender, remote_session) = manager();
         let send = |sender: &incoming::Sender, directory: &str, branch: &str| {
             sender
-                .send(Ok(Packet {
-                    header: Header {
-                        git: Some(transport::GitMetadata {
-                            id: 1,
-                            directory: directory.into(),
-                            branch: branch.into(),
-                        }),
-                        ..Header::default()
-                    },
-                    cells: Vec::new(),
-                }))
+                .send(Ok(Packet::Git(transport::GitMetadata {
+                    id: 1,
+                    directory: directory.into(),
+                    branch: branch.into(),
+                })))
                 .unwrap();
         };
         for manager in [&mut local, &mut remote] {
@@ -3138,13 +3151,13 @@ mod tests {
                     "progress":42, "app":"cargo", "title":"Tests", "message": format!("{state:?}")}
             })).unwrap());
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: meta.clone(),
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
             let updates = manager.poll();
             assert!(updates[&1].progress_changed);
@@ -3183,14 +3196,14 @@ mod tests {
         meta.directory = PathBuf::from("/tmp/project");
         meta.title = "worker".into();
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta,
                     notifications: vec!["ready".into()],
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: vec![],
-            }))
+            })))
             .unwrap();
         let updates = manager.poll();
         assert_eq!(updates.len(), 1);
@@ -3208,23 +3221,18 @@ mod tests {
 
     #[test]
     fn state_from_another_daemon_stops_recovery_without_replacing_the_local_view() {
-        let (mut manager, sender, session) = manager();
-        let packet = |daemon| Packet {
-            header: Header {
-                state: Some(gmux_protocol::control::CommandReply {
-                    home_directory: "/home/test".into(),
-                    machine_kind: gmux_protocol::model::MachineKind::Unknown,
-                    hostname: "test-host".into(),
-                    daemon,
-                    revision: 1,
-                    result: gmux_protocol::control::CommandOutput::Done { ok: true }.into(),
-                    execution: ExecutionSnapshot::default(),
-                    metadata: vec![],
-                }),
-                meta: session.borrow().meta.clone(),
-                ..Header::default()
-            },
-            cells: vec![],
+        let (mut manager, sender, _session) = manager();
+        let packet = |daemon| {
+            Packet::Execution(gmux_protocol::control::CommandReply {
+                home_directory: "/home/test".into(),
+                machine_kind: gmux_protocol::model::MachineKind::Unknown,
+                hostname: "test-host".into(),
+                daemon,
+                revision: 1,
+                result: gmux_protocol::control::CommandOutput::Done { ok: true }.into(),
+                execution: ExecutionSnapshot::default(),
+                metadata: vec![],
+            })
         };
         sender.send(Ok(packet(manager.daemon))).unwrap();
         assert!(manager.poll().is_empty());
@@ -3263,13 +3271,13 @@ mod tests {
             meta.id = id;
             meta.exited = exited;
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta,
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
         }
         let updates = manager.poll();
@@ -3294,14 +3302,14 @@ mod tests {
             meta.exited = exited;
             let empty = notifications.is_empty();
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta,
                         notifications: notifications.into_iter().map(str::to_owned).collect(),
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
             if empty {
                 assert!(manager.poll().is_empty());
@@ -3325,15 +3333,15 @@ mod tests {
             cell.set_text_bytes(&[text]).unwrap();
             frame.cursor_y = row;
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
                         rows: vec![row],
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![cell.clone(), cell],
-                }))
+                })))
                 .unwrap();
         }
         let updates = manager.poll();
@@ -3360,16 +3368,16 @@ mod tests {
         selection: Option<Selection>,
     ) {
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: session.borrow().meta.clone(),
                     frame: Some(frame),
                     rows,
                     selection,
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells,
-            }))
+            })))
             .unwrap();
     }
 
@@ -3389,16 +3397,16 @@ mod tests {
         send_frame(&sender, &session, frame, vec![0, 1], cells("aabb"), None);
         for text in ["cc", "dd"] {
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
                         row_shift: 1,
                         rows: vec![1],
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: cells(text),
-                }))
+                })))
                 .unwrap();
         }
         drop(sender);
@@ -3494,15 +3502,17 @@ mod tests {
         });
         let send = |serial, selection| {
             sender
-                .send(Ok(transport::Packet {
-                    header: Header {
-                        meta: session.borrow().meta.clone(),
-                        selection,
-                        selection_serial: serial,
-                        ..Header::default()
+                .send(Ok(transport::Packet::Pane(
+                    gmux_protocol::transport::PaneUpdate {
+                        header: PaneHeader {
+                            meta: session.borrow().meta.clone(),
+                            selection,
+                            selection_serial: serial,
+                            ..PaneHeader::default()
+                        },
+                        cells: Vec::new(),
                     },
-                    cells: Vec::new(),
-                }))
+                )))
                 .unwrap();
         };
         session
@@ -3593,8 +3603,8 @@ mod tests {
             [cell.clone(), cell]
         };
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: handle.borrow().meta.clone(),
                     frame: Some(frame),
                     generation: 1,
@@ -3603,30 +3613,30 @@ mod tests {
                         start: 0,
                         row_flags: vec![0; 10],
                     }),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: row(b'e')
                     .into_iter()
                     .chain(row(b'f'))
                     .chain((b'a'..=b'j').flat_map(row))
                     .collect(),
-            }))
+            })))
             .unwrap();
         manager.poll();
         handle.borrow_mut().scroll_to(3);
         let send = |origin, valid, frame| {
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: handle.borrow().meta.clone(),
                         generation: 1,
                         cache_origin: origin,
                         cache_valid_before: Some(valid),
                         frame,
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap()
         };
         send(0, 8, None);
@@ -3649,13 +3659,13 @@ mod tests {
         assert_eq!(handle.borrow().snapshot().cells[0].text(), "d");
         // Copy and selection metadata omit cache state and must not reset its origin.
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: handle.borrow().meta.clone(),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: vec![],
-            }))
+            })))
             .unwrap();
         manager.poll();
         assert_eq!(handle.borrow().snapshot().cells[0].text(), "d");
@@ -3665,16 +3675,16 @@ mod tests {
         handle.borrow_mut().clear_cache();
         handle.borrow_mut().scroll_to(10);
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: handle.borrow().meta.clone(),
                     generation: 2,
                     cache_origin: 100,
                     frame: Some(frame),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: vec![],
-            }))
+            })))
             .unwrap();
         manager.poll();
         assert_eq!(
@@ -3820,7 +3830,9 @@ mod tests {
             };
             let send = |header, cells| {
                 let mut bytes = Vec::new();
-                Packet { header, cells }.encode_into(&mut bytes).unwrap();
+                Packet::Pane(gmux_protocol::transport::PaneUpdate { header, cells })
+                    .encode_into(&mut bytes)
+                    .unwrap();
                 sender
                     .send(Ok(Packet::read(&mut bytes.as_slice()).unwrap()))
                     .unwrap();
@@ -3828,7 +3840,7 @@ mod tests {
             let mut cells = vec![cell("viewport"); rows * cols];
             cells.extend(vec![cell("supplemental"); cached * cols]);
             send(
-                Header {
+                PaneHeader {
                     meta: handle.borrow().meta.clone(),
                     generation: 1,
                     frame: Some(frame),
@@ -3838,7 +3850,7 @@ mod tests {
                         start: 80,
                         row_flags: vec![0; cached],
                     }),
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells,
             );
@@ -3858,7 +3870,7 @@ mod tests {
             // A following delta depends on the authoritative grid, regardless
             // of which overlapping supplemental rows the client retained.
             send(
-                Header {
+                PaneHeader {
                     meta: handle.borrow().meta.clone(),
                     generation: 1,
                     frame: Some(Frame {
@@ -3871,7 +3883,7 @@ mod tests {
                     row_shift: 1,
                     rows: vec![rows as u16 - 1],
                     row_flags: vec![1],
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 vec![cell("exposed"); cols],
             );
@@ -3930,8 +3942,8 @@ mod tests {
         };
         let send = |offset, serial, generation, shift, rows, cells, cache| {
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: handle.borrow().meta.clone(),
                         frame: Some(Frame {
                             scrollback: gmux_protocol::Scrollback {
@@ -3945,10 +3957,10 @@ mod tests {
                         row_shift: shift,
                         rows,
                         cache,
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells,
-                }))
+                })))
                 .unwrap();
         };
         let mut initial = [row(b'e'), row(b'f')].concat();
@@ -4023,14 +4035,14 @@ mod tests {
         );
         assert_eq!(wire(receiver.try_recv().unwrap())["method"], "copy");
         sender
-            .send(Ok(Packet {
-                header: Header {
+            .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta: handle.borrow().meta.clone(),
                     generation: 2,
-                    ..Header::default()
+                    ..PaneHeader::default()
                 },
                 cells: Vec::new(),
-            }))
+            })))
             .unwrap();
         assert!(manager.poll()[&1].changed);
         assert!(
@@ -4124,15 +4136,15 @@ mod tests {
         );
         let reply = |serial, frame| {
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: session.borrow().meta.clone(),
                         frame,
                         scroll_serial: serial,
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
         };
         // A responsive viewport acknowledges each scroll before the next wheel
@@ -4379,15 +4391,15 @@ mod tests {
                 len: 2,
             };
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta: session.borrow().meta.clone(),
                         frame: Some(frame),
                         scroll_serial: serial,
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
             assert!(manager.poll()[&1].changed);
             assert_eq!(session.borrow().scroll_pending(), serial < 2);
@@ -4440,13 +4452,13 @@ mod tests {
             let mut meta = session.borrow().meta.clone();
             meta.unread_sequence = sequence;
             sender
-                .send(Ok(Packet {
-                    header: Header {
+                .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                    header: PaneHeader {
                         meta,
-                        ..Header::default()
+                        ..PaneHeader::default()
                     },
                     cells: vec![],
-                }))
+                })))
                 .unwrap();
             assert_eq!(manager.poll()[&1].unread, Some(expected));
             assert_eq!(session.borrow().unread(), expected);

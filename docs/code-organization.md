@@ -33,6 +33,15 @@ The daemon has no GUI dependencies. Build and install scripts compile it
 independently in both modes so GTK dependency features cannot change the shipped
 artifact. `scripts/check.py` enforces the package dependency boundaries.
 
+Stream replies use `transport::Packet`, whose variants carry pane updates,
+execution snapshots, Git metadata, clipboard writes/clears, or clipboard reads.
+`PaneHeader` holds fields that can change together in a pane update, including
+Find state and selection. `transport/record.rs` selects the payload from framing
+before deserialization and audits JSON allocation bounds. `transport/memory.rs`
+charges retained capacities for each variant. The client reserves decode credit
+before parsing and keeps it with worker closures through cancellation. Daemon
+output admission encodes these same variants within the existing queue limits.
+
 ## Frontend
 
 `crates/gtk/src/main.rs` handles CLI entry and application startup. `crates/gtk/src/app.rs` owns the

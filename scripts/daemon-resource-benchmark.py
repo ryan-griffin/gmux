@@ -58,12 +58,12 @@ def run(args, *, caches=False):
                 initial = peer.output('CACHE_' if caches else '')
                 if caches and len(peers) == 1:
                     peer.send('scroll-to', row=0, serial=7001)
-                    initial = peer.until(lambda h: h['scroll_serial'] == 7001 and h['frame'] is not None)
+                    initial = peer.until(lambda h: h.get("scroll_serial") == 7001 and h.get("frame") is not None)
                     assert peer.frame['scrollback']['total'] > peer.frame['rows']
                     peer.send('select', start=[0, 0], end=[4, 0], serial=1)
-                    peer.until(lambda h: h['selection_serial'] == 1)
+                    peer.until(lambda h: h.get("selection_serial") == 1)
                     peer.send('copy')
-                    selected = peer.until(lambda h: h['copy'] is not None)['copy']['content']['text']
+                    selected = peer.until(lambda h: h.get("event_type") == "clipboard")['content']['text']
                     initial_generation = initial['generation']
             # These readers have all applied a full initial viewport. Thereafter
             # one reads 4 KiB per sample, and the others stop reading entirely.
@@ -111,16 +111,16 @@ def run(args, *, caches=False):
                 if args.verify:
                     # A zero scroll preserves the existing tracked viewport.
                     peer.send('scroll', delta=0, bottom=False)
-                    resync = peer.until(lambda h: h['frame'] is not None and h['generation'] > initial_generation)
+                    resync = peer.until(lambda h: h.get("frame") is not None and h['generation'] > initial_generation)
                 else:
                     peer.send('scroll-to', row=0, serial=9001)
-                    resync = peer.until(lambda h: h['scroll_serial'] == 9001 and h['frame'] is not None)
+                    resync = peer.until(lambda h: h.get("scroll_serial") == 9001 and h.get("frame") is not None)
                 if args.verify:
                     assert resync['generation'] > initial_generation, resync
                     assert len(resync['rows']) == 128, resync['rows']
                     assert peer.frame['scrollback']['offset'] == 0
                 peer.send('copy')
-                assert peer.until(lambda h: h['copy'] is not None)['copy']['content']['text'] == selected
+                assert peer.until(lambda h: h.get("event_type") == "clipboard")['content']['text'] == selected
                 peer.send('scroll', bottom=True)
                 peer.output('CACHE_')
                 assert peer.links['spans'], peer.links

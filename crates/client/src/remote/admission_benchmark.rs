@@ -1,6 +1,6 @@
 //! Run alone in release mode, measuring the real socket reader and shared executor.
 use super::*;
-use gmux_protocol::transport::Header;
+use gmux_protocol::transport::PaneHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn rss() -> usize {
@@ -28,13 +28,13 @@ fn cpu() -> u128 {
 }
 fn packet(text: String) -> Vec<u8> {
     let mut bytes = Vec::new();
-    Packet {
-        header: Header {
+    Packet::Pane(gmux_protocol::transport::PaneUpdate {
+        header: PaneHeader {
             notifications: vec![text],
             ..Default::default()
         },
         cells: vec![],
-    }
+    })
     .encode_into(&mut bytes)
     .unwrap();
     bytes
@@ -50,16 +50,10 @@ fn packet_admission_pressure() {
 fn clipboard_decode_pressure() {
     measure_packet_admission("clipboard", || {
         let mut bytes = Vec::new();
-        Packet {
-            header: Header {
-                copy: Some(gmux_protocol::clipboard::Write {
-                    destination: gmux_protocol::clipboard::Destination::Clipboard,
-                    content: Some("x".repeat(4 * 1024 * 1024).into()),
-                }),
-                ..Default::default()
-            },
-            cells: vec![],
-        }
+        Packet::Clipboard(gmux_protocol::clipboard::Write {
+            destination: gmux_protocol::clipboard::Destination::Clipboard,
+            content: Some("x".repeat(4 * 1024 * 1024).into()),
+        })
         .encode_into(&mut bytes)
         .unwrap();
         bytes

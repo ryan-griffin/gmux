@@ -52,7 +52,9 @@ class Client:
             assert 4 <= size <= 64 * 1024 * 1024
             body = self.exact(size)
             self.reply_bytes += size + 4
-            header_size, = struct.unpack("<I", body[:4])
+            header_size, kind = struct.unpack("<II", body[:8])
+            if kind != 1:
+                continue
             header = json.loads(body[16:16 + header_size])
             if header["meta"]["id"] == self.pane and header["frame"]:
                 self.viewport_rows += len(header["rows"])

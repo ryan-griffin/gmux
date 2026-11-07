@@ -30,7 +30,7 @@ with AppFixture(prefix="gmux-graphemes-") as fixture:
         title = f"GRAPHEME_{serial}"
         probe.write(text + f"\x1b]2;{title}\x07")
         for peer in peers:
-            until(peer, lambda h: h["meta"]["title"] == title)
+            until(peer, lambda h: h.get("meta", {}).get("title") == title)
 
     glyphs = ["a" + "\u0301" * 31, "a" + "\u1ab0" * 21,
               "a" + "\u1ab0" * 64, "🧑" + "\U0001d185" * 64]
@@ -59,14 +59,14 @@ with AppFixture(prefix="gmux-graphemes-") as fixture:
             emit("\r\nnext\r\nlast\r\n")
             for peer in peers:
                 peer.send("scroll-to", row=0, serial=1)
-                until(peer, lambda h: h.get("scroll_serial") == 1 and h["frame"])
+                until(peer, lambda h: h.get("scroll_serial") == 1 and h.get("frame"))
                 check(peer)
                 assert getattr(peer, "saw_long_prefetch", False)
         with scenario("new subscribers receive complete historical clusters"):
             peers[1].close()
             peers[1] = Client(fixture, pane, address=address)
             peers[1].send("scroll-to", row=0, serial=2)
-            peers[1].until(lambda h: h.get("scroll_serial") == 2 and h["frame"])
+            peers[1].until(lambda h: h.get("scroll_serial") == 2 and h.get("frame"))
             check(peers[1])
     finally:
         for peer in peers:

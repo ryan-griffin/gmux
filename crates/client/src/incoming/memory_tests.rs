@@ -2,7 +2,7 @@ use crate::incoming;
 use gmux_protocol::{
     control::{CommandOutput, CommandReply},
     model::{ExecutionSnapshot, ExecutionTab, MachineKind, PaneTree},
-    transport::{Header, Metadata, Packet},
+    transport::{Metadata, Packet},
 };
 use std::collections::HashMap;
 
@@ -72,13 +72,7 @@ fn state_capacity_consumes_queue_budget_even_when_json_is_unchanged() {
         let encoded = serde_json::to_vec(&state).unwrap();
         reserve(&mut state);
         assert_eq!(serde_json::to_vec(&state).unwrap(), encoded, "{name}");
-        let packet = Packet {
-            header: Header {
-                state: Some(state),
-                ..Header::default()
-            },
-            cells: vec![],
-        };
+        let packet = Packet::Execution(state);
         let (sender, receiver) = incoming::channel(LIMIT, 8);
         assert_eq!(
             sender.send(Ok(packet)),
@@ -96,22 +90,16 @@ fn state_capacity_consumes_queue_budget_even_when_json_is_unchanged() {
 #[test]
 fn rich_clipboard_capacity_counts_toward_incoming_queue_admission() {
     use gmux_protocol::clipboard::{Content, Destination, Write};
-    let packet = Packet {
-        header: Header {
-            copy: Some(Write {
-                destination: Destination::Clipboard,
-                content: Some(
-                    Content {
-                        text: String::with_capacity(8192),
-                        html: Some(String::with_capacity(8192)),
-                    }
-                    .into(),
-                ),
-            }),
-            ..Header::default()
-        },
-        cells: vec![],
-    };
+    let packet = Packet::Clipboard(Write {
+        destination: Destination::Clipboard,
+        content: Some(
+            Content {
+                text: String::with_capacity(8192),
+                html: Some(String::with_capacity(8192)),
+            }
+            .into(),
+        ),
+    });
     assert!(packet.memory_size() >= 16384);
     let (sender, _) = incoming::channel(12000, 8);
     assert_eq!(sender.send(Ok(packet)), Err(incoming::SendError::TooLarge));
@@ -130,13 +118,7 @@ fn nested_pane_tree_cannot_exceed_the_queue_budget() {
             }
         }
     }
-    let packet = |state| Packet {
-        header: Header {
-            state: Some(state),
-            ..Header::default()
-        },
-        cells: vec![],
-    };
+    let packet = |state| Packet::Execution(state);
     let (sender, receiver) = incoming::channel(4096, 8);
     sender.send(Ok(packet(state()))).unwrap();
     assert!(matches!(receiver.try_recv(), Ok(Ok(_))));
@@ -147,4 +129,46 @@ fn nested_pane_tree_cannot_exceed_the_queue_budget() {
         sender.send(Ok(packet(nested))),
         Err(incoming::SendError::TooLarge)
     );
+}
+
+#[test]
+fn git_and_clipboard_read_events_charge_spare_capacity_before_queue_admission() {
+    use gmux_protocol::{
+        clipboard::{Destination, ReadEvent, ReadRequest},
+        transport::{ClipboardRead, GitMetadata},
+    };
+    let mut branch = String::from("main");
+    branch.reserve(16384);
+    let mut name = String::new();
+    name.reserve(16384);
+    for packet in [
+        Packet::Git(GitMetadata {
+            id: 1,
+            directory: "/tmp".into(),
+            branch,
+        }),
+        Packet::ClipboardRead(ClipboardRead {
+            pane: 1,
+            event: ReadEvent::Request {
+                request: ReadRequest {
+                    id: 1,
+                    destination: Destination::Clipboard,
+                    mimes: vec!["text/plain".into()],
+                    list: false,
+                    name,
+                    granted: false,
+                    epoch: None,
+                },
+            },
+        }),
+    ] {
+        let mut wire = Vec::new();
+        packet.encode_into(&mut wire).unwrap();
+        assert!(wire.len() < 1024);
+        assert!(packet.memory_size() >= 16384);
+        let (sender, receiver) = incoming::channel(4096, 8);
+        assert_eq!(sender.send(Ok(packet)), Err(incoming::SendError::TooLarge));
+        sender.send(Err("still usable".into())).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Err(_))));
+    }
 }

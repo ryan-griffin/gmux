@@ -1,17 +1,17 @@
 use super::*;
-use gmux_protocol::transport::{Header, RECORD_PREFIX_BYTES, Record};
+use gmux_protocol::transport::{PaneHeader, RECORD_PREFIX_BYTES, Record};
 use tokio::io::AsyncWriteExt;
 
 fn record(sequence: u64, text: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
-    Packet {
-        header: Header {
+    Packet::Pane(gmux_protocol::transport::PaneUpdate {
+        header: PaneHeader {
             scroll_serial: sequence,
             notifications: vec!["x".repeat(text)],
             ..Default::default()
         },
         cells: vec![],
-    }
+    })
     .encode_into(&mut bytes)
     .unwrap();
     bytes
@@ -63,7 +63,10 @@ fn partial_bulk_records_cannot_block_small_streams_and_teardown_releases_credit(
     for sequence in 1..=3 {
         loop {
             if let Ok(packet) = receivers[3].try_recv() {
-                assert_eq!(packet.unwrap().header.scroll_serial, sequence);
+                assert_eq!(
+                    packet.unwrap().as_pane().unwrap().header.scroll_serial,
+                    sequence
+                );
                 break;
             }
             assert!(
@@ -155,8 +158,8 @@ fn a_ready_large_cell_decode_yields_before_delaying_other_io() {
         pin::pin,
         task::{Context, Poll, Waker},
     };
-    let packet = Packet {
-        header: Header {
+    let packet = Packet::Pane(gmux_protocol::transport::PaneUpdate {
+        header: PaneHeader {
             frame: Some(gmux_protocol::Frame {
                 cols: 512,
                 rows: 256,
@@ -166,7 +169,7 @@ fn a_ready_large_cell_decode_yields_before_delaying_other_io() {
             ..Default::default()
         },
         cells: vec![Cell::default(); 512 * 256],
-    };
+    });
     let mut bytes = Vec::new();
     packet.encode_into(&mut bytes).unwrap();
     let mut large = bytes.as_slice();
@@ -178,31 +181,51 @@ fn a_ready_large_cell_decode_yields_before_delaying_other_io() {
     let mut small = small.as_slice();
     let mut other = pin!(Packet::read_message_async(&mut small));
     match other.as_mut().poll(&mut context) {
-        Poll::Ready(Ok(Some(packet))) => assert_eq!(packet.header.scroll_serial, 42),
+        Poll::Ready(Ok(Some(packet))) => {
+            assert_eq!(packet.as_pane().unwrap().header.scroll_serial, 42)
+        }
         _ => panic!("small record could not progress while the large decode yielded"),
     }
     let packet = runtime::block_on(decoding).unwrap().unwrap();
-    assert_eq!(packet.cells.len(), 512 * 256);
+    assert_eq!(packet.as_pane().unwrap().cells.len(), 512 * 256);
 }
 
 #[test]
-fn fragmented_large_clipboard_and_following_update_keep_order_and_release_credit() {
+fn fragmented_mixed_events_keep_order_and_release_credit() {
     let shared = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
-    let (sender, receiver) = incoming::channel_with_budget(incoming::MAX_BYTES, 4, shared.clone());
+    let (sender, receiver) = incoming::channel_with_budget(incoming::MAX_BYTES, 8, shared.clone());
     let text = format!("{}終🙂", "x".repeat(128 * 1024));
     let mut bytes = Vec::new();
-    Packet {
-        header: Header {
-            copy: Some(gmux_protocol::clipboard::Write {
-                destination: gmux_protocol::clipboard::Destination::Clipboard,
-                content: Some(text.clone().into()),
-            }),
-            ..Default::default()
-        },
-        cells: vec![],
-    }
+    Packet::Clipboard(gmux_protocol::clipboard::Write {
+        destination: gmux_protocol::clipboard::Destination::Clipboard,
+        content: Some(text.clone().into()),
+    })
     .encode_into(&mut bytes)
     .unwrap();
+    let state = serde_json::from_value(serde_json::json!({
+        "daemon":"01010101010101010101010101010101", "home_directory":"/tmp",
+        "hostname":"host", "machine_kind":"server", "revision":3,
+        "result":{"ok":true}, "execution":{"tabs":[]}, "metadata":[]
+    }))
+    .unwrap();
+    for event in [
+        Packet::Execution(state),
+        Packet::Git(transport::GitMetadata {
+            id: 7,
+            directory: "/tmp".into(),
+            branch: "main".into(),
+        }),
+        Packet::ClipboardRead(transport::ClipboardRead {
+            pane: 7,
+            event: gmux_protocol::clipboard::ReadEvent::Cancel { id: 9 },
+        }),
+        Packet::Clipboard(gmux_protocol::clipboard::Write {
+            destination: gmux_protocol::clipboard::Destination::Primary,
+            content: None,
+        }),
+    ] {
+        event.encode_into(&mut bytes).unwrap();
+    }
     bytes.extend_from_slice(&record(42, 0));
     let (socket, mut peer) = tokio::io::duplex(127);
     let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
@@ -213,12 +236,32 @@ fn fragmented_large_clipboard_and_following_update_keep_order_and_release_credit
         peer.write_all(&bytes).await.unwrap();
     });
     runtime::block_on(writer).unwrap();
-    assert!(runtime::block_on(reader).unwrap().is_err()); // Peer closed after both records.
+    assert!(runtime::block_on(reader).unwrap().is_err()); // Peer closed after the ordered stream.
     let (clipboard, held) = receiver.try_recv_reserved().unwrap();
-    let clipboard = clipboard.unwrap().header.copy.unwrap().content.unwrap();
+    let Packet::Clipboard(write) = clipboard.unwrap() else {
+        panic!("expected clipboard");
+    };
+    let clipboard = write.content.unwrap();
     assert_eq!(clipboard.0[0].data, text.as_bytes());
+    assert!(
+        matches!(receiver.try_recv().unwrap().unwrap(), Packet::Execution(state) if state.revision == 3)
+    );
+    assert!(matches!(receiver.try_recv().unwrap().unwrap(), Packet::Git(git) if git.id == 7));
+    assert!(
+        matches!(receiver.try_recv().unwrap().unwrap(), Packet::ClipboardRead(read) if read.pane == 7)
+    );
+    assert!(
+        matches!(receiver.try_recv().unwrap().unwrap(), Packet::Clipboard(write) if write.content.is_none())
+    );
     assert_eq!(
-        receiver.try_recv().unwrap().unwrap().header.scroll_serial,
+        receiver
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .as_pane()
+            .unwrap()
+            .header
+            .scroll_serial,
         42
     );
     assert!(shared.available_permits() < 1024 * 1024);

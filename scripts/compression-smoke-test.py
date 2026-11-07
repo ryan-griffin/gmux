@@ -120,7 +120,7 @@ def run(binary, mode, args, baseline=False, reference=None, daemon_env=None):
 
             # Measure input on the same visible pane after compression as well.
             probe = Client(fixture, panes[0])
-            probe.until(lambda h: h["meta"]["id"] == panes[0] and h["frame"])
+            probe.until(lambda h: h.get("meta", {}).get("id") == panes[0] and h.get("frame"))
             post_latency = []
             sequence = len(latency)
             for index in range(args.samples):
@@ -143,7 +143,7 @@ def run(binary, mode, args, baseline=False, reference=None, daemon_env=None):
                 # Restoring cold history must schedule another pass on its own.
                 reader = Client(fixture, panes[0])
                 reader.send("scroll-to", row=0, serial=1)
-                reader.until(lambda h: h["scroll_serial"] == 1)
+                reader.until(lambda h: h.get("scroll_serial") == 1)
                 reader.close()
                 wait_for(lambda: any(row["pane"] == panes[0] and row["scheduled"] for row in terminals(fixture)))
             # Close with scheduled work still outstanding. No stale timer may

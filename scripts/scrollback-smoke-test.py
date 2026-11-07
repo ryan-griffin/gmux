@@ -49,7 +49,9 @@ class History:
             size, = struct.unpack("<I", self.exact(4))
             assert size <= 64 * 1024 * 1024
             body = self.exact(size)
-            header_size, = struct.unpack("<I", body[:4])
+            header_size, kind = struct.unpack("<II", body[:8])
+            if kind != 1:
+                continue
             header = json.loads(body[16:16 + header_size])
             if header["meta"]["id"] == self.pane and header["frame"] is not None:
                 frame = header["frame"]

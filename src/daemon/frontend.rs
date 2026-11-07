@@ -225,22 +225,8 @@ impl Frontend {
             })
             .sum()
     }
-    fn queue_clipboard(
-        &mut self,
-        pane: u64,
-        write: gmux_protocol::clipboard::Write,
-    ) -> anyhow::Result<()> {
-        self.queue(Packet {
-            header: Header {
-                meta: Metadata {
-                    id: pane,
-                    ..Metadata::default()
-                },
-                copy: Some(write),
-                ..Header::default()
-            },
-            cells: Vec::new(),
-        })
+    fn queue_clipboard(&mut self, write: gmux_protocol::clipboard::Write) -> anyhow::Result<()> {
+        self.queue(Packet::Clipboard(write))
     }
     pub(super) fn new(socket: UnixStream, budget: &resources::OutputBudget) -> Self {
         Self {
@@ -496,14 +482,13 @@ impl Daemon {
     pub(super) fn deliver_clipboard(
         &mut self,
         recipient: u64,
-        pane: u64,
         writes: Vec<gmux_protocol::clipboard::Write>,
     ) {
         let Some(frontend) = self.frontends.get_mut(&recipient) else {
             return;
         };
         for write in writes {
-            if let Err(error) = frontend.queue_clipboard(pane, write) {
+            if let Err(error) = frontend.queue_clipboard(write) {
                 eprintln!("Detaching frontend: {error}");
                 self.frontends.remove(&recipient);
                 self.git_dirty = true;
@@ -968,13 +953,10 @@ impl Daemon {
         }
         pane.changed = true;
         if let Some(content) = copy {
-            frontend.queue_clipboard(
-                id,
-                gmux_protocol::clipboard::Write {
-                    destination: gmux_protocol::clipboard::Destination::Clipboard,
-                    content: Some(content.into()),
-                },
-            )?;
+            frontend.queue_clipboard(gmux_protocol::clipboard::Write {
+                destination: gmux_protocol::clipboard::Destination::Clipboard,
+                content: Some(content.into()),
+            })?;
         }
         if appearance_changed {
             self.resize_session(id, Some((frontend_id, frontend)));
@@ -1127,27 +1109,7 @@ impl Daemon {
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        Packet {
-            header: Header {
-                state: Some(self.execution_reply()),
-                meta: Metadata {
-                    id: 0,
-                    directory: PathBuf::new(),
-                    title: String::new(),
-                    size: (80, 24),
-                    exited: false,
-                    unread_sequence: 0,
-                    busy: false,
-                    command: Default::default(),
-                    progress: Default::default(),
-                    program_status: None,
-                    modes: [false; 2],
-                },
-                ..Header::default()
-            },
-            cells: Vec::new(),
-        }
-        .encode_into(&mut bytes)?;
+        Packet::Execution(self.execution_reply()).encode_into(&mut bytes)?;
         Ok(bytes)
     }
     #[cfg(test)]
@@ -1203,13 +1165,7 @@ impl Daemon {
                     && pane.git_sent.as_deref() != Some(&meta)
                 {
                     pane.git_sent = Some(Box::new(meta.clone()));
-                    frontend.output.queue(Packet {
-                        header: Header {
-                            git: Some(meta),
-                            ..Header::default()
-                        },
-                        cells: Vec::new(),
-                    })?;
+                    frontend.output.queue(Packet::Git(meta))?;
                 }
             }
             let notify: Vec<_> = notifications
@@ -1485,10 +1441,8 @@ impl Daemon {
             if screen {
                 trim_screen_caches(frontend, &mut self.frontends, resources::MAX_SCREEN_CACHES);
             }
-            frontend.queue(Packet {
-                header: Header {
-                    git: None,
-                    state: None,
+            frontend.queue(Packet::Pane(gmux_protocol::transport::PaneUpdate {
+                header: PaneHeader {
                     meta,
                     frame,
                     hyperlinks,
@@ -1510,11 +1464,9 @@ impl Daemon {
                     selection,
                     selection_serial,
                     selection_origin,
-                    copy: None,
-                    clipboard_read: None,
                 },
                 cells,
-            })?;
+            }))?;
             frame_activity |= viewport_changed || status_changed;
         }
         frontend.frame_activity |= frame_activity;
@@ -1643,7 +1595,15 @@ mod tests {
         daemon.frontends = HashMap::from([(1, fast), (2, slow)]);
         daemon.updates(true);
         for peer in [&mut fast_peer, &mut slow_peer] {
-            assert!(Packet::read(peer).unwrap().header.frame.is_some());
+            assert!(
+                Packet::read(peer)
+                    .unwrap()
+                    .into_pane()
+                    .unwrap()
+                    .header
+                    .frame
+                    .is_some()
+            );
         }
         let mut slow = daemon.frontends.remove(&2).unwrap();
         slow.next_frame = Instant::now() + Duration::from_secs(60);
@@ -1677,7 +1637,11 @@ mod tests {
         daemon.errors.insert(1, "pending error".into());
         daemon.queue_notifications(1, ["paced-alert".to_string()]);
         daemon.updates(false);
-        let fast = Packet::read(&mut fast_peer).unwrap().header;
+        let fast = Packet::read(&mut fast_peer)
+            .unwrap()
+            .into_pane()
+            .unwrap()
+            .header;
         assert_eq!(fast.scroll_serial, 0);
         assert_eq!(fast.selection_serial, 0);
         assert!(fast.selection.is_none());
@@ -1688,7 +1652,11 @@ mod tests {
         daemon.updates(false);
         daemon.frontends.get_mut(&2).unwrap().next_frame = Instant::now();
         daemon.updates(false);
-        let slow = Packet::read(&mut slow_peer).unwrap().header;
+        let slow = Packet::read(&mut slow_peer)
+            .unwrap()
+            .into_pane()
+            .unwrap()
+            .header;
         assert_eq!(slow.scroll_serial, 7);
         assert_eq!(slow.selection_serial, 9);
         assert!(slow.selection.is_some());
@@ -1908,7 +1876,13 @@ mod tests {
             daemon
                 .update_frontend(&mut frontend, false, &mut HashMap::new())
                 .unwrap();
-            let state = Packet::read(&mut peer).unwrap().header.find.unwrap();
+            let state = Packet::read(&mut peer)
+                .unwrap()
+                .into_pane()
+                .unwrap()
+                .header
+                .find
+                .unwrap();
             assert_eq!(state.total, 2);
             assert_eq!(
                 state.highlights,
@@ -1943,7 +1917,13 @@ mod tests {
         daemon
             .update_frontend(&mut frontend, false, &mut HashMap::new())
             .unwrap();
-        let first = Packet::read(&mut peer).unwrap().header.find.unwrap();
+        let first = Packet::read(&mut peer)
+            .unwrap()
+            .into_pane()
+            .unwrap()
+            .header
+            .find
+            .unwrap();
         assert_eq!(first.highlights, [(39, 40, 2)]);
         assert_eq!(first.total, 1);
         assert!(!first.pending);
@@ -1962,7 +1942,7 @@ mod tests {
         daemon
             .update_frontend(&mut frontend, false, &mut HashMap::new())
             .unwrap();
-        let header = Packet::read(&mut peer).unwrap().header;
+        let header = Packet::read(&mut peer).unwrap().into_pane().unwrap().header;
         assert!(header.frame.is_none());
         assert!(header.rows.is_empty());
         let second = header.find.unwrap();
@@ -2092,22 +2072,22 @@ mod tests {
             }
         };
         for character in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
-            frontend.queue_clipboard(1, offer(character)).unwrap();
+            frontend.queue_clipboard(offer(character)).unwrap();
         }
         frontend
-            .queue_clipboard(
-                1,
-                Write {
-                    destination: Destination::Clipboard,
-                    content: None,
-                },
-            )
+            .queue_clipboard(Write {
+                destination: Destination::Clipboard,
+                content: None,
+            })
             .unwrap();
         let storage = frontend.output.inspect();
         let mut reader = storage.bytes.as_slice();
         for character in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
             let packet = Packet::read(&mut reader).unwrap();
-            let content = packet.header.copy.unwrap().content.unwrap();
+            let Packet::Clipboard(write) = packet else {
+                panic!("expected clipboard");
+            };
+            let content = write.content.unwrap();
             let text = content.plain_text().unwrap();
             assert!(text.chars().all(|c| c == character));
             assert_eq!(
@@ -2116,17 +2096,11 @@ mod tests {
             );
         }
         assert!(
-            Packet::read(&mut reader)
-                .unwrap()
-                .header
-                .copy
-                .unwrap()
-                .content
-                .is_none()
+            matches!(Packet::read(&mut reader).unwrap(), Packet::Clipboard(write) if write.content.is_none())
         );
         assert!(reader.is_empty());
         drop(storage);
-        assert!(frontend.queue_clipboard(1, offer('h')).is_err());
+        assert!(frontend.queue_clipboard(offer('h')).is_err());
         assert!(frontend.output.closed());
         assert_eq!(frontend.retained_output(), 0);
     }

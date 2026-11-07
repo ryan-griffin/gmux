@@ -8,7 +8,7 @@ import subprocess
 import time
 
 from cargo_test_support import cargo_binary
-from stream_test_support import Client
+from stream_test_support import clipboard_value, Client
 from test_support import AppFixture, assert_stays, scenario, wait_for
 
 
@@ -34,7 +34,7 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             first.send("paste-begin", size=len(text), enter=True, bottom=True)
             first.send("paste-data", text=text[:8])
             first.send("scroll-to", row=0, serial=5)
-            first.until(lambda h: h["meta"]["id"] == pane and h["scroll_serial"] == 5)
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("scroll_serial") == 5)
             other = "printf 'SECOND_PASTE\\n'"
             second.send("paste-begin", size=len(other), enter=True, bottom=True)
             second.send("paste-data", text=other)
@@ -51,48 +51,48 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             first.output("line 80")
             second.output("line 80")
             first.send("scroll-to", row=0, serial=10)
-            first.until(lambda h: h["meta"]["id"] == pane and h["scroll_serial"] == 10)
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("scroll_serial") == 10)
             assert first.frame["scrollback"]["offset"] == 0
             row, line = next((row, line) for row, line in enumerate(first.text().splitlines()) if "FIRST_INPUT" in line)
             col = line.index("FIRST_INPUT")
             first.send("select", start=[col, row], end=[col + 10, row])
-            first.until(lambda h: h["meta"]["id"] == pane and h["selection"] is not None)
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h["selection"] is not None)
             first.send("copy")
-            copied = first.until(lambda h: h["meta"]["id"] == pane and h["copy"] is not None)
-            assert "FIRST_INPUT" in copied["copy"]["content"]["text"], copied
+            copied = first.until(lambda h: h.get("event_type") == "clipboard")
+            assert "FIRST_INPUT" in copied["content"]["text"], copied
             second.send("copy")
-            rejected = second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
+            rejected = second.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("error") is not None)
             assert rejected["error"] == "Select terminal text to copy it" and rejected["selection"] is None
             second.send("select", start=[col, row], end=[col + 4, row + 1], mode="rectangle", serial=1)
-            block = second.until(lambda h: h["meta"]["id"] == pane and h["selection_serial"] == 1)
+            block = second.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("selection_serial") == 1)
             assert block["selection"] == dict(start=row * second.frame["cols"] + col,
                                                end=(row + 1) * second.frame["cols"] + col + 4, shape="rectangle"), block
             second.send("copy")
-            copied_block = second.until(lambda h: h["copy"] is not None)["copy"]["content"]["text"]
+            copied_block = second.until(lambda h: h.get("event_type") == "clipboard")["content"]["text"]
             assert copied_block.split("\n")[0] == "FIRST" and len(copied_block.split("\n")) == 2, copied_block
             first.send("copy")
-            assert "FIRST_INPUT" in first.until(lambda h: h["copy"] is not None)["copy"]["content"]["text"]
+            assert "FIRST_INPUT" in first.until(lambda h: h.get("event_type") == "clipboard")["content"]["text"]
             first.send("find", query="line")
-            first.until(lambda h: h["meta"]["id"] == pane and h["find"] and h["find"]["total"] == 80 and not h["find"]["pending"])
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("find") and h.get("find")["total"] == 80 and not h.get("find")["pending"])
             second.send("find", query="FIRST_INPUT")
-            second.until(lambda h: h["meta"]["id"] == pane and h["find"] and h["find"]["total"] == 1 and not h["find"]["pending"])
+            second.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("find") and h.get("find")["total"] == 1 and not h.get("find")["pending"])
             second.send("input", bytes=list(b"printf 'SHARED_WHILE_SCROLLED\\n'\n"))
             second.output("SHARED_WHILE_SCROLLED")
-            first.until(lambda h: h["meta"]["id"] == pane and h["find"] and not h["find"]["pending"])
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("find") and not h.get("find")["pending"])
             assert first.frame["scrollback"]["offset"] == 0 and "SHARED_WHILE_SCROLLED" not in first.text()
 
         with scenario("clear screen removes shared history and stale client presentation"):
             first.send("clear-screen")
             for client in (first, second):
-                cleared = client.until(lambda h: h["meta"]["id"] == pane and h["frame"]
-                    and h["frame"]["scrollback"]["total"] == h["frame"]["rows"]
-                    and h["find"] and h["find"]["total"] == 0 and not h["find"]["pending"])
+                cleared = client.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame")
+                    and h.get("frame")["scrollback"]["total"] == h.get("frame")["rows"]
+                    and h.get("find") and h.get("find")["total"] == 0 and not h.get("find")["pending"])
                 assert client.text().strip() == "", client.text()
                 assert cleared["selection"] is None
                 assert client.frame["scrollback"]["offset"] == 0
             first.send("input", bytes=list(b"printf 'line AFTER_CLEAR\\n'\n"))
-            first.until(lambda h: h["meta"]["id"] == pane and h["find"]
-                        and h["find"]["total"] == 1 and not h["find"]["pending"]
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("find")
+                        and h.get("find")["total"] == 1 and not h.get("find")["pending"]
                         and "AFTER_CLEAR" in first.text())
             second.output("AFTER_CLEAR")
             assert not fixture.rpc("_metadata", pane=pane)["meta"]["exited"]
@@ -103,7 +103,7 @@ with AppFixture(prefix="gmux-multi-client-") as fixture:
             wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [50, 12])
             second.send("resize", cols=70, rows=20)
             second.send("copy")
-            second.until(lambda h: h["meta"]["id"] == pane and h["error"] is not None)
+            second.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("error") is not None)
             assert fixture.rpc("_metadata", pane=pane)["meta"]["size"] == [50, 12]
             first.send("focused", active=False)
             second.send("resize", cols=72, rows=22)
@@ -172,25 +172,25 @@ while control.read_text() != "quit": time.sleep(0.005)
             first.output("five")
             second.output("five")
             first.send("scroll-to", row=0, serial=100)
-            first.until(lambda h: h["meta"]["id"] == pane and h["scroll_serial"] == 100)
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("scroll_serial") == 100)
             first.send("select", start=[0, 0], end=[2, 0])
             first.send("find", query="one")
-            first.until(lambda h: h["find"] and h["find"]["total"] == 1 and not h["find"]["pending"])
+            first.until(lambda h: h.get("find") and h.get("find")["total"] == 1 and not h.get("find")["pending"])
             first.send("subscribe", panes=[])
             first.barrier(101)
             control.write_text("hold")
             wait_for(lambda: fixture.rpc("_metadata", pane=pane)["meta"]["title"] == "SYNC_HELD")
             first.send("subscribe", panes=[pane])
-            held = first.until(lambda h: h["meta"]["id"] == pane and h["frame"])
+            held = first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame"))
             assert "partial" not in first.text() and "five" in first.text(), first.text()
             assert held["selection"] is not None
             control.write_text("release")
             second.output("complete")
-            first.until(lambda h: h["meta"]["id"] == pane and h["frame"]
-                        and h["frame"]["scrollback"]["offset"] == 0 and "one" in first.text())
+            first.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame")
+                        and h.get("frame")["scrollback"]["offset"] == 0 and "one" in first.text())
             first.send("copy")
-            copied = first.until(lambda h: h["copy"] is not None)
-            assert copied["copy"] == dict(destination="clipboard", content=dict(text="one")), copied
+            copied = first.until(lambda h: h.get("event_type") == "clipboard")
+            assert clipboard_value(copied) == dict(destination="clipboard", content=dict(text="one")), copied
     finally:
         control.write_text("quit")
         first.close()
@@ -212,7 +212,7 @@ with AppFixture(prefix="gmux-size-owner-") as fixture, (artifacts / "multi-clien
 
     def expect_frame(client, cols, rows):
         if client.frame is None or (client.frame["cols"], client.frame["rows"]) != (cols, rows):
-            client.until(lambda h: h["frame"] and (h["frame"]["cols"], h["frame"]["rows"]) == (cols, rows))
+            client.until(lambda h: h.get("frame") and (h.get("frame")["cols"], h.get("frame")["rows"]) == (cols, rows))
 
     try:
         first.send("focused", active=True)

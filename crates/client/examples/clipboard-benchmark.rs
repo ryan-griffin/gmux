@@ -1,7 +1,7 @@
 //! Measure binary clipboard transport without a desktop or terminal parser.
 use gmux_protocol::{
     clipboard::{Destination, Offer, Representation, Write as ClipboardWrite},
-    transport::{Header, Packet},
+    transport::Packet,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -37,16 +37,10 @@ unsafe impl GlobalAlloc for Counted {
 
 fn run(name: &str, contents: Vec<Representation>) -> anyhow::Result<serde_json::Value> {
     let payload: usize = contents.iter().map(|r| r.data.len()).sum();
-    let packet = Packet {
-        header: Header {
-            copy: Some(ClipboardWrite {
-                destination: Destination::Clipboard,
-                content: Some(Offer(contents)),
-            }),
-            ..Header::default()
-        },
-        cells: vec![],
-    };
+    let packet = Packet::Clipboard(ClipboardWrite {
+        destination: Destination::Clipboard,
+        content: Some(Offer(contents)),
+    });
     let mut wire = Vec::with_capacity(payload + 16384);
     let mut timings = Vec::with_capacity(100);
     // Warm up serde and the reusable transport buffer before measuring.
@@ -59,7 +53,10 @@ fn run(name: &str, contents: Vec<Representation>) -> anyhow::Result<serde_json::
         let began = Instant::now();
         packet.encode_into(&mut wire)?;
         let decoded = Packet::read(&mut wire.as_slice())?;
-        assert_eq!(decoded.header.copy, packet.header.copy);
+        let (Packet::Clipboard(decoded), Packet::Clipboard(source)) = (&decoded, &packet) else {
+            unreachable!()
+        };
+        assert_eq!(decoded, source);
         timings.push(began.elapsed().as_secs_f64() * 1000.0);
     }
     let allocations = ALLOCATIONS.load(Relaxed);

@@ -95,17 +95,48 @@ impl<'de> Deserialize<'de> for ReadEvent {
             Cancel,
             PasteText,
         }
+        // Missing fields distinguish variants. A supplied field must contain a
+        // value, so null cannot hide a field belonging to another variant.
+        fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+            deserializer: D,
+        ) -> Result<Option<T>, D::Error> {
+            T::deserialize(deserializer).map(Some)
+        }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Event {
             kind: Kind,
+            #[serde(default, deserialize_with = "present")]
             request: Option<ReadRequest>,
+            #[serde(default, deserialize_with = "present")]
             id: Option<u64>,
+            #[serde(default, deserialize_with = "present")]
             serial: Option<u64>,
+            #[serde(default, deserialize_with = "present")]
             destination: Option<Destination>,
+            #[serde(default, deserialize_with = "present")]
             epoch: Option<u64>,
         }
         let event = Event::deserialize(deserializer)?;
         use serde::de::Error;
+        let valid = match event.kind {
+            Kind::Request => {
+                event.id.is_none()
+                    && event.serial.is_none()
+                    && event.destination.is_none()
+                    && event.epoch.is_none()
+            }
+            Kind::Cancel => {
+                event.request.is_none()
+                    && event.serial.is_none()
+                    && event.destination.is_none()
+                    && event.epoch.is_none()
+            }
+            Kind::PasteText => event.request.is_none() && event.id.is_none(),
+        };
+        if !valid {
+            return Err(D::Error::custom("Mixed clipboard read event"));
+        }
         Ok(match event.kind {
             Kind::Request => Self::Request {
                 request: event
@@ -237,6 +268,14 @@ mod event_tests {
             r#"{"kind":"cancel"}"#,
             r#"{"kind":"paste_text","serial":4,"destination":"primary"}"#,
             r#"{"kind":"cancel","id":1,"id":2}"#,
+            r#"{"kind":"cancel","id":1,"serial":2}"#,
+            r#"{"kind":"cancel","id":1,"request":null}"#,
+            r#"{"kind":"cancel","id":1,"serial":null}"#,
+            r#"{"kind":"cancel","id":1,"destination":null}"#,
+            r#"{"kind":"cancel","id":1,"epoch":null}"#,
+            r#"{"kind":"cancel","id":1,"frame":null}"#,
+            r#"{"kind":"paste_text","serial":4,"destination":"primary","epoch":1,"id":2}"#,
+            r#"{"kind":"paste_text","serial":4,"destination":"primary","epoch":1,"id":null}"#,
         ] {
             assert!(serde_json::from_str::<ReadEvent>(text).is_err());
         }

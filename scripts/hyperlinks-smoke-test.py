@@ -61,7 +61,7 @@ while True:
             emit(b'\x1b[H' + link("test:second", "same 界 text"))
             for client in (first, second):
                 header = client.until(lambda h: target(client) == "test:second")
-                assert header["frame"] and header["rows"] == [], header
+                assert header.get("frame") and header["rows"] == [], header
             reply = fixture.rpc("links", pane=pane, client=False)
             assert reply["hyperlinks"] == first.links
             cli = subprocess.check_output([str(cargo_binary("gmux")), "links", "--pane", str(pane)], env=fixture.env, text=True)
@@ -71,11 +71,11 @@ while True:
             second.output("row7")
             first.output("row7")
             first.send("scroll-to", row=0, serial=1)
-            first.until(lambda h: h["frame"] and h["scroll_serial"] == 1)
+            first.until(lambda h: h.get("frame") and h.get("scroll_serial") == 1)
             assert target(first) == "test:row/0"
             for row, serial, shift in [(1, 2, 1), (0, 3, -1)]:
                 first.send("scroll-to", row=row, serial=serial)
-                header = first.until(lambda h: h["frame"] and h["scroll_serial"] == serial)
+                header = first.until(lambda h: h.get("frame") and h.get("scroll_serial") == serial)
                 assert header["row_shift"] == shift, header
                 assert target(first) == f"test:row/{row}"
                 assert target(first, 12) == f"test:row/{row + 1}"
@@ -92,7 +92,7 @@ while True:
         with scenario("clear removes targets in every client"):
             first.send("clear-screen")
             for client in (first, second):
-                client.until(lambda h: h["frame"] and not client.links["spans"])
+                client.until(lambda h: h.get("frame") and not client.links["spans"])
                 assert not client.links["targets"]
     finally:
         first.close(); second.close()

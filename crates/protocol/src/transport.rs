@@ -1,4 +1,4 @@
-//! Versioned packets: JSON metadata followed by cell rows or clipboard bytes.
+//! Typed stream events: kind-selected JSON followed by cell rows or clipboard bytes.
 use crate::{Cell, Frame};
 #[cfg(feature = "async")]
 use futures_lite::io::{AsyncBufReadExt, AsyncReadExt};
@@ -8,7 +8,6 @@ use std::{
     path::PathBuf,
 };
 
-mod header;
 mod memory;
 mod record;
 pub use record::{RECORD_PREFIX_BYTES, Record, RecordKind};
@@ -17,7 +16,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 42;
+pub const VERSION: u32 = 43;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -61,6 +60,7 @@ pub struct Metadata {
 
 /// Optional metadata for a pane requested with git-subscribe.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitMetadata {
     pub id: u64,
     pub directory: PathBuf,
@@ -73,11 +73,9 @@ pub struct CachedRows {
     pub row_flags: Vec<u8>,
 }
 
-header::packet_header! {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<crate::control::CommandReply>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git: Option<GitMetadata>,
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneHeader {
     pub meta: Metadata,
     pub frame: Option<Frame>,
     pub scroll_serial: u64,
@@ -108,20 +106,35 @@ header::packet_header! {
     pub selection_serial: u64,
     #[serde(default)]
     pub selection_origin: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clipboard_read: Option<crate::clipboard::ReadEvent>,
-    ;
-    #[serde(default, serialize_with = "crate::clipboard::wire::serialize")]
-    pub copy: Option<crate::clipboard::Write>,
 }
 
 fn is_zero(value: &i16) -> bool {
     *value == 0
 }
 
-pub struct Packet {
-    pub header: Header,
+pub struct PaneUpdate {
+    pub header: PaneHeader,
     pub cells: Vec<Cell>,
+}
+
+/// One framed stream event. Only pane updates can carry terminal cells.
+// Pane updates dominate traffic. Keep their metadata inline to avoid an extra
+// allocation on every update; retained accounting charges the full enum size
+// for every variant. The stream-codec probe measures this choice.
+#[allow(clippy::large_enum_variant)]
+pub enum Packet {
+    Pane(PaneUpdate),
+    Execution(crate::control::CommandReply),
+    Git(GitMetadata),
+    Clipboard(crate::clipboard::Write),
+    ClipboardRead(ClipboardRead),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardRead {
+    pub pane: u64,
+    pub event: crate::clipboard::ReadEvent,
 }
 
 /// Bound metadata while serializing, before growing the daemon output queue.
@@ -132,7 +145,7 @@ struct HeaderWriter<'a> {
 impl Write for HeaderWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.end.saturating_sub(self.bytes.len()) {
-            return Err(std::io::Error::other("Viewport header is too large"));
+            return Err(std::io::Error::other("Stream event header is too large"));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -145,7 +158,7 @@ impl Write for HeaderWriter<'_> {
 // Keep validation and allocation behavior identical for blocking and async I/O.
 macro_rules! packet_reader {
     ($name:ident, $body:ident, [$($async:tt)*], $reader:ty, [$($wait:tt)*], $take:path, [$($yield:tt)*]) => {
-        /// Read a viewport packet or a heartbeat acknowledgement, represented by None.
+        /// Read a stream event or a heartbeat acknowledgement, represented by None.
         pub $($async)* fn $name(reader: &mut $reader) -> anyhow::Result<Option<Self>> {
             let mut prefix = [0; RECORD_PREFIX_BYTES];
             reader.read_exact(&mut prefix[..4])$($wait)*?;
@@ -154,53 +167,34 @@ macro_rules! packet_reader {
             let record = Record::decode(prefix)?;
             let mut bytes = vec![0; record.header_size()];
             reader.read_exact(&mut bytes)$($wait)*?;
-            let header = record.parse_header(&bytes)?;
+            let packet = record.parse_header(&bytes)?;
             drop(bytes);
-            let packet = Self::$body(reader, record, header)$($wait)*?;
+            let packet = Self::$body(reader, record, packet)$($wait)*?;
             record.validate_packet(&packet)?;
             Ok(Some(packet))
         }
 
-        pub $($async)* fn $body(reader: &mut $reader, record: Record, header: Header) -> anyhow::Result<Self> {
-            let header_size = record.header_size();
-            let size = record.size();
-            if let Some(event) = &header.clipboard_read {
-                event.validate()?;
-                anyhow::ensure!(
-                    header_size <= crate::clipboard::MAX_HEADER_BYTES
-                        && size == RECORD_PREFIX_BYTES - 4 + header_size
-                        && header.copy.is_none(),
-                    "Invalid clipboard read packet"
-                );
-                let packet = Self {
-                    header,
-                    cells: Vec::new(),
-                };
-                anyhow::ensure!(packet.clipboard_only(), "Mixed clipboard read packet");
-                return Ok(packet);
-            }
-            if header.copy.is_some() {
-                let mut packet = Self {
-                    header,
-                    cells: Vec::new(),
-                };
-                anyhow::ensure!(
-                    header_size <= crate::clipboard::MAX_HEADER_BYTES && packet.clipboard_only(),
-                    "Invalid clipboard packet"
-                );
-                let write = packet.header.copy.as_mut().unwrap();
-                let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
-                anyhow::ensure!(
-                    size - (RECORD_PREFIX_BYTES - 4) - header_size == payload,
-                    "Invalid clipboard payload length"
-                );
-                if let Some(content) = &mut write.content {
-                    for representation in &mut content.0 {
-                        reader.read_exact(&mut representation.data)$($wait)*?;
+        pub $($async)* fn $body(reader: &mut $reader, record: Record, mut packet: Packet) -> anyhow::Result<Self> {
+            anyhow::ensure!(packet.kind() == record.kind(), "Incorrect record kind");
+            let payload = record.payload_size();
+            let update = match &mut packet {
+                Packet::Clipboard(write) => {
+                    anyhow::ensure!(
+                        write.content.as_ref().map_or(0, |content| content.byte_len())
+                            == payload,
+                        "Invalid clipboard payload length"
+                    );
+                    if let Some(content) = &mut write.content {
+                        for representation in &mut content.0 {
+                            reader.read_exact(&mut representation.data)$($wait)*?;
+                        }
                     }
+                    return Ok(packet);
                 }
-                return Ok(packet);
-            }
+                Packet::Pane(update) => update,
+                _ => return Ok(packet),
+            };
+            let header = &update.header;
             if let Some(end) = header.cache_valid_before {
                 anyhow::ensure!(
                     header.generation != 0
@@ -280,7 +274,6 @@ macro_rules! packet_reader {
                 0
             };
             anyhow::ensure!(expected == record.cell_count(), "Incorrect cell count");
-            let payload = size - (RECORD_PREFIX_BYTES - 4) - header_size;
             anyhow::ensure!(
                 (expected * CELL_PREFIX_BYTES
                     ..=expected * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES))
@@ -322,7 +315,8 @@ macro_rules! packet_reader {
                 cells.push(decode_cell(&bytes[..len])?);
             }
             anyhow::ensure!(remaining == 0, "Trailing viewport cell data");
-            Ok(Self { header, cells })
+            update.cells = cells;
+            Ok(packet)
         }
     };
 }
@@ -336,92 +330,62 @@ impl Packet {
     pub fn encode_into_limit(&self, bytes: &mut Vec<u8>, limit: usize) -> anyhow::Result<()> {
         let start = bytes.len();
         let limit = limit.min(MAX_PACKET + 4);
-        if let Some(event) = &self.header.clipboard_read {
-            event.validate()?;
-            anyhow::ensure!(
-                self.clipboard_only() && self.header.copy.is_none() && self.cells.is_empty(),
-                "Mixed clipboard read packet"
-            );
-        }
-        let clipboard_payload = if let Some(write) = &self.header.copy {
-            let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
-            // Reject backpressure before scanning text or growing the queue.
-            anyhow::ensure!(
-                RECORD_PREFIX_BYTES + payload <= limit,
-                "Frontend is too slow"
-            );
-            anyhow::ensure!(
-                self.clipboard_only() && self.cells.is_empty(),
-                "Clipboard offers require a dedicated packet"
-            );
-            write.validate()?;
-            Some(payload)
-        } else {
-            None
+        let (cells, clipboard_payload) = match self {
+            Self::ClipboardRead(read) => {
+                read.event.validate()?;
+                (&[][..], 0)
+            }
+            Self::Clipboard(write) => {
+                let payload = write.content.as_ref().map_or(0, |c| c.byte_len());
+                // Reject backpressure before scanning text or growing the queue.
+                anyhow::ensure!(
+                    RECORD_PREFIX_BYTES + payload <= limit,
+                    "Frontend is too slow"
+                );
+                write.validate()?;
+                (&[][..], payload)
+            }
+            Self::Pane(update) => (update.cells.as_slice(), 0),
+            _ => (&[][..], 0),
         };
+        anyhow::ensure!(
+            limit >= RECORD_PREFIX_BYTES + clipboard_payload,
+            "Frontend is too slow"
+        );
         // Serialize into the reusable output buffer, then fill the lengths.
         // A failed packet must leave previously queued packets untouched.
         bytes.extend_from_slice(&[0; RECORD_PREFIX_BYTES]);
         let result = (|| {
-            let payload = clipboard_payload.unwrap_or(0);
-            anyhow::ensure!(
-                limit >= RECORD_PREFIX_BYTES + payload,
-                "Frontend is too slow"
-            );
-            serde_json::to_writer(
-                HeaderWriter {
-                    bytes,
-                    end: start
-                        + RECORD_PREFIX_BYTES
-                        + (limit - RECORD_PREFIX_BYTES - payload).min(
-                            if clipboard_payload.is_some() || self.header.clipboard_read.is_some() {
-                                crate::clipboard::MAX_HEADER_BYTES
-                            } else {
-                                record::MAX_HEADER_BYTES
-                            },
-                        ),
-                },
-                &self.header,
-            )?;
+            let payload = clipboard_payload;
+            let kind = self.kind();
+            self.write_header(HeaderWriter {
+                bytes,
+                end: start
+                    + RECORD_PREFIX_BYTES
+                    + (limit - RECORD_PREFIX_BYTES - payload).min(kind.header_limit()),
+            })?;
             let header_size = bytes.len() - start - RECORD_PREFIX_BYTES;
             let json_budget = record::json_budget(&bytes[start + RECORD_PREFIX_BYTES..])?;
-            let cell_bytes: usize = self
-                .cells
+            let cell_bytes: usize = cells
                 .iter()
                 .map(|cell| CELL_PREFIX_BYTES + cell.text().len())
                 .sum();
             let size = bytes.len() - start - 4 + payload + cell_bytes;
-            anyhow::ensure!(size <= MAX_PACKET, "Viewport packet is too large");
+            anyhow::ensure!(size <= MAX_PACKET, "Stream packet is too large");
             anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
-            let kind = RecordKind::of(&self.header);
-            let record = Record::new(size, header_size, kind, json_budget, self.cells.len())?;
+            let record = Record::new(size, header_size, kind, json_budget, cells.len())?;
             bytes[start..start + RECORD_PREFIX_BYTES].copy_from_slice(&record.encode());
-            if let Some(content) = self.header.copy.as_ref().and_then(|w| w.content.as_ref()) {
+            if let Self::Clipboard(crate::clipboard::Write {
+                content: Some(content),
+                ..
+            }) = self
+            {
                 bytes.reserve(content.byte_len());
                 for representation in &content.0 {
                     bytes.extend_from_slice(&representation.data);
                 }
             }
-            bytes.reserve(cell_bytes);
-            for cell in &self.cells {
-                let len = (cell.text().len() as u16).to_le_bytes();
-                bytes.extend_from_slice(&[
-                    len[0],
-                    len[1],
-                    cell.fg[0],
-                    cell.fg[1],
-                    cell.fg[2],
-                    cell.bg[0],
-                    cell.bg[1],
-                    cell.bg[2],
-                    cell.flags,
-                    cell.decoration,
-                    cell.underline_color[0],
-                    cell.underline_color[1],
-                    cell.underline_color[2],
-                ]);
-                bytes.extend_from_slice(cell.text().as_bytes());
-            }
+            encode_cells(cells, bytes, cell_bytes);
             Ok(())
         })();
         if result.is_err() {
@@ -430,19 +394,48 @@ impl Packet {
         result
     }
 
-    fn clipboard_only(&self) -> bool {
-        let h = &self.header;
-        h.frame.is_none()
-            && h.rows.is_empty()
-            && h.cache.is_none()
-            && h.row_shift == 0
-            && h.state.is_none()
-            && h.git.is_none()
-            && h.hyperlinks.is_none()
-            && h.selection.is_none()
-            && h.notifications.is_empty()
-            && h.find.is_none()
-            && h.error.is_none()
+    pub fn kind(&self) -> RecordKind {
+        match self {
+            Self::Pane(_) => RecordKind::Pane,
+            Self::Execution(_) => RecordKind::Execution,
+            Self::Git(_) => RecordKind::Git,
+            Self::Clipboard(_) => RecordKind::Clipboard,
+            Self::ClipboardRead(_) => RecordKind::ClipboardRead,
+        }
+    }
+
+    fn write_header(&self, writer: impl Write) -> serde_json::Result<()> {
+        match self {
+            Self::Pane(update) => serde_json::to_writer(writer, &update.header),
+            Self::Execution(state) => serde_json::to_writer(writer, state),
+            Self::Git(git) => serde_json::to_writer(writer, git),
+            Self::Clipboard(write) => {
+                serde_json::to_writer(writer, &crate::clipboard::wire::WriteRef(write))
+            }
+            Self::ClipboardRead(read) => serde_json::to_writer(writer, read),
+        }
+    }
+
+    pub fn as_pane(&self) -> Option<&PaneUpdate> {
+        if let Self::Pane(update) = self {
+            Some(update)
+        } else {
+            None
+        }
+    }
+    pub fn as_pane_mut(&mut self) -> Option<&mut PaneUpdate> {
+        if let Self::Pane(update) = self {
+            Some(update)
+        } else {
+            None
+        }
+    }
+    pub fn into_pane(self) -> Option<PaneUpdate> {
+        if let Self::Pane(update) = self {
+            Some(update)
+        } else {
+            None
+        }
     }
 
     /// Decode one packet, skipping heartbeat replies and leaving following data buffered.
@@ -465,6 +458,31 @@ impl Packet {
     );
     #[cfg(feature = "async")]
     packet_reader!(read_message_async, read_body_async, [async], (impl futures_lite::io::AsyncBufRead + Unpin), [.await], futures_lite::io::AsyncReadExt::take, [futures_lite::future::yield_now().await;]);
+}
+
+// Keep the hot binary loop independent of JSON serialization and event dispatch.
+#[inline(never)]
+fn encode_cells(cells: &[Cell], bytes: &mut Vec<u8>, cell_bytes: usize) {
+    bytes.reserve(cell_bytes);
+    for cell in cells {
+        let len = (cell.text().len() as u16).to_le_bytes();
+        bytes.extend_from_slice(&[
+            len[0],
+            len[1],
+            cell.fg[0],
+            cell.fg[1],
+            cell.fg[2],
+            cell.bg[0],
+            cell.bg[1],
+            cell.bg[2],
+            cell.flags,
+            cell.decoration,
+            cell.underline_color[0],
+            cell.underline_color[1],
+            cell.underline_color[2],
+        ]);
+        bytes.extend_from_slice(cell.text().as_bytes());
+    }
 }
 
 fn cell_length(bytes: &[u8]) -> anyhow::Result<usize> {
@@ -510,8 +528,8 @@ mod tests {
         cell.flags = 65 | crate::cells::flags::BLINK;
         cell.decoration = underline::CURLY | decoration::OVERLINE | decoration::UNDERLINE_COLOR;
         cell.underline_color = [6, 7, 8];
-        Packet {
-            header: Header {
+        Packet::Pane(PaneUpdate {
+            header: PaneHeader {
                 meta: Metadata {
                     id: 1,
                     directory: PathBuf::from("/tmp"),
@@ -541,10 +559,10 @@ mod tests {
                 rows: vec![1],
                 row_flags: vec![1],
                 notifications: vec!["alert".into()],
-                ..Header::default()
+                ..PaneHeader::default()
             },
             cells: vec![cell, Cell::default()],
-        }
+        })
     }
     #[test]
     fn wire_cache_limits_reserve_encoded_bytes_and_reject_before_cells() {
@@ -557,7 +575,7 @@ mod tests {
             let count = cache_row_limit(cols);
             assert!(count * cols * (CELL_PREFIX_BYTES + 260) <= MAX_CACHE_BYTES);
             let mut packet = packet();
-            packet.header.frame = Some(Frame {
+            packet.as_pane_mut().unwrap().header.frame = Some(Frame {
                 cols: cols as u16,
                 rows: 1,
                 scrollback: crate::Scrollback {
@@ -567,34 +585,53 @@ mod tests {
                 },
                 ..Frame::default()
             });
-            packet.header.rows.clear();
-            packet.header.row_flags.clear();
-            packet.header.cache = Some(CachedRows {
+            packet.as_pane_mut().unwrap().header.rows.clear();
+            packet.as_pane_mut().unwrap().header.row_flags.clear();
+            packet.as_pane_mut().unwrap().header.cache = Some(CachedRows {
                 start: 0,
                 row_flags: vec![0; count],
             });
-            packet.cells = vec![Cell::default(); count * cols];
+            packet.as_pane_mut().unwrap().cells = vec![Cell::default(); count * cols];
             let mut bytes = Vec::new();
             packet.encode_into(&mut bytes).unwrap();
             packet.encode_into(&mut bytes).unwrap();
             let mut reader = bytes.as_slice();
             for _ in 0..2 {
                 let decoded = Packet::read(&mut reader).unwrap();
-                assert!(decoded.cells == packet.cells);
-                assert_eq!(decoded.header.cache.unwrap().row_flags.len(), count);
+                assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
+                assert_eq!(
+                    decoded
+                        .as_pane()
+                        .unwrap()
+                        .header
+                        .cache
+                        .as_ref()
+                        .unwrap()
+                        .row_flags
+                        .len(),
+                    count
+                );
             }
             assert!(reader.is_empty());
 
             // Short text cannot bypass the reservation for worst-case text.
             // Omit the cell data entirely to prove rejection precedes its read.
-            packet.header.cache.as_mut().unwrap().row_flags.push(0);
-            let header = serde_json::to_vec(&packet.header).unwrap();
+            packet
+                .as_pane_mut()
+                .unwrap()
+                .header
+                .cache
+                .as_mut()
+                .unwrap()
+                .row_flags
+                .push(0);
+            let header = serde_json::to_vec(&packet.as_pane().unwrap().header).unwrap();
             let size =
                 RECORD_PREFIX_BYTES - 4 + header.len() + (count + 1) * cols * CELL_PREFIX_BYTES;
             let record = Record::new(
                 size,
                 header.len(),
-                RecordKind::Update,
+                RecordKind::Pane,
                 record::json_budget(&header).unwrap(),
                 (count + 1) * cols,
             )
@@ -626,25 +663,45 @@ mod tests {
     #[test]
     fn cached_rows_round_trip_and_invalid_scroll_storage_is_rejected() {
         let mut packet = packet();
-        packet.header.generation = 1;
-        packet.header.cache_origin = 42;
-        packet.header.cache_valid_before = Some(200);
-        packet.header.row_shift = -1;
-        packet.header.rows = vec![0];
-        packet.header.cache = Some(CachedRows {
+        packet.as_pane_mut().unwrap().header.generation = 1;
+        packet.as_pane_mut().unwrap().header.cache_origin = 42;
+        packet.as_pane_mut().unwrap().header.cache_valid_before = Some(200);
+        packet.as_pane_mut().unwrap().header.row_shift = -1;
+        packet.as_pane_mut().unwrap().header.rows = vec![0];
+        packet.as_pane_mut().unwrap().header.cache = Some(CachedRows {
             start: 196,
             row_flags: vec![0, 1, 0],
         });
-        packet.cells.resize(8, Cell::default());
-        packet.cells[2] = packet.cells[0].clone();
+        packet
+            .as_pane_mut()
+            .unwrap()
+            .cells
+            .resize(8, Cell::default());
+        packet.as_pane_mut().unwrap().cells[2] = packet.as_pane().unwrap().cells[0].clone();
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         let decoded = Packet::read(&mut &bytes[..]).unwrap();
-        assert_eq!(decoded.cells.len(), 8);
-        assert!(decoded.cells[0].blink() && decoded.cells[2].blink());
-        assert_eq!(decoded.header.cache_origin, 42);
-        assert_eq!(decoded.header.cache_valid_before, Some(200));
-        assert_eq!(decoded.header.cache.unwrap().row_flags, [0, 1, 0]);
+        assert_eq!(decoded.as_pane().unwrap().cells.len(), 8);
+        assert!(
+            decoded.as_pane().unwrap().cells[0].blink()
+                && decoded.as_pane().unwrap().cells[2].blink()
+        );
+        assert_eq!(decoded.as_pane().unwrap().header.cache_origin, 42);
+        assert_eq!(
+            decoded.as_pane().unwrap().header.cache_valid_before,
+            Some(200)
+        );
+        assert_eq!(
+            decoded
+                .as_pane()
+                .unwrap()
+                .header
+                .cache
+                .as_ref()
+                .unwrap()
+                .row_flags,
+            [0, 1, 0]
+        );
         for (shift, start, flags) in [
             (3, 196, vec![0]),
             (-3, 196, vec![0]),
@@ -653,8 +710,8 @@ mod tests {
             (0, 0, vec![2]),
             (0, 0, vec![0; MAX_CACHE_ROWS + 1]),
         ] {
-            packet.header.row_shift = shift;
-            packet.header.cache = Some(CachedRows {
+            packet.as_pane_mut().unwrap().header.row_shift = shift;
+            packet.as_pane_mut().unwrap().header.cache = Some(CachedRows {
                 start,
                 row_flags: flags,
             });
@@ -670,20 +727,29 @@ mod tests {
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
         let decoded = Packet::read(&mut &encoded[..]).unwrap();
-        assert_eq!(decoded.header.meta, packet.header.meta);
-        assert_eq!(decoded.header.rows, vec![1]);
-        assert_eq!(decoded.header.row_flags, vec![1]);
-        assert_eq!(decoded.header.scroll_serial, 42);
         assert_eq!(
-            decoded.header.frame.unwrap().scrollback,
-            packet.header.frame.unwrap().scrollback
+            decoded.as_pane().unwrap().header.meta,
+            packet.as_pane().unwrap().header.meta
         );
-        assert!(decoded.cells == packet.cells);
-        assert_eq!(decoded.header.notifications, vec!["alert"]);
+        assert_eq!(decoded.as_pane().unwrap().header.rows, vec![1]);
+        assert_eq!(decoded.as_pane().unwrap().header.row_flags, vec![1]);
+        assert_eq!(decoded.as_pane().unwrap().header.scroll_serial, 42);
+        assert_eq!(
+            decoded.as_pane().unwrap().header.frame.unwrap().scrollback,
+            packet.as_pane().unwrap().header.frame.unwrap().scrollback
+        );
+        assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
+        assert_eq!(
+            decoded.as_pane().unwrap().header.notifications,
+            vec!["alert"]
+        );
         packet.encode_into(&mut encoded).unwrap();
         let mut reader = &encoded[..];
         for _ in 0..2 {
-            assert!(Packet::read(&mut reader).unwrap().cells == packet.cells);
+            assert!(
+                Packet::read(&mut reader).unwrap().as_pane().unwrap().cells
+                    == packet.as_pane().unwrap().cells
+            );
         }
         assert!(reader.is_empty());
     }
@@ -698,6 +764,8 @@ mod tests {
             Packet::read_message(&mut reader)
                 .unwrap()
                 .unwrap()
+                .as_pane()
+                .unwrap()
                 .header
                 .scroll_serial,
             42
@@ -705,14 +773,22 @@ mod tests {
         assert!(Packet::read_message(&mut reader).unwrap().is_none());
         assert!(reader.is_empty());
         let mut reader = &bytes[..];
-        assert_eq!(Packet::read(&mut reader).unwrap().header.scroll_serial, 42);
+        assert_eq!(
+            Packet::read(&mut reader)
+                .unwrap()
+                .as_pane()
+                .unwrap()
+                .header
+                .scroll_serial,
+            42
+        );
         assert_eq!(reader, HEARTBEAT_REPLY);
     }
 
     #[test]
     fn progress_is_required_and_validated_in_stream_and_control_metadata() {
         use serde_json::json;
-        let mut header = serde_json::to_value(Header::default()).unwrap();
+        let mut header = serde_json::to_value(PaneHeader::default()).unwrap();
         for progress in [
             json!({"state":"error","percentage":101}),
             json!({"state":2,"percentage":0}),
@@ -729,32 +805,36 @@ mod tests {
             assert!(serde_json::from_value::<Metadata>(header["meta"].clone()).is_err());
         }
         header["meta"].as_object_mut().unwrap().remove("progress");
-        assert!(serde_json::from_value::<Header>(header).is_err());
+        assert!(serde_json::from_value::<PaneHeader>(header).is_err());
     }
 
     #[test]
     fn malformed_headers_and_payload_lengths_are_rejected() {
         let mut packet = packet();
         for flags in [vec![0, 1], vec![2]] {
-            packet.header.row_flags = flags;
+            packet.as_pane_mut().unwrap().header.row_flags = flags;
             let mut encoded = Vec::new();
             packet.encode_into(&mut encoded).unwrap();
             assert!(Packet::read(&mut &encoded[..]).is_err());
         }
-        packet.header.row_flags.clear();
+        packet.as_pane_mut().unwrap().header.row_flags.clear();
         let mut encoded = Vec::new();
         for rows in [vec![3], vec![1, 1], vec![2, 1], vec![0, 1, 2, 3]] {
-            packet.cells.resize(rows.len() * 2, Cell::default());
-            packet.header.rows = rows;
+            packet
+                .as_pane_mut()
+                .unwrap()
+                .cells
+                .resize(rows.len() * 2, Cell::default());
+            packet.as_pane_mut().unwrap().header.rows = rows;
             encoded.clear();
             packet.encode_into(&mut encoded).unwrap();
             assert!(Packet::read(&mut encoded.as_slice()).is_err());
         }
         // Keep the payload valid so only the grid limits can reject these frames.
-        packet.header.rows.clear();
-        packet.cells.clear();
+        packet.as_pane_mut().unwrap().header.rows.clear();
+        packet.as_pane_mut().unwrap().cells.clear();
         for (cols, rows) in [(0, 3), (2, 0), (1001, 3), (2, 1001), (512, 257)] {
-            let frame = packet.header.frame.as_mut().unwrap();
+            let frame = packet.as_pane_mut().unwrap().header.frame.as_mut().unwrap();
             frame.cols = cols;
             frame.rows = rows;
             encoded.clear();
@@ -762,8 +842,8 @@ mod tests {
             assert!(Packet::read(&mut encoded.as_slice()).is_err());
         }
         packet = self::packet();
-        packet.header.frame = None;
-        packet.cells.clear();
+        packet.as_pane_mut().unwrap().header.frame = None;
+        packet.as_pane_mut().unwrap().cells.clear();
         encoded.clear();
         packet.encode_into(&mut encoded).unwrap();
         assert!(Packet::read(&mut encoded.as_slice()).is_err());
@@ -812,7 +892,7 @@ mod tests {
             vec![[3, 4, 0], [0, 1, 0]],
             vec![[0, 1, 0]; MAX_SPANS + 1],
         ] {
-            packet.header.hyperlinks = Some(Hyperlinks {
+            packet.as_pane_mut().unwrap().header.hyperlinks = Some(Hyperlinks {
                 targets: vec!["test:target".into()],
                 spans,
             });
@@ -826,7 +906,7 @@ mod tests {
             vec!["x".repeat(MAX_URI_BYTES + 1)],
             vec!["x".repeat(MAX_URI_BYTES); MAX_TARGET_BYTES / MAX_URI_BYTES + 1],
         ] {
-            packet.header.hyperlinks = Some(Hyperlinks {
+            packet.as_pane_mut().unwrap().header.hyperlinks = Some(Hyperlinks {
                 spans: (0..targets.len())
                     .map(|i| [i as u32, i as u32 + 1, i as u32])
                     .collect(),
@@ -836,18 +916,21 @@ mod tests {
             packet.encode_into(&mut bytes).unwrap();
             assert!(Packet::read(&mut bytes.as_slice()).is_err());
         }
-        packet.header.hyperlinks = Some(Hyperlinks {
+        packet.as_pane_mut().unwrap().header.hyperlinks = Some(Hyperlinks {
             targets: vec!["test:actual".into()],
             spans: vec![[0, 6, 0]],
         });
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded.header.hyperlinks, packet.header.hyperlinks);
-        packet.header.frame = None;
-        packet.header.rows.clear();
-        packet.header.row_flags.clear();
-        packet.cells.clear();
+        assert_eq!(
+            decoded.as_pane().unwrap().header.hyperlinks,
+            packet.as_pane().unwrap().header.hyperlinks
+        );
+        packet.as_pane_mut().unwrap().header.frame = None;
+        packet.as_pane_mut().unwrap().header.rows.clear();
+        packet.as_pane_mut().unwrap().header.row_flags.clear();
+        packet.as_pane_mut().unwrap().cells.clear();
         bytes.clear();
         packet.encode_into(&mut bytes).unwrap();
         assert!(Packet::read(&mut bytes.as_slice()).is_err());
@@ -857,25 +940,43 @@ mod tests {
     fn link_ranges_address_the_viewport_and_not_appended_cached_rows() {
         use crate::hyperlinks::Hyperlinks;
         let mut packet = packet();
-        packet.header.generation = 1;
-        packet.header.cache = Some(CachedRows {
+        packet.as_pane_mut().unwrap().header.generation = 1;
+        packet.as_pane_mut().unwrap().header.cache = Some(CachedRows {
             start: 0,
             row_flags: vec![0; 10],
         });
-        packet.cells.extend(vec![Cell::default(); 20]);
-        packet.header.hyperlinks = Some(Hyperlinks {
+        packet
+            .as_pane_mut()
+            .unwrap()
+            .cells
+            .extend(vec![Cell::default(); 20]);
+        packet.as_pane_mut().unwrap().header.hyperlinks = Some(Hyperlinks {
             targets: vec!["test:viewport".into()],
             spans: vec![[0, 6, 0]],
         });
         let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
         let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded.cells.len(), 22);
+        assert_eq!(decoded.as_pane().unwrap().cells.len(), 22);
         assert_eq!(
-            decoded.header.hyperlinks.unwrap().target_at(5),
+            decoded
+                .as_pane()
+                .unwrap()
+                .header
+                .hyperlinks
+                .as_ref()
+                .unwrap()
+                .target_at(5),
             Some("test:viewport")
         );
-        packet.header.hyperlinks.as_mut().unwrap().spans[0][1] = 7;
+        packet
+            .as_pane_mut()
+            .unwrap()
+            .header
+            .hyperlinks
+            .as_mut()
+            .unwrap()
+            .spans[0][1] = 7;
         bytes.clear();
         packet.encode_into(&mut bytes).unwrap();
         assert!(Packet::read(&mut bytes.as_slice()).is_err());
@@ -884,7 +985,9 @@ mod tests {
     #[test]
     fn invalid_grapheme_lengths_utf8_and_trailing_data_are_rejected() {
         let mut packet = packet();
-        packet.cells[0].set_text("X").unwrap();
+        packet.as_pane_mut().unwrap().cells[0]
+            .set_text("X")
+            .unwrap();
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
         let start =
@@ -952,11 +1055,25 @@ mod tests {
     #[test]
     fn fragmented_and_interrupted_reads_preserve_cells_and_following_packets() {
         let mut packet = packet();
-        packet.header.frame.as_mut().unwrap().cols = 73;
-        packet.header.frame.as_mut().unwrap().mouse_shape = u8::MAX;
-        packet.header.rows = vec![0, 2];
-        packet.header.row_flags = vec![1, 0];
-        packet.cells = (0..146)
+        packet
+            .as_pane_mut()
+            .unwrap()
+            .header
+            .frame
+            .as_mut()
+            .unwrap()
+            .cols = 73;
+        packet
+            .as_pane_mut()
+            .unwrap()
+            .header
+            .frame
+            .as_mut()
+            .unwrap()
+            .mouse_shape = u8::MAX;
+        packet.as_pane_mut().unwrap().header.rows = vec![0, 2];
+        packet.as_pane_mut().unwrap().header.row_flags = vec![1, 0];
+        packet.as_pane_mut().unwrap().cells = (0..146)
             .map(|i| {
                 let mut cell = Cell::default();
                 cell.set_text(&if i % 2 == 0 {
@@ -973,18 +1090,18 @@ mod tests {
                 cell
             })
             .collect();
-        packet.header.cache = Some(CachedRows {
+        packet.as_pane_mut().unwrap().header.cache = Some(CachedRows {
             start: 10,
             row_flags: vec![1, 0],
         });
-        packet.cells.extend_from_within(..);
+        packet.as_pane_mut().unwrap().cells.extend_from_within(..);
         let mut encoded = Vec::new();
         packet.encode_into(&mut encoded).unwrap();
         // Put an empty delta between two payloads to catch packet overconsumption.
-        let unchanged = Packet {
-            header: Header::default(),
+        let unchanged = Packet::Pane(PaneUpdate {
+            header: PaneHeader::default(),
             cells: vec![],
-        };
+        });
         unchanged.encode_into(&mut encoded).unwrap();
         packet.encode_into(&mut encoded).unwrap();
         for (capacity, chunk) in [
@@ -1005,14 +1122,26 @@ mod tests {
             for index in 0..3 {
                 let decoded = Packet::read(&mut reader).unwrap();
                 if index == 1 {
-                    assert!(decoded.cells.is_empty());
-                    assert!(decoded.header.frame.is_none());
+                    assert!(decoded.as_pane().unwrap().cells.is_empty());
+                    assert!(decoded.as_pane().unwrap().header.frame.is_none());
                 } else {
-                    assert!(decoded.cells == packet.cells);
-                    assert!(decoded.header.frame == packet.header.frame);
-                    assert_eq!(decoded.header.rows, packet.header.rows);
-                    assert_eq!(decoded.header.row_flags, packet.header.row_flags);
-                    assert_eq!(decoded.header.meta, packet.header.meta);
+                    assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
+                    assert!(
+                        decoded.as_pane().unwrap().header.frame
+                            == packet.as_pane().unwrap().header.frame
+                    );
+                    assert_eq!(
+                        decoded.as_pane().unwrap().header.rows,
+                        packet.as_pane().unwrap().header.rows
+                    );
+                    assert_eq!(
+                        decoded.as_pane().unwrap().header.row_flags,
+                        packet.as_pane().unwrap().header.row_flags
+                    );
+                    assert_eq!(
+                        decoded.as_pane().unwrap().header.meta,
+                        packet.as_pane().unwrap().header.meta
+                    );
                 }
             }
             let mut trailing = Vec::new();
@@ -1033,10 +1162,10 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                    assert!(decoded.cells == expected.cells);
+                    assert!(decoded.as_pane().unwrap().cells == expected.as_pane().unwrap().cells);
                     assert_eq!(
-                        serde_json::to_value(decoded.header).unwrap(),
-                        serde_json::to_value(&expected.header).unwrap()
+                        serde_json::to_value(&decoded.as_pane().unwrap().header).unwrap(),
+                        serde_json::to_value(&expected.as_pane().unwrap().header).unwrap()
                     );
                 }
             });
@@ -1061,42 +1190,34 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            packet.header.meta.directory = std::ffi::OsString::from_vec(vec![0xff]).into();
+            packet.as_pane_mut().unwrap().header.meta.directory =
+                std::ffi::OsString::from_vec(vec![0xff]).into();
             assert!(packet.encode_into(&mut encoded).is_err());
             assert_eq!(encoded, original);
         }
 
-        packet.header.meta.directory = "/tmp".into();
-        packet.header.copy = Some(crate::clipboard::Write {
-            destination: crate::clipboard::Destination::Clipboard,
-            content: Some("x".repeat(MAX_PACKET).into()),
-        });
-        assert!(packet.encode_into(&mut encoded).is_err());
+        packet.as_pane_mut().unwrap().header.meta.directory = "/tmp".into();
+        let invalid = offer(&[("text/plain", &vec![b'x'; MAX_PACKET])]);
+        assert!(invalid.encode_into(&mut encoded).is_err());
         assert_eq!(encoded, original);
         let decoded = Packet::read(&mut &encoded[..]).unwrap();
-        assert!(decoded.cells == packet.cells);
+        assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
     }
 
     fn offer(contents: &[(&str, &[u8])]) -> Packet {
         use crate::clipboard::{Destination, Offer, Representation, Write};
-        Packet {
-            header: Header {
-                copy: Some(Write {
-                    destination: Destination::Primary,
-                    content: Some(Offer(
-                        contents
-                            .iter()
-                            .map(|(mime, data)| Representation {
-                                mime: (*mime).into(),
-                                data: data.to_vec(),
-                            })
-                            .collect(),
-                    )),
-                }),
-                ..Header::default()
-            },
-            cells: vec![],
-        }
+        Packet::Clipboard(Write {
+            destination: Destination::Primary,
+            content: Some(Offer(
+                contents
+                    .iter()
+                    .map(|(mime, data)| Representation {
+                        mime: (*mime).into(),
+                        data: data.to_vec(),
+                    })
+                    .collect(),
+            )),
+        })
     }
 
     #[test]
@@ -1115,7 +1236,7 @@ mod tests {
             serde_json::from_slice(&bytes[RECORD_PREFIX_BYTES..RECORD_PREFIX_BYTES + header_len])
                 .unwrap();
         assert_eq!(
-            header["copy"]["content"][0],
+            header["content"][0],
             serde_json::json!({"mime":"image/png", "len":png.len()})
         );
         assert_eq!(&bytes[RECORD_PREFIX_BYTES + header_len..][..png.len()], png);
@@ -1123,7 +1244,7 @@ mod tests {
         for capacity in [1, 3, 79, 65536] {
             let decoded =
                 Packet::read(&mut BufReader::with_capacity(capacity, bytes.as_slice())).unwrap();
-            assert_eq!(decoded.header.copy, packet.header.copy);
+            assert_eq!(clipboard_header(&decoded), clipboard_header(&packet));
         }
         let packet = offer(&[(
             "image/png",
@@ -1140,18 +1261,17 @@ mod tests {
         assert_eq!(queue.capacity(), capacity); // No queue growth on rejection.
     }
 
+    fn clipboard_header(packet: &Packet) -> serde_json::Value {
+        let mut bytes = Vec::new();
+        packet.write_header(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     #[test]
     fn clipboard_header_and_queue_limits_apply_at_the_exact_boundary() {
-        let mut packet = offer(&[("text/plain", b"value")]);
-        let original_header = serde_json::to_vec(&packet.header).unwrap().len();
-        packet.header.meta.title = "x".repeat(crate::clipboard::MAX_HEADER_BYTES - original_header);
-        let mut bytes = vec![];
+        let packet = offer(&[("text/plain", b"value")]);
+        let mut bytes = Vec::new();
         packet.encode_into(&mut bytes).unwrap();
-        let header_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        assert_eq!(header_len, crate::clipboard::MAX_HEADER_BYTES);
-        let decoded = Packet::read(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded.header.copy, packet.header.copy);
-
         let mut queue = bytes.clone();
         packet.encode_into_limit(&mut queue, bytes.len()).unwrap();
         assert_eq!(queue.len(), 2 * bytes.len());
@@ -1161,41 +1281,34 @@ mod tests {
                 .is_err()
         );
         assert_eq!(queue.len(), 2 * bytes.len());
-        packet.header.meta.title.push('x');
-        assert!(packet.encode_into(&mut queue).is_err());
-        assert_eq!(queue.len(), 2 * bytes.len());
-
-        // Bypass encoding to verify the same metadata bound on remote input.
-        let header = serde_json::to_vec(&packet.header).unwrap();
-        let record = Record::new(
-            RECORD_PREFIX_BYTES - 4 + header.len() + 5,
-            header.len(),
-            RecordKind::Clipboard,
-            record::json_budget(&header).unwrap(),
-            0,
-        );
-        assert!(record.is_err());
-        let mut oversized: Vec<_> = [
-            RECORD_PREFIX_BYTES - 4 + header.len() + 5,
-            header.len(),
-            RecordKind::Clipboard as usize,
-            record::json_budget(&header).unwrap(),
-            0,
-        ]
-        .into_iter()
-        .flat_map(|value| (value as u32).to_le_bytes())
-        .collect();
-        oversized.extend_from_slice(&header);
-        oversized.extend_from_slice(b"value");
-        let mut reader = io::Cursor::new(oversized);
-        assert!(Packet::read(&mut reader).is_err());
-        assert_eq!(reader.position(), RECORD_PREFIX_BYTES as u64);
+        // Whitespace is valid JSON metadata and counts against the header limit.
+        for extra in [0, 1] {
+            let mut header = serde_json::to_vec(&clipboard_header(&packet)).unwrap();
+            header.resize(crate::clipboard::MAX_HEADER_BYTES + extra, b' ');
+            let mut wire: Vec<_> = [
+                RECORD_PREFIX_BYTES - 4 + header.len() + 5,
+                header.len(),
+                RecordKind::Clipboard as usize,
+                record::json_budget(&header).unwrap(),
+                0,
+            ]
+            .into_iter()
+            .flat_map(|v| (v as u32).to_le_bytes())
+            .collect();
+            wire.extend_from_slice(&header);
+            wire.extend_from_slice(b"value");
+            let mut reader = io::Cursor::new(wire);
+            assert_eq!(Packet::read(&mut reader).is_ok(), extra == 0);
+            if extra != 0 {
+                assert_eq!(reader.position(), RECORD_PREFIX_BYTES as u64);
+            }
+        }
     }
 
     #[test]
     fn clipboard_rejects_invalid_descriptors_payloads_and_mixed_packets() {
         let valid_packet = offer(&[("text/plain", b"ok"), ("text/html", b"<b>ok</b>")]);
-        let header = serde_json::to_value(&valid_packet.header).unwrap();
+        let header = clipboard_header(&valid_packet);
         let mut cases = Vec::new();
         for content in [
             serde_json::json!([]),
@@ -1215,11 +1328,11 @@ mod tests {
             serde_json::json!([{"mime":"text/plain","len":2}]), // Truncated.
         ] {
             let mut h = header.clone();
-            h["copy"]["content"] = content;
+            h["content"] = content;
             cases.push(h);
         }
         let mut mixed = header.clone();
-        mixed["frame"] = serde_json::to_value(packet().header.frame).unwrap();
+        mixed["frame"] = serde_json::to_value(packet().as_pane().unwrap().header.frame).unwrap();
         cases.push(mixed);
         for header in cases {
             let header = serde_json::to_vec(&header).unwrap();
@@ -1259,3 +1372,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod event_tests;
