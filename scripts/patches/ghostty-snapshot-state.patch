@@ -1,6 +1,9 @@
+Encode history checkpoints without unfinished VT parser input.
+Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
+
 --- a/src/terminal/c/snapshot.zig
 +++ b/src/terminal/c/snapshot.zig
-@@ -626,11 +626,13 @@
+@@ -660,11 +660,13 @@
      };
  }
  
@@ -17,7 +20,7 @@
      // The terminal allocator also owns the temporary continuation copy.
      const native = terminal_c.zigTerminal(terminal) orelse return .{
          .result = .invalid_value,
-@@ -698,12 +700,37 @@
+@@ -733,13 +735,38 @@
      buf_len: usize,
      out_written_: ?*usize,
  ) callconv(lib.calling_conv) Result {
@@ -43,6 +46,7 @@
 +    out_written_: ?*usize,
 +    include_continuation: bool,
 +) Result {
+     if (comptime !lib.feature(.snapshot)) return .unsupported;
      // Validate output storage and preflight the terminal continuation.
      const out_written = out_written_ orelse return .invalid_value;
      out_written.* = 0;
@@ -58,7 +62,7 @@
  
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
-@@ -242,6 +242,7 @@
+@@ -247,6 +247,7 @@
  
  pub const snapshot_encode = snapshot.encode;
  pub const snapshot_encode_buf = snapshot.encode_buf;
@@ -68,20 +72,26 @@
  pub const snapshot_decoder_new_buf = snapshot.decoder_new_buf;
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -387,6 +387,7 @@
-         if (features.snapshot) {
-             @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
-             @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
-+            @export(&c.snapshot_encode_buf_state, .{ .name = "ghostty_snapshot_encode_buf_state" });
-             @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
-             @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
-             @export(&c.snapshot_decoder_new_buf, .{ .name = "ghostty_snapshot_decoder_new_buf" });
+@@ -365,6 +365,7 @@
+         @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
+         @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
+         @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
++        @export(&c.snapshot_encode_buf_state, .{ .name = "ghostty_snapshot_encode_buf_state" });
+         @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
+         @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
+         @export(&c.snapshot_decoder_new_buf, .{ .name = "ghostty_snapshot_decoder_new_buf" });
 --- a/include/ghostty/vt/snapshot.h
 +++ b/include/ghostty/vt/snapshot.h
-@@ -538,6 +538,23 @@
-     size_t* out_written);
- 
- /**
+@@ -442,6 +442,23 @@
+  * @ingroup snapshot
+  */
+ GHOSTTY_API GhosttyResult ghostty_snapshot_encode_buf(
++    GhosttyTerminal terminal,
++    uint8_t* buf,
++    size_t buf_len,
++    size_t* out_written);
++
++/**
 + * Encode committed terminal state, omitting unfinished VT parser input.
 + *
 + * This has the same buffer, size-query and error contract as
@@ -93,12 +103,6 @@
 + * @ingroup snapshot
 + */
 +GHOSTTY_API GhosttyResult ghostty_snapshot_encode_buf_state(
-+    GhosttyTerminal terminal,
-+    uint8_t* buf,
-+    size_t buf_len,
-+    size_t* out_written);
-+
-+/**
-  * Encode a complete terminal snapshot to an allocated buffer.
-  *
-  * The returned buffer is allocated with allocator, or the default allocator
+     GhosttyTerminal terminal,
+     uint8_t* buf,
+     size_t buf_len,

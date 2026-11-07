@@ -34,7 +34,7 @@ mapfile -t gmux_binaries <<< "$gmux_binaries"
 install -Dm755 "${gmux_binaries[0]}" "$gmux_install_prefix/bin/gmux"
 if ! "$gmux_headless"; then install -Dm755 "${gmux_binaries[1]}" "$gmux_install_prefix/bin/gmux-gtk"; fi
 mkdir -p "$gmux_install_prefix/lib/gmux"
-cp -L "$gmux_ghostty_prefix/lib/libghostty-vt.so" "$gmux_install_prefix/lib/gmux/libghostty-vt.so.0"
+cp -L "$gmux_ghostty_prefix/lib/libghostty-vt.so.1" "$gmux_install_prefix/lib/gmux/libghostty-vt.so.1"
 install -Dm644 LICENSE "$gmux_install_prefix/share/doc/gmux/LICENSE"
 mkdir -p "$gmux_install_prefix/share/gmux"
 cp -R data/shell-integration "$gmux_install_prefix/share/gmux/"

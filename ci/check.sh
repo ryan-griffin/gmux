@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$GHOSTTY_PREFIX/lib"
 python3 - <<'PY'
 import runpy
 pins = runpy.run_path("scripts/bootstrap-ghostty.py")
-print(f"Ghostty {pins['REVISION']}; Zig {pins['ZIG_VERSION']}")
+print(f"libghostty-vt {pins['VERSION']} ({pins['REVISION']}); Zig {pins['ZIG_VERSION']}")
 PY
 ./scripts/bootstrap-ghostty.sh
 python3 - <<'PY'
@@ -30,11 +30,12 @@ import hashlib
 from pathlib import Path
 import runpy
 pins = runpy.run_path("scripts/bootstrap-ghostty.py")
-archive = Path(".deps") / f"ghostty-{pins['REVISION']}.tar.gz"
-with archive.open("rb") as source:
-    checksum = hashlib.file_digest(source, "sha256").hexdigest()
-assert checksum == pins["SOURCE_SHA256"]
-print(f"{checksum}  {archive}")
+for suffix, expected in (("", pins["SOURCE_SHA256"]), ("-deps", pins["DEPS_SHA256"])):
+    archive = Path(".deps") / f"libghostty-vt-{pins['VERSION']}{suffix}.tar.gz"
+    with archive.open("rb") as source:
+        checksum = hashlib.file_digest(source, "sha256").hexdigest()
+    assert checksum == expected
+    print(f"{checksum}  {archive}")
 PY
 python3 scripts/check.py --headless
 python3 - <<'PY'

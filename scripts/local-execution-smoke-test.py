@@ -158,6 +158,8 @@ with (artifacts / "local-execution-smoke.log").open("w") as log, \
         assert not widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED)
         assert not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE)
         click("Local Daemon", "switch")
+        wait_accessible(lambda: widget("Local Daemon", "switch").get_state_set().contains(Atspi.StateType.CHECKED),
+                        message="The local toggle did not turn on")
         click("Local Daemon", "switch")
         wait_accessible(lambda: not widget("Save", "button").get_state_set().contains(Atspi.StateType.SENSITIVE),
                         message="Reverting the local toggle did not disable Save")

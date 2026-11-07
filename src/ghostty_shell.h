@@ -31,7 +31,7 @@ static void shell_output_clear(OutputAnchor *anchor) {
 
 static bool shell_output_snapshot(OutputAnchor *anchor, GhosttyGridRef *out) {
     if (!anchor->point) return false;
-    GhosttyGridRef guard = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef guard = {0};
     if (!ghostty_tracked_grid_ref_snapshot(anchor->point, out) &&
         !ghostty_tracked_grid_ref_snapshot(anchor->guard, &guard) &&
         !(out->node == guard.node && out->x == guard.x && out->y == guard.y)) return true;
@@ -40,7 +40,7 @@ static bool shell_output_snapshot(OutputAnchor *anchor, GhosttyGridRef *out) {
 }
 
 static bool shell_prompt_valid(GhosttyTrackedGridRef anchor) {
-    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef ref = {0};
     GhosttyRow row;
     GhosttyRowSemanticPrompt kind;
     return !ghostty_tracked_grid_ref_snapshot(anchor, &ref) &&
@@ -97,8 +97,8 @@ static void shell_prune(GmuxEngine *e) {
             // Erasing a partial page can clamp erased pins to its first cell
             // instead of invalidating them. Collapse that discarded prefix.
             // Snapshots compare opaque coordinates without reading page text.
-            GhosttyGridRef a = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-            GhosttyGridRef b = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+            GhosttyGridRef a = {0};
+            GhosttyGridRef b = {0};
             discard = !ghostty_tracked_grid_ref_snapshot(shell_prompt(e, 0)->point, &a) &&
                 !ghostty_tracked_grid_ref_snapshot(shell_prompt(e, 1)->point, &b) &&
                 a.node == b.node && a.y == b.y;
@@ -113,7 +113,7 @@ static void shell_prune(GmuxEngine *e) {
         free(e->prompts); e->prompts = NULL;
         e->prompt_head = e->prompt_capacity = 0;
     }
-    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef ref = {0};
     shell_output_snapshot(&e->output, &ref);
     shell_output_snapshot(&e->completed_output, &ref);
 }
@@ -322,20 +322,20 @@ int gmux_engine_output_anchor(GmuxEngine *e, uint16_t x, uint32_t y) {
 }
 
 static GhosttyResult shell_output_select(GmuxEngine *e, OutputAnchor *anchor, GhosttySelection *selection) {
-    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef ref = {0};
     if (!shell_output_get(e, anchor, &ref)) return GHOSTTY_NO_VALUE;
-    return ghostty_terminal_select_output(e->terminal, ref, selection);
+    return ghostty_terminal_select_output(e->terminal, &ref, selection);
 }
 
 int gmux_engine_select_output(GmuxEngine *e, uint8_t target, uint16_t x, uint32_t y) {
     if (!shell_primary(e) || e->held) return 1;
-    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    GhosttySelection selection = {0};
     GhosttyResult result;
     if (target == 1) {
-        GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        GhosttyGridRef ref = {0};
         GhosttyPoint point = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {x, y}};
         if (ghostty_terminal_grid_ref(e->terminal, point, &ref)) return 1;
-        result = ghostty_terminal_select_output(e->terminal, ref, &selection);
+        result = ghostty_terminal_select_output(e->terminal, &ref, &selection);
     } else {
         OutputAnchor *anchor = target == 2 ? &e->output_anchor : &e->completed_output;
         result = shell_output_select(e, anchor, &selection);

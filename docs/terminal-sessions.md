@@ -178,9 +178,10 @@ Ghostty source revision, pane ID, and payload length. `GHOSTTY_PREFIX` must poin
 to a build matching the pin in `scripts/bootstrap-ghostty.py`.
 Missing, mismatched, or damaged checkpoints log a warning and leave that pane
 with empty history. Other panes still restore. Updating the Ghostty pin, including
-the update to 1.4.0, invalidates history saved by the previous revision. Tabs,
-directories, and saved scrollback limits still restore with fresh shells. To keep
-text before an upgrade, export it with `gmux read` while the old daemon is running.
+the update to libghostty-vt 1.0.0, invalidates history saved by the previous
+revision. Tabs, directories, and saved scrollback limits still restore with fresh
+shells. To keep text before an upgrade, export it with `gmux read` while the old
+daemon is running.
 
 Limits are 8 MiB per pane, 64 MiB per layout, and 128 panes. Snapshot decoding has
 a 64 MiB allocation budget per pane; formatted history replay has an 8 MiB limit.

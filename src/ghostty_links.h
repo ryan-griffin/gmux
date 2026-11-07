@@ -154,7 +154,7 @@ static void links_capture(GhosttyTerminal terminal, GhosttyRenderState render,
             bool linked=false;
             if (ghostty_cell_get(cells.ptr[x], GHOSTTY_CELL_DATA_HAS_HYPERLINK, &linked)) goto fail;
             if (!linked) continue;
-            GhosttyGridRef ref=GHOSTTY_INIT_SIZED(GhosttyGridRef);
+            GhosttyGridRef ref={0};
             GhosttyPoint point={.tag=GHOSTTY_POINT_TAG_VIEWPORT, .value.coordinate={x,(uint32_t)y}};
             size_t len=0;
             if (ghostty_terminal_grid_ref(terminal, point, &ref) ||

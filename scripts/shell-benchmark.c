@@ -35,7 +35,7 @@ static void free_allocation(void *ctx, void *p, size_t n, uint8_t a, uintptr_t r
     live_bytes -= n;
     free(p);
 }
-static const GhosttyAllocatorVtable vtable = {allocate, resize_allocation, remap_allocation, free_allocation};
+static const GhosttyAllocatorVtable vtable = {.alloc=allocate, .resize=resize_allocation, .remap=remap_allocation, .free=free_allocation};
 static const GhosttyAllocator allocator = {.vtable = &vtable};
 GhosttyResult __real_ghostty_terminal_new(const GhosttyAllocator *, GhosttyTerminal *, uint16_t, uint16_t);
 GhosttyResult __wrap_ghostty_terminal_new(const GhosttyAllocator *a, GhosttyTerminal *t, uint16_t cols, uint16_t rows) {

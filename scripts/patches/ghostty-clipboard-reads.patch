@@ -1,7 +1,10 @@
+Allow asynchronous clipboard reads without blocking unrelated terminals.
+Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
+
 --- a/include/ghostty/vt/terminal.h
 +++ b/include/ghostty/vt/terminal.h
-@@ -1219,10 +1219,11 @@
-  * callback duration.
+@@ -1033,10 +1033,11 @@
+  * The request is borrowed and only valid until the callback returns.
   *
   * The read is answered by calling `reply` with this request and a
 - * GhosttyClipboardReadReply. This must happen before the callback returns;
@@ -14,9 +17,9 @@
 + * ignored. Returning without a reply or successful deferral answers the program
 + * with an empty clipboard (OSC 52) or EPERM (OSC 5522).
   *
-  * @ingroup terminal
-  */
-@@ -1282,15 +1283,45 @@
+  * This struct has a frozen layout and will never gain fields. It is 72 bytes
+  * on 64-bit targets and 36 bytes on wasm32. If a later version of
+@@ -1098,15 +1099,46 @@
  };
  
  /**
@@ -54,21 +57,23 @@
   *
   * Called synchronously when the running program requests clipboard contents
   * via OSC 52 with a "?" payload or a Kitty clipboard (OSC 5522) read.
-  * Answering lets the program read the user's clipboard, so the embedder is
+- * Answering lets the program read the clipboard of the person using your terminal, so you are
 - * expected to mediate consent. Because the read is synchronous, an embedder
-- * that needs to ask the user must block (for example by running a modal
+- * that needs to ask them must block (for example by running a modal
 - * prompt) until it has an answer; the VT stream waits until the callback
 - * returns.
-+ * expected to mediate consent. For asynchronous consent or clipboard access,
-+ * transfer to owned state with ghostty_terminal_clipboard_read_defer(), stop the
-+ * terminal at OSC_END, and complete/step later on its owner thread. Do not block
-+ * unrelated terminals or retain this callback's borrowed request.
++ * Answering lets the program read the clipboard of the person using your
++ * terminal, so you are expected to mediate consent. For asynchronous consent
++ * or clipboard access, transfer to owned state with
++ * ghostty_terminal_clipboard_read_defer(), stop the terminal at OSC_END, and
++ * complete/step later on its owner thread. Do not block unrelated terminals
++ * or retain this callback's borrowed request.
   *
   * Answer by calling `read->reply(read, &reply)` before returning. See
   * GhosttyClipboardRead for the full contract.
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -329,6 +329,11 @@
+@@ -316,6 +316,11 @@
          @export(&c.terminal_reset, .{ .name = "ghostty_terminal_reset" });
          @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
          @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
@@ -82,7 +87,7 @@
          @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
-@@ -192,6 +192,11 @@
+@@ -197,6 +197,11 @@
  pub const terminal_reset = terminal.reset;
  pub const terminal_resize = terminal.resize;
  pub const terminal_set = terminal.set;
@@ -96,7 +101,7 @@
  pub const terminal_scroll_viewport = terminal.scroll_viewport;
 --- a/src/terminal/c/terminal.zig
 +++ b/src/terminal/c/terminal.zig
-@@ -86,6 +86,7 @@
+@@ -87,6 +87,7 @@
      terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
      stream: Stream,
      effects: Effects = .{},
@@ -104,7 +109,7 @@
      tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
      searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
  
-@@ -575,6 +576,8 @@
+@@ -576,6 +577,8 @@
              .ctx = &ctx,
              .reply = &clipboardReadReplyTrampoline,
          };
@@ -113,7 +118,7 @@
          func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
      }
  
-@@ -1052,6 +1055,74 @@
+@@ -1061,6 +1064,74 @@
          io,
          default_continuation_max_bytes,
      );
@@ -188,7 +193,7 @@
  }
  
  pub fn vt_write(
-@@ -1849,6 +1920,9 @@
+@@ -1863,6 +1934,9 @@
  
  pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
      const wrapper = terminal_ orelse return;
@@ -513,7 +518,7 @@
          self.kittyClipboardAbort();
          self.kitty_clipboard_grants.deinit(self.terminal.gpa());
          self.apc_handler.deinit();
-@@ -1096,6 +1298,7 @@
+@@ -1105,6 +1307,7 @@
              .can_remember = false,
              .reply_ctx = &state,
              .reply_fn = &ClipboardReadState.reply,
@@ -521,7 +526,7 @@
          });
  
          // The program is waiting on us, so a callback that returned
-@@ -1113,6 +1316,14 @@
+@@ -1122,6 +1325,14 @@
          location: clipboard.Location,
          terminator: osc.Terminator,
          replied: bool = false,
@@ -536,7 +541,7 @@
  
          fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
              const self: *ClipboardReadState = @ptrCast(@alignCast(ctx));
-@@ -1245,6 +1456,7 @@
+@@ -1254,6 +1465,7 @@
                      targets = true;
                      continue;
                  }
@@ -544,7 +549,7 @@
                  if (len == mimes_buf.len) continue;
                  mimes_buf[len] = mime;
                  len += 1;
-@@ -1280,6 +1492,7 @@
+@@ -1289,6 +1501,7 @@
              .can_remember = pw.len > 0,
              .reply_ctx = &state,
              .reply_fn = &KittyClipboardReadState.reply,
@@ -552,7 +557,7 @@
          });
  
          // The program is waiting on us, so a callback that returned
-@@ -1303,6 +1516,14 @@
+@@ -1312,6 +1525,14 @@
          list: bool,
          terminator: osc.Terminator,
          replied: bool = false,

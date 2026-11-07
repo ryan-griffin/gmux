@@ -10,8 +10,9 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Atspi, Gdk
 
 from cargo_test_support import cargo_binary
-from test_support import (AccessibilityFixture, AppFixture, assert_stays, descendants,
-                          scenario, wait_accessible, wait_for)
+from test_support import (AccessibilityFixture, AppFixture, assert_stays,
+                          create_tab_when_connected, descendants, scenario,
+                          wait_accessible, wait_for)
 from wayland_test_support import ensure_wayland_session, WaylandInput
 
 ensure_wayland_session()
@@ -33,7 +34,7 @@ with (artifacts / "terminal-feedback.log").open("w") as log, AccessibilityFixtur
     server.rpc("split", pane=remote["pane"])
     desktop.rpc("connection-add", name="build-server", address=address, authentication={"mode": "none"})
     app = desktop.start_app(client, stdout=log, stderr=log)
-    local = desktop.rpc("new", connection="local", name="Local")
+    local = create_tab_when_connected(desktop.env["GMUX_SOCKET"], connection="local", name="Local")
     desktop.rpc("focus", connection="build-server", pane=remote["pane"])
     wait_for(lambda: desktop.rpc("renderer-info")["viewport"]["width"] > 0)
 
