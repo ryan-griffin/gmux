@@ -31,7 +31,7 @@ static void free_allocation(void *ctx, void *ptr, size_t len, uint8_t alignment,
     (void)ctx; (void)len; (void)alignment; (void)ra;
     free(ptr);
 }
-static const GhosttyAllocatorVtable vtable = {allocate, resize_allocation, remap_allocation, free_allocation};
+static const GhosttyAllocatorVtable vtable = {.alloc=allocate, .resize=resize_allocation, .remap=remap_allocation, .free=free_allocation};
 static const GhosttyAllocator allocator = {.vtable = &vtable};
 static double seconds(clockid_t clock) {
     struct timespec t;

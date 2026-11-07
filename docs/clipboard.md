@@ -179,7 +179,7 @@ Malformed native protocol requests can be ignored before admission. Per-pane
 and per-window rate limits, a maximum of 16 pending reads, bounded staging
 memory, and existing transport queues limit malicious bursts.
 
-The [pinned callback contract](https://github.com/ghostty-org/ghostty/blob/83fb95624b0439ee660c2679b43b38c8b63769cd/include/ghostty/vt/terminal.h)
+The [pinned callback contract](https://github.com/ghostty-org/ghostty/blob/0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec/include/ghostty/vt/terminal.h)
 defines borrowing, atomicity, and protocol replies. GDK documents
 [byte providers](https://docs.gtk.org/gdk4/ctor.ContentProvider.new_for_bytes.html),
 [union ordering](https://docs.gtk.org/gdk4/ctor.ContentProvider.new_union.html), and

@@ -39,7 +39,7 @@ static void free_allocation(void *ctx, void *ptr, size_t len, uint8_t alignment,
     free(ptr);
 }
 static const GhosttyAllocatorVtable vtable = {
-    allocate, resize_allocation, remap_allocation, free_allocation
+    .alloc=allocate, .resize=resize_allocation, .remap=remap_allocation, .free=free_allocation
 };
 static const GhosttyAllocator allocator = {.vtable = &vtable};
 GhosttyResult __real_ghostty_render_state_new(const GhosttyAllocator *, GhosttyRenderState *);

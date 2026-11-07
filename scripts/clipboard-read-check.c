@@ -43,7 +43,7 @@ static void *remap_fn(void *c, void *p, size_t l, uint8_t a, size_t n, uintptr_t
 static void free_fn(void *c, void *p, size_t l, uint8_t a, uintptr_t r) { (void)c; (void)a; (void)r; assert(allocated >= l); allocated -= l; free(p); }
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 int main(void) {
-    const GhosttyAllocatorVtable vtable = {alloc_fn, resize_fn, remap_fn, free_fn};
+    const GhosttyAllocatorVtable vtable = {.alloc=alloc_fn, .resize=resize_fn, .remap=remap_fn, .free=free_fn};
     const GhosttyAllocator allocator = {.vtable = &vtable};
     GhosttyTerminal t = terminal(&allocator), other = terminal(NULL);
     uint8_t *data = malloc(4 * 1024 * 1024); assert(data); memset(data, 'X', 4 * 1024 * 1024);

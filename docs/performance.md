@@ -761,6 +761,29 @@ before and 8.34 ms after at 4,000,000 characters. Streaming buffer growth raised
 peak copy scratch from about 4 to 6 MiB at that size. All buffers are temporary;
 plain-only requests allocate no HTML storage.
 
+## Copy formatter reuse
+
+`copy-formatter-benchmark.c` measures native plain-text and HTML copies over 64
+rows of colored text, unwritten gaps, and padding. Each copy configures one
+formatter and reuses it across styled fragments and rectangular rows.
+
+```sh
+ghostty_prefix=${GHOSTTY_PREFIX:-"$PWD/.deps/ghostty"}
+cc -O2 -std=c11 -I"$ghostty_prefix/include" \
+  scripts/copy-formatter-benchmark.c \
+  -Wl,--wrap=ghostty_formatter_terminal_new \
+  -L"$ghostty_prefix/lib" -Wl,-rpath,"$ghostty_prefix/lib" -lghostty-vt \
+  -o artifacts/copy-formatter-benchmark
+artifacts/copy-formatter-benchmark 1 1
+```
+
+The arguments enable HTML and rectangular selection, respectively; use `0` to
+disable either. The report records process CPU per copy, formatter constructions,
+and output bytes and hash. CPU includes the counting/hash writer, but excludes
+fixture ingestion, GTK, Rust HTML normalization, and socket delivery.
+Override `GMUX_BRIDGE_SOURCE` as in the plain-copy benchmark to
+compare another bridge against the same library. Byte counts and hashes must match.
+
 ## Client connections
 
 Measure idle client sockets without a daemon or GTK:

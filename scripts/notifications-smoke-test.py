@@ -6,7 +6,8 @@ Uses private settings, sockets, and shells.
 """
 import json
 from functools import partial
-from test_support import rpc as shared_rpc, wait_for as shared_wait_for
+from test_support import (create_tab_when_connected, rpc as shared_rpc,
+                          wait_for as shared_wait_for)
 import os
 from pathlib import Path
 from cargo_test_support import cargo_binary
@@ -53,6 +54,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
             app = subprocess.Popen([str(cargo_binary("gmux-gtk"))], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("status")["local_clients"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
+            expected = {tab["id"] for tab in shared_rpc(env["GMUX_SOCKET"], "list", client=False)["tabs"]}
+            wait_for(lambda: expected <= {tab["id"] for tab in rpc("list")["tabs"] if tab["connected"]})
 
         def detach():
             global app
@@ -95,7 +98,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-notifications-") as directory:
 
         try:
             start()
-            background = rpc("new", name="Background", directory=str(temp))
+            background = create_tab_when_connected(env["GMUX_SOCKET"], name="Background", directory=str(temp))
             foreground = rpc("new", name="Foreground", directory=str(temp))
             with ThreadPoolExecutor(max_workers=24) as requests:
                 states = list(requests.map(lambda _: rpc("list"), range(48)))

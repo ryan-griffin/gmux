@@ -48,7 +48,7 @@ int main(void) {
          .data = {.ptr = (const uint8_t *)"text", .len = 4}},
     };
     GhosttyClipboardWrite write = {
-        .size = sizeof(write), .location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
+        .location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
         .contents = contents, .contents_len = 1, .reply = reply,
     };
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS, 1);
@@ -86,9 +86,9 @@ int main(void) {
     gmux_engine_clipboard_callback(engine, NULL);
     request(engine, &write, GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY, 0);
     calls = replies = 0;
-    write.size = offsetof(GhosttyClipboardWrite, reply);
+    write.reply = NULL;
     clipboard_write(engine->terminal, engine, &write);
-    assert(!calls && !replies); // Unknown layouts follow the library's default denial.
+    assert(!calls && !replies);
     gmux_engine_free(engine);
     puts("PASS: atomic MIME forwarding, destinations, clear/empty, limits, synchronous replies and unavailable recipient");
 }
