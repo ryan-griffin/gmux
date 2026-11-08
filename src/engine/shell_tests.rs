@@ -134,23 +134,26 @@ fn prompt_navigation_and_output_selection_belong_to_each_view() {
         e.scroll_to(0);
         e.prompt(false).unwrap();
         e.snapshot().unwrap();
-        assert_eq!(e.frame.scrollback.offset, 2);
+        assert_eq!(e.frame().scrollback.offset, 2);
         e.select_output(Some((0, 3))).unwrap();
         assert_eq!(e.copy().unwrap(), "two");
-    });
+    })
+    .unwrap();
     e.with_view(&mut second, |e| {
         e.snapshot().unwrap();
-        assert!(e.frame.scrollback.offset > 2);
+        assert!(e.frame().scrollback.offset > 2);
         assert_eq!(e.selection(), None);
         e.scroll_to(0);
-    });
+    })
+    .unwrap();
     e.resize(8, 3, 0, 0).unwrap();
     e.with_view(&mut first, |e| {
         assert_eq!(e.copy().unwrap(), "two");
         e.prompt(true).unwrap();
         e.snapshot().unwrap();
-        assert_eq!(e.frame.scrollback.offset, 0);
-    });
+        assert_eq!(e.frame().scrollback.offset, 0);
+    })
+    .unwrap();
     assert_eq!(e.command_state().phase, Input);
 }
 
@@ -216,20 +219,24 @@ fn captured_output_survives_reflow_and_cannot_select_unrelated_pruned_text() {
     command(&mut e, "1234567890abcdef");
     let mut view = e.new_view().unwrap();
     let mut other = e.new_view().unwrap();
-    e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
+    e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap())
+        .unwrap();
     e.resize(8, 3, 0, 0).unwrap();
     e.with_view(&mut view, |e| {
         e.select_anchored_output().unwrap();
         assert_eq!(e.copy().unwrap(), "1234567890abcdef");
-    });
-    e.with_view(&mut other, |e| assert!(e.select_anchored_output().is_err()));
+    })
+    .unwrap();
+    e.with_view(&mut other, |e| assert!(e.select_anchored_output().is_err()))
+        .unwrap();
     // The pinned API can clamp partial-page erasures instead of invalidating
     // their pins. Captured targets in that discarded prefix must be released.
     for _ in 0..20 {
         command(&mut e, "x");
     }
     e.write(b"\x1b[2J\x1b[3J\x1b[Hunrelated\r\n\x1b]133;A\x07$ ");
-    e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
+    e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()))
+        .unwrap();
 }
 
 #[test]
@@ -237,9 +244,11 @@ fn erasing_the_only_command_cannot_retarget_its_output_to_new_text() {
     let mut e = terminal();
     command(&mut e, &"old output\r\n".repeat(20));
     let mut view = e.new_view().unwrap();
-    e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
+    e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap())
+        .unwrap();
     e.write(b"\x1b[2J\x1b[3J\x1b[Hunrelated\r\n\x1b]133;A\x07$ ");
-    e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
+    e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()))
+        .unwrap();
     assert!(e.select_output(None).is_err());
 }
 
@@ -255,10 +264,12 @@ fn captured_output_rejects_reused_active_cells_with_or_without_a_following_promp
             e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         }
         let mut view = e.new_view().unwrap();
-        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
+        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap())
+            .unwrap();
         e.write(b"\x1b[10;1H.\x1b[2J\x1b[H");
         command(&mut e, "replacement");
-        e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
+        e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()))
+            .unwrap();
         e.select_output(None).unwrap();
         assert_eq!(e.copy().unwrap(), "replacement");
     }
@@ -273,18 +284,21 @@ fn captured_output_rejects_cells_erased_inside_the_next_command() {
         e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         let mut view = e.new_view().unwrap();
         let mut other = e.new_view().unwrap();
-        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
+        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap())
+            .unwrap();
         e.write(b"clear\r\n\x1b]133;C\x07\x1b[10;1H.\x1b[2J\x1b[H");
         e.write("replacement\r\n".repeat(lines).as_bytes());
         e.write(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         // The new prompt is on or below the former prompt's row. A retained
         // prompt ID alone cannot prove that its original row still exists.
-        e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
+        e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()))
+            .unwrap();
         e.with_view(&mut other, |e| {
             e.anchor_output((0, 0)).unwrap();
             e.select_anchored_output().unwrap();
             assert_eq!(e.copy().unwrap(), vec!["replacement"; lines].join("\n"));
-        });
+        })
+        .unwrap();
     }
 }
 
@@ -300,20 +314,24 @@ fn screen_clear_preserves_captured_output_moved_into_native_history() {
         e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         let mut history = e.new_view().unwrap();
         let mut active = e.new_view().unwrap();
-        e.with_view(&mut history, |e| e.anchor_output((0, 1)).unwrap());
+        e.with_view(&mut history, |e| e.anchor_output((0, 1)).unwrap())
+            .unwrap();
         e.with_view(&mut active, |e| {
             e.anchor_output((0, commands * 2 - 1)).unwrap()
-        });
+        })
+        .unwrap();
         e.write(b"\x1b[2J\x1b[H");
         command(&mut e, "replacement");
         e.with_view(&mut active, |e| {
             e.select_anchored_output().unwrap();
             assert_eq!(e.copy().unwrap(), format!("old{}", commands - 1));
-        });
+        })
+        .unwrap();
         e.with_view(&mut history, |e| {
             e.select_anchored_output().unwrap();
             assert_eq!(e.copy().unwrap(), "old0");
-        });
+        })
+        .unwrap();
     }
 }
 
@@ -325,7 +343,8 @@ fn captured_output_outlives_the_prompt_index_but_rejects_later_rewrites() {
         e.resize(4, 5000, 0, 0).unwrap();
         e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07keep\r\n\x1b]133;D;0\x07");
         let mut view = e.new_view().unwrap();
-        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
+        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap())
+            .unwrap();
         for _ in 0..2100 {
             e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07x\r\n\x1b]133;D;0\x07");
         }
@@ -333,13 +352,15 @@ fn captured_output_outlives_the_prompt_index_but_rejects_later_rewrites() {
         e.with_view(&mut view, |e| {
             e.select_anchored_output().unwrap();
             assert_eq!(e.copy().unwrap(), "keep");
-        });
+        })
+        .unwrap();
         if forward_prompt {
             e.write(b"\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07\x1b[5000;1H.\x1b[2J\x1b[Hnew\r\n\x1b]133;D;0\x07\x1b[4500H\x1b]133;A\x07$ \x1b]133;B\x07");
         } else {
             e.write(b"\x1b[5000;1H.\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07r\r\n\x1b]133;C\x07new\r\n\x1b]133;D;0\x07");
         }
-        e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()));
+        e.with_view(&mut view, |e| assert!(e.select_anchored_output().is_err()))
+            .unwrap();
     }
 }
 
@@ -350,10 +371,12 @@ fn output_targets_survive_narrow_reflow_and_wide_first_cells() {
         command(&mut e, text);
         let mut view = e.new_view().unwrap();
         let mut tail = e.new_view().unwrap();
-        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap());
+        e.with_view(&mut view, |e| e.anchor_output((0, 1)).unwrap())
+            .unwrap();
         e.with_view(&mut tail, |e| {
             e.anchor_output((u16::from(!text.is_ascii()), 1)).unwrap()
-        });
+        })
+        .unwrap();
         // A grid narrower than a wide glyph cannot retain that glyph.
         for cols in if text.is_ascii() {
             [2, 1, 12]
@@ -368,7 +391,8 @@ fn output_targets_survive_narrow_reflow_and_wide_first_cells() {
                 e.with_view(view, |e| {
                     e.select_anchored_output().unwrap();
                     assert_eq!(e.copy().unwrap(), text, "{cols} columns");
-                });
+                })
+                .unwrap();
             }
         }
     }

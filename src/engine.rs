@@ -642,7 +642,7 @@ impl Engine {
     pub(crate) fn semantic_busy(&self) -> bool {
         self.events.command.phase == gmux_protocol::shell::CommandPhase::Running
     }
-    pub(crate) fn prompt(&mut self, previous: bool) -> anyhow::Result<()> {
+    fn prompt(&mut self, previous: bool) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_prompt(self.raw.as_ptr(), previous) };
         anyhow::ensure!(
             result == 0,
@@ -651,10 +651,19 @@ impl Engine {
         );
         Ok(())
     }
-    pub(crate) fn select_output(&mut self, point: Option<(u16, u32)>) -> anyhow::Result<()> {
+    fn select_output(&mut self, point: Option<(u16, u32)>) -> anyhow::Result<()> {
         self.select_output_target(u8::from(point.is_some()), point.unwrap_or_default())
     }
-    pub(crate) fn select_anchored_output(&mut self) -> anyhow::Result<()> {
+    /// Control requests copy output in the terminal's default view.
+    pub(crate) fn command_output(
+        &mut self,
+        point: Option<(u16, u32)>,
+        formats: gmux_protocol::clipboard::Formats,
+    ) -> anyhow::Result<gmux_protocol::clipboard::Content> {
+        self.select_output(point)?;
+        self.copy_content(formats)
+    }
+    fn select_anchored_output(&mut self) -> anyhow::Result<()> {
         self.select_output_target(2, (0, 0))
     }
     fn select_output_target(&mut self, target: u8, (x, y): (u16, u32)) -> anyhow::Result<()> {
@@ -662,7 +671,7 @@ impl Engine {
         anyhow::ensure!(result == 0, "No command output available");
         Ok(())
     }
-    pub(crate) fn anchor_output(&mut self, (x, y): (u16, u32)) -> anyhow::Result<()> {
+    fn anchor_output(&mut self, (x, y): (u16, u32)) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_output_anchor(self.raw.as_ptr(), x, y) };
         anyhow::ensure!(result == 0, "No command output available");
         Ok(())
@@ -869,44 +878,43 @@ impl Engine {
             held_frame: Frame::default(),
         })
     }
+    /// Enter one frontend's presentation state for this call only. The guard is
+    /// owned here so it cannot escape or be forgotten by the caller.
     pub(crate) fn with_view<T>(
         &mut self,
         view: &mut EngineView,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        if view.retention_revision != self.retention_revision {
-            view.restart_find();
-            view.retention_revision = self.retention_revision;
-        }
-        unsafe { gmux_engine_view_enter(self.raw.as_ptr(), view.raw.as_ptr()) }
+        f: impl FnOnce(&mut ActiveView<'_>) -> T,
+    ) -> anyhow::Result<T> {
+        view.check_resources()?;
+        anyhow::ensure!(
+            unsafe { gmux_engine_view_enter(self.raw.as_ptr(), view.raw.as_ptr()) },
+            "Terminal view does not belong to this idle engine"
+        );
         self.swap_view(view);
-        let held = self.mode(2026);
-        if !held {
-            self.held_hyperlinks = Default::default();
-            self.held_link_revision = 0;
+        let mut active = ActiveView {
+            engine: self,
+            view,
+            held: false,
+        };
+        if active.view.retention_revision != active.engine.retention_revision {
+            active.engine.find.restart();
+            active.view.retention_revision = active.engine.retention_revision;
         }
-        if held {
+        if active.engine.mode(2026) {
             // Every held snapshot extracts all rows, so one scratch buffer
             // serves every view while preserving the normal incremental cells.
-            self.held_cells.resize(self.cells.len(), Cell::default());
-            self.held_row_flags.resize(self.row_flags.len(), 0);
-            std::mem::swap(&mut self.cells, &mut self.held_cells);
-            std::mem::swap(&mut self.row_flags, &mut self.held_row_flags);
-            std::mem::swap(&mut self.frame, &mut view.held_frame);
-            std::mem::swap(&mut self.hyperlinks, &mut self.held_hyperlinks);
-            std::mem::swap(&mut self.link_revision, &mut self.held_link_revision);
+            let engine = &mut active.engine;
+            engine
+                .held_cells
+                .resize(engine.cells.len(), Cell::default());
+            engine.held_row_flags.resize(engine.row_flags.len(), 0);
+            active.swap_held();
+            active.held = true;
+        } else {
+            active.engine.held_hyperlinks = Default::default();
+            active.engine.held_link_revision = 0;
         }
-        let result = f(self);
-        if held {
-            std::mem::swap(&mut self.cells, &mut self.held_cells);
-            std::mem::swap(&mut self.row_flags, &mut self.held_row_flags);
-            std::mem::swap(&mut self.frame, &mut view.held_frame);
-            std::mem::swap(&mut self.hyperlinks, &mut self.held_hyperlinks);
-            std::mem::swap(&mut self.link_revision, &mut self.held_link_revision);
-        }
-        self.swap_view(view);
-        unsafe { gmux_engine_view_leave(self.raw.as_ptr(), view.raw.as_ptr()) }
-        result
+        Ok(f(&mut active))
     }
     fn swap_view(&mut self, view: &mut EngineView) {
         std::mem::swap(&mut self.find, &mut view.find);
@@ -1167,10 +1175,7 @@ impl Engine {
         self.hyperlinks = links;
         Ok(result != 0)
     }
-    pub(crate) fn cache_rows(
-        &self,
-        range: std::ops::Range<u64>,
-    ) -> anyhow::Result<(Vec<Cell>, Vec<u8>)> {
+    fn cache_rows(&self, range: std::ops::Range<u64>) -> anyhow::Result<(Vec<Cell>, Vec<u8>)> {
         let cols = self.frame.cols as usize;
         let count = range
             .end
@@ -1199,16 +1204,16 @@ impl Engine {
         anyhow::ensure!(result == 0, "Could not read scrollback rows");
         Ok((cells, flags))
     }
-    pub fn find(&mut self, query: &str) {
+    fn find(&mut self, query: &str) {
         self.find.set_query(query);
         if !self.find_pending() {
             self.find_row = Vec::new();
         }
     }
-    pub fn find_pending(&self) -> bool {
+    fn find_pending(&self) -> bool {
         self.find.pending || self.find.dirty
     }
-    pub fn poll_find(&mut self) -> bool {
+    fn poll_find(&mut self) -> bool {
         if !self.find_pending() {
             return false;
         }
@@ -1251,11 +1256,11 @@ impl Engine {
         }
         true
     }
-    pub fn find_state(&self) -> gmux_protocol::search::FindState {
+    fn find_state(&self) -> gmux_protocol::search::FindState {
         self.find
             .state(self.frame.scrollback.offset, self.cells.len())
     }
-    pub fn find_advance(&mut self, previous: bool) {
+    fn find_advance(&mut self, previous: bool) {
         if let Some(row) = self.find.advance(previous) {
             let offset = self.frame.scrollback.offset;
             if row < offset || row >= offset + self.frame.rows as u64 {
@@ -1263,7 +1268,7 @@ impl Engine {
             }
         }
     }
-    pub fn select(
+    fn select(
         &mut self,
         start: (u16, u32),
         end: (u16, u32),
@@ -1282,10 +1287,10 @@ impl Engine {
         anyhow::ensure!(result == 0, "Selection is outside terminal history");
         Ok(())
     }
-    pub fn clear_selection(&mut self) {
+    fn clear_selection(&mut self) {
         unsafe { gmux_engine_clear_selection(self.raw.as_ptr()) }
     }
-    pub fn selection_origin(&self) -> Option<u64> {
+    fn selection_origin(&self) -> Option<u64> {
         let mut origin = 0;
         (unsafe { gmux_engine_selection_origin(self.raw.as_ptr(), &mut origin) } == 0)
             .then_some(origin)
@@ -1299,7 +1304,7 @@ impl Engine {
         self.find.restart();
         Ok(())
     }
-    pub fn selection(&self) -> Option<Selection> {
+    fn selection(&self) -> Option<Selection> {
         let (mut start, mut end, mut rectangle) = (0, 0, false);
         (unsafe { gmux_engine_selection(self.raw.as_ptr(), &mut start, &mut end, &mut rectangle) }
             == 0)
@@ -1313,11 +1318,11 @@ impl Engine {
                 },
             })
     }
-    pub fn copy(&self) -> anyhow::Result<String> {
+    fn copy(&self) -> anyhow::Result<String> {
         self.format_copy(false, gmux_protocol::transport::MAX_PASTE)
             .map(|(text, _)| text)
     }
-    pub fn copy_content(
+    fn copy_content(
         &self,
         formats: gmux_protocol::clipboard::Formats,
     ) -> anyhow::Result<gmux_protocol::clipboard::Content> {
@@ -1374,10 +1379,10 @@ impl Engine {
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }
     }
-    pub fn scroll(&mut self, delta: isize, bottom: bool) {
+    fn scroll(&mut self, delta: isize, bottom: bool) {
         unsafe { gmux_engine_scroll(self.raw.as_ptr(), delta, bottom) }
     }
-    pub fn scroll_to(&mut self, row: u64) {
+    fn scroll_to(&mut self, row: u64) {
         unsafe { gmux_engine_scroll_to(self.raw.as_ptr(), row) }
     }
     pub fn metadata(&self, pwd: bool) -> String {
@@ -1475,6 +1480,127 @@ impl Engine {
         out[..len].to_vec()
     }
 }
+/// Scoped access to one frontend's presentation. No terminal mutation or
+/// mutable Engine access is available while the native view is entered.
+/// Snapshot slices borrow the engine's shared scratch and cannot escape the call.
+pub(crate) struct ActiveView<'a> {
+    engine: &'a mut Engine,
+    view: &'a mut EngineView,
+    held: bool,
+}
+impl ActiveView<'_> {
+    fn swap_held(&mut self) {
+        let engine = &mut self.engine;
+        std::mem::swap(&mut engine.cells, &mut engine.held_cells);
+        std::mem::swap(&mut engine.row_flags, &mut engine.held_row_flags);
+        std::mem::swap(&mut engine.frame, &mut self.view.held_frame);
+        std::mem::swap(&mut engine.hyperlinks, &mut engine.held_hyperlinks);
+        std::mem::swap(&mut engine.link_revision, &mut engine.held_link_revision);
+    }
+    pub(crate) fn frame(&self) -> Frame {
+        self.engine.frame
+    }
+    pub(crate) fn cells(&self) -> &[Cell] {
+        &self.engine.cells
+    }
+    pub(crate) fn row_flags(&self) -> &[u8] {
+        &self.engine.row_flags
+    }
+    pub(crate) fn hyperlinks(&self) -> &gmux_protocol::hyperlinks::Hyperlinks {
+        &self.engine.hyperlinks
+    }
+    pub(crate) fn revision(&self) -> u64 {
+        self.engine.revision
+    }
+    pub(crate) fn history(&self) -> GmuxHistory {
+        self.engine.history
+    }
+    pub(crate) fn mode(&self, mode: i32) -> bool {
+        self.engine.mode(mode)
+    }
+    pub(crate) fn prompt(&mut self, previous: bool) -> anyhow::Result<()> {
+        self.engine.prompt(previous)
+    }
+    pub(crate) fn select_output(&mut self, point: Option<(u16, u32)>) -> anyhow::Result<()> {
+        self.engine.select_output(point)
+    }
+    pub(crate) fn select_anchored_output(&mut self) -> anyhow::Result<()> {
+        self.engine.select_anchored_output()
+    }
+    pub(crate) fn anchor_output(&mut self, point: (u16, u32)) -> anyhow::Result<()> {
+        self.engine.anchor_output(point)
+    }
+    pub(crate) fn snapshot(&mut self) -> anyhow::Result<bool> {
+        self.engine.snapshot()
+    }
+    pub(crate) fn cache_rows(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> anyhow::Result<(Vec<Cell>, Vec<u8>)> {
+        self.engine.cache_rows(range)
+    }
+    pub(crate) fn find(&mut self, query: &str) {
+        self.engine.find(query)
+    }
+    pub(crate) fn find_pending(&self) -> bool {
+        self.engine.find_pending()
+    }
+    pub(crate) fn poll_find(&mut self) -> bool {
+        self.engine.poll_find()
+    }
+    pub(crate) fn find_state(&self) -> gmux_protocol::search::FindState {
+        self.engine.find_state()
+    }
+    pub(crate) fn find_advance(&mut self, previous: bool) {
+        self.engine.find_advance(previous)
+    }
+    pub(crate) fn select(
+        &mut self,
+        start: (u16, u32),
+        end: (u16, u32),
+        mode: SelectionMode,
+    ) -> anyhow::Result<()> {
+        self.engine.select(start, end, mode)
+    }
+    pub(crate) fn clear_selection(&mut self) {
+        self.engine.clear_selection()
+    }
+    pub(crate) fn selection_origin(&self) -> Option<u64> {
+        self.engine.selection_origin()
+    }
+    pub(crate) fn selection(&self) -> Option<Selection> {
+        self.engine.selection()
+    }
+    #[cfg(test)]
+    pub(crate) fn copy(&self) -> anyhow::Result<String> {
+        self.engine.copy()
+    }
+    pub(crate) fn copy_content(
+        &self,
+        formats: gmux_protocol::clipboard::Formats,
+    ) -> anyhow::Result<gmux_protocol::clipboard::Content> {
+        self.engine.copy_content(formats)
+    }
+    pub(crate) fn scroll(&mut self, delta: isize, bottom: bool) {
+        self.engine.scroll(delta, bottom)
+    }
+    pub(crate) fn scroll_to(&mut self, row: u64) {
+        self.engine.scroll_to(row)
+    }
+    #[cfg(test)]
+    pub(crate) fn text(&mut self) -> anyhow::Result<String> {
+        self.engine.text()
+    }
+}
+impl Drop for ActiveView<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.swap_held();
+        }
+        self.engine.swap_view(self.view);
+        unsafe { gmux_engine_view_leave(self.engine.raw.as_ptr(), self.view.raw.as_ptr()) }
+    }
+}
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe { gmux_engine_free(self.raw.as_ptr()) }
@@ -1531,19 +1657,21 @@ mod tests {
         let recovered_matches = reference.find_state().total;
         assert_eq!(recovered_matches, 1);
         let mut view = engine.new_view().unwrap();
-        let viewed = engine.with_view(&mut view, |engine| {
-            engine.scroll_to(100);
-            engine.snapshot().unwrap();
-            engine
-                .select((0, 100), (7, 100), SelectionMode::Cell)
-                .unwrap();
-            (
-                engine.frame,
-                engine.cells.clone(),
-                engine.hyperlinks.clone(),
-                engine.copy().unwrap(),
-            )
-        });
+        let viewed = engine
+            .with_view(&mut view, |engine| {
+                engine.scroll_to(100);
+                engine.snapshot().unwrap();
+                engine
+                    .select((0, 100), (7, 100), SelectionMode::Cell)
+                    .unwrap();
+                (
+                    engine.frame(),
+                    engine.cells().to_vec(),
+                    engine.hyperlinks().clone(),
+                    engine.copy().unwrap(),
+                )
+            })
+            .unwrap();
         view.set_active(false);
         let before = engine.memory_usage().unwrap();
         let mut live_view = engine.new_view().unwrap();
@@ -1560,7 +1688,9 @@ mod tests {
             assert_eq!(result, CompressionResult::Unsupported);
         }
         for _ in 0..8 {
-            engine.with_view(&mut live_view, |engine| engine.snapshot().unwrap());
+            engine
+                .with_view(&mut live_view, |engine| engine.snapshot().unwrap())
+                .unwrap();
         }
         assert_eq!(
             engine.compression_activity().unwrap(),
@@ -1575,13 +1705,15 @@ mod tests {
         assert!(restored_cache == cached);
         assert_eq!(restored_flags, flags);
         view.set_active(true);
-        engine.with_view(&mut view, |engine| {
-            engine.snapshot().unwrap();
-            assert!(engine.frame == viewed.0);
-            assert!(engine.cells == viewed.1);
-            assert_eq!(engine.hyperlinks, viewed.2);
-            assert_eq!(engine.copy().unwrap(), viewed.3);
-        });
+        engine
+            .with_view(&mut view, |engine| {
+                engine.snapshot().unwrap();
+                assert!(engine.frame() == viewed.0);
+                assert!(engine.cells() == viewed.1);
+                assert_eq!(engine.hyperlinks(), &viewed.2);
+                assert_eq!(engine.copy().unwrap(), viewed.3);
+            })
+            .unwrap();
         engine.find(&query);
         while engine.find_pending() {
             engine.poll_find();
@@ -1822,22 +1954,26 @@ mod tests {
         let mut first = engine.new_view().unwrap();
         let mut second = engine.new_view().unwrap();
         for view in [&mut first, &mut second] {
-            engine.with_view(view, |engine| {
-                engine.scroll_to(0);
-                engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
-                engine.snapshot().unwrap();
-            });
+            engine
+                .with_view(view, |engine| {
+                    engine.scroll_to(0);
+                    engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
+                    engine.snapshot().unwrap();
+                })
+                .unwrap();
         }
         engine.write(b"\x1b[?2026hHELD");
         engine.clear_screen().unwrap();
         assert!(!engine.mode(2026));
         for view in [&mut first, &mut second] {
-            engine.with_view(view, |engine| {
-                assert_eq!(engine.text().unwrap(), "");
-                assert!(engine.selection().is_none());
-                assert_eq!(engine.frame.scrollback.total, 3);
-                assert_eq!(engine.frame.scrollback.offset, 0);
-            });
+            engine
+                .with_view(view, |engine| {
+                    assert_eq!(engine.text().unwrap(), "");
+                    assert!(engine.selection().is_none());
+                    assert_eq!(engine.frame().scrollback.total, 3);
+                    assert_eq!(engine.frame().scrollback.offset, 0);
+                })
+                .unwrap();
         }
     }
 
@@ -1858,50 +1994,62 @@ mod tests {
         engine.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let mut first = engine.new_view().unwrap();
         let mut second = engine.new_view().unwrap();
-        engine.with_view(&mut first, |engine| {
-            engine.scroll_to(0);
-            engine.select((1, 0), (1, 0), SelectionMode::Word).unwrap();
-            engine.find("one");
-            while engine.find_pending() {
-                engine.poll_find();
-            }
-            assert!(engine.text().unwrap().starts_with("one"));
-            assert_eq!(engine.copy().unwrap(), "one");
-        });
-        engine.with_view(&mut second, |engine| {
-            assert!(engine.text().unwrap().contains("five"));
-            assert!(engine.selection().is_none());
-            assert_eq!(engine.find_state().total, 0);
-            engine.select((1, 1), (1, 1), SelectionMode::Line).unwrap();
-            assert_eq!(engine.copy().unwrap(), "two");
-        });
+        engine
+            .with_view(&mut first, |engine| {
+                engine.scroll_to(0);
+                engine.select((1, 0), (1, 0), SelectionMode::Word).unwrap();
+                engine.find("one");
+                while engine.find_pending() {
+                    engine.poll_find();
+                }
+                assert!(engine.text().unwrap().starts_with("one"));
+                assert_eq!(engine.copy().unwrap(), "one");
+            })
+            .unwrap();
+        engine
+            .with_view(&mut second, |engine| {
+                assert!(engine.text().unwrap().contains("five"));
+                assert!(engine.selection().is_none());
+                assert_eq!(engine.find_state().total, 0);
+                engine.select((1, 1), (1, 1), SelectionMode::Line).unwrap();
+                assert_eq!(engine.copy().unwrap(), "two");
+            })
+            .unwrap();
         engine.write(b"\r\nsix");
         first.invalidate();
         second.invalidate();
         // A normal snapshot can consume Ghostty's dirty flags before either client.
         assert!(engine.text().unwrap().contains("six"));
-        engine.with_view(&mut second, |engine| {
-            assert!(engine.text().unwrap().contains("six"));
-        });
-        engine.with_view(&mut first, |engine| {
-            assert!(engine.text().unwrap().starts_with("one"));
-            assert_eq!(engine.copy().unwrap(), "one");
-            while engine.find_pending() {
-                engine.poll_find();
-            }
-            assert_eq!(engine.find_state().total, 1);
-        });
+        engine
+            .with_view(&mut second, |engine| {
+                assert!(engine.text().unwrap().contains("six"));
+            })
+            .unwrap();
+        engine
+            .with_view(&mut first, |engine| {
+                assert!(engine.text().unwrap().starts_with("one"));
+                assert_eq!(engine.copy().unwrap(), "one");
+                while engine.find_pending() {
+                    engine.poll_find();
+                }
+                assert_eq!(engine.find_state().total, 1);
+            })
+            .unwrap();
         engine.resize(20, 4, 8, 16).unwrap();
-        engine.with_view(&mut first, |engine| {
-            assert_eq!(engine.copy().unwrap(), "one");
-            engine.select((1, 0), (2, 2), SelectionMode::Word).unwrap();
-            assert_eq!(engine.copy().unwrap(), "one\ntwo\nthree");
-        });
-        engine.with_view(&mut second, |engine| {
-            assert_eq!(engine.copy().unwrap(), "two");
-            engine.select((1, 1), (1, 0), SelectionMode::Line).unwrap();
-            assert_eq!(engine.copy().unwrap(), "one\ntwo");
-        });
+        engine
+            .with_view(&mut first, |engine| {
+                assert_eq!(engine.copy().unwrap(), "one");
+                engine.select((1, 0), (2, 2), SelectionMode::Word).unwrap();
+                assert_eq!(engine.copy().unwrap(), "one\ntwo\nthree");
+            })
+            .unwrap();
+        engine
+            .with_view(&mut second, |engine| {
+                assert_eq!(engine.copy().unwrap(), "two");
+                engine.select((1, 1), (1, 0), SelectionMode::Line).unwrap();
+                assert_eq!(engine.copy().unwrap(), "one\ntwo");
+            })
+            .unwrap();
         // Tracked view references can be freed after their terminal disappears.
         drop(engine);
         drop(first);
@@ -1915,38 +2063,54 @@ mod tests {
         engine.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let mut first = engine.new_view().unwrap();
         let mut second = engine.new_view().unwrap();
-        let earlier = engine.with_view(&mut first, |engine| {
-            engine.scroll_to(0);
-            engine.text().unwrap()
-        });
-        let later = engine.with_view(&mut second, |engine| engine.text().unwrap());
+        let earlier = engine
+            .with_view(&mut first, |engine| {
+                engine.scroll_to(0);
+                engine.text().unwrap()
+            })
+            .unwrap();
+        let later = engine
+            .with_view(&mut second, |engine| engine.text().unwrap())
+            .unwrap();
         engine.write(b"\x1b[?2026h\r\x1b[2Kchanged");
         let mut attached_during_hold = engine.new_view().unwrap();
-        engine.with_view(&mut attached_during_hold, |engine| {
-            assert_eq!(engine.text().unwrap(), later)
-        });
-        for _ in 0..2 {
-            engine.with_view(&mut first, |engine| {
-                assert_eq!(engine.text().unwrap(), earlier)
-            });
-            engine.with_view(&mut second, |engine| {
+        engine
+            .with_view(&mut attached_during_hold, |engine| {
                 assert_eq!(engine.text().unwrap(), later)
-            });
+            })
+            .unwrap();
+        for _ in 0..2 {
+            engine
+                .with_view(&mut first, |engine| {
+                    assert_eq!(engine.text().unwrap(), earlier)
+                })
+                .unwrap();
+            engine
+                .with_view(&mut second, |engine| {
+                    assert_eq!(engine.text().unwrap(), later)
+                })
+                .unwrap();
         }
         engine.write(b"\x1b[?2026l");
-        engine.with_view(&mut second, |engine| {
-            assert!(engine.text().unwrap().contains("changed"))
-        });
-        engine.with_view(&mut first, |engine| {
-            assert_eq!(engine.text().unwrap(), earlier)
-        });
+        engine
+            .with_view(&mut second, |engine| {
+                assert!(engine.text().unwrap().contains("changed"))
+            })
+            .unwrap();
+        engine
+            .with_view(&mut first, |engine| {
+                assert_eq!(engine.text().unwrap(), earlier)
+            })
+            .unwrap();
         // An empty hold fills the shared scratch buffer with a scrolled view.
         // The normal incremental buffer must retain its own unchanged rows.
         let complete = engine.text().unwrap();
         engine.write(b"\x1b[?2026h");
-        engine.with_view(&mut first, |engine| {
-            assert_eq!(engine.text().unwrap(), earlier)
-        });
+        engine
+            .with_view(&mut first, |engine| {
+                assert_eq!(engine.text().unwrap(), earlier)
+            })
+            .unwrap();
         engine.write(b"\x1b[?2026l");
         assert_eq!(engine.text().unwrap(), complete);
     }
@@ -1970,22 +2134,28 @@ mod tests {
                 } else {
                     &mut second
                 };
-                engine.with_view(view, |engine| assert_eq!(engine.text().unwrap(), complete));
+                engine
+                    .with_view(view, |engine| assert_eq!(engine.text().unwrap(), complete))
+                    .unwrap();
             }
             engine.write(b" frame\x1b[?2026l");
-            engine.with_view(&mut second, |engine| {
-                assert_eq!(engine.text().unwrap(), "partial frame")
-            });
+            engine
+                .with_view(&mut second, |engine| {
+                    assert_eq!(engine.text().unwrap(), "partial frame")
+                })
+                .unwrap();
         }
         // Reuse also follows a changed grid size after resize ends a hold.
         engine.write(b"\x1b[?2026h\r\x1b[2Kresized");
         engine.resize(40, 4, 0, 0).unwrap();
         engine.write(b"\x1b[?2026h\r\x1b[2Kunfinished");
         for view in [&mut first, &mut second] {
-            engine.with_view(view, |engine| {
-                assert_eq!(engine.text().unwrap(), "resized");
-                assert_eq!((engine.frame.cols, engine.frame.rows), (40, 4));
-            });
+            engine
+                .with_view(view, |engine| {
+                    assert_eq!(engine.text().unwrap(), "resized");
+                    assert_eq!((engine.frame().cols, engine.frame().rows), (40, 4));
+                })
+                .unwrap();
         }
     }
 
@@ -1997,15 +2167,19 @@ mod tests {
         let mut view = engine.new_view().unwrap();
         let light = Theme::adwaita(false);
         view.set_theme(&light);
-        engine.with_view(&mut view, |engine| {
-            engine.scroll_to(0);
-            engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
-            engine.find("one");
-        });
+        engine
+            .with_view(&mut view, |engine| {
+                engine.scroll_to(0);
+                engine.select((0, 0), (2, 0), SelectionMode::Cell).unwrap();
+                engine.find("one");
+            })
+            .unwrap();
         engine.write(b"\x1b[?2026h");
-        engine.with_view(&mut view, |engine| {
-            assert_eq!(engine.text().unwrap(), "one\ntwo\nthree")
-        });
+        engine
+            .with_view(&mut view, |engine| {
+                assert_eq!(engine.text().unwrap(), "one\ntwo\nthree")
+            })
+            .unwrap();
         view.set_active(false);
         engine.write(b"\x1b[?2026l");
         for _ in 0..3 {
@@ -2014,25 +2188,31 @@ mod tests {
         engine.write(b"\x1b[?2026h\r\x1b[2Kpartial");
         view.set_active(true);
         let mut new_view = engine.new_view().unwrap();
-        let complete = engine.with_view(&mut new_view, |engine| engine.text().unwrap());
-        engine.with_view(&mut view, |engine| {
-            // As for a new subscription, use the complete base frozen frame
-            // until release; never read the already modified live terminal.
-            assert_eq!(engine.text().unwrap(), complete);
-            assert!(!complete.contains("partial"));
-            assert_eq!(engine.copy().unwrap(), "one");
-        });
+        let complete = engine
+            .with_view(&mut new_view, |engine| engine.text().unwrap())
+            .unwrap();
+        engine
+            .with_view(&mut view, |engine| {
+                // As for a new subscription, use the complete base frozen frame
+                // until release; never read the already modified live terminal.
+                assert_eq!(engine.text().unwrap(), complete);
+                assert!(!complete.contains("partial"));
+                assert_eq!(engine.copy().unwrap(), "one");
+            })
+            .unwrap();
         engine.write(b"\x1b[?2026l");
-        engine.with_view(&mut view, |engine| {
-            assert_eq!(engine.text().unwrap(), "one\ntwo\nthree");
-            assert_eq!(engine.frame.scrollback.offset, 0);
-            assert_eq!(engine.frame.background, light.background);
-            assert_eq!(engine.copy().unwrap(), "one");
-            while engine.find_pending() {
-                engine.poll_find();
-            }
-            assert_eq!(engine.find_state().total, 1);
-        });
+        engine
+            .with_view(&mut view, |engine| {
+                assert_eq!(engine.text().unwrap(), "one\ntwo\nthree");
+                assert_eq!(engine.frame().scrollback.offset, 0);
+                assert_eq!(engine.frame().background, light.background);
+                assert_eq!(engine.copy().unwrap(), "one");
+                while engine.find_pending() {
+                    engine.poll_find();
+                }
+                assert_eq!(engine.find_state().total, 1);
+            })
+            .unwrap();
     }
 
     type HistoryRendition = (String, [u8; 3], [u8; 3], u8, u8, [u8; 3]);
@@ -2924,7 +3104,9 @@ mod tests {
         let mut second = engine.new_view().unwrap();
         engine.write(b"before\x1b[?2026h\r\x1b[2Kafter");
         for view in [&mut first, &mut second] {
-            engine.with_view(view, |engine| assert_eq!(engine.text().unwrap(), "before"));
+            engine
+                .with_view(view, |engine| assert_eq!(engine.text().unwrap(), "before"))
+                .unwrap();
         }
         assert!(!engine.expire_render_hold());
         std::thread::sleep(std::time::Duration::from_millis(1050));
@@ -2932,7 +3114,9 @@ mod tests {
         assert!(!engine.mode(2026));
         assert_eq!(engine.text().unwrap(), "after");
         for view in [&mut first, &mut second] {
-            engine.with_view(view, |engine| assert_eq!(engine.text().unwrap(), "after"));
+            engine
+                .with_view(view, |engine| assert_eq!(engine.text().unwrap(), "after"))
+                .unwrap();
         }
     }
 
@@ -3450,12 +3634,13 @@ mod tests {
             ] {
                 e.with_view(view, |e| {
                     e.snapshot().unwrap();
-                    assert_eq!(e.frame.background, theme.background);
-                    assert_eq!(e.cells[0].fg, theme.foreground);
-                    assert_eq!(e.cells[1].fg, theme.palette[4]);
-                    assert_eq!(e.cells[2].fg, [1, 2, 3]);
-                    assert_eq!(e.frame.cursor_style, style as u8);
-                });
+                    assert_eq!(e.frame().background, theme.background);
+                    assert_eq!(e.cells()[0].fg, theme.foreground);
+                    assert_eq!(e.cells()[1].fg, theme.palette[4]);
+                    assert_eq!(e.cells()[2].fg, [1, 2, 3]);
+                    assert_eq!(e.frame().cursor_style, style as u8);
+                })
+                .unwrap();
             }
         }
         assert!(
@@ -3470,11 +3655,12 @@ mod tests {
         for view in [&mut first, &mut second] {
             e.with_view(view, |e| {
                 e.snapshot().unwrap();
-                assert_eq!(e.frame.background, [0x11, 0x22, 0x33]);
-                assert_eq!(e.cells[0].fg, [255; 3]);
-                assert_eq!(e.cells[1].fg, dark.palette[4]);
-                assert_eq!(e.frame.cursor_style, CursorStyle::Block as u8);
-            });
+                assert_eq!(e.frame().background, [0x11, 0x22, 0x33]);
+                assert_eq!(e.cells()[0].fg, [255; 3]);
+                assert_eq!(e.cells()[1].fg, dark.palette[4]);
+                assert_eq!(e.frame().cursor_style, CursorStyle::Block as u8);
+            })
+            .unwrap();
         }
         e.write(b"\x1b]110\x07\x1b]111\x07\x1b]104;4\x07\x1b[0 q");
         for (view, theme, style) in [
@@ -3483,11 +3669,12 @@ mod tests {
         ] {
             e.with_view(view, |e| {
                 e.snapshot().unwrap();
-                assert_eq!(e.frame.background, theme.background);
-                assert_eq!(e.cells[0].fg, theme.foreground);
-                assert_eq!(e.cells[1].fg, theme.palette[4]);
-                assert_eq!(e.frame.cursor_style, style as u8);
-            });
+                assert_eq!(e.frame().background, theme.background);
+                assert_eq!(e.cells()[0].fg, theme.foreground);
+                assert_eq!(e.cells()[1].fg, theme.palette[4]);
+                assert_eq!(e.frame().cursor_style, style as u8);
+            })
+            .unwrap();
         }
         e.use_view_appearance(&second).unwrap();
         assert_eq!(e.take_events().0, b"\x1b[?997;2n");
@@ -3495,8 +3682,9 @@ mod tests {
         assert_eq!(e.frame.background, light.background);
         e.with_view(&mut first, |e| {
             e.snapshot().unwrap();
-            assert_eq!(e.frame.background, dark.background);
-        });
+            assert_eq!(e.frame().background, dark.background);
+        })
+        .unwrap();
         e.write(b"\x1b[?996n");
         assert_eq!(e.take_events().0, b"\x1b[?997;2n");
     }
@@ -3521,19 +3709,21 @@ mod tests {
                 for (view, theme) in [(&mut first, &dark), (&mut second, &light)] {
                     e.with_view(view, |e| {
                         e.snapshot().unwrap();
-                        assert_eq!(e.frame.background, theme.background);
-                        assert_eq!(e.cells[0].fg, foreground.unwrap_or(theme.foreground));
-                        assert_eq!(e.cells[0].text(), "O");
-                    });
+                        assert_eq!(e.frame().background, theme.background);
+                        assert_eq!(e.cells()[0].fg, foreground.unwrap_or(theme.foreground));
+                        assert_eq!(e.cells()[0].text(), "O");
+                    })
+                    .unwrap();
                 }
                 e.write(b"\x1b[?2026l");
                 for (view, theme) in [(&mut first, &dark), (&mut second, &light)] {
                     e.with_view(view, |e| {
                         e.snapshot().unwrap();
-                        assert_eq!(e.frame.background, theme.background);
-                        assert_eq!(e.cells[0].fg, foreground.unwrap_or(theme.foreground));
-                        assert_eq!(e.cells[0].text(), "N");
-                    });
+                        assert_eq!(e.frame().background, theme.background);
+                        assert_eq!(e.cells()[0].fg, foreground.unwrap_or(theme.foreground));
+                        assert_eq!(e.cells()[0].text(), "N");
+                    })
+                    .unwrap();
                 }
             }
         }
@@ -3651,11 +3841,12 @@ mod tests {
                 e.with_view(view, |e| {
                     e.snapshot().unwrap();
                     assert_eq!(
-                        e.frame.cursor_blink,
+                        e.frame().cursor_blink,
                         expected.unwrap_or(default),
                         "{sequence:?}"
                     );
-                });
+                })
+                .unwrap();
             }
         }
         e.write(b"\x1b[1 q\x1b[?2026h\x1b[2 q");

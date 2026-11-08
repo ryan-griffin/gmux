@@ -343,7 +343,8 @@ void gmux_engine_view_free(GmuxView *v) {
     v->budget->count--;
     free(v);
 }
-void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
+bool gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
+    if (v->owner != e || e->view_history) return false;
     gmux_engine_expire_render_hold(e);
     swap_view(e, v);
     e->view_history = &v->history;
@@ -361,6 +362,7 @@ void gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
         gmux_engine_scroll_to(e, ghostty_tracked_grid_ref_point(v->viewport,
             GHOSTTY_POINT_TAG_SCREEN, &point) ? 0 : point.y);
     } else gmux_engine_scroll(e, 0, true);
+    return true;
 }
 void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
     GhosttyTerminalScrollbar bar;
@@ -421,10 +423,10 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
                 v->failed=true;
                 continue;
             }
+            if (!gmux_engine_view_enter(e, v)) { v->failed=true; continue; }
             v->links_reserved=links_max;
             v->budget->links_reserved += additional;
             v->budget->used += additional;
-            gmux_engine_view_enter(e, v);
             v->captured=false;
             if (!v->render) ghostty_render_state_new(&v->budget->allocator, &v->render);
             // Reapplying the current default dirties Ghostty's terminal
@@ -1001,6 +1003,7 @@ int gmux_engine_view_cursor_style(GmuxView *v, uint8_t style) {
     return 0;
 }
 int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
+    if (v->owner != e || e->view_history) return GHOSTTY_INVALID_VALUE;
     int result=gmux_engine_theme(e, v->appearance.background, v->appearance.foreground,
         v->appearance.cursor, (const uint8_t *)v->appearance.ansi, v->appearance.dark);
     if (result) return result;

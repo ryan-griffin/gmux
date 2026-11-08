@@ -910,7 +910,7 @@ impl Daemon {
                     bytes.push(b'\r');
                 }
                 if options.bottom {
-                    session.with_view(view, |engine| engine.scroll(0, true));
+                    session.with_view(view, |active| active.scroll(0, true))?;
                 }
                 session.send(&bytes)?;
             }
@@ -924,7 +924,7 @@ impl Daemon {
                 let bytes = session.key(&name, layout, mods, action, &text);
                 if !bytes.is_empty() {
                     if action != KeyAction::Release {
-                        session.with_view(view, |engine| engine.scroll(0, true));
+                        session.with_view(view, |active| active.scroll(0, true))?;
                     }
                     session.send(&bytes)?;
                 }
@@ -953,12 +953,12 @@ impl Daemon {
                 view.set_cursor_blink(blink)?;
             }
             StreamCommand::Scroll { delta, bottom } => {
-                session.with_view(view, |engine| engine.scroll(delta, bottom));
+                session.with_view(view, |active| active.scroll(delta, bottom))?;
             }
             StreamCommand::ScrollTo { row, serial } => {
                 let previous = &mut presentation.scroll_serial;
                 if serial >= *previous {
-                    session.with_view(view, |engine| engine.scroll_to(row));
+                    session.with_view(view, |active| active.scroll_to(row))?;
                     *previous = serial;
                 }
             }
@@ -968,21 +968,21 @@ impl Daemon {
                     *old = serial;
                     // A missing target is harmless, but still acknowledge the
                     // viewport serial so the client can drop its prediction.
-                    let _ = session.with_view(view, |engine| engine.prompt(previous));
+                    let _ = session.with_view(view, |active| active.prompt(previous))?;
                 }
             }
-            command => session.with_view(view, |engine| -> anyhow::Result<()> {
+            command => session.with_view(view, |active| -> anyhow::Result<()> {
                 // Search navigation uses this client's current viewport metadata.
                 if matches!(command, StreamCommand::FindAdvance { .. }) {
-                    engine.snapshot()?;
+                    active.snapshot()?;
                 }
                 match command {
                     StreamCommand::Copy { formats } => {
                         anyhow::ensure!(
-                            engine.selection().is_some(),
+                            active.selection().is_some(),
                             "Select terminal text to copy it"
                         );
-                        copy = Some(engine.copy_content(formats)?);
+                        copy = Some(active.copy_content(formats)?);
                     }
                     StreamCommand::SelectOutput {
                         point,
@@ -992,17 +992,17 @@ impl Daemon {
                     } => {
                         presentation.selection_serial = serial;
                         if anchored {
-                            engine.select_anchored_output()?;
+                            active.select_anchored_output()?;
                         } else {
-                            engine.select_output(point)?;
+                            active.select_output(point)?;
                         }
                         if let Some(formats) = should_copy {
-                            copy = Some(engine.copy_content(formats)?);
+                            copy = Some(active.copy_content(formats)?);
                         }
                     }
-                    StreamCommand::AnchorOutput { point } => engine.anchor_output(point)?,
-                    StreamCommand::Find { query } => engine.find(&query),
-                    StreamCommand::FindAdvance { previous } => engine.find_advance(previous),
+                    StreamCommand::AnchorOutput { point } => active.anchor_output(point)?,
+                    StreamCommand::Find { query } => active.find(&query),
+                    StreamCommand::FindAdvance { previous } => active.find_advance(previous),
                     StreamCommand::Select {
                         start,
                         end,
@@ -1010,16 +1010,16 @@ impl Daemon {
                         serial,
                     } => {
                         presentation.selection_serial = serial;
-                        engine.select(start, end, mode)?
+                        active.select(start, end, mode)?
                     }
                     StreamCommand::ClearSelection { serial } => {
                         presentation.selection_serial = serial;
-                        engine.clear_selection();
+                        active.clear_selection();
                     }
                     _ => unreachable!(),
                 }
                 Ok(())
-            })?,
+            })??,
         }
         pane.changed = true;
         if let Some(content) = copy {
@@ -1292,11 +1292,11 @@ impl Daemon {
                 if terminal_changed {
                     view.invalidate();
                 }
-                session.with_view(view, |engine| -> anyhow::Result<_> {
+                session.with_view(view, |active| -> anyhow::Result<_> {
                     // Search scans bounded batches even when its visible state
                     // is unchanged. Keep those batches paced instead of spinning.
-                    frame_activity |= engine.find_pending();
-                    if engine.poll_find() && !engine.find_pending() {
+                    frame_activity |= active.find_pending();
+                    if active.poll_find() && !active.find_pending() {
                         // A rescan can move highlights without changing visible
                         // cells or counts, including when it fits in one batch.
                         presentation.find = None;
@@ -1304,25 +1304,25 @@ impl Daemon {
                     if screen {
                         // Repeated output can dirty and extract rows without
                         // changing their final cells. Coalesce that work too.
-                        frame_activity |= engine.snapshot()?;
+                        frame_activity |= active.snapshot()?;
                     }
                     let frame = if screen {
-                        let frame = engine.frame;
-                        let cells_snapshot = &engine.cells;
+                        let frame = active.frame();
+                        let cells_snapshot = active.cells();
                         self.snapshots += 1;
                         let cols = frame.cols as usize;
                         let old = presentation.screen.get_or_insert_with(Default::default);
                         let full = old.frame.cols != frame.cols
                             || old.frame.rows != frame.rows
                             || old.cells.len() != cells_snapshot.len();
-                        let same_content = old.source_revision == Some(engine.revision) && !full;
+                        let same_content = old.source_revision == Some(active.revision()) && !full;
                         let reset = full
                             || old.source_revision.is_none()
-                            || old.history_generation != engine.history.generation;
+                            || old.history_generation != active.history().generation;
                         let removed = if reset {
                             0
                         } else {
-                            engine.history.origin.saturating_sub(old.cache_origin)
+                            active.history().origin.saturating_sub(old.cache_origin)
                         };
                         if reset {
                             cache_invalidated = old.cache_active;
@@ -1344,13 +1344,13 @@ impl Daemon {
                             }
                         }
                         if !same_content {
-                            old.prefetch_at = (!engine.mode(2026)
+                            old.prefetch_at = (!active.mode(2026)
                                 && !super::prefetch::window(frame).is_empty())
                             .then(|| Instant::now() + Duration::from_millis(100));
                         }
-                        old.source_revision = Some(engine.revision);
-                        old.history_generation = engine.history.generation;
-                        old.cache_origin = engine.history.origin;
+                        old.source_revision = Some(active.revision());
+                        old.history_generation = active.history().generation;
+                        old.cache_origin = active.history().origin;
                         generation = old.generation;
                         cache_origin = old.cache_origin;
                         if full {
@@ -1366,7 +1366,7 @@ impl Daemon {
                         }
                         for (row, data) in cells_snapshot.chunks_exact(cols).enumerate() {
                             let previous = &mut old.cells[row * cols..(row + 1) * cols];
-                            let flags = engine.row_flags[row];
+                            let flags = active.row_flags()[row];
                             let exposed = (row_shift > 0
                                 && row >= frame.rows as usize - row_shift as usize)
                                 || (row_shift < 0 && row < row_shift.unsigned_abs() as usize);
@@ -1384,7 +1384,7 @@ impl Daemon {
                         let serial = presentation.scroll_serial;
                         // Immutable history remains useful during output. Only
                         // prefetch live screen rows after output has settled.
-                        if !engine.mode(2026) {
+                        if !active.mode(2026) {
                             let quiet = old.prefetch_at.is_none_or(|at| at <= Instant::now());
                             let mut wanted = super::prefetch::window(frame);
                             let history_end =
@@ -1418,7 +1418,7 @@ impl Daemon {
                                     wanted.clone()
                                 };
                                 if !missing.is_empty() {
-                                    let (extra, flags) = engine.cache_rows(missing.clone())?;
+                                    let (extra, flags) = active.cache_rows(missing.clone())?;
                                     cells.extend(extra);
                                     cache = Some(transport::CachedRows {
                                         start: missing.start,
@@ -1432,9 +1432,9 @@ impl Daemon {
                                 old.prefetch_at = None;
                             }
                         }
-                        if old.hyperlinks != engine.hyperlinks || full {
-                            old.hyperlinks.clone_from(&engine.hyperlinks);
-                            hyperlinks = Some(engine.hyperlinks.clone());
+                        if &old.hyperlinks != active.hyperlinks() || full {
+                            old.hyperlinks.clone_from(active.hyperlinks());
+                            hyperlinks = Some(active.hyperlinks().clone());
                         }
                         let send = hyperlinks.is_some()
                             || full
@@ -1452,11 +1452,11 @@ impl Daemon {
                     };
                     Ok((
                         frame,
-                        engine.find_state(),
-                        engine.selection(),
-                        engine.selection_origin(),
+                        active.find_state(),
+                        active.selection(),
+                        active.selection_origin(),
                     ))
-                })?
+                })??
             } else {
                 (
                     None,
@@ -1631,10 +1631,7 @@ mod tests {
     fn deferred_pane_updates_keep_each_frontends_serials_errors_and_dirty_state() {
         let mut daemon = Daemon::empty_for_test();
         let mut session = session(1);
-        let mut seed = session.new_view().unwrap();
-        session.with_view(&mut seed, |engine| {
-            engine.feed(b"first row\r\nsecond row\r\n");
-        });
+        session.feed(b"first row\r\nsecond row\r\n");
         daemon.sessions.insert(1, session);
         let (mut fast, fast_peer) = connection();
         let (mut slow, slow_peer) = connection();
@@ -1924,8 +1921,7 @@ mod tests {
     fn same_count_query_changes_send_new_highlights_without_terminal_output() {
         let mut daemon = Daemon::empty_for_test();
         let mut session = session(1);
-        let mut seed = session.new_view().unwrap();
-        session.with_view(&mut seed, |e| e.feed(b"one two one two"));
+        session.feed(b"one two one two");
         daemon.sessions.insert(1, session);
         let (mut frontend, peer) = client((80, 24, 8, 16, 640, 384));
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1966,10 +1962,7 @@ mod tests {
         let mut daemon = Daemon::empty_for_test();
         let mut session = session(1);
         session.resize(10, 4, 8, 16, 80, 64).unwrap();
-        let mut seed = session.new_view().unwrap();
-        session.with_view(&mut seed, |e| {
-            e.feed(b"zero\r\nfirst\r\nsecond\r\nthird\r\n         abc");
-        });
+        session.feed(b"zero\r\nfirst\r\nsecond\r\nthird\r\n         abc");
         daemon.sessions.insert(1, session);
         let (mut frontend, peer) = client((10, 4, 8, 16, 80, 64));
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -2005,9 +1998,7 @@ mod tests {
             .sessions
             .get_mut(&1)
             .unwrap()
-            .with_view(&mut seed, |e| {
-                e.feed(b"\x1b[4;1Hzzabc\x1b[4;3H");
-            });
+            .feed(b"\x1b[4;1Hzzabc\x1b[4;3H");
         frontend.panes.get_mut(&1).unwrap().terminal_changed = true;
         daemon
             .update_frontend(&mut frontend, false, &mut HashMap::new())
@@ -2027,8 +2018,7 @@ mod tests {
             .unwrap()
             .search = gmux_protocol::search::SearchBudget::new(32 * 1024);
         let mut session = session(1);
-        let mut seed = session.new_view().unwrap();
-        session.with_view(&mut seed, |e| e.feed(&vec![b'a'; 16000]));
+        session.feed(&vec![b'a'; 16000]);
         daemon.sessions.insert(1, session);
         let (mut frontend, _peer) = client((80, 24, 8, 16, 640, 384));
         daemon

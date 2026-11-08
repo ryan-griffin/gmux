@@ -498,7 +498,7 @@ impl Daemon {
                     self.sessions
                         .get_mut(&id)
                         .unwrap()
-                        .with_view(view, |engine| engine.copy_content(formats))?
+                        .with_view(view, |active| active.copy_content(formats))??
                 } else {
                     String::new().into()
                 };

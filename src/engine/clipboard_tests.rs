@@ -289,20 +289,26 @@ fn rich_copy_falls_back_after_bounded_styled_expansion_and_keeps_view_selection(
     );
     let mut first = engine.new_view().unwrap();
     let mut second = engine.new_view().unwrap();
-    engine.with_view(&mut first, |e| {
-        e.select((0, 0), (999, 99), SelectionMode::Cell).unwrap();
-        let content = e.copy_content(Formats::TextHtml).unwrap();
-        assert_eq!(content.text.len(), 100_000);
-        assert!(content.html.is_none());
-    });
-    engine.with_view(&mut second, |e| {
-        assert!(e.selection().is_none());
-        e.select((1, 0), (2, 0), SelectionMode::Cell).unwrap();
-        let content = e.copy_content(Formats::TextHtml).unwrap();
-        assert_eq!(content.text, "xx");
-        assert!(content.html.is_some());
-    });
-    engine.with_view(&mut first, |e| assert_eq!(e.copy().unwrap().len(), 100_000));
+    engine
+        .with_view(&mut first, |e| {
+            e.select((0, 0), (999, 99), SelectionMode::Cell).unwrap();
+            let content = e.copy_content(Formats::TextHtml).unwrap();
+            assert_eq!(content.text.len(), 100_000);
+            assert!(content.html.is_none());
+        })
+        .unwrap();
+    engine
+        .with_view(&mut second, |e| {
+            assert!(e.selection().is_none());
+            e.select((1, 0), (2, 0), SelectionMode::Cell).unwrap();
+            let content = e.copy_content(Formats::TextHtml).unwrap();
+            assert_eq!(content.text, "xx");
+            assert!(content.html.is_some());
+        })
+        .unwrap();
+    engine
+        .with_view(&mut first, |e| assert_eq!(e.copy().unwrap().len(), 100_000))
+        .unwrap();
 }
 
 #[test]

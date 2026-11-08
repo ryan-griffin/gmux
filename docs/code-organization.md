@@ -81,6 +81,30 @@ terminal engine. `src/ghostty_bridge.h` defines the C/Rust boundary, and
 generates Rust bindings with bindgen and checks struct layouts at compile time.
 Edit the shared header when changing the boundary.
 
+`Engine` owns terminal-wide input, modes, geometry, retention, checkpoints, and
+the shared snapshot buffers. Each `EngineView` owns a frontend's scroll anchor,
+selection, search, appearance, and held-frame metadata. `Engine::with_view` and
+the session adapter lend an `ActiveView` to a closure. It exposes presentation
+operations and read-only snapshot data, with no mutable access to `Engine`.
+The scope borrows both owners, so neither can be changed or destroyed during
+the call, and borrowed cells and hyperlinks cannot escape it.
+
+Entry rejects failed captures and views belonging to another or destroyed
+engine. The native bridge checks ownership before entering and rejects nested
+entry. An internal guard restores search and synchronized-output state and
+leaves the native view on return, error, or Rust unwinding. The caller cannot
+retain or forget that guard. Views can outlive their terminal for teardown;
+their detached native owner prevents reuse with a new engine.
+
+Normal snapshots reuse the engine's cells in place. Held snapshots use one
+shared scratch buffer across frontend views and restore the normal cells,
+frame, row flags, and hyperlinks when the scope ends. The native view retains
+its own frozen render cache under the shared resource budget. CLI reads, links,
+and command-output copies use the terminal's default view; frontend copies use
+the selected frontend's `ActiveView`. View state stays in memory; terminal
+checkpoints store shared history. GTK consumes viewport packets through the
+client library and has no engine dependency.
+
 `src/ghostty_shell.h` keeps tracked primary prompts and command-output selection
 inside the C boundary. The semantic callback reports bounded command metadata
 to `engine.rs`. `src/shell.rs` configures startup using the packaged Bash and
