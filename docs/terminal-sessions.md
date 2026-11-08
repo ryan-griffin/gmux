@@ -59,9 +59,18 @@ refreshed once a second. Dirty viewport extraction, visible presentation changes
 incremental history-search batches, and changed progress reports restart the
 connection's frame interval. Other metadata packets and passes without that
 work do not postpone the next visible response. Hidden
-panes keep parsing output without extracting viewports. A frontend pass can
-continue across turns; only visited panes consume their dirty flags. Its frame
-interval starts with the pass, and continuations do not wait for another frame.
+panes keep parsing output without extracting viewports. Frame planning scans the
+pane topology, then sorts and queues only panes with pending changes, initial
+state, due prefetch, ongoing searches, notifications, errors, or subscribed Git
+updates. Unchanged panes consume no publication items and create no continuation.
+A frontend pass can continue across turns; only visited panes consume their dirty
+flags. Its frame interval starts with the pass, and continuations do not wait for
+another frame.
+Changes to panes outside an in-progress pass remain pending for the next paced
+frame. Queued IDs are checked against live sessions when visited; closure removes
+their frontend state. Each pass contains at most one entry per pane and drains
+before another plan replaces it. Disconnecting a frontend drops its entire pass;
+there is no separate pending-work or deadline index to clean up.
 Frontends rotate between turns, including background clients. Socket flushes
 write at most 256 KiB per visit. When no publication is due, flushing has a
 separate 1 ms, 16-connection budget.
@@ -88,8 +97,8 @@ wakeups while queued and return to the queue's tail when more work arrives.
 
 These are cooperative limits, not hard deadlines. A packet, native snapshot,
 command handler, or GTK presentation update completes before yielding. Readiness
-scans, dirty-state fan-out, control mutations, and persistence bookkeeping also
-run on the owner thread. Pending userspace work requests another turn explicitly;
+and deadline scans, frame planning, dirty-state fan-out, control mutations, and
+persistence bookkeeping also run on the owner thread. Pending userspace work requests another turn explicitly;
 blocked sockets wait for readiness. Read batches that yield before observing
 WouldBlock request another turn even after their process exits. Drained queues
 remove their continuation source, without an idle polling timer.

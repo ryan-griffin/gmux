@@ -721,13 +721,17 @@ impl Daemon {
         if let StreamCommand::GitSubscribe { mut panes } = command {
             panes.retain(|id| self.sessions.contains_key(id));
             for (&id, state) in &mut frontend.panes {
-                state.git_subscribed = panes.contains(&id);
-                if !state.git_subscribed {
+                if !panes.contains(&id) {
+                    state.git_subscribed = false;
                     state.git_sent = None;
                 }
             }
             for id in panes {
-                frontend.panes.entry(id).or_default().git_subscribed = true;
+                let state = frontend.panes.entry(id).or_default();
+                // A continued frame can publish its old Git revision after
+                // this request. Keep new subscriptions pending on the pane.
+                state.metadata_changed |= !state.git_subscribed;
+                state.git_subscribed = true;
             }
             frontend.git_revision = None;
             self.git_dirty = true;
@@ -1034,6 +1038,7 @@ impl Daemon {
         Ok(())
     }
     pub(super) fn next_update(&self) -> Option<Instant> {
+        let _cost = profile::scope(profile::Stage::NextUpdate, self.frontends.len());
         self.frontends
             .values()
             .filter(|frontend| frontend.attached)
@@ -1097,6 +1102,14 @@ impl Daemon {
         let mut state = None;
         // Deliver each alert once, preferring a focused client. All clients receive unread state.
         let mut notifications = std::mem::take(&mut self.notifications);
+        let fanout_cost = profile::scope(
+            profile::Stage::Fanout,
+            self.frontends.len()
+                * (self.changed.len()
+                    + self.metadata_changed.len()
+                    + self.errors.len()
+                    + if metadata_due { self.sessions.len() } else { 0 }),
+        );
         for frontend in self
             .frontends
             .values_mut()
@@ -1117,6 +1130,7 @@ impl Daemon {
                 frontend.pane_error(id, error.clone());
             }
         }
+        drop(fanout_cost);
         for id in ids {
             if budget.expired() {
                 break;
@@ -1179,6 +1193,7 @@ impl Daemon {
     }
     fn state_packet(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
+        let _cost = profile::scope(profile::Stage::Encode, 1);
         Packet::Execution(self.execution_reply()).encode_into(&mut bytes)?;
         Ok(bytes)
     }
@@ -1205,19 +1220,48 @@ impl Daemon {
     ) -> anyhow::Result<()> {
         let mut frame_activity = false;
         if frontend.frame_panes.is_empty() {
+            let _cost = profile::scope(
+                profile::Stage::FramePlan,
+                self.sessions.len() + frontend.panes.len(),
+            );
+            let now = Instant::now();
+            let git_revision = self.git.as_ref().map(crate::branch::Service::revision);
             let mut ids: Vec<_> = self
                 .sessions
                 .keys()
-                .chain(frontend.panes.keys())
+                .filter(|id| {
+                    notifications.contains_key(id)
+                        || self.errors.contains_key(id)
+                        || frontend.panes.get(id).is_none_or(|pane| {
+                            pane.pending()
+                                || pane.metadata.is_none()
+                                || (pane.visible && pane.screen().is_none())
+                                || pane.screen().is_some_and(|screen| {
+                                    screen.prefetch_at.is_some_and(|at| at <= now)
+                                })
+                                || (pane.git_subscribed && frontend.git_revision != git_revision)
+                        })
+                })
+                // Normally closure removes the pane state too. A queued frame
+                // can still outlive its session; retain the cleanup visit.
+                .chain(
+                    frontend
+                        .panes
+                        .keys()
+                        .filter(|id| !self.sessions.contains_key(id)),
+                )
                 .copied()
                 .collect();
+            // Only actual work occupies the cooperative pane budget or keeps a
+            // frame continuation alive. Idle topology must not create frames
+            // which in turn perpetually schedule more idle frames.
             ids.sort_unstable();
-            ids.dedup();
             frontend.frame_panes.extend(ids);
             frontend.frame_git_revision = self.git.as_ref().map(crate::branch::Service::revision);
             frontend.frame_started = Some(Instant::now());
         }
         while !frontend.frame_panes.is_empty() && budget.take() {
+            let _cost = profile::scope(profile::Stage::PaneVisit, 1);
             let id = frontend.frame_panes.pop_front().unwrap();
             let Some(session) = self.sessions.get_mut(&id) else {
                 if let Some(pane) = frontend.panes.get_mut(&id) {
@@ -1304,6 +1348,7 @@ impl Daemon {
                     if screen {
                         // Repeated output can dirty and extract rows without
                         // changing their final cells. Coalesce that work too.
+                        let _cost = profile::scope(profile::Stage::Snapshot, 1);
                         frame_activity |= active.snapshot()?;
                     }
                     let frame = if screen {
@@ -1554,6 +1599,134 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_frames_settle_and_keep_work_added_during_a_continuation() {
+        let mut daemon = Daemon::empty_for_test();
+        for id in 1..=3 {
+            daemon.sessions.insert(id, session(id));
+            daemon.changed.insert(id);
+        }
+        let mut peers = Vec::new();
+        for id in 1..=2 {
+            let (mut frontend, peer) = connection();
+            frontend.attached = true;
+            daemon.frontends.insert(id, frontend);
+            peers.push(peer);
+        }
+        daemon.updates(false);
+        assert!(daemon.next_update().is_none());
+
+        // Each connection has three panes but only one needs work. A one-pane
+        // slice must settle after two visits, without idle continuations.
+        daemon.changed.insert(3);
+        for _ in 0..2 {
+            let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+            daemon.updates_budgeted(false, &mut budget);
+        }
+        assert!(daemon.next_update().is_none());
+        assert!(daemon.frontends.values().all(|f| f.frame_panes.is_empty()));
+
+        // A newly dirty pane excluded from the original plan belongs to the
+        // next frame, even when another broadcast consumes shared dirty IDs.
+        daemon.frontends.remove(&2);
+        daemon.changed.extend([1, 2]);
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+        daemon.updates_budgeted(false, &mut budget);
+        assert_eq!(daemon.frontends[&1].frame_panes, [2]);
+        daemon.changed.insert(3);
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+        daemon.updates_budgeted(false, &mut budget);
+        assert!(daemon.frontends[&1].panes[&3].terminal_changed);
+        assert!(daemon.changed.is_empty());
+        assert!(daemon.next_update().is_some());
+        daemon.updates(false);
+        assert!(daemon.next_update().is_none());
+    }
+
+    #[test]
+    fn git_subscriptions_added_during_a_frame_remain_pending() {
+        let mut daemon = Daemon::empty_for_test();
+        for id in 1..=3 {
+            daemon.sessions.insert(id, session(id));
+        }
+        let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
+        let mut git = crate::branch::Service::new(wake);
+        // Another frontend can already have all these panes cached.
+        git.sync((1..=3).map(|id| (id, PathBuf::from("/tmp"))).collect());
+        daemon.git = Some(git);
+        let (mut frontend, peer) = connection();
+        frontend.attached = true;
+        frontend.state_revision = Some(0);
+        daemon
+            .update_frontend(&mut frontend, true, &mut HashMap::new())
+            .unwrap();
+        daemon
+            .input(
+                1,
+                &mut frontend,
+                StreamRequest::pane(
+                    1,
+                    StreamCommand::GitSubscribe {
+                        panes: HashSet::from([1, 2]),
+                    },
+                ),
+            )
+            .unwrap();
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+        daemon
+            .update_frontend_budgeted(&mut frontend, &mut HashMap::new(), &mut budget)
+            .unwrap();
+        assert_eq!(frontend.frame_panes, [2]);
+        daemon
+            .input(
+                1,
+                &mut frontend,
+                StreamRequest::pane(
+                    1,
+                    StreamCommand::GitSubscribe {
+                        panes: HashSet::from([1, 2, 3]),
+                    },
+                ),
+            )
+            .unwrap();
+        let mut budget = gmux_platform::work::Budget::new(Duration::from_secs(60), 1);
+        daemon
+            .update_frontend_budgeted(&mut frontend, &mut HashMap::new(), &mut budget)
+            .unwrap();
+        assert!(frontend.panes[&3].git_sent.is_none());
+        daemon.frontends.insert(1, frontend);
+        assert!(
+            daemon.next_update().is_some(),
+            "new Git subscription must remain pending"
+        );
+        daemon.updates(false);
+        assert!(daemon.next_update().is_none());
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut peer = std::io::BufReader::new(peer);
+        let mut git_ids = Vec::new();
+        while git_ids.len() < 3 {
+            if let Packet::Git(meta) = Packet::read(&mut peer).unwrap() {
+                git_ids.push(meta.id);
+            }
+        }
+        assert_eq!(git_ids, [1, 2, 3]);
+        // Repeating subscriptions must not dirty their pane metadata.
+        let mut frontend = daemon.frontends.remove(&1).unwrap();
+        daemon
+            .input(
+                1,
+                &mut frontend,
+                StreamRequest::pane(
+                    1,
+                    StreamCommand::GitSubscribe {
+                        panes: HashSet::from([1, 2, 3]),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(frontend.panes.values().all(|pane| !pane.metadata_changed));
+    }
 
     #[test]
     fn deferred_frontends_rotate_and_keep_unvisited_dirty_panes() {

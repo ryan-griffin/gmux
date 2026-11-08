@@ -381,6 +381,13 @@ alive outside the timed teardown. The default update alternates a row and
 generates a viewport delta; the metadata-only update compares pane metadata.
 Use the daemon pressure benchmark for native memory and disconnection behavior.
 
+Set `GMUX_BENCH_PANES=128 GMUX_BENCH_SCHEDULED=1` to time a complete scheduled
+broadcast to eight frontends with one active pane. The report also counts Rust
+allocations per update. This isolates frame planning and publication without
+poll readiness, socket input, metadata timers or display presentation. Use the
+[daemon scheduling workload](performance.md#event-loop-scheduling) to measure
+those costs and idle blocking end to end.
+
 Measure dense searches and ordinary complete navigation separately:
 
 ```sh

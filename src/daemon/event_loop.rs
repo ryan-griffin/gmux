@@ -88,6 +88,10 @@ pub fn run() -> anyhow::Result<()> {
         if daemon.quitting && saving.is_none() && quit_at.is_none() {
             quit_at = Some(now + Duration::from_millis(100));
         }
+        let readiness_cost = profile::scope(
+            profile::Stage::Readiness,
+            daemon.sessions.len() + daemon.frontends.len(),
+        );
         fds.clear();
         fds.extend([
             libc::pollfd {
@@ -144,6 +148,11 @@ pub fn run() -> anyhow::Result<()> {
                 });
             }
         }
+        drop(readiness_cost);
+        let deadline_cost = profile::scope(
+            profile::Stage::Deadlines,
+            daemon.sessions.len() + daemon.frontends.len(),
+        );
         let attached = daemon.frontends.values().any(|f| f.attached);
         let held = daemon.sessions.values().any(TerminalSession::render_held);
         let compression_deadline = daemon
@@ -193,6 +202,7 @@ pub fn run() -> anyhow::Result<()> {
         {
             deadline = Some(deadline.map_or(next, |current| current.min(next)));
         }
+        drop(deadline_cost);
         let timeout = poll_timeout(deadline, Instant::now());
         let result = unsafe {
             libc::ppoll(
@@ -255,6 +265,7 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        let input_cost = profile::scope(profile::Stage::Input, frontend_indices.len());
         for &(id, index) in &frontend_indices {
             daemon
                 .frontends
@@ -307,6 +318,8 @@ pub fn run() -> anyhow::Result<()> {
                 daemon.resize_sessions(None);
             }
         }
+        drop(input_cost);
+        let control_cost = profile::scope(profile::Stage::Control, 1);
         // Revoked or timed-out remote requests release their payloads even
         // while a preceding durable save is still pending.
         controls.retain(|request: &ControlRequest| !request.cancelled());
@@ -376,6 +389,8 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        drop(control_cost);
+        let pty_cost = profile::scope(profile::Stage::Pty, daemon.sessions.len());
         let metadata_due =
             daemon.frontends.values().any(|f| f.attached) && Instant::now() >= next_metadata;
         for &(id, index) in &pane_indices {
@@ -456,6 +471,7 @@ pub fn run() -> anyhow::Result<()> {
             daemon.git_dirty |= daemon.git.is_some();
             next_metadata = Instant::now() + Duration::from_secs(1);
         }
+        drop(pty_cost);
         daemon.sync_git(&wake);
         if let Some(git) = &mut daemon.git
             && (fds[1].revents != 0
@@ -492,6 +508,7 @@ pub fn run() -> anyhow::Result<()> {
         // Observe activity once after all terminal access, including reads
         // that restore compressed history. Compression itself leaves the token
         // unchanged, so the next poll can use these cached deadlines.
+        let compression_cost = profile::scope(profile::Stage::Compression, daemon.sessions.len());
         let now = Instant::now();
         if !daemon.quitting {
             let next = daemon
@@ -506,6 +523,7 @@ pub fn run() -> anyhow::Result<()> {
                 compression_budget.used(Instant::now());
             }
         }
+        drop(compression_cost);
     }
     let mut shutdown = None;
     if !daemon.checkpointed {
@@ -536,6 +554,7 @@ pub fn run() -> anyhow::Result<()> {
             eprintln!("Could not save layout during shutdown: {error}");
         }
     }
+    profile::finish();
     Ok(())
 }
 
