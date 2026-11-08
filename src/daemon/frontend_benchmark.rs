@@ -48,10 +48,7 @@ fn frontend_pane_workload() {
             Default::default(),
         )
         .unwrap();
-        let mut view = session.new_view().unwrap();
-        session.with_view(&mut view, |engine| {
-            engine.feed(b"\x1b[2J\x1b[Hbenchmark row\r\nsecond row\r\n");
-        });
+        session.feed(b"\x1b[2J\x1b[Hbenchmark row\r\nsecond row\r\n");
         daemon.sessions.insert(id, session);
     }
     let mut readers = Vec::new();
@@ -88,17 +85,14 @@ fn frontend_pane_workload() {
     let retained = (RETAINED.load(Relaxed) - before).saturating_sub(output_bytes);
     let mut notifications = HashMap::new();
     let mut current = daemon.frontends.remove(&1).unwrap();
-    let mut feed_view = daemon.sessions[&1].new_view().unwrap();
     let started = thread_cpu();
     for i in 0..1000 {
         // Alternate one row without terminal input or PTY scheduling in the timed region.
         let session = daemon.sessions.get_mut(&1).unwrap();
-        session.with_view(&mut feed_view, |engine| {
-            engine.feed(if i % 2 == 0 {
-                b"\x1b[HAAAA"
-            } else {
-                b"\x1b[HBBBB"
-            });
+        session.feed(if i % 2 == 0 {
+            b"\x1b[HAAAA"
+        } else {
+            b"\x1b[HBBBB"
         });
         if visible != 0 {
             daemon
@@ -137,7 +131,6 @@ fn frontend_pane_workload() {
         .load(Relaxed)
         .saturating_sub(before + output_after_close);
     drop(daemon);
-    drop(feed_view);
     drop(sessions);
     for reader in readers {
         reader.join().unwrap();

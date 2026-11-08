@@ -86,34 +86,47 @@ fn rectangles_belong_to_views_and_follow_retained_rows_until_pruned() {
     engine.write(b"01234567\r\nabcdefgh\r\n");
     let mut first = engine.new_view().unwrap();
     let mut second = engine.new_view().unwrap();
-    engine.with_view(&mut first, |view| {
-        view.select((2, 0), (4, 1), SelectionMode::Rectangle)
-            .unwrap();
-        assert_eq!(view.copy().unwrap(), "234\ncde");
-    });
-    engine.with_view(&mut second, |view| {
-        assert_eq!(view.selection(), None);
-        view.select((0, 0), (7, 0), SelectionMode::Cell).unwrap();
-    });
+    engine
+        .with_view(&mut first, |view| {
+            view.select((2, 0), (4, 1), SelectionMode::Rectangle)
+                .unwrap();
+            assert_eq!(view.copy().unwrap(), "234\ncde");
+        })
+        .unwrap();
+    engine
+        .with_view(&mut second, |view| {
+            assert_eq!(view.selection(), None);
+            view.select((0, 0), (7, 0), SelectionMode::Cell).unwrap();
+        })
+        .unwrap();
     engine.write("retained row\r\n".repeat(512).as_bytes());
-    engine.with_view(&mut first, |view| {
-        view.scroll(0, true);
-        view.snapshot().unwrap();
-        assert_eq!(view.copy().unwrap(), "234\ncde");
-        assert_eq!(view.selection().unwrap().shape, Shape::Rectangle);
-    });
-    engine.with_view(&mut second, |view| {
-        assert_eq!(view.copy().unwrap(), "01234567");
-        assert_eq!(view.selection().unwrap().shape, Shape::Linear);
-    });
+    engine
+        .with_view(&mut first, |view| {
+            view.scroll(0, true);
+            view.snapshot().unwrap();
+            assert_eq!(view.copy().unwrap(), "234\ncde");
+            assert_eq!(view.selection().unwrap().shape, Shape::Rectangle);
+        })
+        .unwrap();
+    engine
+        .with_view(&mut second, |view| {
+            assert_eq!(view.copy().unwrap(), "01234567");
+            assert_eq!(view.selection().unwrap().shape, Shape::Linear);
+        })
+        .unwrap();
     for _ in 0..128 {
         engine.write("pruning row\r\n".repeat(512).as_bytes());
-        if engine.with_view(&mut first, |view| view.selection().is_none()) {
+        if engine
+            .with_view(&mut first, |view| view.selection().is_none())
+            .unwrap()
+        {
             break;
         }
     }
-    engine.with_view(&mut first, |view| {
-        assert_eq!(view.selection(), None);
-        assert_eq!(view.copy().unwrap(), "");
-    });
+    engine
+        .with_view(&mut first, |view| {
+            assert_eq!(view.selection(), None);
+            assert_eq!(view.copy().unwrap(), "");
+        })
+        .unwrap();
 }

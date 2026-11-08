@@ -156,11 +156,16 @@ impl TerminalSession {
     ) -> anyhow::Result<crate::engine::EngineView> {
         self.engine.new_view_in(resources)
     }
+    /// Inject terminal output without PTY scheduling in daemon tests/benchmarks.
+    #[cfg(test)]
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> (bool, usize) {
+        self.engine.feed(bytes)
+    }
     pub(crate) fn with_view<T>(
         &mut self,
         view: &mut crate::engine::EngineView,
-        f: impl FnOnce(&mut Engine) -> T,
-    ) -> T {
+        f: impl FnOnce(&mut crate::engine::ActiveView<'_>) -> T,
+    ) -> anyhow::Result<T> {
         self.engine.with_view(view, f)
     }
     pub(crate) fn spawn(
@@ -563,7 +568,6 @@ impl TerminalSession {
         {
             update.error = Some(error.to_string());
         }
-        update.changed |= self.engine.poll_find();
         if self.engine.take_directory_update() {
             let previous = self.directory.clone();
             self.refresh_directory();
@@ -663,8 +667,7 @@ impl TerminalSession {
         point: Option<(u16, u32)>,
         formats: gmux_protocol::clipboard::Formats,
     ) -> anyhow::Result<gmux_protocol::clipboard::Content> {
-        self.engine.select_output(point)?;
-        self.engine.copy_content(formats)
+        self.engine.command_output(point, formats)
     }
 
     /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.
@@ -1050,9 +1053,14 @@ mod tests {
         assert_eq!(session.size(), (40, 3));
         assert_eq!(session.title(), "Detached worker");
         assert!(session.text().unwrap().contains("line-40"));
-        session.engine.scroll(-100, false);
-        assert!(session.text().unwrap().contains("line-01"));
-        session.engine.scroll(0, true);
+        let mut view = session.new_view().unwrap();
+        session
+            .with_view(&mut view, |active| {
+                active.scroll(-100, false);
+                assert!(active.text().unwrap().contains("line-01"));
+                active.scroll(0, true);
+            })
+            .unwrap();
         session.send_text("hello", true).unwrap();
         wait_for(|| notification(&mut session, "input-received"));
         assert!(session.text().unwrap().contains("reattached:hello"));

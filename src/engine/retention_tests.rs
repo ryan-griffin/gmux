@@ -19,7 +19,7 @@ fn history() -> Engine {
     engine.snapshot().unwrap();
     engine
 }
-fn finish_find(engine: &mut Engine) -> usize {
+fn finish_find(engine: &mut ActiveView<'_>) -> usize {
     while engine.find_pending() {
         engine.poll_find();
     }
@@ -35,30 +35,34 @@ fn immediate_pruning_updates_views_search_selection_prompts_and_history_identity
     let origin = engine.history.origin;
     let generation = engine.history.generation;
     let revision = engine.revision;
-    engine.with_view(&mut old, |e| {
-        e.scroll_to(0);
-        e.snapshot().unwrap();
-        e.select((0, 0), (15, 1), SelectionMode::Cell).unwrap();
-        e.anchor_output((0, 1)).unwrap();
-        e.find("row");
-        // Leave a search in flight to catch scanning against the old origin.
-        e.poll_find();
-        assert!(e.find_pending());
-    });
-    let (selected, cells) = engine.with_view(&mut retained, |e| {
-        e.scroll_to(total - 40);
-        e.snapshot().unwrap();
-        e.select(
-            (0, total as u32 - 39),
-            (15, total as u32 - 37),
-            SelectionMode::Rectangle,
-        )
+    engine
+        .with_view(&mut old, |e| {
+            e.scroll_to(0);
+            e.snapshot().unwrap();
+            e.select((0, 0), (15, 1), SelectionMode::Cell).unwrap();
+            e.anchor_output((0, 1)).unwrap();
+            e.find("row");
+            // Leave a search in flight to catch scanning against the old origin.
+            e.poll_find();
+            assert!(e.find_pending());
+        })
         .unwrap();
-        e.find("row179");
-        assert!(finish_find(e) > 0);
-        e.anchor_output((0, total as u32 - 38)).unwrap();
-        (e.copy().unwrap(), e.cells.clone())
-    });
+    let (selected, cells) = engine
+        .with_view(&mut retained, |e| {
+            e.scroll_to(total - 40);
+            e.snapshot().unwrap();
+            e.select(
+                (0, total as u32 - 39),
+                (15, total as u32 - 37),
+                SelectionMode::Rectangle,
+            )
+            .unwrap();
+            e.find("row179");
+            assert!(finish_find(e) > 0);
+            e.anchor_output((0, total as u32 - 38)).unwrap();
+            (e.copy().unwrap(), e.cells().to_vec())
+        })
+        .unwrap();
     assert!(selected.contains("界é"));
     let active = engine.text().unwrap();
     engine
@@ -75,33 +79,37 @@ fn immediate_pruning_updates_views_search_selection_prompts_and_history_identity
     assert_eq!(engine.history.origin, origin + removed);
     assert_ne!(engine.revision, revision);
     assert_eq!(engine.text().unwrap(), active);
-    engine.with_view(&mut old, |e| {
-        e.snapshot().unwrap();
-        assert!(e.copy().unwrap().is_empty());
-        assert_eq!(e.frame.scrollback.offset, 0);
-        assert!(e.select_anchored_output().is_err());
-        assert!(e.find_state().highlights.is_empty());
-        assert!(finish_find(e) as u64 <= remaining / 2 + 1);
-        e.scroll_to(0);
-        assert!(e.prompt(true).is_err());
-        e.scroll(0, true);
-        e.prompt(true).unwrap();
-        e.snapshot().unwrap();
-        assert!(e.frame.scrollback.offset < remaining - 6);
-    });
-    engine.with_view(&mut retained, |e| {
-        e.snapshot().unwrap();
-        assert_eq!(e.copy().unwrap(), selected);
-        assert!(
-            e.cells == cells,
-            "Pruning must preserve retained text and rendition"
-        );
-        assert_eq!(e.frame.scrollback.offset, total - 40 - removed);
-        assert!(finish_find(e) > 0);
-        assert!(matches!(e.selection().unwrap().shape, Shape::Rectangle));
-        e.select_anchored_output().unwrap();
-        assert!(e.copy().unwrap().contains("row"));
-    });
+    engine
+        .with_view(&mut old, |e| {
+            e.snapshot().unwrap();
+            assert!(e.copy().unwrap().is_empty());
+            assert_eq!(e.frame().scrollback.offset, 0);
+            assert!(e.select_anchored_output().is_err());
+            assert!(e.find_state().highlights.is_empty());
+            assert!(finish_find(e) as u64 <= remaining / 2 + 1);
+            e.scroll_to(0);
+            assert!(e.prompt(true).is_err());
+            e.scroll(0, true);
+            e.prompt(true).unwrap();
+            e.snapshot().unwrap();
+            assert!(e.frame().scrollback.offset < remaining - 6);
+        })
+        .unwrap();
+    engine
+        .with_view(&mut retained, |e| {
+            e.snapshot().unwrap();
+            assert_eq!(e.copy().unwrap(), selected);
+            assert!(
+                e.cells() == cells,
+                "Pruning must preserve retained text and rendition"
+            );
+            assert_eq!(e.frame().scrollback.offset, total - 40 - removed);
+            assert!(finish_find(e) > 0);
+            assert!(matches!(e.selection().unwrap().shape, Shape::Rectangle));
+            e.select_anchored_output().unwrap();
+            assert!(e.copy().unwrap().contains("row"));
+        })
+        .unwrap();
 }
 
 #[test]
@@ -120,18 +128,24 @@ fn byte_and_line_limits_are_independent_zero_is_native_and_active_application_su
     // Byte zero erases even a partial page. Keep active-area selections valid.
     let mut retained = engine.new_view().unwrap();
     let mut erased = engine.new_view().unwrap();
-    engine.with_view(&mut retained, |e| {
-        e.select(
-            (0, line_rows as u32 - 2),
-            (12, line_rows as u32 - 2),
-            SelectionMode::Cell,
-        )
+    engine
+        .with_view(&mut retained, |e| {
+            e.select(
+                (0, line_rows as u32 - 2),
+                (12, line_rows as u32 - 2),
+                SelectionMode::Cell,
+            )
+            .unwrap();
+        })
         .unwrap();
-    });
-    engine.with_view(&mut erased, |e| {
-        e.select((0, 0), (12, 0), SelectionMode::Rectangle).unwrap();
-    });
-    let selected = engine.with_view(&mut retained, |e| e.copy().unwrap());
+    engine
+        .with_view(&mut erased, |e| {
+            e.select((0, 0), (12, 0), SelectionMode::Rectangle).unwrap();
+        })
+        .unwrap();
+    let selected = engine
+        .with_view(&mut retained, |e| e.copy().unwrap())
+        .unwrap();
     engine.write(b"\x1b[?1049h\x1b[?2004h\x1b[?1004h\x1b[2;3Happ\x1b[38;5;42m");
     let alternate = engine.text().unwrap();
     engine.set_scrollback_limits(limits(Some(0), None)).unwrap();
@@ -140,8 +154,12 @@ fn byte_and_line_limits_are_independent_zero_is_native_and_active_application_su
     engine.write(b"\x1b[?1049l");
     engine.snapshot().unwrap();
     assert_eq!(engine.frame.scrollback.total, 6);
-    engine.with_view(&mut retained, |e| assert_eq!(e.copy().unwrap(), selected));
-    engine.with_view(&mut erased, |e| assert!(e.copy().unwrap().is_empty()));
+    engine
+        .with_view(&mut retained, |e| assert_eq!(e.copy().unwrap(), selected))
+        .unwrap();
+    engine
+        .with_view(&mut erased, |e| assert!(e.copy().unwrap().is_empty()))
+        .unwrap();
     engine.write(b"more\r\n".repeat(400).as_slice());
     engine.snapshot().unwrap();
     assert_eq!(engine.frame.scrollback.total, 6);
@@ -183,11 +201,13 @@ fn pruning_during_a_render_hold_refreshes_each_view_after_expiry_without_output(
         let original = [(0, &mut first), (total - 40, &mut second)]
             .into_iter()
             .map(|(offset, view)| {
-                engine.with_view(view, |e| {
-                    e.scroll_to(offset);
-                    e.snapshot().unwrap();
-                    (e.frame, e.cells.clone(), e.history)
-                })
+                engine
+                    .with_view(view, |e| {
+                        e.scroll_to(offset);
+                        e.snapshot().unwrap();
+                        (e.frame(), e.cells().to_vec(), e.history())
+                    })
+                    .unwrap()
             })
             .collect::<Vec<_>>();
         let pages = engine.memory_usage().unwrap().pages;
@@ -200,26 +220,30 @@ fn pruning_during_a_render_hold_refreshes_each_view_after_expiry_without_output(
         assert!(engine.memory_usage().unwrap().pages < pages);
         for (view, (frame, cells, history)) in [&mut first, &mut second].into_iter().zip(&original)
         {
-            engine.with_view(view, |e| {
-                e.snapshot().unwrap();
-                assert!(e.frame == *frame && e.cells == *cells);
-                assert!(e.history == *history);
-            });
+            engine
+                .with_view(view, |e| {
+                    e.snapshot().unwrap();
+                    assert!(e.frame() == *frame && e.cells() == *cells);
+                    assert!(e.history() == *history);
+                })
+                .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(1050));
         assert!(engine.expire_render_hold());
         for (view, (frame, _, _)) in [&mut first, &mut second].into_iter().zip(&original) {
-            engine.with_view(view, |e| {
-                e.snapshot().unwrap();
-                let remaining = e.frame.scrollback.total;
-                assert!(remaining < 400);
-                let removed = total - remaining;
-                assert_eq!(
-                    e.frame.scrollback.offset,
-                    frame.scrollback.offset.saturating_sub(removed)
-                );
-                assert!(e.history != original[0].2);
-            });
+            engine
+                .with_view(view, |e| {
+                    e.snapshot().unwrap();
+                    let remaining = e.frame().scrollback.total;
+                    assert!(remaining < 400);
+                    let removed = total - remaining;
+                    assert_eq!(
+                        e.frame().scrollback.offset,
+                        frame.scrollback.offset.saturating_sub(removed)
+                    );
+                    assert!(e.history() != original[0].2);
+                })
+                .unwrap();
         }
     }
 }

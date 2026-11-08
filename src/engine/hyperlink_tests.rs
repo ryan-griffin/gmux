@@ -85,37 +85,39 @@ fn independent_scrolled_views_and_hold_start_keep_their_own_targets() {
     }
     let mut first = e.new_view().unwrap();
     let mut second = e.new_view().unwrap();
-    let read = |e: &mut Engine| {
+    let read = |e: &mut ActiveView<'_>| {
         e.snapshot().unwrap();
-        e.hyperlinks.clone()
+        e.hyperlinks().clone()
     };
-    let top = e.with_view(&mut first, |e| {
-        e.scroll_to(0);
-        read(e)
-    });
-    let bottom = e.with_view(&mut second, read);
+    let top = e
+        .with_view(&mut first, |e| {
+            e.scroll_to(0);
+            read(e)
+        })
+        .unwrap();
+    let bottom = e.with_view(&mut second, read).unwrap();
     assert_ne!(top, bottom);
     assert_eq!(top.target_at(0), Some("https://row/0"));
     // Leave the shared normal cache on a different viewport before the hold.
-    assert_eq!(e.with_view(&mut first, read), top);
+    assert_eq!(e.with_view(&mut first, read).unwrap(), top);
     // Capture at the hold boundary, before a same-chunk live target rewrite.
     e.write(format!("\x1b[?2026h\x1b[H{}", link("https://hidden/", "row 6")).as_bytes());
-    assert_eq!(e.with_view(&mut first, read), top);
-    assert_eq!(e.with_view(&mut second, read), bottom);
-    assert_eq!(e.with_view(&mut first, read), top);
+    assert_eq!(e.with_view(&mut first, read).unwrap(), top);
+    assert_eq!(e.with_view(&mut second, read).unwrap(), bottom);
+    assert_eq!(e.with_view(&mut first, read).unwrap(), top);
     e.write(b"\x1b[?2026l");
-    let updated = e.with_view(&mut second, read);
+    let updated = e.with_view(&mut second, read).unwrap();
     assert_ne!(updated, bottom);
     assert_eq!(
         updated.target_at(12),
         bottom.target_at(12),
         "Clean rows after a hold must use the bottom view"
     );
-    assert_eq!(e.with_view(&mut first, read), top);
+    assert_eq!(e.with_view(&mut first, read).unwrap(), top);
     // A fresh client receives a fresh bottom snapshot, including its links.
     drop(second);
     let mut reconnected = e.new_view().unwrap();
-    let latest = e.with_view(&mut reconnected, read);
+    let latest = e.with_view(&mut reconnected, read).unwrap();
     assert_eq!(latest.target_at(0), Some("https://hidden/"));
 }
 
@@ -128,8 +130,9 @@ fn variable_rust_hold_scratch_releases_after_release_expiry_and_host_clear() {
         e.write(b"\x1b[?2026h\x1b[H\x1b[2Jplain");
         e.with_view(&mut view, |e| {
             e.snapshot().unwrap();
-            assert_eq!(e.hyperlinks.target_at(0), Some("test:held"));
-        });
+            assert_eq!(e.hyperlinks().target_at(0), Some("test:held"));
+        })
+        .unwrap();
         assert!(e.held_hyperlinks.memory_size() > 0);
         match ending {
             0 => {
