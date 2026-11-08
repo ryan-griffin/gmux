@@ -4,6 +4,7 @@ pub mod daemon;
 mod engine;
 mod persistence;
 mod scrollback;
+mod search;
 mod session;
 mod shell;
 mod title;

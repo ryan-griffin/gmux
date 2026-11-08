@@ -520,7 +520,7 @@ pub struct Engine {
     link_revision: u64,
     held_link_revision: u64,
     size: (u16, u16),
-    find: gmux_protocol::search::HistorySearch,
+    find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
 }
@@ -530,7 +530,7 @@ pub(crate) const MAX_VIEW_NATIVE_BYTES: usize = 128 * 1024 * 1024;
 /// The Rc outlives every native allocator and view registered in this pool.
 pub(crate) struct ViewResources {
     raw: NonNull<GmuxViewBudget>,
-    pub(crate) search: gmux_protocol::search::SearchBudget,
+    pub(crate) search: crate::search::SearchBudget,
 }
 impl Default for ViewResources {
     fn default() -> Self {
@@ -566,7 +566,7 @@ pub(crate) struct EngineView {
     _resources: Rc<ViewResources>,
     raw: NonNull<GmuxView>,
     held_frame: Frame,
-    find: gmux_protocol::search::HistorySearch,
+    find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
 }
@@ -872,7 +872,7 @@ impl Engine {
                 gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
             })
             .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?,
-            find: gmux_protocol::search::HistorySearch::with_budget(resources.search.clone()),
+            find: crate::search::HistorySearch::with_budget(resources.search.clone()),
             find_row: Vec::new(),
             retention_revision: 0,
             held_frame: Frame::default(),
@@ -1022,7 +1022,7 @@ impl Engine {
             row_flags: vec![0; 24],
             hyperlinks: Default::default(),
             size: (80, 24),
-            find: gmux_protocol::search::HistorySearch::default(),
+            find: crate::search::HistorySearch::default(),
             find_row: Vec::new(),
             retention_revision: 0,
             held_cells: Vec::new(),
