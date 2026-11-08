@@ -395,8 +395,8 @@ python3 scripts/view-search-benchmark.py --binary /path/to/release/gmux \
   --output artifacts/view-search-dense.json
 python3 scripts/view-search-benchmark.py --binary /path/to/release/gmux \
   --rows 600 --output artifacts/view-search-complete.json
-cargo test -p gmux-protocol --release dense_search_storage -- --ignored --nocapture
-GMUX_SEARCH_ROWS=600 cargo test -p gmux-protocol --release dense_search_storage -- --ignored --nocapture
+cargo test -p gmux-daemon --release dense_search_storage -- --ignored --nocapture
+GMUX_SEARCH_ROWS=600 cargo test -p gmux-daemon --release dense_search_storage -- --ignored --nocapture
 ```
 
 The daemon probe uses four independent frontend views, dense history, a rescan,
@@ -411,6 +411,6 @@ Both workloads support complete results with the default four views. Add
 retained histories can reach the explicit search limit. Existing scrollback
 retention determines how much of the generated history survives. Run benchmarks
 alone against matching release binaries; use `--protocol-version` when measuring a preserved older binary.
-The protocol-only probe isolates allocated search capacities and excludes native
-storage, allocator overhead, and process RSS. Use the native multi-window probe
+The daemon search unit benchmark isolates allocated search capacities and excludes
+native storage, allocator overhead, and process RSS. Use the native multi-window probe
 above for GTK rendering and window-lifecycle measurements.

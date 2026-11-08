@@ -2189,7 +2189,7 @@ mod tests {
         let mut daemon = Daemon::empty_for_test();
         std::rc::Rc::get_mut(&mut daemon.view_resources)
             .unwrap()
-            .search = gmux_protocol::search::SearchBudget::new(32 * 1024);
+            .search = crate::search::SearchBudget::new(32 * 1024);
         let mut session = session(1);
         session.feed(&vec![b'a'; 16000]);
         daemon.sessions.insert(1, session);

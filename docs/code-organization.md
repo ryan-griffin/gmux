@@ -105,6 +105,13 @@ the selected frontend's `ActiveView`. View state stays in memory; terminal
 checkpoints store shared history. GTK consumes viewport packets through the
 client library and has no engine dependency.
 
+`src/search.rs` and its private `search/index.rs` own history matching, retained
+match indexes, storage admission, and per-view and aggregate search limits.
+`EngineView` retains each search, and `ViewResources` shares its admission pool
+across frontend views. The protocol keeps `FindState`, `FindStatus`, and the query
+size limit. Clients and GTK consume these shared values without depending on
+the search implementation.
+
 `src/ghostty_shell.h` keeps tracked primary prompts and command-output selection
 inside the C boundary. The semantic callback reports bounded command metadata
 to `engine.rs`. `src/shell.rs` configures startup using the packaged Bash and

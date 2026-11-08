@@ -36,6 +36,16 @@ Test the protocol and client without Ghostty or a C compiler:
 cargo test --locked -p gmux-protocol -p gmux-platform -p gmux-client
 ```
 
+Search matching, index, and storage-admission tests belong to the daemon:
+
+```sh
+cargo test --locked -p gmux-daemon search::
+```
+
+Protocol Find values and codec tests remain in `gmux-protocol`. See the
+[dense-search storage benchmark](resource-budgets.md#retained-views-and-searches)
+for retained-capacity measurements.
+
 All workspace packages inherit the lint policy in the root `Cargo.toml`.
 Compiler warnings fail normal checks, builds, and tests. Clippy warnings fail
 when running `cargo clippy`; normal builds do not run Clippy.
