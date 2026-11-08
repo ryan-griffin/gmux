@@ -123,7 +123,8 @@ See [terminal rendering](renderer.md) for cache behavior and diagnostics.
 `src/daemon.rs` owns live sessions and execution state. Its submodules handle:
 
 - `event_loop.rs`: PTYs, sockets, signals, disk-worker completions, and fair ready queues.
-- `frontend.rs`: stream input, paste assembly, subscriptions, and viewport output.
+- `frontend.rs`: stream input, paste assembly, subscriptions, and viewport output for pending pane work.
+- `profile.rs`: opt-in owner-stage timing and work counts, reported at shutdown.
 - `commands.rs`: layout and control handlers, ordered command replies, and save warnings.
 - `mutation.rs`: typed mutation outcomes, live execution revision publication,
   save-before-apply scrollback settings, process-exit topology changes, and shutdown checkpoints.

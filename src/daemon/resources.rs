@@ -159,7 +159,10 @@ impl Output {
         Ok(())
     }
     pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
-        self.enqueue(0, |bytes, limit| packet.encode_into_limit(bytes, limit))
+        self.enqueue(0, |bytes, limit| {
+            let _cost = super::profile::scope(super::profile::Stage::Encode, 1);
+            packet.encode_into_limit(bytes, limit)
+        })
     }
     pub(super) fn queue_encoded(&mut self, encoded: &[u8]) -> anyhow::Result<()> {
         self.enqueue(encoded.len(), |bytes, limit| {
@@ -169,6 +172,7 @@ impl Output {
         })
     }
     pub(super) fn flush(&mut self, socket: &mut impl Write, limit: usize) -> anyhow::Result<()> {
+        let _cost = super::profile::scope(super::profile::Stage::Flush, 1);
         let mut storage = self.storage.borrow_mut();
         anyhow::ensure!(!storage.closed, "Frontend output budget exhausted");
         let end = storage.bytes.len().min(storage.offset + limit);

@@ -6,6 +6,42 @@ builds. Results depend on the compositor, driver, font, and machine.
 
 ## Event-loop scheduling
 
+For headless scheduling comparisons, preserve the release `gmux` binary before
+changing the scheduler. Run each build alone with the same workload:
+
+```sh
+python3 scripts/daemon-scheduling-benchmark.py --binary /path/to/release/gmux \
+  --panes 128 --active 2 --clients 8 --shared-views \
+  --batch-lines 1 --interval .02 --seconds 5 --samples 100 \
+  --output artifacts/scheduling-sparse.json
+python3 scripts/daemon-scheduling-benchmark.py --binary /path/to/release/gmux \
+  --panes 8 --active 8 --clients 8 --interval 0 --seconds 5 --samples 100 \
+  --output artifacts/scheduling-busy.json
+```
+
+Half the output readers use TCP and half Unix sockets. Separate Unix and TCP
+probe views measure raw terminal echo; control probes use both transports.
+Reports include owner-thread CPU, RSS, context switches, per-writer throughput,
+reader progress, attached idle and detached idle. Context switches include
+preemption and IPC; they are not exact wakeup counts. Latency includes Python,
+socket handling, and view decoding, and excludes GTK and compositing. Writer
+counters are sampled every 50 ms. The fixture uses disposable shells and state;
+large topologies can exceed checkpoint admission during teardown.
+
+Add `--profile` for owner-stage timings in a companion report. Without it, the
+scheduling benchmark clears inherited `GMUX_OWNER_PROFILE` settings. For direct
+daemon runs, set `GMUX_OWNER_PROFILE=/absolute/path/profile.json`. It writes
+once at orderly shutdown, with calls, work units, total elapsed nanoseconds and
+maximum call duration. Timings include preemption and nested scopes, so do not
+sum them as CPU time. Readiness/deadline, PTY and compression units count topology
+considered per turn; frame-plan units count session and frontend pane entries,
+fan-out units count recipient/change pairs, and pane visits, snapshots and encodes
+count operations. Next-update and input units count frontend entries. Use calls
+and units to separate topology scans from active work. Profiling adds clock and
+counter overhead, especially to short pane visits. Compare end-to-end release
+runs with profiling disabled; the disabled hooks take no timestamps and allocate
+no per-operation storage. No profiling fields enter the wire protocol or saved state.
+
 Measure concurrent output and real input with a matching release frontend and
 daemon. Use the same command against preserved baseline binaries, run one build
 at a time, and interleave revisions when repeating the comparison:
@@ -27,6 +63,9 @@ p95/p99, daemon Status and GTK renderer-info RPC p95, per-writer and aggregate
 output throughput, process/main-thread CPU, RSS, and main-thread context switches.
 Idle and detached samples check continuation cleanup. See the script's recorded
 latency and resource methods for included costs.
+On hybrid CPUs, `--daemon-cpu N --frontend-cpu M` pins those main threads to
+separate chosen cores after writer creation. Existing writers and other threads
+retain their normal affinity. Use the same choices for both builds.
 
 On an i7-13700H with GTK 4.24.1, Mutter 51.1 and OpenGL, two release runs per
 revision produced these ranges of per-run quantiles. The baseline was
@@ -70,7 +109,8 @@ small hidden-output throughput/CPU cost in this fixture; the visible throughput
 variation prevents a stronger claim.
 
 The budgets are cooperative. Single packets, native snapshots, commands, GTK
-presentation updates, readiness scans and dirty-state fan-out can exceed a slice.
+presentation updates, readiness/deadline scans, frame planning and dirty-state
+fan-out can exceed a slice.
 The RPC measurements are responsiveness proxies, including worker and socket
 costs, rather than direct event-loop instrumentation. PipeWire capture includes
 compositor/observer latency and excludes physical display scanout. Two runs with

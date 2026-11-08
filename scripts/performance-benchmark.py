@@ -34,6 +34,8 @@ parser.add_argument("--windows", type=int, default=1)
 parser.add_argument("--background-panes", type=int, default=0)
 parser.add_argument("--batch-lines", type=int, default=20)
 parser.add_argument("--batch-interval", type=float, default=1 / 60)
+parser.add_argument("--daemon-cpu", type=int, help="Pin the daemon owner thread to this Linux CPU")
+parser.add_argument("--frontend-cpu", type=int, help="Pin the GTK main thread to this Linux CPU")
 args = parser.parse_args()
 assert args.seconds >= 1 and args.samples >= 5
 assert args.windows >= 1 and args.background_panes >= 0 and args.batch_lines > 0 and args.batch_interval >= 0
@@ -129,12 +131,19 @@ try:
         env = dict(os.environ, GTK_A11Y="none", GSK_RENDERER=args.renderer,
                    SHELL=str(shell), GMUX_SOCKET=str(temp / "socket"), XDG_CONFIG_HOME=str(temp / "config"))
         with args.output.with_suffix(".log").open("w") as log, WaylandInput() as native:
+            benchmark_window = None
+
             def rpc(method, **params):
+                if benchmark_window is not None and method in {
+                    "new", "split", "read", "send", "focus", "renderer-info", "screenshot", "action"
+                }:
+                    params.setdefault("window", benchmark_window)
                 return socket_rpc(env["GMUX_SOCKET"], method, **params)
 
             app = subprocess.Popen([str(args.binary)], env=env, stdout=log, stderr=log)
             wait_for(lambda: rpc("status")["local_clients"])
             wait_for(lambda: rpc("renderer-info")["gtk"])
+            benchmark_window = rpc("windows")["windows"][0]["id"]
             daemon_pid = rpc("status")["pid"]
             first = create_tab_when_connected(env["GMUX_SOCKET"], name="Benchmark", directory=str(temp))
             right = rpc("split", pane=first["pane"])["pane"]
@@ -166,6 +175,11 @@ try:
             rpc("focus", pane=first["pane"])
             native.click_color((230, 30, 45))
             wait_for(lambda: rpc("renderer-info", pane=first["pane"])["viewport"]["focused"])
+            # Apply after spawning writers so they retain their normal affinity.
+            if args.daemon_cpu is not None:
+                os.sched_setaffinity(daemon_pid, {args.daemon_cpu})
+            if args.frontend_cpu is not None:
+                os.sched_setaffinity(app.pid, {args.frontend_cpu})
             time.sleep(1)
             renderer = rpc("renderer-info", pane=first["pane"])
             assert renderer["display"] == "GdkWaylandDisplay", renderer
@@ -180,6 +194,7 @@ try:
                 monitor=native.parameters, capture="PipeWire / GStreamer RGBA appsink", xwayland=False,
                 samples=args.samples, seconds_per_cpu_sample=args.seconds, windows=args.windows,
                 background_panes=args.background_panes, batch_lines=args.batch_lines, batch_interval=args.batch_interval,
+                daemon_cpu=args.daemon_cpu, frontend_cpu=args.frontend_cpu,
                 output_processes=len(output_pids),
                 workload=(f"{len(output_pids)} programs with 64 OSC 7501 records each, sending {args.batch_lines} OSC 9;4 reports per batch beneath a retained status, with a {args.batch_interval:g}s sleep, plus an interactive probe."
                           if args.workload == "program-status-mixed" else

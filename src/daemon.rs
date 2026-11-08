@@ -35,6 +35,7 @@ mod frontend;
 mod mutation;
 mod network;
 mod prefetch;
+mod profile;
 mod remote_access;
 mod resources;
 
