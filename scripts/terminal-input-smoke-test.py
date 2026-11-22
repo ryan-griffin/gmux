@@ -144,7 +144,14 @@ try:
         if command == b'stop':
             break
         if command != previous:
-            os.write(1, command)
+            if command == b'password':
+                mode = termios.tcgetattr(0)
+                mode[3] |= termios.ICANON
+                termios.tcsetattr(0, termios.TCSANOW, mode)
+            elif command == b'raw':
+                tty.setraw(0)
+            else:
+                os.write(1, command)
             applied.write_bytes(command)
             previous = command
         if select.select([0], [], [], .01)[0]:
@@ -160,7 +167,8 @@ done.touch()
             def appearance(predicate=lambda state: True):
                 state = rpc("renderer-info", pane=pane)["viewport"]
                 return state if predicate(state) else None
-            wait_for(lambda: appearance(lambda s: s["mouse_shape"] == 0 and s["pointer_name"] == "default"))
+            wait_for(lambda: appearance(lambda s: s["mouse_shape"] == 0
+                and s["pointer_name"] == "default" and not s["cursor_password_input"]))
             for sequence, predicate in [
                 (b'\x1b[2 q\x1b]22;crosshair\x07', lambda s: s["mouse_shape"] == 7 and s["pointer_name"] == "crosshair" and not s["cursor_blink_running"]),
                 (b'\x1b]22;unknown-name\x07', lambda s: s["mouse_shape"] == 7 and s["pointer_name"] == "crosshair"),
@@ -169,6 +177,8 @@ done.touch()
                 (b'\x1b[?2026l\x1b]22;\x07', lambda s: s["mouse_shape"] == 8 and s["pointer_name"] == "text"),
                 (b'\x1b[1 q\x1b[?25l', lambda s: not s["cursor_blink_running"]),
                 (b'\x1b[?25h', lambda s: s["cursor_blink_running"]),
+                (b'password', lambda s: s["cursor_password_input"] and not s["cursor_blink_running"]),
+                (b'raw', lambda s: not s["cursor_password_input"] and s["cursor_blink_running"]),
             ]:
                 appearance_control.write_bytes(sequence)
                 wait_for(lambda: appearance_applied.read_bytes() == sequence)

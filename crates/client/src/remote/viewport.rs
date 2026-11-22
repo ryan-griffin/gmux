@@ -411,7 +411,10 @@ impl Viewport {
         let hyperlink_revision = self.hyperlink_revision.wrapping_mul(2);
         if let Some(prediction) = &self.prediction {
             return ScreenSnapshot {
-                frame: prediction.frame,
+                frame: Frame {
+                    cursor_password_input: self.frame.cursor_password_input,
+                    ..prediction.frame
+                },
                 cells: &prediction.cells,
                 row_flags: &prediction.row_flags,
                 hyperlinks: &NO_HYPERLINKS,

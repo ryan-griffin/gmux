@@ -36,7 +36,10 @@ fn cache_pressure_preserves_displayed_prediction_until_real_invalidation() {
         .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
             header: PaneHeader {
                 meta: session.borrow().viewport.meta.clone(),
-                frame: Some(frame),
+                frame: Some(Frame {
+                    cursor_password_input: true,
+                    ..frame
+                }),
                 generation: 7,
                 cache_origin: 100,
                 cache: Some(Default::default()),
@@ -48,6 +51,7 @@ fn cache_pressure_preserves_displayed_prediction_until_real_invalidation() {
     manager.poll();
     assert!(session.borrow().viewport.prediction.is_some());
     assert_eq!(session.borrow().snapshot().cells[0].text(), "p");
+    assert!(session.borrow().snapshot().frame.cursor_password_input);
     sender
         .send(Ok(Packet::Pane(gmux_protocol::transport::PaneUpdate {
             header: PaneHeader {

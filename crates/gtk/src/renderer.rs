@@ -41,10 +41,6 @@ impl Scene<'_> {
             && self.frame.cursor_y < self.frame.rows
     }
 
-    fn block_cursor(&self) -> bool {
-        self.cursor_visible() && self.focused && self.frame.cursor_style == 1
-    }
-
     fn cursor_index(&self) -> usize {
         self.frame.cursor_y as usize * self.frame.cols as usize + self.frame.cursor_x as usize
     }
@@ -79,11 +75,11 @@ impl Scene<'_> {
     }
 }
 
-/// Shape and wide edges are resolved once per row. Color lookups share this
-/// interval without copying the scene or calculating geometry for each cell.
+/// Color lookups use the selection and cursor spans resolved for the row.
 struct RowColors<'a, 'b> {
     scene: &'a Scene<'b>,
     selection: Option<(usize, usize)>,
+    cursor: Option<std::ops::Range<usize>>,
 }
 
 impl RowColors<'_, '_> {
@@ -94,8 +90,10 @@ impl RowColors<'_, '_> {
 
     fn foreground(&self, index: usize, cell: &Cell) -> ([u8; 3], f32) {
         let scene = self.scene;
-        let under_cursor = scene.block_cursor()
-            && (scene.cursor_index()..scene.cursor_index() + scene.cursor_width()).contains(&index);
+        let under_cursor = self
+            .cursor
+            .as_ref()
+            .is_some_and(|span| span.contains(&index));
         (
             if under_cursor {
                 cell.bg
@@ -506,6 +504,18 @@ impl Renderer {
             (0.0, 0.0, scene.width as f64, scene.height as f64),
         );
         let cols = scene.frame.cols as usize;
+        let cursor_visible = scene.cursor_visible();
+        let block_cursor = (cursor_visible
+            && scene.focused
+            && scene.frame.cursor_style == 1
+            && !scene.frame.cursor_password_input)
+            .then(|| {
+                (
+                    scene.frame.cursor_x as usize,
+                    scene.cursor_width(),
+                    scene.frame.cursor,
+                )
+            });
         self.reuse_scrolled_rows(scene.cells, cols);
         let mut stats = RenderStats::default();
         let batch = &mut self.batches;
@@ -515,17 +525,12 @@ impl Renderer {
             let selection = scene
                 .selection
                 .and_then(|selection| selection.row(base, cells, scene.frame.cols));
+            let cursor = block_cursor.filter(|_| scene.frame.cursor_y as usize == y);
             let colors = RowColors {
                 scene,
                 selection: selection.map(|(start, end)| (base + start, base + end)),
+                cursor: cursor.map(|(start, width, _)| base + start..base + start + width),
             };
-            let cursor = (scene.block_cursor() && scene.frame.cursor_y as usize == y).then(|| {
-                (
-                    scene.frame.cursor_x as usize,
-                    scene.cursor_width(),
-                    scene.frame.cursor,
-                )
-            });
             let row = &mut self.rows[y];
             // Rectangle snapping depends on the row's position in device pixels.
             let pixel_phase = (y as f64 * scene.metrics.1 * scene.scale).fract();
@@ -848,16 +853,19 @@ impl Renderer {
                 snapshot.restore();
             }
         }
-        if scene.cursor_visible() && !scene.block_cursor() {
+        if cursor_visible && block_cursor.is_none() {
             let alpha = if scene.focused { 1.0 } else { 0.35 };
-            render::cursor_rects(
-                scene.frame.cursor_style,
-                scene.focused,
-                scene.cursor_rect(),
-                |rect| {
-                    append_row_rect(snapshot, scene, 0.0, scene.frame.cursor, alpha, rect);
-                },
-            );
+            let password = scene.frame.cursor_password_input;
+            if !password
+                || !append_password_cursor(snapshot, scene, rgba(scene.frame.cursor, alpha))
+            {
+                render::cursor_rects(
+                    scene.frame.cursor_style,
+                    scene.focused && !password,
+                    scene.cursor_rect(),
+                    |rect| append_row_rect(snapshot, scene, 0.0, scene.frame.cursor, alpha, rect),
+                );
+            }
         }
         stats.cached_shapes = self.shapes.order.len();
         stats.cached_shape_bytes = self.shapes.bytes;
@@ -1029,6 +1037,37 @@ fn snapped_row_rect(scene: &Scene<'_>, row_y: f64, (x, y, w, h): Rect) -> Rect {
     let top = snap(y, scene.origin.1 + row_y);
     let bottom = snap(y + h, scene.origin.1 + row_y);
     (left, top, right - left, bottom - top)
+}
+
+fn append_password_cursor(snapshot: &gtk::Snapshot, scene: &Scene<'_>, color: gdk::RGBA) -> bool {
+    thread_local! {
+        static LOCK: Option<gtk::IconPaintable> = {
+            let theme = gtk::IconTheme::new();
+            theme.set_theme_name(Some("Adwaita"));
+            let name = "changes-prevent-symbolic";
+            theme.has_icon(name).then(|| theme.lookup_icon(
+                name, &[], 16, 1, gtk::TextDirection::None, gtk::IconLookupFlags::FORCE_SYMBOLIC,
+            ))
+        };
+    }
+    LOCK.with(|icon| {
+        let Some(icon) = icon else {
+            return false;
+        };
+        let (x, y, w, h) = scene.cursor_rect();
+        // The visible lock occupies 12 of the icon's 16 columns.
+        let size = (scene.metrics.0 * (16.0 / 12.0)).min(h);
+        let (x, y, width, height) = snapped_row_rect(
+            scene,
+            0.0,
+            (x + (w - size) / 2.0, y + (h - size) / 2.0, size, size),
+        );
+        snapshot.save();
+        snapshot.translate(&graphene::Point::new(x as f32, y as f32));
+        icon.snapshot_symbolic(snapshot, width, height, &[color]);
+        snapshot.restore();
+        true
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

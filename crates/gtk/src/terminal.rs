@@ -117,6 +117,7 @@ pub struct Terminal {
     text_blink: Rc<text_blink::TextBlink>,
     render_font: RefCell<Option<(pango::FontDescription, pango::Context, u32)>>,
     im: gtk::IMMulticontext,
+    password_input: ValueCell<bool>,
     mouse_position: ValueCell<(f64, f64)>,
     mouse_pressed: ValueCell<i32>,
     theme: ValueCell<Theme>,
@@ -336,6 +337,7 @@ impl Terminal {
             text_blink,
             render_font: RefCell::new(None),
             im,
+            password_input: ValueCell::new(false),
             mouse_position: ValueCell::new((0.0, 0.0)),
             mouse_pressed: ValueCell::new(0),
             theme: ValueCell::new(Theme::adwaita(adw::StyleManager::default().is_dark())),
@@ -636,7 +638,18 @@ impl Terminal {
                 screen.frame
             };
             self.sync_chrome(frame);
-            self.cursor.update(frame, self.exited());
+            let exited = self.exited();
+            let password_input = frame.cursor_password_input && !exited;
+            if self.password_input.replace(password_input) != password_input {
+                let (purpose, hints) = if password_input {
+                    (gtk::InputPurpose::Password, gtk::InputHints::PRIVATE)
+                } else {
+                    (gtk::InputPurpose::FreeForm, gtk::InputHints::NONE)
+                };
+                self.im.set_input_hints(hints);
+                self.im.set_input_purpose(purpose);
+            }
+            self.cursor.update(frame, exited);
         }
         if update.directory_changed {
             self.title
@@ -783,6 +796,7 @@ impl Terminal {
             "cols": cols, "rows": rows, "cell_width": cw, "cell_height": ch,
             "title_bar_visible": self.title_bar.is_visible(), "cursor_style": frame.cursor_style,
             "cursor_blink": frame.cursor_blink, "cursor_blink_running": self.cursor.running(),
+            "cursor_password_input": frame.cursor_password_input,
             "cursor_phase_visible": self.cursor.visible(), "mouse_shape": frame.mouse_shape,
             "text_blink_running": self.text_blink.running(),
             "text_blink_phase_visible": self.text_blink.visible(),

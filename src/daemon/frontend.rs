@@ -8,6 +8,7 @@ const READ_CHUNK: usize = 16 * 1024;
 const MAX_INPUT_PER_VISIT: usize = 512 * 1024;
 const MAX_REQUESTS_PER_VISIT: usize = 8;
 const MAX_COMMAND: usize = 1_048_577;
+const PASSWORD_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 struct SentScreen {
@@ -202,6 +203,10 @@ pub(super) struct Paste {
 impl Frontend {
     pub(super) fn is_visible(&self, pane: u64) -> bool {
         self.panes.get(&pane).is_some_and(|pane| pane.visible)
+    }
+
+    fn visible_pane_mut(&mut self, id: u64) -> Option<&mut PaneViewState> {
+        self.panes.get_mut(&id).filter(|pane| pane.visible)
     }
 
     pub(super) fn view(&self, pane: u64) -> Option<&crate::engine::EngineView> {
@@ -1112,6 +1117,36 @@ impl Daemon {
         }
         Ok(())
     }
+    pub(super) fn poll_password_input(&mut self) {
+        let Some(deadline) = self.password_poll else {
+            return;
+        };
+        let now = Instant::now();
+        if now < deadline {
+            return;
+        }
+        // Termios changes can happen without producing any PTY output.
+        self.password_poll = None;
+        for (&id, session) in &mut self.sessions {
+            if session.exited() {
+                continue;
+            }
+            let mut views = self
+                .frontends
+                .values_mut()
+                .filter_map(|frontend| frontend.visible_pane_mut(id))
+                .peekable();
+            if views.peek().is_some() {
+                self.password_poll = Some(now + PASSWORD_POLL_INTERVAL);
+                if session.refresh_password_input() {
+                    for pane in views {
+                        pane.changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn next_update(&self) -> Option<Instant> {
         let _cost = profile::scope(profile::Stage::NextUpdate, self.frontends.len());
         self.frontends
@@ -1185,14 +1220,23 @@ impl Daemon {
                     + self.errors.len()
                     + if metadata_due { self.sessions.len() } else { 0 }),
         );
+        for &id in &self.changed {
+            let mut visible = false;
+            for frontend in self.frontends.values_mut().filter(|f| f.attached) {
+                let pane = frontend.panes.entry(id).or_default();
+                pane.terminal_changed = true;
+                visible |= pane.visible;
+            }
+            // Sample once for all subscribers before a prompt's output is sent.
+            if visible && let Some(session) = self.sessions.get_mut(&id) {
+                session.refresh_password_input();
+            }
+        }
         for frontend in self
             .frontends
             .values_mut()
             .filter(|frontend| frontend.attached)
         {
-            for &id in &self.changed {
-                frontend.panes.entry(id).or_default().terminal_changed = true;
-            }
             if metadata_due {
                 for &id in self.sessions.keys() {
                     frontend.panes.entry(id).or_default().metadata_changed = true;
@@ -1374,7 +1418,8 @@ impl Daemon {
                     screen.prefetch_at.is_some_and(|at| at <= Instant::now())
                 })
                 || pane.find_pending();
-            let screen = pane.visible && (changed || pane.screen().is_none());
+            let first_frame = pane.visible && pane.screen().is_none();
+            let screen = first_frame || (pane.visible && changed);
             if !metadata_changed
                 && !changed
                 && !screen
@@ -1392,6 +1437,19 @@ impl Daemon {
                 && pane.metadata.as_ref() == Some(&meta)
             {
                 continue;
+            }
+            if first_frame && !session.exited() {
+                self.password_poll
+                    .get_or_insert_with(|| Instant::now() + PASSWORD_POLL_INTERVAL);
+                if session.refresh_password_input() {
+                    for other in self
+                        .frontends
+                        .values_mut()
+                        .filter_map(|f| f.visible_pane_mut(id))
+                    {
+                        other.changed = true;
+                    }
+                }
             }
             let mut rows = Vec::new();
             let mut cells = Vec::new();

@@ -178,6 +178,8 @@ pub struct Frame {
     pub cursor_visible: u8,
     pub cursor_style: u8,
     pub cursor_blink: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_password_input: bool,
     pub mouse_shape: u8,
     pub background: [u8; 3],
     pub foreground: [u8; 3],

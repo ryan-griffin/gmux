@@ -1458,6 +1458,8 @@ fn validate_cache(
         ("cursor-color", 1),
         ("block-blink-off", 1),
         ("block-blink-on", 1),
+        ("password", 1),
+        ("password-end", 1),
         ("unfocused", 1),
         ("bar", 0),
         ("bar-blink-off", 0),
@@ -1494,6 +1496,8 @@ fn validate_cache(
             "block-blink-on" | "bar-blink-on" | "underline-blink-on" => {
                 scene.frame.cursor_visible = 1
             }
+            "password" => scene.frame.cursor_password_input = true,
+            "password-end" => scene.frame.cursor_password_input = false,
             "unfocused" => scene.focused = false,
             "bar" => {
                 scene.focused = true;

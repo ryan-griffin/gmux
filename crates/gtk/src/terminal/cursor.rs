@@ -14,7 +14,7 @@ struct CursorState {
     rows: u16,
     style: u8,
     visible: u8,
-    blink: u8,
+    blink: bool,
 }
 
 impl From<Frame> for CursorState {
@@ -26,7 +26,7 @@ impl From<Frame> for CursorState {
             rows: frame.rows,
             style: frame.cursor_style,
             visible: frame.cursor_visible,
-            blink: frame.cursor_blink,
+            blink: frame.cursor_blink != 0 && !frame.cursor_password_input,
         }
     }
 }
@@ -220,7 +220,7 @@ impl Cursor {
     fn eligible(&self) -> bool {
         let state = self.state.get();
         self.default_blink()
-            && state.blink != 0
+            && state.blink
             && state.visible != 0
             && state.x < state.cols
             && state.y < state.rows
