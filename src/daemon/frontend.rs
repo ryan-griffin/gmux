@@ -1599,6 +1599,7 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Shutdown;
 
     #[test]
     fn sparse_frames_settle_and_keep_work_added_during_a_continuation() {
@@ -2019,8 +2020,10 @@ mod tests {
         let (socket, mut rejected) = UnixStream::pair().unwrap();
         assert!(!daemon.admit_frontend(socket).unwrap());
         assert_eq!(rejected.read(&mut [0]).unwrap(), 0);
-        drop(peers.pop());
-        // Input EOF, rather than a write, detects an idle peer's teardown.
+        let peer = peers.pop().unwrap();
+        // Signal EOF even if a parallel test's child still holds the peer socket.
+        peer.shutdown(Shutdown::Write).unwrap();
+        drop(peer);
         daemon
             .frontends
             .retain(|_, frontend| frontend.requests().is_ok() && frontend.flush().is_ok());
