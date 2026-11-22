@@ -1,4 +1,5 @@
 use gmux_protocol::{
+    glyphs::Glyphs,
     model::CursorStyle,
     selection::{Selection, Shape},
     theme::Theme,
@@ -42,6 +43,10 @@ unsafe extern "C" fn capture_cell(ud: *mut c_void, index: usize, raw: *const Gmu
 }
 const _: () = assert!(GMUX_GRAPHEME_MAX_CODEPOINTS == 65);
 const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_protocol::cells::MAX_GRAPHEME_BYTES);
+
+#[path = "engine/glyphs.rs"]
+mod glyphs;
+use glyphs::{GlyphState, glyph_hold};
 
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
@@ -239,6 +244,7 @@ struct Events {
     read_refill: Option<std::time::Instant>,
     command: gmux_protocol::shell::CommandState,
     resize_request: Option<(u16, u16)>,
+    glyphs: GlyphState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
 const _: () =
@@ -1015,6 +1021,7 @@ impl Engine {
         .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
         unsafe {
             gmux_engine_read_callback(raw.as_ptr(), Some(clipboard_read));
+            gmux_engine_glyph_hold_callback(raw.as_ptr(), Some(glyph_hold));
         }
         let mut engine = Self {
             revision: 1,
@@ -1518,6 +1525,14 @@ impl ActiveView<'_> {
     }
     pub(crate) fn row_flags(&self) -> &[u8] {
         &self.engine.row_flags
+    }
+    pub(crate) fn glyphs(&mut self) -> (u64, &Glyphs) {
+        let state = &mut self.engine.events.glyphs;
+        if !self.held {
+            state.live.refresh(self.engine.raw.as_ptr());
+            return (state.live.revision, &state.live.glyphs);
+        }
+        (state.held.revision, &state.held.glyphs)
     }
     pub(crate) fn hyperlinks(&self) -> &gmux_protocol::hyperlinks::Hyperlinks {
         &self.engine.hyperlinks
@@ -2673,6 +2688,7 @@ mod tests {
                                     &ScreenSnapshot {
                                         hyperlinks: &Default::default(),
                                         hyperlink_revision: 0,
+                                        glyphs: &Glyphs::default(),
                                         frame: engine.frame,
                                         cells: &engine.cells,
                                         row_flags: &engine.row_flags,

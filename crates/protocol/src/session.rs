@@ -7,6 +7,8 @@ pub struct ScreenSnapshot<'a> {
     pub hyperlinks: &'a crate::hyperlinks::Hyperlinks,
     /// Opaque token that changes with the map, dimensions or prediction state.
     pub hyperlink_revision: u64,
+    /// Pane-local glyph definitions used by both live and predicted rows.
+    pub glyphs: &'a crate::glyphs::Glyphs,
     /// Bit zero marks a soft wrap to the next row.
     pub row_flags: &'a [u8],
     pub revision: u64,

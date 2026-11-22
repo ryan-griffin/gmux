@@ -64,6 +64,9 @@ Media and volume keys delivered by the desktop work in terminal programs that
 enable the Kitty keyboard protocol. See [keyboard input](docs/keyboard.md) for
 supported keys and browser-key limitations.
 
+Programs can also [register custom glyphs](docs/renderer.md#registered-glyphs)
+for terminal icons without installing a font.
+
 Copying terminal selections or command output offers plain text and styled
 HTML together. Compatible destinations preserve terminal colors and formatting;
 text destinations receive plain text. See [clipboard behavior](docs/clipboard.md)

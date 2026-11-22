@@ -16,7 +16,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 44;
+pub const VERSION: u32 = 45;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -94,6 +94,9 @@ pub struct PaneHeader {
     /// Replacement map for this frame; absent keeps the displayed map.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hyperlinks: Option<crate::hyperlinks::Hyperlinks>,
+    /// The pane glossary replaces the previous snapshot when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glyphs: Option<crate::glyphs::Glyphs>,
     pub rows: Vec<u16>,
     /// Flags corresponding to `rows`; empty means every changed row is unwrapped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -274,11 +277,15 @@ macro_rules! packet_reader {
                 if let Some(links) = &header.hyperlinks {
                     links.validate(cols * rows)?;
                 }
+                if let Some(glyphs) = &header.glyphs {
+                    glyphs.validate()?;
+                }
                 (header.rows.len() + cached) * cols
             } else {
                 anyhow::ensure!(
-                    header.rows.is_empty() && header.cache.is_none() && header.row_shift == 0,
-                    "Rows require a frame"
+                    header.rows.is_empty() && header.cache.is_none() && header.row_shift == 0
+                        && header.glyphs.is_none(),
+                    "Rows and glyph glossaries require a frame"
                 );
                 0
             };

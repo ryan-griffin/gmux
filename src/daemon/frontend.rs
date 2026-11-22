@@ -21,6 +21,7 @@ struct SentScreen {
     cache_active: bool,
     prefetch_at: Option<Instant>,
     hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
+    glyph_revision: Option<u64>,
     cache_bytes: usize,
     last_used: Option<Instant>,
 }
@@ -1360,6 +1361,7 @@ impl Daemon {
             let mut cache = None;
             let mut cache_invalidated = false;
             let mut hyperlinks = None;
+            let mut glyphs = None;
             let (frame, find, selection, selection_origin) = if screen
                 || pane.presentation.is_some()
             {
@@ -1385,10 +1387,15 @@ impl Daemon {
                     }
                     let frame = if screen {
                         let frame = active.frame();
+                        let old = presentation.screen.get_or_insert_with(Default::default);
+                        let (revision, glossary) = active.glyphs();
+                        if old.glyph_revision != Some(revision) {
+                            old.glyph_revision = Some(revision);
+                            glyphs = Some(glossary.clone());
+                        }
                         let cells_snapshot = active.cells();
                         self.snapshots += 1;
                         let cols = frame.cols as usize;
-                        let old = presentation.screen.get_or_insert_with(Default::default);
                         let full = old.frame.cols != frame.cols
                             || old.frame.rows != frame.rows
                             || old.cells.len() != cells_snapshot.len();
@@ -1514,6 +1521,7 @@ impl Daemon {
                             hyperlinks = Some(active.hyperlinks().clone());
                         }
                         let send = hyperlinks.is_some()
+                            || glyphs.is_some()
                             || full
                             || !rows.is_empty()
                             || old.frame != frame
@@ -1593,6 +1601,7 @@ impl Daemon {
                     meta,
                     frame,
                     hyperlinks,
+                    glyphs,
                     scroll_serial,
                     generation,
                     cache_origin,

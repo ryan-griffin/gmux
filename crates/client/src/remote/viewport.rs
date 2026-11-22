@@ -65,6 +65,7 @@ pub(super) struct Viewport {
     row_flags: Vec<u8>,
     hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     hyperlink_revision: u64,
+    glyphs: gmux_protocol::glyphs::Glyphs,
     cache: crate::scroll_cache::RowCache,
     prediction: Option<Prediction>,
     scroll_target: Option<u64>,
@@ -115,6 +116,7 @@ impl Viewport {
             row_flags: vec![0; 24],
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
+            glyphs: Default::default(),
             cache: {
                 let cache = crate::scroll_cache::RowCache::default();
                 cache.set_focused(focused);
@@ -242,6 +244,12 @@ impl Viewport {
             } else if dimensions_changed {
                 self.hyperlinks = Default::default();
             }
+            let glyphs_changed = packet.header.glyphs.is_some_and(|mut glyphs| {
+                glyphs.reuse_entries(&self.glyphs);
+                let changed = !glyphs.same(&self.glyphs);
+                self.glyphs = glyphs;
+                changed
+            });
             self.frame = frame;
             if visible && (packet.header.cache.is_some() || !self.cache.is_empty()) {
                 if self.cache.configure(packet.header.generation, frame) {
@@ -279,7 +287,10 @@ impl Viewport {
                 prediction_changed = self.predict(target);
                 text_changed |= prediction_changed;
             }
-            if !packet.header.rows.is_empty() || packet.header.row_shift != 0 || prediction_changed
+            if !packet.header.rows.is_empty()
+                || packet.header.row_shift != 0
+                || prediction_changed
+                || glyphs_changed
             {
                 self.revision = self.revision.wrapping_add(1);
             }
@@ -402,6 +413,7 @@ impl Viewport {
                 row_flags: &prediction.row_flags,
                 hyperlinks: &NO_HYPERLINKS,
                 hyperlink_revision: hyperlink_revision | 1,
+                glyphs: &self.glyphs,
                 revision: self.revision,
                 text_revision: self.text_revision,
             };
@@ -412,6 +424,7 @@ impl Viewport {
             row_flags: &self.row_flags,
             hyperlinks: &self.hyperlinks,
             hyperlink_revision,
+            glyphs: &self.glyphs,
             revision: self.revision,
             text_revision: self.text_revision,
         }

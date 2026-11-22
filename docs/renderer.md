@@ -3,6 +3,23 @@
 The GTK frontend draws terminal cells with GSK render nodes. Ghostty parses PTY
 output in the daemon; fonts and render nodes stay in each frontend.
 
+## Registered glyphs
+
+Programs can register monochrome OpenType `glyf` outlines at U+100000–U+1003FF
+using the [Glyph Protocol](https://github.com/raphamorim/rio/blob/main/specs/glyph-protocol.md).
+The support reply advertises `glyf`. Coverage queries report registered glyphs
+and return `unknown` when coverage depends on the frontend's fonts.
+
+Registrations belong to one pane and follow it across clients and reconnects.
+Replacement and clearing apply to existing cells, including scrollback. A full
+terminal reset clears the glossary. Checkpoints retain the original codepoints.
+Copy and search also use the original text.
+
+The renderer clips each outline to its cell span and uses the cell's displayed
+foreground. It caches vector paths and rebuilds rows affected by glossary
+changes. A pane can hold 512 KiB of decoded outlines, with up to 64 KiB of points
+per glyph. Registrations may be replaced or cleared to free space.
+
 ## Implementation
 
 `crates/gtk/src/renderer.rs` retains row nodes and shapes text through Pango. Compatible

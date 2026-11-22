@@ -11,8 +11,9 @@ workspace = true
 
 [dependencies]
 anyhow = "1"
+base64 = "0.21"
 memchr = "2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
 [features]

@@ -139,6 +139,7 @@ struct GmuxEngine {
     GmuxEventFn callback;
     GmuxClipboardFn clipboard;
     GmuxClipboardReadFn clipboard_read;
+    GmuxGlyphHoldFn glyph_hold;
     uint64_t read_id;
     bool feed_osc, feed_escape, feed_st;
     void *userdata;
@@ -394,7 +395,19 @@ static uint64_t now_ms(void) {
     return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
 }
 
+// Private extension of the pinned libghostty-vt build.
+extern uint64_t ghostty_terminal_gmux_glyphs(GhosttyTerminal, uint64_t, void *, GmuxGlyphFn);
+
+uint64_t gmux_engine_glyphs(const GmuxEngine *e, uint64_t known, void *userdata, GmuxGlyphFn callback) {
+    return ghostty_terminal_gmux_glyphs(e->terminal, known, userdata, callback);
+}
+
+void gmux_engine_glyph_hold_callback(GmuxEngine *e, GmuxGlyphHoldFn callback) {
+    e->glyph_hold = callback;
+}
+
 static void end_render_hold(GmuxEngine *e) {
+    if (e->held && e->glyph_hold) e->glyph_hold(e->userdata, e, false);
     e->held=false;
     e->links.valid=false;
     links_free(&e->link_scratch.spare);
@@ -410,6 +423,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         // Capture at the exact start of the hold, even if the same PTY chunk
         // contains the next frame. Keep it visible until that frame is complete.
         if (ghostty_render_state_update(e->render, terminal)) return;
+        if (e->glyph_hold) e->glyph_hold(e->userdata, e, true);
         e->links.valid=false;
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
         links_capture(terminal, e->render, e->iterator, &e->held_links, &e->link_scratch, ++e->link_revision, false);
@@ -733,7 +747,9 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, color_scheme);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, progress_report);
-    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, program_status) ||
+    const bool glyph_protocol = true;
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyph_protocol) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, program_status) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, semantic_prompt) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RESET, shell_reset)) {
         gmux_engine_free(e); return NULL;
