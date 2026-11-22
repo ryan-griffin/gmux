@@ -16,8 +16,9 @@ terminal reset clears the glossary. Checkpoints retain the original codepoints.
 Copy and search also use the original text.
 
 The renderer clips each outline to its cell span and uses the cell's displayed
-foreground. It caches vector paths and rebuilds rows affected by glossary
-changes. A pane can hold 512 KiB of decoded outlines, with up to 64 KiB of points
+foreground. It reuses vector paths and rebuilds rows affected by glossary
+changes. On Cairo it also caches up to 2 MiB of glyph textures per renderer.
+A pane can hold 512 KiB of decoded outlines, with up to 64 KiB of points
 per glyph. Registrations may be replaced or cleared to free space.
 
 ## Implementation

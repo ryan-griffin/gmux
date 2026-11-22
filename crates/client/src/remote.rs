@@ -949,11 +949,19 @@ impl SessionManager {
                     let id = packet.header.meta.id;
                     if let Some(session) = self.sessions.get(&id) {
                         let mut session = session.borrow_mut();
-                        let changes = session.viewport.apply(
+                        let changes = match session.viewport.apply(
                             packet,
                             self.visible.contains(&id),
                             Instant::now(),
-                        );
+                        ) {
+                            Ok(changes) => changes,
+                            Err(error) => {
+                                self.disconnect_error = Some(error);
+                                self.disconnected = true;
+                                let _ = self.connection.socket.shutdown(std::net::Shutdown::Both);
+                                break;
+                            }
+                        };
                         merge_presentation(updates.entry(id).or_default(), changes.presentation);
                         let _ = session.enqueue_scroll(changes.scroll);
                     } else if packet.header.meta.exited || !packet.header.notifications.is_empty() {

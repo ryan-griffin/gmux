@@ -26,12 +26,19 @@ pub struct Glyphs(Arc<[Arc<Glyph>]>);
 
 impl Glyphs {
     pub fn new(mut glyphs: Vec<Arc<Glyph>>) -> Self {
+        if glyphs.is_empty() {
+            return Self::default();
+        }
         glyphs.sort_unstable_by_key(|glyph| glyph.codepoint);
         Self(glyphs.into())
     }
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub fn entries(&self) -> &[Arc<Glyph>] {
+        &self.0
     }
 
     pub fn same(&self, other: &Self) -> bool {
@@ -53,7 +60,7 @@ impl Glyphs {
         };
         for glyph in &mut *glyphs {
             if let Some(old) = previous.get(glyph.codepoint)
-                && **old == **glyph
+                && (Arc::ptr_eq(old, glyph) || **old == **glyph)
             {
                 *glyph = old.clone();
             }
@@ -86,7 +93,7 @@ impl Glyphs {
                     && glyph.pad[1] + glyph.pad[3] < 1.0,
                 "Invalid registered glyph"
             );
-            bytes += glyph.outline.decoded_size();
+            bytes += glyph.outline.decoded_bytes;
             previous = Some(glyph.codepoint);
         }
         anyhow::ensure!(
@@ -102,8 +109,70 @@ impl Glyphs {
             + self
                 .0
                 .iter()
-                .map(|glyph| glyph.outline.0.len())
+                .map(|glyph| glyph.outline.bytes.len())
                 .sum::<usize>()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GlyphUpdate {
+    Replace(Glyphs),
+    Patch { defined: Glyphs, removed: Vec<char> },
+}
+
+impl GlyphUpdate {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Replace(glyphs) => glyphs.validate(),
+            Self::Patch { defined, removed } => {
+                defined.validate()?;
+                anyhow::ensure!(
+                    removed.len() <= SLOT_COUNT
+                        && removed.windows(2).all(|pair| pair[0] < pair[1])
+                        && removed
+                            .iter()
+                            .all(|&cp| slot(cp) && defined.get(cp).is_none()),
+                    "Invalid glyph removals"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn memory_size(&self) -> usize {
+        match self {
+            Self::Replace(glyphs) => glyphs.memory_size(),
+            Self::Patch { defined, removed } => {
+                defined.memory_size() + removed.capacity() * size_of::<char>()
+            }
+        }
+    }
+
+    /// Apply a validated update within the retained glossary budget.
+    pub fn apply(self, current: &mut Glyphs) -> anyhow::Result<bool> {
+        let mut next = match self {
+            Self::Replace(glyphs) => glyphs,
+            Self::Patch { defined, removed } => Glyphs::new(
+                current
+                    .entries()
+                    .iter()
+                    .filter(|glyph| {
+                        removed.binary_search(&glyph.codepoint).is_err()
+                            && defined.get(glyph.codepoint).is_none()
+                    })
+                    .chain(defined.entries())
+                    .cloned()
+                    .collect(),
+            ),
+        };
+        next.validate()?;
+        next.reuse_entries(current);
+        if next.same(current) {
+            return Ok(false);
+        }
+        *current = next;
+        Ok(true)
     }
 }
 
@@ -169,40 +238,43 @@ pub struct Point {
 /// Each point is two little-endian i32 coordinates and one byte of flags.
 /// The last point of each contour carries its end flag.
 #[derive(PartialEq)]
-pub struct Outline(Box<[u8]>);
+pub struct Outline {
+    bytes: Box<[u8]>,
+    decoded_bytes: usize,
+}
 
 impl Outline {
     pub fn new(points: impl ExactSizeIterator<Item = Point>) -> Self {
         let mut bytes = Vec::with_capacity(points.len() * POINT_BYTES);
+        let mut decoded_bytes = points.len() * 12;
         for point in points {
             bytes.extend_from_slice(&point.x.to_le_bytes());
             bytes.extend_from_slice(&point.y.to_le_bytes());
             bytes.push(u8::from(point.on_curve) | (u8::from(point.contour_end) << 1));
+            decoded_bytes += 2 * usize::from(point.contour_end);
         }
-        Self(bytes.into_boxed_slice())
+        Self {
+            bytes: bytes.into_boxed_slice(),
+            decoded_bytes,
+        }
     }
 
     pub fn points(&self) -> impl Iterator<Item = Point> + '_ {
-        self.0.as_chunks::<POINT_BYTES>().0.iter().map(decode_point)
+        self.bytes
+            .as_chunks::<POINT_BYTES>()
+            .0
+            .iter()
+            .map(decode_point)
     }
 
     pub fn contours(
         &self,
     ) -> impl Iterator<Item = impl DoubleEndedIterator<Item = Point> + '_> + '_ {
-        self.0
+        self.bytes
             .as_chunks::<POINT_BYTES>()
             .0
             .split_inclusive(|point| point[8] & 2 != 0)
             .map(|points| points.iter().map(decode_point))
-    }
-
-    fn decoded_size(&self) -> usize {
-        self.0
-            .as_chunks::<POINT_BYTES>()
-            .0
-            .iter()
-            .map(|point| 12 + if point[8] & 2 != 0 { 2 } else { 0 })
-            .sum()
     }
 }
 
@@ -217,7 +289,7 @@ fn decode_point(bytes: &[u8; POINT_BYTES]) -> Point {
 
 impl Serialize for Outline {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&base64::display::Base64Display::new(&self.0, &STANDARD))
+        serializer.collect_str(&base64::display::Base64Display::new(&self.bytes, &STANDARD))
     }
 }
 
@@ -243,10 +315,7 @@ impl serde::de::Visitor<'_> for OutlineVisitor {
         }
         let bytes = STANDARD.decode(text.as_bytes()).map_err(E::custom)?;
         let (points, remainder) = bytes.as_chunks::<POINT_BYTES>();
-        if !remainder.is_empty()
-            || points.last().is_some_and(|point| point[8] & 2 == 0)
-            || points.iter().any(|point| point[8] > 3)
-        {
+        if !remainder.is_empty() || points.last().is_some_and(|point| point[8] & 2 == 0) {
             return Err(E::custom("Invalid glyph outline"));
         }
         if points.len() * 12 > MAX_OUTLINE_BYTES {
@@ -254,6 +323,72 @@ impl serde::de::Visitor<'_> for OutlineVisitor {
                 "Glyph outline expands beyond its allocation limit",
             ));
         }
-        Ok(Outline(bytes.into_boxed_slice()))
+        let mut decoded_bytes = points.len() * 12;
+        for point in points {
+            if point[8] > 3 {
+                return Err(E::custom("Invalid glyph outline"));
+            }
+            decoded_bytes += usize::from(point[8] & 2);
+        }
+        Ok(Outline {
+            bytes: bytes.into_boxed_slice(),
+            decoded_bytes,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_patches_enforce_the_retained_glossary_limit() {
+        let glyphs = |slots: std::ops::Range<u32>| {
+            Glyphs::new(
+                slots
+                    .map(|cp| {
+                        Arc::new(Glyph {
+                            codepoint: char::from_u32(cp).unwrap(),
+                            upm: 1000,
+                            extent: None,
+                            width: 1,
+                            size: Size::Contain,
+                            horizontal: Horizontal::Center,
+                            vertical: Vertical::Center,
+                            pad: [0.0; 4],
+                            outline: Outline::new((0..5461).map(|point| Point {
+                                x: point,
+                                y: 0,
+                                on_curve: true,
+                                contour_end: point == 5460,
+                            })),
+                            revision: 0,
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        let first = 0x100000;
+        let original = glyphs(first..first + 8);
+        let mut current = original.clone();
+        // Both input glossaries fit on their own. One more glyph exceeds the
+        // budget unless a previous one is removed in the same update.
+        let mut version = GlyphUpdate::Patch {
+            defined: glyphs(first + 8..first + 9),
+            removed: Vec::new(),
+        };
+        version.validate().unwrap();
+        assert!(version.apply(&mut current).is_err());
+        assert!(current.same(&original));
+
+        version = GlyphUpdate::Patch {
+            defined: glyphs(first + 8..first + 9),
+            removed: vec![char::from_u32(first).unwrap()],
+        };
+        version.validate().unwrap();
+        assert!(version.apply(&mut current).unwrap());
+        assert_eq!(current.entries().len(), 8);
+        assert!(current.get(char::from_u32(first).unwrap()).is_none());
+        assert!(Arc::ptr_eq(&current.entries()[0], &original.entries()[1]));
     }
 }

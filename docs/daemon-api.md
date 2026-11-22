@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 45:
+handshake. The current protocol version is 46:
 
 ```json
-{"version":45,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":46,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":45,"daemon":"returned-identity"}
+{"method":"attach","version":46,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -505,7 +505,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 45; clients must match
+cell data are rejected. This is stream protocol version 46; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.
@@ -515,9 +515,10 @@ count. Decoration bits 0-2 encode no underline, single, double, curly,
 dotted, or dashed as 0-5. Bit 3 enables overline. Bit 4 selects the independent
 underline color; otherwise the underline follows the displayed text color.
 
-A viewport header may carry `glyphs`, the replacement glossary for the pane.
-An empty array clears it. Omission keeps the previous glossary. Each glyph
-contains its codepoint, placement parameters, and a base64 outline. An outline
+A viewport header may carry a `glyphs` update for the pane. A `replace` array
+sets the complete glossary on attachment. A `patch` object supplies `defined`
+glyphs and `removed` codepoints. Omission keeps the previous glossary. Each
+glyph contains its codepoint, placement parameters, and a base64 outline. An outline
 point contains signed little-endian 32-bit X and Y coordinates and one flag byte.
 Bit 0 marks on-curve points and bit 1 marks the last point in a contour.
 Cached rows use the same glossary as the viewport.

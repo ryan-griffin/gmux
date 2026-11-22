@@ -1,5 +1,6 @@
 //! Frontend socket buffering, terminal input, and viewport updates.
 use super::*;
+use gmux_protocol::glyphs::{GlyphUpdate, Glyphs};
 use gmux_protocol::transport::{KeyAction, PasteOptions, StreamCommand, StreamRequest};
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
@@ -21,9 +22,48 @@ struct SentScreen {
     cache_active: bool,
     prefetch_at: Option<Instant>,
     hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
-    glyph_revision: Option<u64>,
+    glyphs: SentGlyphs,
     cache_bytes: usize,
     last_used: Option<Instant>,
+}
+
+#[derive(Default)]
+struct SentGlyphs {
+    revision: Option<u64>,
+    codepoints: Vec<char>,
+}
+
+impl SentGlyphs {
+    fn update(&mut self, revision: u64, glossary: &Glyphs) -> Option<GlyphUpdate> {
+        if self.revision == Some(revision) {
+            return None;
+        }
+        let update = if let Some(previous) = self.revision.filter(|&old| old < revision) {
+            let defined = Glyphs::new(
+                glossary
+                    .entries()
+                    .iter()
+                    .filter(|glyph| glyph.revision > previous)
+                    .cloned()
+                    .collect(),
+            );
+            let removed: Vec<_> = self
+                .codepoints
+                .iter()
+                .copied()
+                .filter(|&cp| glossary.get(cp).is_none())
+                .collect();
+            (!defined.is_empty() || !removed.is_empty())
+                .then_some(GlyphUpdate::Patch { defined, removed })
+        } else {
+            Some(GlyphUpdate::Replace(glossary.clone()))
+        };
+        self.revision = Some(revision);
+        self.codepoints.clear();
+        self.codepoints
+            .extend(glossary.entries().iter().map(|glyph| glyph.codepoint));
+        update
+    }
 }
 struct SentSelection {
     range: Option<gmux_protocol::selection::Selection>,
@@ -429,11 +469,13 @@ impl SentScreen {
             + self.cells.iter().map(Cell::heap_bytes).sum::<usize>()
             + self.row_flags.capacity()
             + self.hyperlinks.memory_size()
+            + self.glyphs.codepoints.capacity() * size_of::<char>()
     }
     fn release_cache(&mut self) {
         self.cells = Vec::new();
         self.row_flags = Vec::new();
         self.hyperlinks = Default::default();
+        self.glyphs = Default::default();
         self.cache_bytes = 0;
         self.source_revision = None;
         self.prefetch_at = None;
@@ -1389,10 +1431,7 @@ impl Daemon {
                         let frame = active.frame();
                         let old = presentation.screen.get_or_insert_with(Default::default);
                         let (revision, glossary) = active.glyphs();
-                        if old.glyph_revision != Some(revision) {
-                            old.glyph_revision = Some(revision);
-                            glyphs = Some(glossary.clone());
-                        }
+                        glyphs = old.glyphs.update(revision, glossary);
                         let cells_snapshot = active.cells();
                         self.snapshots += 1;
                         let cols = frame.cols as usize;

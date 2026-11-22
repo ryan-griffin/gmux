@@ -16,7 +16,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 45;
+pub const VERSION: u32 = 46;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -94,9 +94,9 @@ pub struct PaneHeader {
     /// Replacement map for this frame; absent keeps the displayed map.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hyperlinks: Option<crate::hyperlinks::Hyperlinks>,
-    /// The pane glossary replaces the previous snapshot when present.
+    /// Glyph state delivered with this viewport.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub glyphs: Option<crate::glyphs::Glyphs>,
+    pub glyphs: Option<crate::glyphs::GlyphUpdate>,
     pub rows: Vec<u16>,
     /// Flags corresponding to `rows`; empty means every changed row is unwrapped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

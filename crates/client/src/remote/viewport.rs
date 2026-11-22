@@ -130,7 +130,16 @@ impl Viewport {
     }
     /// Packets have already passed protocol validation and must arrive in wire
     /// order. Always update canonical cells, even while showing a prediction.
-    pub fn apply(&mut self, packet: PaneUpdate, visible: bool, now: Instant) -> ViewChanges {
+    pub fn apply(
+        &mut self,
+        packet: PaneUpdate,
+        visible: bool,
+        now: Instant,
+    ) -> anyhow::Result<ViewChanges> {
+        let glyphs_changed = match packet.header.glyphs {
+            Some(update) => update.apply(&mut self.glyphs)?,
+            None => false,
+        };
         let mut update = SessionUpdate {
             exited: packet.header.meta.exited,
             notifications: packet.header.notifications,
@@ -244,12 +253,6 @@ impl Viewport {
             } else if dimensions_changed {
                 self.hyperlinks = Default::default();
             }
-            let glyphs_changed = packet.header.glyphs.is_some_and(|mut glyphs| {
-                glyphs.reuse_entries(&self.glyphs);
-                let changed = !glyphs.same(&self.glyphs);
-                self.glyphs = glyphs;
-                changed
-            });
             self.frame = frame;
             if visible && (packet.header.cache.is_some() || !self.cache.is_empty()) {
                 if self.cache.configure(packet.header.generation, frame) {
@@ -300,10 +303,10 @@ impl Viewport {
             update.changed = true;
         }
 
-        ViewChanges {
+        Ok(ViewChanges {
             presentation: update,
             scroll: self.due_scroll(now),
-        }
+        })
     }
     pub fn scroll_to(&mut self, row: u64, now: Instant) -> ViewChanges {
         self.scroll_target = Some(row);

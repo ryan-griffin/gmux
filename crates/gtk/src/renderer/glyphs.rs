@@ -1,5 +1,134 @@
 use gmux_protocol::glyphs::{Glyph, Horizontal, Point, Size, Vertical};
-use gtk::{gdk, graphene, gsk, prelude::*};
+use gtk::{cairo, gdk, glib, graphene, gsk, prelude::*};
+use std::collections::HashMap;
+
+// Row nodes can retain textures, so keep admitted entries until their rows
+// are invalidated. Once full, draw new variants as paths.
+const MAX_RASTER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RASTERS: usize = 2048;
+const PHASES: f64 = 64.0;
+
+#[derive(Default)]
+pub(super) struct GlyphRasters {
+    entries: HashMap<RasterKey, Raster>,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct RasterKey {
+    codepoint: char,
+    color: [u32; 4],
+    phase: [u8; 2],
+    span: u8,
+}
+
+struct Raster {
+    texture: gdk::MemoryTexture,
+    bytes: usize,
+}
+
+pub(super) struct RasterCell {
+    pub bounds: (f64, f64, f64),
+    pub row_y: f64,
+    pub origin: (f64, f64),
+    pub scale: f64,
+    pub span: u8,
+    pub baseline: f64,
+}
+
+impl GlyphRasters {
+    pub fn retain(&mut self, keep: impl Fn(char) -> bool) {
+        self.entries.retain(|key, raster| {
+            if keep(key.codepoint) {
+                true
+            } else {
+                self.bytes -= raster.bytes;
+                false
+            }
+        });
+    }
+
+    pub fn append(
+        &mut self,
+        snapshot: &gtk::Snapshot,
+        path: &GlyphPath,
+        glyph: &Glyph,
+        cell: RasterCell,
+        color: &gdk::RGBA,
+    ) -> bool {
+        let (x, width, height) = cell.bounds;
+        let scale = cell.scale;
+        let phase = [
+            ((cell.origin.0 + x) * scale).rem_euclid(1.0),
+            ((cell.origin.1 + cell.row_y) * scale).rem_euclid(1.0),
+        ];
+        // Share rasterizations across equivalent device-pixel positions.
+        let key = RasterKey {
+            codepoint: glyph.codepoint,
+            color: [color.red(), color.green(), color.blue(), color.alpha()].map(f32::to_bits),
+            phase: phase.map(|value| (value * PHASES).round().min(PHASES - 1.0) as u8),
+            span: cell.span,
+        };
+        if !self.entries.contains_key(&key) {
+            let [px, py] = key.phase.map(|value| f64::from(value) / PHASES);
+            let w = (px + width * scale).ceil() as i32;
+            let h = (py + height * scale).ceil() as i32;
+            let bytes = w as usize * h as usize * 4;
+            if self.entries.len() >= MAX_RASTERS || bytes > MAX_RASTER_BYTES - self.bytes {
+                return false;
+            }
+            let Some(texture) = rasterize(w, h, |cr| {
+                let glyph_snapshot = gtk::Snapshot::new();
+                path.append(
+                    &glyph_snapshot,
+                    glyph,
+                    (0.0, width, height),
+                    cell.baseline,
+                    color,
+                );
+                cr.translate(px, py);
+                cr.scale(scale, scale);
+                glyph_snapshot.to_node()?.draw(cr);
+                Some(())
+            }) else {
+                return false;
+            };
+            self.entries.insert(key, Raster { texture, bytes });
+            self.bytes += bytes;
+        }
+        let texture = &self.entries[&key].texture;
+        snapshot.append_texture(
+            texture,
+            &graphene::Rect::new(
+                (x - phase[0] / scale) as f32,
+                (-phase[1] / scale) as f32,
+                (f64::from(texture.width()) / scale) as f32,
+                (f64::from(texture.height()) / scale) as f32,
+            ),
+        );
+        true
+    }
+}
+
+fn rasterize(
+    w: i32,
+    h: i32,
+    paint: impl FnOnce(&cairo::Context) -> Option<()>,
+) -> Option<gdk::MemoryTexture> {
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).ok()?;
+    let cr = cairo::Context::new(&surface).ok()?;
+    paint(&cr)?;
+    cr.status().ok()?;
+    drop(cr);
+    let stride = surface.stride() as usize;
+    let bytes = glib::Bytes::from_owned(surface.take_data().ok()?);
+    let format = if cfg!(target_endian = "little") {
+        gdk::MemoryFormat::B8g8r8a8Premultiplied
+    } else {
+        gdk::MemoryFormat::A8r8g8b8Premultiplied
+    };
+    Some(gdk::MemoryTexture::new(w, h, format, &bytes, stride))
+}
 
 pub(super) struct GlyphPath {
     path: gsk::Path,
