@@ -31,9 +31,10 @@ functional codes still absent in the release. It changes no public headers or
 ABI. The [clipboard-read patch](../scripts/patches/ghostty-clipboard-reads.patch)
 adds owned deferred requests for asynchronous desktop access. The
 [snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) adds
-checkpoint encoding that omits unfinished parser input. There are no additional
-security backports on top of the release source. An external `GHOSTTY_PREFIX`
-must provide this exact revision with all three integration patches.
+checkpoint encoding that omits unfinished parser input. The
+[glyph patch](../scripts/patches/ghostty-glyphs.patch) exposes pane-local outlines
+and updates Glyph Protocol placement and responses. An external `GHOSTTY_PREFIX`
+must provide this exact revision with the integration patches.
 Ghostty implementation types stay inside the C bridge; Rust and frontend clients
 use Gmux's declarations.
 

@@ -1014,7 +1014,11 @@ impl Terminal {
             exited,
             text_blink_visible: self.text_blink.visible(),
         };
-        let stats = draw(&mut self.renderer.borrow_mut(), &scene, &font, &context);
+        let stats = {
+            let mut renderer = self.renderer.borrow_mut();
+            renderer.set_glyphs(e.glyphs);
+            draw(&mut renderer, &scene, &font, &context)
+        };
         self.text_blink.update(stats.blinking_rows != 0 && !exited);
         // This span is already painted. Refresh pointer state below without
         // scheduling another frame just because the displayed map changed.

@@ -21,7 +21,7 @@ commands when bulk work fills the queue. Outgoing admission failures are reporte
 to the caller; accepted commands retain their order and reservations through the
 socket write. Input cannot bypass an earlier paste on the same stream.
 
-Protocol 44 records start with five little-endian u32 values: the remaining
+Protocol 45 records start with five little-endian u32 values: the remaining
 wire length, JSON header length, record kind, JSON decode allowance, and cell
 count. Kinds distinguish pane updates, execution snapshots, Git metadata, clipboard
 writes/clears, clipboard reads, and window resize requests.

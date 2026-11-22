@@ -1,0 +1,1135 @@
+Expose runtime glyph outlines to Gmux and update the glyph wire protocol.
+Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
+
+--- a/src/terminal/apc/glyph/request.zig
++++ b/src/terminal/apc/glyph/request.zig
+@@ -7,7 +7,7 @@
+ 
+ /// Maximum decoded glyph payload size accepted by the protocol.
+ /// This is documented in the spec.
+-const max_payload_size = 64 * 1024; // 64 KiB
++const max_payload_size = 32 * 1024;
+ 
+ /// Stateful parser for a single glyph APC payload after the `25a1;` prefix.
+ pub const CommandParser = struct {
+@@ -111,6 +111,14 @@
+         /// Lazily decode a query option on demand.
+         pub fn get(self: Query, comptime option: Option) ?option.Type() {
+             return option.read(self.rawOptions());
++        }
++
++        pub fn grapheme(self: Query) ?[]const u8 {
++            return optionValue(self.rawOptions(), "grapheme");
++        }
++
++        pub fn hasCodepoint(self: Query) bool {
++            return optionValue(self.rawOptions(), "cp") != null;
+         }
+ 
+         /// Return the raw option portion of a valid query command.
+@@ -160,6 +168,9 @@
+ 
+             /// Authored line height in units-per-em units.
+             lh,
++
++            /// Bottom edge of the declared extent.
++            ymin,
+ 
+             /// Unicode cell width for terminal layout.
+             width,
+@@ -182,6 +193,7 @@
+                     .upm => u32,
+                     .aw => u32,
+                     .lh => u32,
++                    .ymin => i32,
+                     .width => Width,
+                     .size => Size,
+                     .@"align" => Align,
+@@ -199,7 +211,8 @@
+                     .aw => null,
+                     .lh => null,
+                     .width => .narrow,
+-                    .size => .height,
++                    .ymin => 0,
++                    .size => .contain,
+                     .@"align" => .{},
+                     .pad => .{},
+                 };
+@@ -220,6 +233,7 @@
+                     .upm => std.fmt.parseInt(u32, value, 10) catch null,
+                     .aw => std.fmt.parseInt(u32, value, 10) catch null,
+                     .lh => std.fmt.parseInt(u32, value, 10) catch null,
++                    .ymin => std.fmt.parseInt(i32, value, 10) catch null,
+                     .width => Width.init(value),
+                     .size => Size.init(value),
+                     .@"align" => Align.init(value),
+@@ -239,6 +253,10 @@
+                 };
+             }
+             return option.read(raw);
++        }
++
++        pub fn has(self: Register, comptime option: Option) bool {
++            return optionValue(self.rawOptions(), option.key()) != null;
+         }
+ 
+         /// Return the base64 payload carried by a register request.
+@@ -260,6 +278,7 @@
+         pub const DecodeError = Allocator.Error || error{
+             /// The decoded payload exceeds the protocol limit.
+             PayloadTooLarge,
++            OutlineTooLarge,
+ 
+             /// The payload could not be decoded or parsed as the declared format.
+             MalformedPayload,
+@@ -281,6 +300,8 @@
+             // Prep base64 decoding, initial validation.
+             const Decoder = std.base64.standard.Decoder;
+             const payload_bytes = self.payload();
++            if (payload_bytes.len > std.base64.standard.Encoder.calcSize(max_payload_size))
++                return error.PayloadTooLarge;
+             const size = Decoder.calcSizeForSlice(payload_bytes) catch
+                 return error.MalformedPayload;
+             if (size > max_payload_size) return error.PayloadTooLarge;
+@@ -310,7 +331,7 @@
+             var limited: LimitedAllocator = .init(alloc, max_allocation_bytes);
+             return glyf_entry.decode(limited.allocator()) catch |err| switch (err) {
+                 error.OutOfMemory => if (limited.limit_exceeded)
+-                    error.PayloadTooLarge
++                    error.OutlineTooLarge
+                 else
+                     error.OutOfMemory,
+                 // Unsupported fields
+@@ -386,6 +407,11 @@
+         /// Return whether a clear option was provided, even if malformed.
+         pub fn has(self: Clear, comptime option: Option) bool {
+             return option.present(self.rawOptions());
++        }
++
++        pub fn reply(self: Clear) Reply {
++            const value = optionValue(self.rawOptions(), "reply") orelse return .all;
++            return Reply.init(value) orelse .all;
+         }
+ 
+         /// Return the raw option portion of a valid clear command.
+@@ -683,7 +709,7 @@
+     try testing.expect(Option.aw.default() == null);
+     try testing.expect(Option.lh.default() == null);
+     try testing.expectEqual(Width.narrow, Option.width.default().?);
+-    try testing.expectEqual(Size.height, Option.size.default().?);
++    try testing.expectEqual(Size.contain, Option.size.default().?);
+     try testing.expectEqual(Align{}, Option.@"align".default().?);
+     try testing.expectEqual(Pad{}, Option.pad.default().?);
+     try testing.expectEqual(Reply.all, Option.reply.default().?);
+@@ -702,7 +728,7 @@
+     try testing.expectEqual(@as(u32, 1000), cmd.register.get(.aw).?);
+     try testing.expectEqual(@as(u32, 1000), cmd.register.get(.lh).?);
+     try testing.expectEqual(Width.narrow, cmd.register.get(.width).?);
+-    try testing.expectEqual(Size.height, cmd.register.get(.size).?);
++    try testing.expectEqual(Size.contain, cmd.register.get(.size).?);
+     try testing.expectEqual(Align{}, cmd.register.get(.@"align").?);
+     try testing.expectEqual(Pad{}, cmd.register.get(.pad).?);
+     try testing.expectEqual(Reply.all, cmd.register.get(.reply).?);
+--- a/src/terminal/apc/glyph/Glossary.zig
++++ b/src/terminal/apc/glyph/Glossary.zig
+@@ -6,7 +6,6 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
+-const CircBuf = @import("../../../datastruct/circ_buf.zig").CircBuf;
+ const FontGlyph = @import("../../../font/Glyph.zig");
+ const Glyf = @import("../../../font/opentype/glyf.zig").Glyf;
+ 
+@@ -14,11 +13,9 @@
+ const RegisterReq = request.Request.Register;
+ 
+ const DesignMetrics = FontGlyph.DesignMetrics;
+-const Constraint = FontGlyph.RenderOptions.Constraint;
+-
+-/// Maximum entries allowed in the glossary before eviction.
+-/// Defined by the specification.
+-pub const max_entries = 1024;
++
++/// Total decoded outline storage per terminal.
++pub const max_bytes = 512 * 1024;
+ 
+ /// Maximum size of any allocation made while decoding a glyf registration.
+ /// This is limited by the dynamic allocations not the struct size so the
+@@ -29,23 +26,14 @@
+ pub const empty: Glossary = .{ .entries = .empty };
+ 
+ /// Errors that can occur while registering a glossary entry.
+-pub const RegisterError = Allocator.Error || error{OutOfNamespace};
++pub const RegisterError = Allocator.Error || error{ OutOfNamespace, NoSpace };
+ 
+ /// Errors that can occur while clearing glossary entries.
+ pub const ClearError = error{OutOfNamespace};
+ 
+-/// The set of entries in the glossary keyed by the codepoint.
+-///
+-/// The array hash map preserves insertion order and has O(N)
+-/// orderedRemove, so we use it as a FIFO too for eviction when
+-/// the glossary is full. Since the specification limits the protocol
+-/// to 1024 maximum entries, ordered removal should never be that
+-/// expensive.
+-///
+-/// I'm also operating under the assumption that full glossaries
+-/// for a session will be rare, so the eviction cost shouldn't
+-/// happen regularly.
+ entries: std.AutoArrayHashMapUnmanaged(u21, Entry),
++bytes: usize = 0,
++revision: u64 = 0,
+ 
+ /// Release all glyph entries and hash map storage owned by the glossary.
+ pub fn deinit(self: *Glossary, alloc: Allocator) void {
+@@ -63,32 +51,16 @@
+     cp: u21,
+     entry: Entry,
+ ) RegisterError!void {
+-    // Validate codepoint according to spec.
+-    if (!isPrivateUse(cp)) return error.OutOfNamespace;
+-
++    if (!inNamespace(cp)) return error.OutOfNamespace;
++    const old_size = if (self.entries.getPtr(cp)) |old| old.byteSize() else 0;
++    const bytes = self.bytes - old_size + entry.byteSize();
++    if (bytes > max_bytes) return error.NoSpace;
+     const gop = try self.entries.getOrPut(alloc, cp);
+-    if (gop.found_existing) {
+-        // Found an existing entry, we need to shift the FIFO so
+-        // that this is now the most recent (at the end). This is
+-        // O(N) but N is usually small and max N is bounded by the spec.
+-        gop.value_ptr.*.deinit(alloc);
+-        assert(self.entries.orderedRemove(cp));
+-
+-        // We already had enough capacity for this key before removing it, so
+-        // reinserting the replacement cannot require another allocation.
+-        self.entries.putAssumeCapacity(cp, entry);
+-        return;
+-    }
+-
+-    // Array hash maps preserve insertion order so always immediately insert.
++    if (gop.found_existing) gop.value_ptr.deinit(alloc);
++    self.revision +%= 1;
++    self.bytes = bytes;
+     gop.value_ptr.* = entry;
+-
+-    // Fast, typical path: we fit within the glossary, just return.
+-    if (self.entries.count() <= max_entries) return;
+-
+-    // Slow path: we need to evict.
+-    self.entries.values()[0].deinit(alloc);
+-    self.entries.orderedRemoveAt(0);
++    gop.value_ptr.revision = self.revision;
+ }
+ 
+ /// Delete a single entry from the glossary. If the entry doesn't exist,
+@@ -98,18 +70,22 @@
+     alloc: Allocator,
+     cp: u21,
+ ) ClearError!void {
+-    if (!isPrivateUse(cp)) return error.OutOfNamespace;
+-    const kv = self.entries.fetchOrderedRemove(cp) orelse return;
++    if (!inNamespace(cp)) return error.OutOfNamespace;
++    const kv = self.entries.fetchSwapRemove(cp) orelse return;
+     var entry = kv.value;
++    self.bytes -= entry.byteSize();
++    self.revision +%= 1;
+     entry.deinit(alloc);
+ }
+ 
+ /// Clear all entries from the glossary and free up any underlying
+ /// storage.
+ pub fn clearAndFree(self: *Glossary, alloc: Allocator) void {
++    if (self.entries.count() != 0) self.revision +%= 1;
+     for (self.entries.values()) |*entry| entry.deinit(alloc);
+     self.entries.deinit(alloc);
+     self.entries = .empty;
++    self.bytes = 0;
+ }
+ 
+ /// Contains returns true if the codepoint is covered by the glossary.
+@@ -136,8 +112,18 @@
+     /// Unicode cell width requested by the registration.
+     width: request.Width,
+ 
+-    /// Normalized scale, alignment, and padding behavior for rasterization.
+-    constraint: Constraint,
++    declared_extent: bool,
++    ymin: i32,
++    size: request.Size,
++    alignment: request.Align,
++    pad: request.Pad,
++    revision: u64 = 0,
++
++    fn byteSize(self: *const Entry) usize {
++        const outline = self.glyph.glyf;
++        return outline.points.len * @sizeOf(Glyf.Outline.Point) +
++            outline.contours.len * @sizeOf(u16);
++    }
+ 
+     /// Errors that can occur while constructing a glossary entry from a
+     /// register request.
+@@ -157,8 +143,8 @@
+     /// returned entry owns decoded glyph memory and must be released with
+     /// `deinit`.
+     pub fn init(alloc: Allocator, req: RegisterReq) Entry.InitError!Entry {
+-        // Validate format
+-        const fmt = req.get(.fmt) orelse return error.InvalidOptions;
++        const fmt = req.get(.fmt) orelse return error.UnsupportedFormat;
++        if (fmt != .glyf) return error.UnsupportedFormat;
+         const design: DesignMetrics = .{
+             .units_per_em = req.get(.upm) orelse return error.InvalidOptions,
+             .advance_width = req.get(.aw) orelse return error.InvalidOptions,
+@@ -169,8 +155,10 @@
+             design.line_height == 0) return error.InvalidOptions;
+         const width = req.get(.width) orelse return error.InvalidOptions;
+ 
+-        // Get our constraints
+-        const constraint = try constraintFromRegister(req);
++        const ymin = req.get(.ymin) orelse return error.InvalidOptions;
++        const size = req.get(.size) orelse return error.InvalidOptions;
++        const alignment = req.get(.@"align") orelse return error.InvalidOptions;
++        const pad = req.get(.pad) orelse return error.InvalidOptions;
+ 
+         // Decode the payload into some usable glyph format for
+         // future rasterization.
+@@ -186,7 +174,11 @@
+             .glyph = glyph,
+             .design = design,
+             .width = width,
+-            .constraint = constraint,
++            .declared_extent = req.has(.aw) or req.has(.lh) or req.has(.ymin),
++            .ymin = ymin,
++            .size = size,
++            .alignment = alignment,
++            .pad = pad,
+         };
+     }
+ 
+@@ -198,68 +190,10 @@
+         self.* = undefined;
+     }
+ 
+-    /// Return the renderer constraint for a register request.
+-    ///
+-    /// Glyph Protocol §8.5 defines sizing, alignment, and padding in terms of
+-    /// the authored extent and render span. This function is the single
+-    /// normalization point for how protocol sizing choices map to the
+-    /// renderer-neutral constraint stored here.
+-    fn constraintFromRegister(
+-        req: RegisterReq,
+-    ) error{InvalidOptions}!Constraint {
+-        // Register.get applies the Glyph Protocol §6.1 defaults when options
+-        // are omitted: size=height, align=center,center, and pad=0,0,0,0.
+-        const size = req.get(.size) orelse return error.InvalidOptions;
+-        const alignment = req.get(.@"align") orelse return error.InvalidOptions;
+-        const pad = req.get(.pad) orelse return error.InvalidOptions;
+-
+-        return .{
+-            .size = switch (size) {
+-                // The rasterizer's base transform already maps the design em
+-                // to the cell height. That is the closest existing behavior to
+-                // the protocol's default height-driven mode.
+-                .height => .none,
+-                // There is no width-driven, aspect-preserving constraint mode
+-                // today. Leave the base transform intact rather than forcing a
+-                // fit/contain policy that would unexpectedly prevent overflow.
+-                .advance => .none,
+-                // Constraint.cover currently scales preserving aspect ratio to
+-                // the available bounds, which is the best existing match for
+-                // the protocol's contain mode.
+-                .contain => .cover,
+-                // There is no true protocol-cover equivalent that chooses the
+-                // larger axis scale, so use the nearest named renderer policy.
+-                .cover => .cover,
+-                .stretch => .stretch,
+-            },
+-            .align_horizontal = switch (alignment.horizontal) {
+-                .start => .start,
+-                .center => .center,
+-                .end => .end,
+-            },
+-            .align_vertical = switch (alignment.vertical) {
+-                .start => .start,
+-                .center => .center,
+-                .end => .end,
+-                // The current constraint API has no baseline alignment mode.
+-                // Start is the closest stable default because the glyf
+-                // rasterizer's coordinate model already treats y=0 as the
+-                // baseline/bottom before constraints are applied.
+-                .baseline => .start,
+-            },
+-            .pad_top = pad.top,
+-            .pad_right = pad.right,
+-            .pad_bottom = pad.bottom,
+-            .pad_left = pad.left,
+-        };
+-    }
+ };
+ 
+-/// Return true if `cp` is in one of the Unicode Private Use Areas.
+-fn isPrivateUse(cp: u21) bool {
+-    return (cp >= 0xE000 and cp <= 0xF8FF) or
+-        (cp >= 0xF0000 and cp <= 0xFFFFD) or
+-        (cp >= 0x100000 and cp <= 0x10FFFD);
++pub fn inNamespace(cp: u21) bool {
++    return cp >= 0x100000 and cp <= 0x1003ff;
+ }
+ 
+ fn testParseRegister(alloc: Allocator, data: []const u8) !RegisterReq {
+@@ -343,7 +277,7 @@
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
+-    const req = try testRegisterReq(alloc, 0xE000);
++    const req = try testRegisterReq(alloc, 0x100000);
+     defer alloc.free(req.raw);
+ 
+     var entry = try Entry.init(alloc, req);
+@@ -353,13 +287,13 @@
+     try testing.expectEqual(@as(u32, 1024), entry.design.advance_width);
+     try testing.expectEqual(@as(u32, 1536), entry.design.line_height);
+     try testing.expectEqual(request.Width.wide, entry.width);
+-    try testing.expectEqual(Constraint.Size.stretch, entry.constraint.size);
+-    try testing.expectEqual(Constraint.Align.end, entry.constraint.align_horizontal);
+-    try testing.expectEqual(Constraint.Align.start, entry.constraint.align_vertical);
+-    try testing.expectEqual(@as(f64, 0.1), entry.constraint.pad_top);
+-    try testing.expectEqual(@as(f64, 0.2), entry.constraint.pad_right);
+-    try testing.expectEqual(@as(f64, 0.3), entry.constraint.pad_bottom);
+-    try testing.expectEqual(@as(f64, 0.4), entry.constraint.pad_left);
++    try testing.expectEqual(request.Size.stretch, entry.size);
++    try testing.expectEqual(request.Align.Horizontal.end, entry.alignment.horizontal);
++    try testing.expectEqual(request.Align.Vertical.start, entry.alignment.vertical);
++    try testing.expectEqual(@as(f64, 0.1), entry.pad.top);
++    try testing.expectEqual(@as(f64, 0.2), entry.pad.right);
++    try testing.expectEqual(@as(f64, 0.3), entry.pad.bottom);
++    try testing.expectEqual(@as(f64, 0.4), entry.pad.left);
+ 
+     try testing.expectEqual(@as(usize, 3), entry.glyph.glyf.points.len);
+     try testing.expectEqual(@as(usize, 1), entry.glyph.glyf.contours.len);
+@@ -383,7 +317,7 @@
+     const req = try testRepeatedPointRegisterReq(alloc, &.{5461});
+     defer alloc.free(req.raw);
+ 
+-    try testing.expectError(error.PayloadTooLarge, Entry.init(alloc, req));
++    try testing.expectError(error.OutlineTooLarge, Entry.init(alloc, req));
+ }
+ 
+ test "Entry init accepts largest glyf points allocation under limit" {
+@@ -400,38 +334,19 @@
+     try testing.expectEqual(@as(usize, 2), entry.glyph.glyf.contours.len);
+ }
+ 
+-test "Glossary register overwrites and moves entry to newest position" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-
+-    var glossary: Glossary = .empty;
+-    defer glossary.deinit(alloc);
+-
+-    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+-    try glossary.register(alloc, 0xE001, try testRegisterEntry(alloc, 0xE001));
+-    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
++test "Glossary register overwrites the registered slot" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var glossary: Glossary = .empty;
++    defer glossary.deinit(alloc);
++
++    try glossary.register(alloc, 0x100000, try testRegisterEntry(alloc, 0x100000));
++    try glossary.register(alloc, 0x100001, try testRegisterEntry(alloc, 0x100001));
++    try glossary.register(alloc, 0x100000, try testRegisterEntry(alloc, 0x100000));
+ 
+     try testing.expectEqual(@as(usize, 2), glossary.entries.count());
+-    try testing.expectEqual(@as(u21, 0xE001), glossary.entries.keys()[0]);
+-    try testing.expectEqual(@as(u21, 0xE000), glossary.entries.keys()[1]);
+-}
+-
+-test "Glossary register evicts oldest entry" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-
+-    var glossary: Glossary = .empty;
+-    defer glossary.deinit(alloc);
+-
+-    for (0..max_entries + 1) |i| {
+-        const cp: u21 = @intCast(0xE000 + i);
+-        try glossary.register(alloc, cp, try testRegisterEntry(alloc, cp));
+-    }
+-
+-    try testing.expectEqual(@as(usize, max_entries), glossary.entries.count());
+-    try testing.expect(!glossary.entries.contains(0xE000));
+-    try testing.expect(glossary.entries.contains(0xE001));
+-    try testing.expect(glossary.entries.contains(0xE000 + max_entries));
++    try testing.expectEqual(@as(u64, 3), glossary.entries.getPtr(0x100000).?.revision);
+ }
+ 
+ test "Glossary register rejects non-PUA codepoint" {
+@@ -441,7 +356,7 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var entry = try testRegisterEntry(alloc, 0xE000);
++    var entry = try testRegisterEntry(alloc, 0x100000);
+     defer entry.deinit(alloc);
+     try testing.expectError(error.OutOfNamespace, glossary.register(alloc, 'A', entry));
+ }
+@@ -453,17 +368,17 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+-    try glossary.register(alloc, 0xE001, try testRegisterEntry(alloc, 0xE001));
+-
+-    try glossary.delete(alloc, 0xE000);
++    try glossary.register(alloc, 0x100000, try testRegisterEntry(alloc, 0x100000));
++    try glossary.register(alloc, 0x100001, try testRegisterEntry(alloc, 0x100001));
++
++    try glossary.delete(alloc, 0x100000);
+     try testing.expectEqual(@as(usize, 1), glossary.entries.count());
+-    try testing.expect(!glossary.contains(0xE000));
+-    try testing.expect(glossary.contains(0xE001));
+-
+-    try glossary.delete(alloc, 0xE000);
++    try testing.expect(!glossary.contains(0x100000));
++    try testing.expect(glossary.contains(0x100001));
++
++    try glossary.delete(alloc, 0x100000);
+     try testing.expectEqual(@as(usize, 1), glossary.entries.count());
+-    try testing.expect(glossary.contains(0xE001));
++    try testing.expect(glossary.contains(0x100001));
+ }
+ 
+ test "Glossary delete rejects non-PUA codepoint" {
+@@ -473,10 +388,10 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
++    try glossary.register(alloc, 0x100000, try testRegisterEntry(alloc, 0x100000));
+     try testing.expectError(error.OutOfNamespace, glossary.delete(alloc, 'A'));
+     try testing.expectEqual(@as(usize, 1), glossary.entries.count());
+-    try testing.expect(glossary.contains(0xE000));
++    try testing.expect(glossary.contains(0x100000));
+ }
+ 
+ test "Glossary clearAndFree removes all slots and remains reusable" {
+@@ -486,17 +401,17 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+-    try glossary.register(alloc, 0xE001, try testRegisterEntry(alloc, 0xE001));
++    try glossary.register(alloc, 0x100000, try testRegisterEntry(alloc, 0x100000));
++    try glossary.register(alloc, 0x100001, try testRegisterEntry(alloc, 0x100001));
+ 
+     glossary.clearAndFree(alloc);
+     try testing.expectEqual(@as(usize, 0), glossary.entries.count());
+-    try testing.expect(!glossary.contains(0xE000));
+-    try testing.expect(!glossary.contains(0xE001));
+-
+-    try glossary.register(alloc, 0xE002, try testRegisterEntry(alloc, 0xE002));
++    try testing.expect(!glossary.contains(0x100000));
++    try testing.expect(!glossary.contains(0x100001));
++
++    try glossary.register(alloc, 0x100002, try testRegisterEntry(alloc, 0x100002));
+     try testing.expectEqual(@as(usize, 1), glossary.entries.count());
+-    try testing.expect(glossary.contains(0xE002));
++    try testing.expect(glossary.contains(0x100002));
+ }
+ 
+ test "Glossary contains reports registered slots" {
+@@ -506,9 +421,9 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    try testing.expect(!glossary.contains(0xE000));
+-
+-    try glossary.register(alloc, 0xE000, try testRegisterEntry(alloc, 0xE000));
+-    try testing.expect(glossary.contains(0xE000));
+-    try testing.expect(!glossary.contains(0xE001));
+-}
++    try testing.expect(!glossary.contains(0x100000));
++
++    try glossary.register(alloc, 0x100000, try testRegisterEntry(alloc, 0x100000));
++    try testing.expect(glossary.contains(0x100000));
++    try testing.expect(!glossary.contains(0x100001));
++}
+--- a/src/terminal/apc/glyph/execute.zig
++++ b/src/terminal/apc/glyph/execute.zig
+@@ -45,13 +45,31 @@
+     glossary: *Glossary,
+     qry: Request.Query,
+ ) ?Response {
+-    const cp = qry.get(.cp) orelse return null;
+-    return .{ .query = .{
+-        .cp = cp,
+-        .status = .{
+-            .glossary = glossary.contains(cp),
+-        },
+-    } };
++    const cp = qry.get(.cp);
++    if (qry.grapheme()) |raw| {
++        if (!qry.hasCodepoint()) {
++            var parts = std.mem.splitScalar(u8, raw, ',');
++            var count: usize = 0;
++            while (parts.next()) |part| {
++                const point = std.fmt.parseInt(u21, part, 16) catch break;
++                if (!isScalar(point)) break;
++                count += 1;
++                if (count > 32) break;
++                if (parts.index == null) return .{ .query = .{ .grapheme = raw, .reason = "unsupported" } };
++            }
++        }
++        return .{ .query = .{ .cp = cp, .reason = "malformed_query" } };
++    }
++    const point = cp orelse return .{ .query = .{ .reason = "malformed_query" } };
++    if (!isScalar(point)) return .{ .query = .{ .reason = "malformed_query" } };
++    return .{ .query = if (glossary.contains(point))
++        .{ .cp = point, .status = .{ .glossary = true } }
++    else
++        .{ .cp = point, .reason = "unknown" } };
++}
++
++fn isScalar(cp: u21) bool {
++    return cp <= 0x10ffff and (cp < 0xd800 or cp > 0xdfff);
+ }
+ 
+ fn register(
+@@ -66,15 +84,15 @@
+             .cp = reg.get(.cp) orelse 0,
+             .status = .err,
+             .reason = switch (err) {
+-                error.OutOfMemory => .{ .other = "out_of_memory" },
++                error.OutOfMemory, error.NoSpace => .{ .other = "no_space" },
++                error.OutlineTooLarge => .{ .other = "outline_too_large" },
++                error.UnsupportedFormat => .{ .other = "unsupported_format" },
+                 error.OutOfNamespace => .out_of_namespace,
+                 error.PayloadTooLarge => .payload_too_large,
+                 error.MalformedPayload => .malformed_payload,
+                 error.CompositeUnsupported => .composite_unsupported,
+                 error.HintingUnsupported => .hinting_unsupported,
+-                error.InvalidOptions,
+-                error.UnsupportedFormat,
+-                => .malformed_payload,
++                error.InvalidOptions => .malformed_payload,
+             },
+         } },
+     };
+@@ -90,8 +108,8 @@
+     glossary: *Glossary,
+     reg: Request.Register,
+ ) (Glossary.Entry.InitError || Glossary.RegisterError)!u21 {
+-    const cp = reg.get(.cp) orelse
+-        return error.MalformedPayload;
++    const cp = reg.get(.cp) orelse return error.OutOfNamespace;
++    if (!Glossary.inNamespace(cp)) return error.OutOfNamespace;
+ 
+     var entry = try Glossary.Entry.init(alloc, reg);
+     errdefer entry.deinit(alloc);
+@@ -105,23 +123,21 @@
+     glossary: *Glossary,
+     clr: Request.Clear,
+ ) ?Response {
+-    if (clr.get(.cp)) |cp| {
+-        glossary.delete(alloc, cp) catch |err| return .{ .clear = .{
+-            .status = .err,
+-            .reason = switch (err) {
+-                error.OutOfNamespace => "out_of_namespace",
+-            },
+-        } };
+-    } else if (clr.has(.cp)) {
+-        return .{ .clear = .{
+-            .status = .err,
+-            .reason = "malformed_payload",
+-        } };
+-    } else {
++    const cp = clr.get(.cp);
++    const reason: ?[]const u8 = if (cp) |point| reason: {
++        glossary.delete(alloc, point) catch break :reason "out_of_namespace";
++        break :reason null;
++    } else if (clr.has(.cp))
++        "out_of_namespace"
++    else reason: {
+         glossary.clearAndFree(alloc);
+-    }
+-
+-    return .{ .clear = .{} };
++        break :reason null;
++    };
++    return switch (clr.reply()) {
++        .none => null,
++        .failures => if (reason == null) null else .{ .clear = .{ .cp = cp, .status = .err, .reason = reason } },
++        .all => .{ .clear = .{ .cp = cp, .status = if (reason == null) .ok else .err, .reason = reason } },
++    };
+ }
+ 
+ fn testParse(alloc: Allocator, data: []const u8) !Request {
+@@ -142,13 +158,13 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var req = try testParse(alloc, "r;cp=e0a0;AAAAAAAAAAAAAA==");
+-    defer req.deinit(alloc);
+-
+-    try testing.expectEqual(Response{
+-        .register = .{ .cp = 0xE0A0 },
+-    }, testExecute(alloc, &glossary, &req).?);
+-    try testing.expect(glossary.contains(0xE0A0));
++    var req = try testParse(alloc, "r;cp=100000;AAAAAAAAAAAAAA==");
++    defer req.deinit(alloc);
++
++    try testing.expectEqual(Response{
++        .register = .{ .cp = 0x100000 },
++    }, testExecute(alloc, &glossary, &req).?);
++    try testing.expect(glossary.contains(0x100000));
+ }
+ 
+ test "execute register reply failures suppresses success" {
+@@ -158,11 +174,11 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var req = try testParse(alloc, "r;cp=e0a0;reply=2;AAAAAAAAAAAAAA==");
++    var req = try testParse(alloc, "r;cp=100000;reply=2;AAAAAAAAAAAAAA==");
+     defer req.deinit(alloc);
+ 
+     try testing.expect(testExecute(alloc, &glossary, &req) == null);
+-    try testing.expect(glossary.contains(0xE0A0));
++    try testing.expect(glossary.contains(0x100000));
+ }
+ 
+ test "execute register reply none suppresses failure" {
+@@ -206,17 +222,17 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var req = try testParse(alloc, "r;cp=e0a0;%%%not-base64%%%");
++    var req = try testParse(alloc, "r;cp=100000;%%%not-base64%%%");
+     defer req.deinit(alloc);
+ 
+     try testing.expectEqual(Response{
+         .register = .{
+-            .cp = 0xE0A0,
++            .cp = 0x100000,
+             .status = .err,
+             .reason = .malformed_payload,
+         },
+     }, testExecute(alloc, &glossary, &req).?);
+-    try testing.expect(!glossary.contains(0xE0A0));
++    try testing.expect(!glossary.contains(0x100000));
+ }
+ 
+ test "execute clear removes all glyphs" {
+@@ -226,11 +242,11 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var reg1 = try testParse(alloc, "r;cp=e0a0;AAAAAAAAAAAAAA==");
++    var reg1 = try testParse(alloc, "r;cp=100000;AAAAAAAAAAAAAA==");
+     defer reg1.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg1);
+ 
+-    var reg2 = try testParse(alloc, "r;cp=e0a1;AAAAAAAAAAAAAA==");
++    var reg2 = try testParse(alloc, "r;cp=100001;AAAAAAAAAAAAAA==");
+     defer reg2.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg2);
+ 
+@@ -238,8 +254,8 @@
+     defer req.deinit(alloc);
+ 
+     try testing.expectEqual(Response{ .clear = .{} }, testExecute(alloc, &glossary, &req).?);
+-    try testing.expect(!glossary.contains(0xE0A0));
+-    try testing.expect(!glossary.contains(0xE0A1));
++    try testing.expect(!glossary.contains(0x100000));
++    try testing.expect(!glossary.contains(0x100001));
+ }
+ 
+ test "execute clear removes one glyph" {
+@@ -249,20 +265,20 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var reg1 = try testParse(alloc, "r;cp=e0a0;AAAAAAAAAAAAAA==");
++    var reg1 = try testParse(alloc, "r;cp=100000;AAAAAAAAAAAAAA==");
+     defer reg1.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg1);
+ 
+-    var reg2 = try testParse(alloc, "r;cp=e0a1;AAAAAAAAAAAAAA==");
++    var reg2 = try testParse(alloc, "r;cp=100001;AAAAAAAAAAAAAA==");
+     defer reg2.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg2);
+ 
+-    var req = try testParse(alloc, "c;cp=e0a0");
+-    defer req.deinit(alloc);
+-
+-    try testing.expectEqual(Response{ .clear = .{} }, testExecute(alloc, &glossary, &req).?);
+-    try testing.expect(!glossary.contains(0xE0A0));
+-    try testing.expect(glossary.contains(0xE0A1));
++    var req = try testParse(alloc, "c;cp=100000");
++    defer req.deinit(alloc);
++
++    try testing.expectEqual(Response{ .clear = .{ .cp = 0x100000 } }, testExecute(alloc, &glossary, &req).?);
++    try testing.expect(!glossary.contains(0x100000));
++    try testing.expect(glossary.contains(0x100001));
+ }
+ 
+ test "execute clear rejects non-PUA" {
+@@ -277,6 +293,7 @@
+ 
+     try testing.expectEqual(Response{
+         .clear = .{
++            .cp = 0x41,
+             .status = .err,
+             .reason = "out_of_namespace",
+         },
+@@ -290,11 +307,11 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var reg1 = try testParse(alloc, "r;cp=e0a0;AAAAAAAAAAAAAA==");
++    var reg1 = try testParse(alloc, "r;cp=100000;AAAAAAAAAAAAAA==");
+     defer reg1.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg1);
+ 
+-    var reg2 = try testParse(alloc, "r;cp=e0a1;AAAAAAAAAAAAAA==");
++    var reg2 = try testParse(alloc, "r;cp=100001;AAAAAAAAAAAAAA==");
+     defer reg2.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg2);
+ 
+@@ -305,28 +322,28 @@
+         try testing.expectEqual(Response{
+             .clear = .{
+                 .status = .err,
+-                .reason = "malformed_payload",
++                .reason = "out_of_namespace",
+             },
+         }, testExecute(alloc, &glossary, &req).?);
+-        try testing.expect(glossary.contains(0xE0A0));
+-        try testing.expect(glossary.contains(0xE0A1));
++        try testing.expect(glossary.contains(0x100000));
++        try testing.expect(glossary.contains(0x100001));
+     }
+ }
+ 
+-test "execute query reports no coverage" {
+-    const testing = std.testing;
+-    const alloc = testing.allocator;
+-
+-    var glossary: Glossary = .empty;
+-    defer glossary.deinit(alloc);
+-
+-    var req = try testParse(alloc, "q;cp=e0a0");
++test "execute query reports unknown system coverage" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var glossary: Glossary = .empty;
++    defer glossary.deinit(alloc);
++
++    var req = try testParse(alloc, "q;cp=100000");
+     defer req.deinit(alloc);
+ 
+     try testing.expectEqual(Response{
+         .query = .{
+-            .cp = 0xE0A0,
+-            .status = .{},
++            .cp = 0x100000,
++            .reason = "unknown",
+         },
+     }, testExecute(alloc, &glossary, &req).?);
+ }
+@@ -338,22 +355,22 @@
+     var glossary: Glossary = .empty;
+     defer glossary.deinit(alloc);
+ 
+-    var reg = try testParse(alloc, "r;cp=e0a0;AAAAAAAAAAAAAA==");
++    var reg = try testParse(alloc, "r;cp=100000;AAAAAAAAAAAAAA==");
+     defer reg.deinit(alloc);
+     _ = testExecute(alloc, &glossary, &reg);
+ 
+-    var req = try testParse(alloc, "q;cp=e0a0");
++    var req = try testParse(alloc, "q;cp=100000");
+     defer req.deinit(alloc);
+ 
+     try testing.expectEqual(Response{
+         .query = .{
+-            .cp = 0xE0A0,
++            .cp = 0x100000,
+             .status = .{ .glossary = true },
+         },
+     }, testExecute(alloc, &glossary, &req).?);
+ }
+ 
+-test "execute query without cp returns no response" {
++test "execute query without cp reports malformed query" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
+@@ -363,5 +380,5 @@
+     var req = try testParse(alloc, "q;foo=bar");
+     defer req.deinit(alloc);
+ 
+-    try testing.expect(testExecute(alloc, &glossary, &req) == null);
+-}
++    try testing.expectEqual(Response{ .query = .{ .reason = "malformed_query" } }, testExecute(alloc, &glossary, &req).?);
++}
+--- a/src/terminal/apc/glyph/response.zig
++++ b/src/terminal/apc/glyph/response.zig
+@@ -76,10 +76,10 @@
+     /// Codepoint query response fields.
+     pub const Query = struct {
+         /// The queried codepoint.
+-        cp: u21,
+-
+-        /// Coverage status for the codepoint.
+-        status: Coverage,
++        cp: ?u21 = null,
++        grapheme: ?[]const u8 = null,
++        status: Coverage = .free,
++        reason: ?[]const u8 = null,
+     };
+ 
+     /// Register response fields.
+@@ -129,6 +129,7 @@
+ 
+     /// Clear response fields.
+     pub const Clear = struct {
++        cp: ?u21 = null,
+         /// Result status of the clear operation encoded as a decimal u8.
+         status: Status = .ok,
+ 
+@@ -185,7 +186,23 @@
+                 // status is a comma-separated list of coverage names — the
+                 // set of sources that can render cp in this session. Order is
+                 // not significant; clients MUST treat the value as a set.
+-                try writer.print("q;cp={x};status=", .{r.cp});
++                try writer.writeByte('q');
++                if (r.cp) |cp| try writer.print(";cp={x}", .{cp});
++                if (r.grapheme) |raw| {
++                    try writer.writeAll(";grapheme=");
++                    var parts = std.mem.splitScalar(u8, raw, ',');
++                    var first = true;
++                    while (parts.next()) |part| {
++                        if (!first) try writer.writeByte(',');
++                        first = false;
++                        try writer.print("{x}", .{std.fmt.parseInt(u21, part, 16) catch unreachable});
++                    }
++                }
++                if (r.reason) |reason| {
++                    try writer.print(";reason={s}\x1b\\", .{reason});
++                    return;
++                }
++                try writer.writeAll(";status=");
+                 var first = true;
+                 if (r.status.system) {
+                     first = false;
+@@ -204,7 +221,9 @@
+                 }
+             },
+             .clear => |r| {
+-                try writer.print("c;status={d}", .{@backingInt(r.status)});
++                try writer.writeByte('c');
++                if (r.cp) |cp| try writer.print(";cp={x}", .{cp});
++                try writer.print(";status={d}", .{@backingInt(r.status)});
+                 if (r.reason) |reason| {
+                     try writer.writeAll(";reason=");
+                     try writer.writeAll(reason);
+--- a/src/font/opentype/glyf.zig
++++ b/src/font/opentype/glyf.zig
+@@ -32,7 +32,7 @@
+         points: []const Point,
+ 
+         /// A single decoded point in a simple glyph contour.
+-        pub const Point = struct {
++        pub const Point = extern struct {
+             x: i32,
+             y: i32,
+             on_curve: bool,
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -851,6 +851,61 @@
+ pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
+     return (terminal_ orelse return null).terminal;
+ }
++
++// Decoded outlines borrowed by the Gmux renderer bridge.
++const GmuxGlyph = extern struct {
++    revision: u64,
++    points: [*]const @import("../../font/opentype/glyf.zig").Glyf.Outline.Point,
++    point_count: usize,
++    contours: [*]const u16,
++    contour_count: usize,
++    pad: [4]f64,
++    codepoint: u32,
++    upm: u32,
++    advance: u32,
++    line_height: u32,
++    ymin: i32,
++    width: u8,
++    size: u8,
++    horizontal: u8,
++    vertical: u8,
++    declared_extent: bool,
++};
++
++pub fn gmux_glyphs(
++    terminal: Terminal,
++    known: u64,
++    userdata: ?*anyopaque,
++    callback: ?*const fn (?*anyopaque, *const GmuxGlyph) callconv(lib.calling_conv) void,
++) callconv(lib.calling_conv) u64 {
++    const native = zigTerminal(terminal) orelse return 0;
++    const glossary = &native.glyph_glossary;
++    if (glossary.revision != known) if (callback) |emit| {
++        for (glossary.entries.keys(), glossary.entries.values()) |cp, entry| {
++            const outline = entry.glyph.glyf;
++            emit(userdata, &.{
++                .revision = entry.revision,
++                .points = outline.points.ptr,
++                .point_count = outline.points.len,
++                .contours = outline.contours.ptr,
++                .contour_count = outline.contours.len,
++                .pad = .{ entry.pad.top, entry.pad.right, entry.pad.bottom, entry.pad.left },
++                .codepoint = cp,
++                .upm = entry.design.units_per_em,
++                .advance = entry.design.advance_width,
++                .line_height = entry.design.line_height,
++                .ymin = entry.ymin,
++                .width = @intFromEnum(entry.width),
++                .size = @intFromEnum(entry.size),
++                .horizontal = @intFromEnum(entry.alignment.horizontal),
++                .vertical = @intFromEnum(entry.alignment.vertical),
++                .declared_extent = entry.declared_extent,
++            });
++        }
++    };
++    return glossary.revision;
++}
++
+ 
+ /// Attach the persistent C stream and I/O owner to a heap-stable terminal.
+ /// The caller retains ownership of both inputs if wrapper allocation fails.
+@@ -8151,22 +8206,22 @@
+     defer free(t);
+ 
+     // Off by default, so nothing registers until it's enabled.
+-    const register = "\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\";
++    const register = "\x1B_25a1;r;cp=100000;AAAAAAAAAAAAAA==\x1B\\";
+     vt_write(t, register, register.len);
+-    try testing.expect(!t.?.terminal.glyph_glossary.contains(0xE0A0));
++    try testing.expect(!t.?.terminal.glyph_glossary.contains(0x100000));
+ 
+     const enabled = true;
+     try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&enabled)));
+     vt_write(t, register, register.len);
+-    try testing.expect(t.?.terminal.glyph_glossary.contains(0xE0A0));
++    try testing.expect(t.?.terminal.glyph_glossary.contains(0x100000));
+ 
+     const disabled = false;
+     try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&disabled)));
+     try testing.expect(!t.?.stream.handler.apc_handler.enabled.contains(.glyph));
+-    try testing.expect(!t.?.terminal.glyph_glossary.contains(0xE0A0));
++    try testing.expect(!t.?.terminal.glyph_glossary.contains(0x100000));
+ 
+     vt_write(t, register, register.len);
+-    try testing.expect(!t.?.terminal.glyph_glossary.contains(0xE0A0));
++    try testing.expect(!t.?.terminal.glyph_glossary.contains(0x100000));
+ }
+ 
+ test "get_multi success" {
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -19304,29 +19304,29 @@
+ 
+     var register_parser = glyph.CommandParser.init(alloc, 1024 * 1024);
+     defer register_parser.deinit();
+-    for ("r;cp=e0a0;AAAAAAAAAAAAAA==") |byte| try register_parser.feed(byte);
++    for ("r;cp=100000;AAAAAAAAAAAAAA==") |byte| try register_parser.feed(byte);
+     var register_req = try register_parser.complete(alloc);
+     defer register_req.deinit(alloc);
+ 
+     try testing.expectEqual(glyph.Response{
+-        .register = .{ .cp = 0xE0A0 },
++        .register = .{ .cp = 0x100000 },
+     }, t.glyphProtocol(alloc, &register_req).?);
+-    try testing.expect(t.glyph_glossary.contains(0xE0A0));
++    try testing.expect(t.glyph_glossary.contains(0x100000));
+     try testing.expect(t.flags.dirty.glyph_glossary);
+ 
+     var query_parser = glyph.CommandParser.init(alloc, 1024 * 1024);
+     defer query_parser.deinit();
+-    for ("q;cp=e0a0") |byte| try query_parser.feed(byte);
++    for ("q;cp=100000") |byte| try query_parser.feed(byte);
+     var query_req = try query_parser.complete(alloc);
+     defer query_req.deinit(alloc);
+ 
+     try testing.expectEqual(glyph.Response{ .query = .{
+-        .cp = 0xE0A0,
++        .cp = 0x100000,
+         .status = .{ .glossary = true },
+     } }, t.glyphProtocol(alloc, &query_req).?);
+ 
+     t.fullReset();
+-    try testing.expect(!t.glyph_glossary.contains(0xE0A0));
++    try testing.expect(!t.glyph_glossary.contains(0x100000));
+ }
+ 
+ test "Terminal: scroll region linefeed recycled row has default metadata" {
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -3578,8 +3578,8 @@
+     s.nextSlice("\x1B[10;20H");
+     s.nextSlice("\x1B[5;20r"); // Set scroll region
+     s.nextSlice("\x1B[?7l"); // Disable wraparound
+-    s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+-    try testing.expect(t.glyph_glossary.contains(0xE0A0));
++    s.nextSlice("\x1B_25a1;r;cp=100000;AAAAAAAAAAAAAA==\x1B\\");
++    try testing.expect(t.glyph_glossary.contains(0x100000));
+ 
+     // Full reset
+     s.nextSlice("\x1Bc");
+@@ -3590,7 +3590,7 @@
+     try testing.expectEqual(@as(usize, 0), t.scrolling_region.top);
+     try testing.expectEqual(@as(usize, 23), t.scrolling_region.bottom);
+     try testing.expect(t.modes.get(.wraparound));
+-    try testing.expect(!t.glyph_glossary.contains(0xE0A0));
++    try testing.expect(!t.glyph_glossary.contains(0x100000));
+ }
+ 
+ test "glyph protocol APC with write_pty callback" {
+@@ -3618,9 +3618,9 @@
+     s.nextSlice("\x1B_25a1;s\x1B\\");
+     try testing.expectEqualStrings("\x1B_25a1;s;fmt=glyf\x1B\\", S.last_response.?);
+ 
+-    s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+-    try testing.expectEqualStrings("\x1B_25a1;r;cp=e0a0;status=0\x1B\\", S.last_response.?);
+-    try testing.expect(t.glyph_glossary.contains(0xE0A0));
++    s.nextSlice("\x1B_25a1;r;cp=100000;AAAAAAAAAAAAAA==\x1B\\");
++    try testing.expectEqualStrings("\x1B_25a1;r;cp=100000;status=0\x1B\\", S.last_response.?);
++    try testing.expect(t.glyph_glossary.contains(0x100000));
+ }
+ 
+ test "ignores query actions" {
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -245,6 +245,8 @@
+ pub const terminal_grid_ref_track = terminal.grid_ref_track;
+ pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
+ 
++pub const terminal_gmux_glyphs = terminal.gmux_glyphs;
++
+ pub const snapshot_encode = snapshot.encode;
+ pub const snapshot_encode_buf = snapshot.encode_buf;
+ pub const snapshot_encode_buf_state = snapshot.encode_buf_state;
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -362,6 +362,7 @@
+         @export(&c.search_get_multi, .{ .name = "ghostty_search_get_multi" });
+         @export(&c.terminal_grid_ref, .{ .name = "ghostty_terminal_grid_ref" });
+         @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
++        @export(&c.terminal_gmux_glyphs, .{ .name = "ghostty_terminal_gmux_glyphs" });
+         @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
+         @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
+         @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });

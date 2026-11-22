@@ -41,6 +41,10 @@ impl Packet {
                 .hyperlinks
                 .as_ref()
                 .map_or(0, crate::hyperlinks::Hyperlinks::memory_size)
+            + header
+                .glyphs
+                .as_ref()
+                .map_or(0, crate::glyphs::Glyphs::memory_size)
             + header.row_flags.capacity()
             + header
                 .cache

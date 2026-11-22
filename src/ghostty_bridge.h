@@ -166,6 +166,23 @@ int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
 // The size owner supplies defaults for shared program queries and resets.
 // The view must belong to this engine. Call outside view_enter/view_leave.
 int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);
+typedef struct { int32_t x, y; bool on_curve; } GmuxGlyphPoint;
+typedef struct {
+    uint64_t revision;
+    const GmuxGlyphPoint *points;
+    size_t point_count;
+    const uint16_t *contours;
+    size_t contour_count;
+    double pad[4];
+    uint32_t codepoint, upm, advance, line_height;
+    int32_t ymin;
+    uint8_t width, size, horizontal, vertical;
+    bool declared_extent;
+} GmuxGlyph;
+typedef void (*GmuxGlyphFn)(void *userdata, const GmuxGlyph *glyph);
+typedef void (*GmuxGlyphHoldFn)(void *userdata, const GmuxEngine *engine, bool held);
+uint64_t gmux_engine_glyphs(const GmuxEngine *engine, uint64_t known, void *userdata, GmuxGlyphFn callback);
+void gmux_engine_glyph_hold_callback(GmuxEngine *engine, GmuxGlyphHoldFn callback);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
 // Event kind 9. Zero keeps the current dimension.

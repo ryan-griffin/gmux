@@ -1,13 +1,18 @@
+#[path = "renderer/glyphs.rs"]
+mod glyphs;
+
 use crate::render::{self, Rect};
 use gmux_protocol::{
     Cell, Frame,
     cells::{decoration, flags, underline},
+    glyphs::{Glyphs, Vertical, cell_codepoint},
     theme::Theme,
 };
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
 use std::{
     collections::{HashMap, VecDeque},
     rc::Rc,
+    sync::Arc,
 };
 
 pub struct Scene<'a> {
@@ -292,6 +297,7 @@ struct CachedRow {
     hidden_foreground: Option<gsk::RenderNode>,
     blink: bool,
     blink_start: Option<u16>,
+    glyphs_changed: bool,
 }
 
 /// Retain both phases with shared nodes. Segment boundaries preserve paint
@@ -357,6 +363,9 @@ pub struct Renderer {
     batches: TextBatches,
     appearance: Option<Appearance>,
     rows: Vec<CachedRow>,
+    glyphs: Glyphs,
+    glyph_paths: HashMap<char, glyphs::GlyphPath>,
+    baseline: Option<f64>,
 }
 
 impl Renderer {
@@ -369,8 +378,28 @@ impl Renderer {
         self.text = String::new();
         self.batches = TextBatches::default();
         self.font = None;
+        self.baseline = None;
         self.rows.clear();
         self.appearance = None;
+    }
+
+    pub fn set_glyphs(&mut self, glyphs: &Glyphs) {
+        if self.glyphs.same(glyphs) {
+            return;
+        }
+        let changed = |cp| match (self.glyphs.get(cp), glyphs.get(cp)) {
+            (Some(old), Some(new)) => !Arc::ptr_eq(old, new),
+            (None, None) => false,
+            _ => true,
+        };
+        for row in &mut self.rows {
+            row.glyphs_changed |= row
+                .cells
+                .iter()
+                .any(|cell| cell_codepoint(cell.text()).is_some_and(changed));
+        }
+        self.glyph_paths.retain(|cp, _| !changed(*cp));
+        self.glyphs = glyphs.clone();
     }
 
     fn reuse_scrolled_rows(&mut self, cells: &[Cell], cols: usize) {
@@ -487,7 +516,8 @@ impl Renderer {
                 || row.highlights != highlights
                 || row.selection != selection
                 || row.cursor != cursor
-                || row.pixel_phase != pixel_phase;
+                || row.pixel_phase != pixel_phase
+                || row.glyphs_changed;
             let hovered_link = scene.hovered_link.and_then(|(start, end)| {
                 (start < base + cells.len() && end > base).then(|| {
                     (
@@ -615,6 +645,43 @@ impl Renderer {
                         scene.metrics.1,
                     );
                     let (rgb, alpha) = colors.foreground(base + x, cell);
+                    if !self.glyphs.is_empty()
+                        && let Some(cp) = cell_codepoint(text)
+                        && let Some(glyph) = self.glyphs.get(cp)
+                    {
+                        stats.text_nodes += batch.flush(&mut foreground);
+                        foreground.set_blink(cell.blink());
+                        let span = if cells.get(x + 1).is_some_and(|next| {
+                            next.flags & 64 != 0
+                                || (glyph.width == 2
+                                    && next.flags & 128 == 0
+                                    && matches!(next.text(), "" | " "))
+                        }) {
+                            2.0
+                        } else {
+                            1.0
+                        };
+                        let baseline = if matches!(glyph.vertical, Vertical::Baseline) {
+                            *self.baseline.get_or_insert_with(|| {
+                                let metrics = context.metrics(Some(font), None);
+                                f64::from(metrics.ascent()) / f64::from(pango::SCALE) + 1.0
+                            })
+                        } else {
+                            0.0
+                        };
+                        self.glyph_paths
+                            .entry(cp)
+                            .or_insert_with(|| glyphs::GlyphPath::new(glyph))
+                            .append(
+                                &foreground.current,
+                                glyph,
+                                (rect.0, rect.2 * span, rect.3),
+                                baseline,
+                                &rgba(rgb, alpha),
+                            );
+                        x += 1;
+                        continue;
+                    }
                     let mut first_rect = true;
                     let graphic = has_glyph
                         && render::graphic_rects(text, rect, |rect| {
@@ -709,6 +776,7 @@ impl Renderer {
                 row.selection = selection;
                 row.cursor = cursor;
                 row.pixel_phase = pixel_phase;
+                row.glyphs_changed = false;
                 stats.rebuilt_rows += 1;
             }
             if row

@@ -3,6 +3,7 @@ pub mod activity;
 pub mod cells;
 pub mod clipboard;
 pub mod control;
+pub mod glyphs;
 pub mod hyperlinks;
 pub mod model;
 pub mod network;

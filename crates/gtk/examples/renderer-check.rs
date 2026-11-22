@@ -2049,6 +2049,104 @@ fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context
     assert_eq!(colors(&hidden), 9);
 }
 
+fn registered_glyph(gpu: &gsk::Renderer, context: &pango::Context, output: &Path) {
+    use gmux_protocol::glyphs::{
+        Extent, Glyph, Glyphs, Horizontal, Outline, Point, Size, Vertical,
+    };
+    use std::sync::Arc;
+
+    let theme = Theme::adwaita(true);
+    let font = pango::FontDescription::from_string("Monospace 12");
+    let cp = '\u{100000}';
+    let mut cells = vec![cell(" ", theme, 0); 40 * 8];
+    cells[0] = cell("\u{100000}", theme, gmux_protocol::cells::flags::BLINK);
+    cells[40] = cell("A", theme, 0);
+    let mut scene = scene(&cells, theme);
+    let mut renderer = Renderer::new();
+    let capture = |renderer: &mut Renderer, scene: &Scene<'_>| {
+        let snapshot = gtk::Snapshot::new();
+        let stats = renderer.snapshot(&snapshot, scene, &font, context);
+        (snapshot.to_node().unwrap(), stats.rebuilt_rows)
+    };
+    let (fallback, _) = capture(&mut renderer, &scene);
+    let glossary = |left, right| {
+        let points = [(left, 250), (right, 250), (right, 750), (left, 750)];
+        Glyphs::new(vec![Arc::new(Glyph {
+            codepoint: cp,
+            upm: 1000,
+            extent: Some(Extent {
+                advance: 1000,
+                line_height: 1000,
+                ymin: 0,
+            }),
+            width: 2,
+            size: Size::Stretch,
+            horizontal: Horizontal::Center,
+            vertical: Vertical::Center,
+            pad: [0.0; 4],
+            outline: Outline::new(points.into_iter().enumerate().map(|(i, (x, y))| Point {
+                x,
+                y,
+                on_curve: true,
+                contour_end: i == 3,
+            })),
+            revision: 0,
+        })])
+    };
+    let original = glossary(200, 800);
+    renderer.set_glyphs(&original);
+    let (first, rebuilt) = capture(&mut renderer, &scene);
+    assert_eq!(rebuilt, 1);
+
+    let mut repeated: Glyphs =
+        serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+    repeated.reuse_entries(&original);
+    assert!(repeated.same(&original));
+    renderer.set_glyphs(&repeated);
+    scene.text_blink_visible = false;
+    let (hidden, rebuilt) = capture(&mut renderer, &scene);
+    assert_eq!(rebuilt, 0);
+    scene.text_blink_visible = true;
+    let expected = |x: f32, width: f32| {
+        let snapshot = gtk::Snapshot::new();
+        snapshot.append_node(&hidden);
+        snapshot.append_color(
+            &gdk::RGBA::new(
+                f32::from(theme.foreground[0]) / 255.0,
+                f32::from(theme.foreground[1]) / 255.0,
+                f32::from(theme.foreground[2]) / 255.0,
+                1.0,
+            ),
+            &graphene::Rect::new(x, 6.0, width, 12.0),
+        );
+        snapshot.to_node().unwrap()
+    };
+    assert_render_eq(
+        gpu,
+        &first,
+        &expected(4.0, 12.0),
+        &scene,
+        output,
+        "registered-glyph",
+    );
+    renderer.set_glyphs(&glossary(500, 1500));
+    let (replacement, rebuilt) = capture(&mut renderer, &scene);
+    assert_eq!(rebuilt, 1);
+    assert_render_eq(
+        gpu,
+        &replacement,
+        &expected(10.0, 10.0),
+        &scene,
+        output,
+        "replaced-glyph",
+    );
+
+    renderer.set_glyphs(&Glyphs::default());
+    let (cleared, rebuilt) = capture(&mut renderer, &scene);
+    assert_eq!(rebuilt, 1);
+    assert_render_eq(gpu, &cleared, &fallback, &scene, output, "cleared-glyph");
+}
+
 fn main() -> anyhow::Result<()> {
     let options = Options::parse();
     std::fs::create_dir_all(&options.output)?;
@@ -2067,6 +2165,7 @@ fn main() -> anyhow::Result<()> {
         CacheBackend::Cairo => &cairo.0,
         CacheBackend::Selected => &gpu,
     };
+    registered_glyph(cache_gpu, &context, &options.output);
     let mut cases = Vec::new();
     for dark in [true, false] {
         for font_name in [
