@@ -190,6 +190,15 @@ fn main() -> anyhow::Result<()> {
     )?;
     measure("git", Packet::Git(git), 10000)?;
     measure(
+        "window-resize",
+        Packet::WindowResize(gmux_protocol::transport::WindowResize {
+            pane: 1,
+            cols: 100,
+            rows: 35,
+        }),
+        10000,
+    )?;
+    measure(
         "clipboard-clear",
         Packet::Clipboard(gmux_protocol::clipboard::Write {
             destination: gmux_protocol::clipboard::Destination::Clipboard,

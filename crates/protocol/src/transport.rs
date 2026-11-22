@@ -16,7 +16,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 43;
+pub const VERSION: u32 = 44;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -128,6 +128,15 @@ pub enum Packet {
     Git(GitMetadata),
     Clipboard(crate::clipboard::Write),
     ClipboardRead(ClipboardRead),
+    WindowResize(WindowResize),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowResize {
+    pub pane: u64,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -401,6 +410,7 @@ impl Packet {
             Self::Git(_) => RecordKind::Git,
             Self::Clipboard(_) => RecordKind::Clipboard,
             Self::ClipboardRead(_) => RecordKind::ClipboardRead,
+            Self::WindowResize(_) => RecordKind::WindowResize,
         }
     }
 
@@ -413,6 +423,7 @@ impl Packet {
                 serde_json::to_writer(writer, &crate::clipboard::wire::WriteRef(write))
             }
             Self::ClipboardRead(read) => serde_json::to_writer(writer, read),
+            Self::WindowResize(size) => serde_json::to_writer(writer, size),
         }
     }
 

@@ -31,10 +31,13 @@ def decode_cells(data):
 def decode_packet(body):
     """Decode a stream body into its header and cell bytes."""
     header_size, kind, allowance, count = struct.unpack("<IIII", body[:16])
-    assert kind in (1, 2, 3, 4, 5)
+    assert kind in (1, 2, 3, 4, 5, 6)
     assert header_size <= len(body) - 16
     header = json.loads(body[16:16 + header_size])
-    header["event_type"] = {1: "pane", 2: "execution", 3: "clipboard", 4: "git", 5: "clipboard_read"}[kind]
+    header["event_type"] = {
+        1: "pane", 2: "execution", 3: "clipboard", 4: "git", 5: "clipboard_read",
+        6: "window_resize",
+    }[kind]
     if kind == 3:
         assert count == 0
         write = header

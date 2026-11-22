@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 43:
+handshake. The current protocol version is 44:
 
 ```json
-{"version":43,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":44,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":43,"daemon":"returned-identity"}
+{"method":"attach","version":44,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -188,6 +188,9 @@ and version discovery. Attachment is required once per connection. Each view
 owns its subscriptions, scroll position, selection, search, and paste assembly.
 The daemon shares terminal output and processes across views. The most recently
 focused view controls a pane's PTY size.
+That view receives `WindowResize` when a program requests a new grid size.
+If it can resize its window, it reports the resulting allocation with
+`resize`.
 
 Use `input` with a byte array to write terminal input, or `key`, `mouse`, and
 `paste` for terminal-aware input. `focused` declares the connection's focus.
@@ -287,6 +290,7 @@ prefix is followed by UTF-8 JSON and binary cell or clipboard bytes.
 | `3` clipboard write/clear | `clipboard::Write` | `destination` and `content` descriptors | Representation bytes in descriptor order |
 | `4` Git metadata | `GitMetadata` | `id`, `directory`, and `branch` | None |
 | `5` clipboard read | `ClipboardRead` | `pane` and `event` | None |
+| `6` window resize | `WindowResize` | `pane`, `cols`, and `rows` | None |
 
 `transport::Packet` is an enum of these payloads. Readers select the concrete JSON
 schema from the record kind before decoding. Unknown kinds, fields from another
@@ -501,7 +505,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 43; clients must match
+cell data are rejected. This is stream protocol version 44; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.

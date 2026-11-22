@@ -168,6 +168,8 @@ int gmux_engine_view_cursor_style(GmuxView *view, uint8_t style);
 int gmux_engine_use_view_appearance(GmuxEngine *engine, GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
+// Event kind 9. Zero keeps the current dimension.
+typedef struct { uint16_t cols, rows; } GmuxResizeEvent;
 // Event kind 7. Stable codes, independent of upstream enum representation.
 typedef struct { const uint8_t *ptr; size_t len; } GmuxText;
 typedef struct {

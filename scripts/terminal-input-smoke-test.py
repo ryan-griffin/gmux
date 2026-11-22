@@ -109,6 +109,20 @@ with tempfile.TemporaryDirectory(prefix="gmux-terminal-input-") as directory:
             wait_for(lambda: abs(rpc("renderer-info")["frame_interval_us"] - expected_interval) < 500)
             rpc("screenshot", path=str(artifacts / "terminal-input-initial.png"))
 
+            def grid_size():
+                frame = rpc("renderer-info", pane=pane)["viewport"]
+                return frame["cols"], frame["rows"]
+
+            original_width, original_height = rpc("renderer-info")["window_size"]
+            original_cols, original_rows = grid_size()
+            cols, rows = original_cols - 10, original_rows - 5
+            rpc("send", pane=pane, text=f"printf '\\033[8;{rows};{cols}t'", paste=True, enter=True)
+            wait_for(lambda: grid_size() == (cols, rows))
+            rpc("send", pane=pane, text=f"printf '\\033[8;0;{original_cols}t'", paste=True, enter=True)
+            wait_for(lambda: grid_size() == (original_cols, rows))
+            rpc("resize", width=original_width, height=original_height)
+            wait_for(lambda: grid_size() == (original_cols, original_rows))
+
             # The probe consumes input without moving the terminal cursor. This
             # isolates GTK activity resets from cursor-motion-driven resets.
             appearance_probe = temp / "appearance.py"

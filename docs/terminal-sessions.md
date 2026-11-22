@@ -38,6 +38,10 @@ from any view reaches the same PTY.
 
 The most recently focused client viewing a pane controls its PTY size. Other
 views remember their requested sizes and apply them when they become the owner.
+When a program requests a grid size with `CSI 8 ; rows ; cols t`, the daemon
+forwards the request to the size owner. GTK can apply it to an unsplit tab in a
+freely resizable window. With no size owner, the daemon resizes the pane's PTY
+and grid directly. A zero dimension keeps its current size.
 Presentation saves provide defaults for new windows without replacing shared
 layout topology or other live windows' choices.
 

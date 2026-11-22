@@ -22,6 +22,7 @@ pub struct SessionUpdate {
     pub git_changed: bool,
     pub progress_changed: bool,
     pub program_status_changed: bool,
+    pub window_resize: Option<(u16, u16)>,
     pub unread: Option<bool>,
     pub error: Option<String>,
     pub notifications: Vec<String>,

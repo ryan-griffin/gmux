@@ -908,6 +908,13 @@ impl SessionManager {
                             });
                             continue;
                         }
+                        Packet::WindowResize(size) => {
+                            if self.visible.contains(&size.pane) {
+                                updates.entry(size.pane).or_default().window_resize =
+                                    Some((size.cols, size.rows));
+                            }
+                            continue;
+                        }
                         Packet::Git(git) => {
                             if self.git_panes.contains(&git.id) {
                                 if let Some(session) = self.sessions.get(&git.id) {

@@ -48,6 +48,11 @@ fn events() -> Vec<Packet> {
             pane: 7,
             event: ReadEvent::Cancel { id: 8 },
         }),
+        Packet::WindowResize(WindowResize {
+            pane: 7,
+            cols: 80,
+            rows: 24,
+        }),
         Packet::Clipboard(Write {
             destination: Destination::Primary,
             content: None,
@@ -157,7 +162,10 @@ fn framing_selects_one_schema_and_rejects_cross_kind_or_extra_binary_data() {
         rejects(&wrong);
         if matches!(
             packet.kind(),
-            RecordKind::Execution | RecordKind::Git | RecordKind::ClipboardRead
+            RecordKind::Execution
+                | RecordKind::Git
+                | RecordKind::ClipboardRead
+                | RecordKind::WindowResize
         ) {
             let mut wrong = valid.clone();
             let size = u32::from_le_bytes(wrong[..4].try_into().unwrap()) + 1;

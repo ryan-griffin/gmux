@@ -622,6 +622,13 @@ static void pwd_changed(GhosttyTerminal t, void *ud) {
     GmuxEngine *e = ud;
     e->callback(e->userdata, 3, NULL, 0);
 }
+static void resize_window(GhosttyTerminal t, void *ud, const GhosttyTerminalResizeWindow *request) {
+    (void)t;
+    if (request->tag != GHOSTTY_TERMINAL_RESIZE_WINDOW_GRID) return;
+    GmuxEngine *e = ud;
+    GmuxResizeEvent size = {request->value.grid.columns, request->value.grid.rows};
+    e->callback(e->userdata, 9, (const uint8_t *)&size, sizeof(size));
+}
 static void notify(GhosttyTerminal t, void *ud, const GhosttyTerminalDesktopNotification *n) {
     (void)t;
     GmuxEngine *e = ud;
@@ -734,6 +741,7 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     static const uint8_t terminfo[] = "xterm-256color";
     GhosttyString terminfo_name = {.ptr = terminfo, .len = sizeof(terminfo) - 1};
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SIZE, terminal_size) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RESIZE_WINDOW, resize_window) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_XTVERSION, xtversion) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &terminfo_name)) {
         gmux_engine_free(e); return NULL;

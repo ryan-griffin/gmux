@@ -434,6 +434,7 @@ pub fn run() -> anyhow::Result<()> {
             let (update, clipboard) = session.poll_with_clipboard(recipient.is_some());
             session.set_read_enabled(false);
             let read = session.take_read_request();
+            let resize = session.take_resize_request();
             if update.progress_changed || update.program_status_changed {
                 daemon.metadata_changed.insert(id);
             }
@@ -465,6 +466,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             if let Some(request) = read {
                 daemon.admit_read(id, read_recipient, request);
+            }
+            if let Some((cols, rows)) = resize {
+                daemon.request_window_resize(id, cols, rows);
             }
         }
         if metadata_due {

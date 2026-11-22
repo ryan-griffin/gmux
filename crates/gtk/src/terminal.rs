@@ -749,6 +749,21 @@ impl Terminal {
     pub fn renderer_name(&self) -> &'static str {
         "gsk"
     }
+    pub(crate) fn grid_resize_delta(&self, cols: u16, rows: u16) -> (i32, i32) {
+        let (current_cols, current_rows) = self.grid.get();
+        let (cw, ch) = self.metrics.get();
+        let width = if cols == current_cols {
+            0
+        } else {
+            (f64::from(cols) * cw).ceil() as i32 - self.area.width()
+        };
+        let height = if rows == current_rows {
+            0
+        } else {
+            (f64::from(rows) * ch).ceil() as i32 - self.area.height()
+        };
+        (width, height)
+    }
     pub fn unread(&self) -> bool {
         self.session.borrow().unread()
     }

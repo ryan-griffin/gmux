@@ -2,6 +2,10 @@
 use super::*;
 use crate::client::control::BackendReply;
 
+const SIDEBAR_BREAKPOINT_SP: f64 = 700.0;
+pub(super) const WINDOW_WIDTH: std::ops::RangeInclusive<i32> = 360..=7680;
+pub(super) const WINDOW_HEIGHT: std::ops::RangeInclusive<i32> = 280..=4320;
+
 impl Ui {
     pub(super) fn new(
         app: &adw::Application,
@@ -42,7 +46,7 @@ impl Ui {
                 740
             })
             .build();
-        window.set_size_request(360, 280);
+        window.set_size_request(*WINDOW_WIDTH.start(), *WINDOW_HEIGHT.start());
         let split = adw::OverlaySplitView::builder()
             .min_sidebar_width(220.0)
             .max_sidebar_width(280.0)
@@ -215,8 +219,11 @@ impl Ui {
         let toast = adw::ToastOverlay::new();
         toast.set_child(Some(&split));
         window.set_content(Some(&toast));
-        let breakpoint =
-            adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 700sp").unwrap());
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            SIDEBAR_BREAKPOINT_SP,
+            adw::LengthUnit::Sp,
+        ));
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
         let keyboard = Rc::new(RefCell::new(crate::terminal::KeyboardState::default()));
@@ -582,17 +589,24 @@ impl Ui {
             if update.exited {
                 ui.controller.borrow_mut().exited(id);
             }
-            let pane = ui
-                .tabs
-                .borrow()
-                .iter()
-                .find_map(|tab| tab.panes.get(&id).map(|pane| (tab.id, pane.clone())));
-            let Some((tab, pane)) = pane else {
+            let pane = ui.tabs.borrow().iter().find_map(|tab| {
+                tab.panes
+                    .get(&id)
+                    .map(|pane| (tab.id, pane.clone(), tab.panes.len() == 1))
+            });
+            let Some((tab, pane, single_pane)) = pane else {
                 for message in update.notifications {
                     ui.notify(None, id, message);
                 }
                 continue;
             };
+            if let Some((cols, rows)) = update.window_resize
+                && !update.exited
+                && single_pane
+                && ui.active.get() == Some(tab)
+            {
+                ui.resize_terminal_window(&pane, cols, rows);
+            }
             if update.program_status_changed
                 || (update.progress_changed && pane.program_status().is_none())
             {
@@ -656,6 +670,69 @@ impl Ui {
         }
         ui.schedule_deadlines(wake);
     }
+
+    fn resize_terminal_window(&self, pane: &Terminal, cols: u16, rows: u16) {
+        let Some(toplevel) = self.window.surface().and_downcast::<gdk::Toplevel>() else {
+            return;
+        };
+        if pane.exited()
+            || !pane.area.is_mapped()
+            || !self.window.is_resizable()
+            || self.window.is_fullscreen()
+            || self.window.is_maximized()
+            || toplevel.state().contains(gdk::ToplevelState::TILED)
+        {
+            return;
+        }
+        let (width, height) = (self.window.width(), self.window.height());
+        let (dx, dy) = pane.grid_resize_delta(cols, rows);
+        let new_width = if dx == 0 {
+            width
+        } else {
+            let content = self.split.content().unwrap();
+            self.width_with_sidebar(width - self.split.width() + content.width() + dx)
+                .clamp(*WINDOW_WIDTH.start(), *WINDOW_WIDTH.end())
+        };
+        let new_height = if dy == 0 {
+            height
+        } else {
+            (height + dy).clamp(*WINDOW_HEIGHT.start(), *WINDOW_HEIGHT.end())
+        };
+        if (new_width, new_height) != (width, height) {
+            self.window.set_default_size(new_width, new_height);
+        }
+    }
+
+    fn width_with_sidebar(&self, content_width: i32) -> i32 {
+        if !self.split.shows_sidebar() {
+            return content_width;
+        }
+        let settings = self.split.settings();
+        let unit = self.split.sidebar_width_unit();
+        let sidebar = self.split.sidebar().unwrap();
+        let (minimum, _, _, _) = sidebar.measure(gtk::Orientation::Horizontal, -1);
+        let minimum = minimum.max(
+            unit.to_px(self.split.min_sidebar_width(), Some(&settings))
+                .ceil() as i32,
+        );
+        let maximum = minimum.max(
+            unit.to_px(self.split.max_sidebar_width(), Some(&settings))
+                .ceil() as i32,
+        );
+        let fraction = self.split.sidebar_width_fraction();
+        // The sidebar's fraction is based on the full width, including the sidebar.
+        let sidebar_width = (f64::from(content_width) * fraction / (1.0 - fraction)) as i32;
+        let expanded = content_width + sidebar_width.clamp(minimum, maximum);
+        let breakpoint = adw::LengthUnit::Sp.to_px(SIDEBAR_BREAKPOINT_SP, Some(&settings));
+        if f64::from(content_width) > breakpoint
+            || (!self.split.is_collapsed() && f64::from(expanded) > breakpoint)
+        {
+            expanded
+        } else {
+            content_width
+        }
+    }
+
     /// Wake for connection retries and coalesced scroll releases. Waiting
     /// creates no permanent worker; deadlines are rescheduled on every poll.
     fn schedule_deadlines(self: &Rc<Self>, wake: &gmux_platform::unix::ipc::Wake) {

@@ -358,7 +358,8 @@ impl TerminalSession {
         self.engine.clear_grants();
     }
     pub(crate) fn needs_output_poll(&self) -> bool {
-        (self.read_yielded || !self.output_tail.is_empty()) && self.read_pending() == 0
+        (self.read_yielded || !self.output_tail.is_empty() || self.delayed_resize.is_some())
+            && self.read_pending() == 0
     }
     pub(crate) fn complete_read(
         &mut self,
@@ -468,7 +469,10 @@ impl TerminalSession {
         };
         if self.read_pending() == 0 {
             if let Some((cols, rows, cw, ch, width, height)) = self.delayed_resize.take() {
-                let _ = self.resize(cols, rows, cw, ch, width, height);
+                match self.resize(cols, rows, cw, ch, width, height) {
+                    Ok(changed) => update.changed |= changed,
+                    Err(error) => update.error = Some(error.to_string()),
+                }
             }
             if !self.output_tail.is_empty() {
                 let (changed, consumed) = self.engine.feed(&self.output_tail);
@@ -670,6 +674,36 @@ impl TerminalSession {
         self.engine.command_output(point, formats)
     }
 
+    pub(crate) fn take_resize_request(&mut self) -> Option<(u16, u16)> {
+        let (cols, rows) = self.engine.take_resize_request()?;
+        let cols = if cols == 0 { self.size.cols } else { cols };
+        let rows = if rows == 0 { self.size.rows } else { rows };
+        (!self.exited
+            && (cols, rows) != self.size()
+            && gmux_protocol::viewport::valid(cols.into(), rows.into()))
+        .then_some((cols, rows))
+    }
+
+    pub(crate) fn resize_detached(&mut self, cols: u16, rows: u16) -> anyhow::Result<bool> {
+        let (cw, ch) = self.cell_size;
+        let pixels = |cells: u16, cell_size: u32| {
+            u32::from(cells)
+                .saturating_mul(cell_size)
+                .min(u32::from(u16::MAX)) as u16
+        };
+        let width = if cols == self.size.cols {
+            self.size.pixel_width
+        } else {
+            pixels(cols, cw)
+        };
+        let height = if rows == self.size.rows {
+            self.size.pixel_height
+        } else {
+            pixels(rows, ch)
+        };
+        self.resize(cols, rows, cw, ch, width, height)
+    }
+
     /// Apply changed grid, cell, or pixel dimensions; return whether a resize ran.
     pub(crate) fn resize(
         &mut self,
@@ -699,6 +733,8 @@ impl TerminalSession {
             return Ok(false);
         }
         self.engine.resize(cols, rows, cw, ch)?;
+        // In-band size reports can be queued while the PTY is idle.
+        self.read_yielded |= self.engine.has_replies();
         if let Some(pty) = &self.pty {
             pty.master.resize(size)?;
         }
@@ -984,6 +1020,36 @@ mod tests {
         assert!(bytes[..end].starts_with(b"\x1b]52;c;"));
         assert!(bytes[end + 1..].starts_with(b"\x1b]5522;"));
         assert!(bytes[end + 1..].windows(4).any(|s| s == b":pw="));
+    }
+
+    #[test]
+    fn a_resize_deferred_by_clipboard_resumes_without_pty_output() {
+        use gmux_protocol::clipboard::{ReadResult, ReadStatus};
+        let directory = TestDirectory::new();
+        let mut session = start(1, &directory.0, "sleep 5");
+        session.set_read_enabled(true);
+        session.engine.feed(b"\x1b[8;31;92t\x1b]52;c;?\x07");
+        let request = session.take_read_request().unwrap();
+        let (cols, rows) = session.take_resize_request().unwrap();
+        assert!(!session.resize_detached(cols, rows).unwrap());
+        assert!(!session.needs_output_poll());
+        session
+            .complete_read(
+                &ReadResult {
+                    id: request.id,
+                    status: ReadStatus::Denied,
+                    epoch: 0,
+                    available: vec![],
+                    contents: vec![],
+                },
+                &[],
+                0,
+            )
+            .unwrap();
+        assert!(session.needs_output_poll());
+        assert!(session.poll().changed);
+        assert_eq!(session.size(), (92, 31));
+        assert!(!session.needs_output_poll());
     }
 
     #[test]
