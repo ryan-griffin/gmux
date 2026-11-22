@@ -12,7 +12,7 @@ This project is pre-alpha. Saved data formats may change between builds.
 
 ## Build and run
 
-Requires Linux, Rust 1.99+, a C compiler, libclang, pkg-config, curl, patch, and Python
+Requires Linux, Rust 1.100+, a C compiler, libclang, pkg-config, curl, patch, and Python
 3.12+. The GNOME client also requires GTK 4.22+, libadwaita 1.9+, and
 `glib-compile-resources`. The checked-in Rust toolchain file selects the
 development compiler with rustup.
