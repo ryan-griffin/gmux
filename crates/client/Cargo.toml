@@ -2,7 +2,7 @@
 name = "gmux-client"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "Daemon connections and cached terminal sessions for Gmux clients"
 license = "MIT"
 

@@ -2,7 +2,7 @@
 name = "gmux-gtk"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 default-run = "gmux-gtk"
 description = "GTK client for the Gmux terminal daemon"
 license = "MIT"
