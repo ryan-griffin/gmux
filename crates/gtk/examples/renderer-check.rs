@@ -2063,6 +2063,7 @@ fn registered_glyph(gpu: &gsk::Renderer, context: &pango::Context, output: &Path
     cells[40] = cell("A", theme, 0);
     let mut scene = scene(&cells, theme);
     let mut renderer = Renderer::new();
+    renderer.set_cairo_glyphs(gpu.is::<gsk::CairoRenderer>());
     let capture = |renderer: &mut Renderer, scene: &Scene<'_>| {
         let snapshot = gtk::Snapshot::new();
         let stats = renderer.snapshot(&snapshot, scene, &font, context);
@@ -2145,6 +2146,16 @@ fn registered_glyph(gpu: &gsk::Renderer, context: &pango::Context, output: &Path
     let (cleared, rebuilt) = capture(&mut renderer, &scene);
     assert_eq!(rebuilt, 1);
     assert_render_eq(gpu, &cleared, &fallback, &scene, output, "cleared-glyph");
+
+    if gpu.is::<gsk::CairoRenderer>() {
+        scene.scale = 1.5;
+        scene.origin = (1.0 / 3.0, 1.0 / 3.0);
+        renderer.set_glyphs(&original);
+        let (cached, _) = capture(&mut renderer, &scene);
+        renderer.set_cairo_glyphs(false);
+        let (vector, _) = capture(&mut renderer, &scene);
+        assert_render_eq(gpu, &cached, &vector, &scene, output, "fractional-glyph");
+    }
 }
 
 fn main() -> anyhow::Result<()> {

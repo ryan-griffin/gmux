@@ -127,6 +127,7 @@ fn apply_rows(view: &mut Viewport, rows: Vec<u16>, cells: Vec<Cell>) -> ViewChan
         false,
         Instant::now(),
     )
+    .unwrap()
 }
 
 fn manager() -> (SessionManager, incoming::Sender, SessionHandle) {
@@ -2337,19 +2338,21 @@ fn scroll_effects_commit_only_after_admission_and_retry_at_the_display_cadence()
         (Some(view.frame), 2, true),
         (Some(view.frame), 3, false),
     ] {
-        let changes = view.apply(
-            PaneUpdate {
-                header: PaneHeader {
-                    meta: view.meta.clone(),
-                    frame,
-                    scroll_serial: serial,
-                    ..PaneHeader::default()
+        let changes = view
+            .apply(
+                PaneUpdate {
+                    header: PaneHeader {
+                        meta: view.meta.clone(),
+                        frame,
+                        scroll_serial: serial,
+                        ..PaneHeader::default()
+                    },
+                    cells: vec![],
                 },
-                cells: vec![],
-            },
-            false,
-            release,
-        );
+                false,
+                release,
+            )
+            .unwrap();
         assert!(changes.scroll.is_none());
         assert_eq!(view.scroll_pending(), pending);
     }

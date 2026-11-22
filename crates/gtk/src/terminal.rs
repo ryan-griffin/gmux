@@ -1016,6 +1016,14 @@ impl Terminal {
         };
         let stats = {
             let mut renderer = self.renderer.borrow_mut();
+            if !e.glyphs.is_empty() {
+                renderer.set_cairo_glyphs(
+                    self.area
+                        .native()
+                        .and_then(|native| native.renderer())
+                        .is_some_and(|renderer| renderer.is::<gtk::gsk::CairoRenderer>()),
+                );
+            }
             renderer.set_glyphs(e.glyphs);
             draw(&mut renderer, &scene, &font, &context)
         };

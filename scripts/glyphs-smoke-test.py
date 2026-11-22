@@ -11,6 +11,7 @@ from stream_test_support import Client
 from test_support import AppFixture, scenario, wait_for
 
 CODEPOINT = "\U00100000"
+OTHER_CODEPOINT = "\U00100001"
 DA1 = "\x1b[c"
 TRIANGLE = "AAEAZABkA4QDhAACAAABAQEB9P5wAyADhPzgAAA="
 
@@ -89,12 +90,15 @@ while True:
                 peer.send("resize", cols=12, rows=3)
                 peer.barrier("resize")
                 if peer.frame is None:
-                    assert peer.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame"))["glyphs"] == []
+                    assert peer.until(lambda h: h.get("meta", {}).get("id") == pane and h.get("frame"))["glyphs"] == {"replace": []}
             exchange(apc("s"), ["s;fmt=glyf"])
-            exchange(apc(f"r;cp=100000;width=2;{TRIANGLE}") + "\x1b[H\x1b[2J" + CODEPOINT + " A",
+            exchange(apc(f"r;cp=100000;width=2;{TRIANGLE}") + apc(f"r;cp=100001;reply=0;{TRIANGLE}")
+                     + "\x1b[H\x1b[2J" + CODEPOINT + " A",
                      ["r;cp=100000;status=0"])
             for peer in peers:
-                glyph, = updated(peer)["glyphs"]
+                patch = updated(peer)["glyphs"]["patch"]
+                glyph, unmodified = patch["defined"]
+                assert patch["removed"] == [] and unmodified["codepoint"] == OTHER_CODEPOINT
                 assert glyph["codepoint"] == CODEPOINT and glyph["width"] == 2
                 assert outline(glyph) == [(500, 900, 1), (100, 100, 1), (900, 100, 3)], glyph
                 assert [peer.cells[0, x] for x in range(3)] == [CODEPOINT, " ", "A"]
@@ -109,7 +113,7 @@ while True:
                       "q;grapheme=1f468,200d,1f469;reason=unsupported"])
             other_pane = fixture.rpc("new", directory=str(fixture.path))["pane"]
             other = Client(fixture, other_pane, address=address)
-            assert other.until(lambda h: h.get("meta", {}).get("id") == other_pane and h.get("frame"))["glyphs"] == []
+            assert other.until(lambda h: h.get("meta", {}).get("id") == other_pane and h.get("frame"))["glyphs"] == {"replace": []}
 
         with scenario("Synchronized output holds the old glyph until the frame commits"):
             title = exchange("\x1b[?2026h" + apc(f"r;cp=100000;fmt=glyf;size=stretch;reply=2;{box()}"),
@@ -119,25 +123,30 @@ while True:
             exchange("\x1b[?2026l", [])
             for peer in peers:
                 packet = updated(peer)
-                glyph, = packet["glyphs"]
+                patch = packet["glyphs"]["patch"]
+                glyph, = patch["defined"]
+                assert patch["removed"] == []
                 assert glyph["size"] == "stretch" and len(outline(glyph)) == 4, glyph
                 assert not packet["rows"] and peer.cells[0, 0] == CODEPOINT
             peers[1].close()
             peers[1] = Client(fixture, pane, address=address)
-            assert len(outline(updated(peers[1])["glyphs"][0])) == 4
+            glyph, unmodified = updated(peers[1])["glyphs"]["replace"]
+            assert len(outline(glyph)) == 4 and unmodified["codepoint"] == OTHER_CODEPOINT
 
         with scenario("Clear and RIS remove registrations from live panes"):
             exchange(apc("c;cp=100000") + apc("q;cp=100000"),
                      ["c;cp=100000;status=0", "q;cp=100000;reason=unknown"])
             for peer in peers:
-                assert updated(peer)["glyphs"] == []
+                assert updated(peer)["glyphs"]["patch"] == {"defined": [], "removed": [CODEPOINT]}
                 assert peer.cells[0, 0] == CODEPOINT
             exchange(apc(f"r;cp=100000;reply=0;{TRIANGLE}"), [])
             for peer in peers:
-                assert updated(peer)["glyphs"]
+                glyph, = updated(peer)["glyphs"]["patch"]["defined"]
+                assert glyph["codepoint"] == CODEPOINT
             exchange("\x1bc" + apc("q;cp=100000"), ["q;cp=100000;reason=unknown"])
             for peer in peers:
-                assert updated(peer)["glyphs"] == []
+                assert updated(peer)["glyphs"]["patch"] == {
+                    "defined": [], "removed": [CODEPOINT, OTHER_CODEPOINT]}
     finally:
         for peer in peers:
             peer.close()

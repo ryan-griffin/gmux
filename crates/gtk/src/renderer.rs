@@ -365,6 +365,7 @@ pub struct Renderer {
     rows: Vec<CachedRow>,
     glyphs: Glyphs,
     glyph_paths: HashMap<char, glyphs::GlyphPath>,
+    glyph_rasters: Option<glyphs::GlyphRasters>,
     baseline: Option<f64>,
 }
 
@@ -379,6 +380,9 @@ impl Renderer {
         self.batches = TextBatches::default();
         self.font = None;
         self.baseline = None;
+        if let Some(rasters) = self.glyph_rasters.as_mut() {
+            *rasters = Default::default();
+        }
         self.rows.clear();
         self.appearance = None;
     }
@@ -399,7 +403,17 @@ impl Renderer {
                 .any(|cell| cell_codepoint(cell.text()).is_some_and(changed));
         }
         self.glyph_paths.retain(|cp, _| !changed(*cp));
+        if let Some(rasters) = self.glyph_rasters.as_mut() {
+            rasters.retain(|cp| !changed(cp));
+        }
         self.glyphs = glyphs.clone();
+    }
+
+    pub fn set_cairo_glyphs(&mut self, enabled: bool) {
+        if enabled != self.glyph_rasters.is_some() {
+            self.glyph_rasters = enabled.then(glyphs::GlyphRasters::default);
+            self.rows.clear();
+        }
     }
 
     fn reuse_scrolled_rows(&mut self, cells: &[Cell], cols: usize) {
@@ -477,6 +491,9 @@ impl Renderer {
             ],
         };
         if self.appearance.as_ref() != Some(&appearance) {
+            if let Some(rasters) = self.glyph_rasters.as_mut() {
+                *rasters = Default::default();
+            }
             self.rows.clear();
             self.appearance = Some(appearance);
         }
@@ -657,9 +674,9 @@ impl Renderer {
                                     && next.flags & 128 == 0
                                     && matches!(next.text(), "" | " "))
                         }) {
-                            2.0
+                            2
                         } else {
-                            1.0
+                            1
                         };
                         let baseline = if matches!(glyph.vertical, Vertical::Baseline) {
                             *self.baseline.get_or_insert_with(|| {
@@ -669,16 +686,31 @@ impl Renderer {
                         } else {
                             0.0
                         };
-                        self.glyph_paths
+                        let path = self
+                            .glyph_paths
                             .entry(cp)
-                            .or_insert_with(|| glyphs::GlyphPath::new(glyph))
-                            .append(
+                            .or_insert_with(|| glyphs::GlyphPath::new(glyph));
+                        let bounds = (rect.0, rect.2 * f64::from(span), rect.3);
+                        let color = rgba(rgb, alpha);
+                        let rasterized = self.glyph_rasters.as_mut().is_some_and(|rasters| {
+                            rasters.append(
                                 &foreground.current,
+                                path,
                                 glyph,
-                                (rect.0, rect.2 * span, rect.3),
-                                baseline,
-                                &rgba(rgb, alpha),
-                            );
+                                glyphs::RasterCell {
+                                    bounds,
+                                    row_y: y as f64 * scene.metrics.1,
+                                    origin: scene.origin,
+                                    scale: scene.scale,
+                                    span,
+                                    baseline,
+                                },
+                                &color,
+                            )
+                        });
+                        if !rasterized {
+                            path.append(&foreground.current, glyph, bounds, baseline, &color);
+                        }
                         x += 1;
                         continue;
                     }
