@@ -1,4 +1,5 @@
 //! Backend requests, state reconciliation, and presentation persistence.
+use super::window::{WINDOW_HEIGHT, WINDOW_WIDTH};
 use super::*;
 use crate::client::{
     connections::Route,
@@ -632,7 +633,7 @@ impl Ui {
             }
             PublicRequest::Resize { width, height } => {
                 anyhow::ensure!(
-                    (360..=7680).contains(&width) && (280..=4320).contains(&height),
+                    WINDOW_WIDTH.contains(&width) && WINDOW_HEIGHT.contains(&height),
                     "Window size is outside the supported range"
                 );
                 // On a normal Wayland window, an unnecessary unmaximize can

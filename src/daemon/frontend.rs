@@ -485,7 +485,7 @@ fn trim_screen_caches(current: &mut Frontend, others: &mut HashMap<u64, Frontend
 fn size_owner<'a>(
     pane: u64,
     frontends: impl Iterator<Item = (u64, &'a Frontend)>,
-) -> Option<&'a Frontend> {
+) -> Option<(u64, &'a Frontend)> {
     frontends
         .filter(|(_, frontend)| {
             frontend.attached
@@ -496,14 +496,13 @@ fn size_owner<'a>(
         })
         // Without a focused subscriber, keep a stable owner to avoid contention.
         .min_by_key(|(id, frontend)| (!frontend.focused, *id))
-        .map(|(_, frontend)| frontend)
 }
 #[cfg(test)]
 fn requested_size<'a>(
     pane: u64,
     frontends: impl Iterator<Item = (u64, &'a Frontend)>,
 ) -> Option<TerminalSize> {
-    size_owner(pane, frontends).map(|frontend| frontend.panes[&pane].size.unwrap())
+    size_owner(pane, frontends).map(|(_, frontend)| frontend.panes[&pane].size.unwrap())
 }
 
 impl Daemon {
@@ -568,9 +567,42 @@ impl Daemon {
         }
     }
 
+    pub(super) fn request_window_resize(&mut self, pane: u64, cols: u16, rows: u16) {
+        let owner = size_owner(
+            pane,
+            self.frontends.iter().map(|(&id, frontend)| (id, frontend)),
+        );
+        if let Some((id, _)) = owner {
+            let frontend = self.frontends.get_mut(&id).unwrap();
+            if let Err(error) = frontend.queue(Packet::WindowResize(transport::WindowResize {
+                pane,
+                cols,
+                rows,
+            })) {
+                eprintln!("Could not deliver window resize request: {error}");
+            }
+            return;
+        }
+        match self
+            .sessions
+            .get_mut(&pane)
+            .unwrap()
+            .resize_detached(cols, rows)
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                self.changed.insert(pane);
+            }
+            Err(error) => {
+                self.errors.insert(pane, error.to_string());
+                self.changed.insert(pane);
+            }
+        }
+    }
+
     fn resize_session(&mut self, pane: u64, current: Option<(u64, &Frontend)>) {
         // Input processing temporarily removes its frontend from the map.
-        let Some(owner) = size_owner(
+        let Some((_, owner)) = size_owner(
             pane,
             self.frontends
                 .iter()

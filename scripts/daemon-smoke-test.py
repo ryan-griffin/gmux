@@ -148,6 +148,12 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         time.sleep(0.1)
         cli("send", "--pane", pane, "printf '\\033[2J\\033[HHEADLESS_READY'", "--enter")
         wait_for(lambda: "HEADLESS_READY" in cli("read", "--pane", pane, text=True))
+        # The shell must see the new PTY size when a detached pane resizes itself.
+        for request, (cols, rows) in [("31;92", (92, 31)), ("0;80", (80, 31)), ("24;0", (80, 24))]:
+            send(pane, f"printf '\\033[8;{request}t'")
+            wait_for(lambda: rpc("metadata", pane=pane)["meta"]["size"] == [cols, rows])
+            send(pane, "stty size > " + shlex.quote(str(temp / "pty-size")))
+            wait_for(lambda: (temp / "pty-size").read_text().strip() == f"{rows} {cols}")
         assert rpc("status")["snapshots"] == 0, "Detached output must not extract viewports"
         pid = rpc("status")["pid"]
         before = ticks(pid)

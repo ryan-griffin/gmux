@@ -24,6 +24,7 @@ impl Packet {
                         .map_or(0, crate::clipboard::Offer::memory_size);
             }
             Self::ClipboardRead(read) => return size_of::<Self>() + read.event.memory_size(),
+            Self::WindowResize(_) => return size_of::<Self>(),
             Self::Pane(update) => update,
         };
         let header = &update.header;

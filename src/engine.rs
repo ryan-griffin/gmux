@@ -238,6 +238,7 @@ struct Events {
     read_tokens: f64,
     read_refill: Option<std::time::Instant>,
     command: gmux_protocol::shell::CommandState,
+    resize_request: Option<(u16, u16)>,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
 const _: () =
@@ -501,6 +502,12 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
             });
         }
         8 => events.program_status.end_execution(),
+        9 if len == std::mem::size_of::<GmuxResizeEvent>() => {
+            let size = unsafe { &*data.cast::<GmuxResizeEvent>() };
+            if size.cols != 0 || size.rows != 0 {
+                events.resize_request = Some((size.cols, size.rows));
+            }
+        }
         _ => {}
     }
 }
@@ -1408,6 +1415,12 @@ impl Engine {
             std::mem::take(&mut self.events.replies),
             std::mem::take(&mut self.events.notifications),
         )
+    }
+    pub(crate) fn has_replies(&self) -> bool {
+        !self.events.replies.is_empty()
+    }
+    pub(crate) fn take_resize_request(&mut self) -> Option<(u16, u16)> {
+        self.events.resize_request.take()
     }
     pub fn take_title_update(&mut self) -> Option<String> {
         std::mem::take(&mut self.events.title_changed).then(|| self.metadata(false))

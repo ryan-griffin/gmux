@@ -13,11 +13,13 @@ pub enum RecordKind {
     Clipboard = 3,
     Git = 4,
     ClipboardRead = 5,
+    WindowResize = 6,
 }
 impl RecordKind {
     pub(super) fn header_limit(self) -> usize {
         match self {
             Self::Clipboard | Self::ClipboardRead => crate::clipboard::MAX_HEADER_BYTES,
+            Self::WindowResize => 256,
             Self::Pane | Self::Execution | Self::Git => MAX_HEADER_BYTES,
         }
     }
@@ -67,6 +69,7 @@ impl Record {
             3 => RecordKind::Clipboard,
             4 => RecordKind::Git,
             5 => RecordKind::ClipboardRead,
+            6 => RecordKind::WindowResize,
             _ => anyhow::bail!("Unknown record kind"),
         };
         Self::new(values[0], values[1], kind, values[3], values[4])
@@ -107,7 +110,10 @@ impl Record {
                 self.cells == 0 && self.payload_size() <= crate::clipboard::MAX_OFFER_BYTES,
                 "Invalid clipboard record"
             ),
-            RecordKind::ClipboardRead | RecordKind::Git | RecordKind::Execution => anyhow::ensure!(
+            RecordKind::ClipboardRead
+            | RecordKind::Git
+            | RecordKind::Execution
+            | RecordKind::WindowResize => anyhow::ensure!(
                 self.cells == 0 && self.payload_size() == 0,
                 "Unexpected binary payload"
             ),
@@ -167,6 +173,14 @@ impl Record {
                 let read = super::ClipboardRead::deserialize(&mut de)?;
                 read.event.validate()?;
                 Packet::ClipboardRead(read)
+            }
+            RecordKind::WindowResize => {
+                let size = super::WindowResize::deserialize(&mut de)?;
+                anyhow::ensure!(
+                    crate::viewport::valid(size.cols.into(), size.rows.into()),
+                    "Invalid terminal size"
+                );
+                Packet::WindowResize(size)
             }
         };
         de.end()?;
