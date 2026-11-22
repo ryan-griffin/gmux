@@ -1352,7 +1352,7 @@ static int update_history_cache(GmuxEngine *e, const GmuxFrame *frame,
 GmuxHistory gmux_engine_history_state(GmuxEngine *e) {
     return (e->view_history ? e->view_history : &e->history)->state;
 }
-int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags) {
+int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, bool pty_password_input, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags) {
     if (e->appearance_error) return -1;
     if (!e->view_held) gmux_engine_expire_render_hold(e);
     if (e->held) {
@@ -1375,7 +1375,8 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, GmuxCellFn write, void
     memcpy(frame->cursor, colors.cursor_has_value ? &colors.cursor : &colors.foreground, 3);
     frame->cursor_x = cursor.viewport_x;
     frame->cursor_y = cursor.viewport_y;
-    frame->cursor_visible = cursor.visible && cursor.viewport_has_value;
+    frame->cursor_password_input = cursor.password_input || pty_password_input;
+    frame->cursor_visible = cursor.viewport_has_value && (cursor.visible || frame->cursor_password_input);
     frame->cursor_style = cursor.visual_style;
     frame->cursor_blink = cursor.blinking;
     GhosttyMouseShape shape = GHOSTTY_MOUSE_SHAPE_TEXT;

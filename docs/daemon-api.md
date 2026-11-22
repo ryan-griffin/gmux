@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 46:
+handshake. The current protocol version is 47:
 
 ```json
-{"version":46,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":47,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":46,"daemon":"returned-identity"}
+{"method":"attach","version":47,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -505,7 +505,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 46; clients must match
+cell data are rejected. This is stream protocol version 47; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.
@@ -530,6 +530,13 @@ the previous shape intact. Pointer changes remain live during synchronized-outpu
 holds. The `style` stream command takes `style` and `blink`
 to configure per-view cursor defaults. Explicit program changes take precedence
 until a program reset selects these defaults again.
+
+The optional boolean `cursor_password_input` reports password entry and defaults
+to false when absent. A pane's PTY is treated as a password prompt while canonical
+input is enabled and echo is disabled. This flag can change in a frame with no
+changed rows, including during synchronized output. It also applies when the
+cursor is outside the viewport.
+
 The Rust `transport::Packet::read` and async reader share the same validation.
 `PaneHeader` dimensions, row indices, shifts, and cache boundaries are checked
 before allocating cells. Clipboard descriptor lengths must equal the framed

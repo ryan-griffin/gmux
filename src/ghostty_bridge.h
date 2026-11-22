@@ -103,6 +103,7 @@ typedef struct {
     uint8_t cursor_visible;
     uint8_t cursor_style;
     uint8_t cursor_blink;
+    bool cursor_password_input;
     uint8_t mouse_shape; // GMUX_MOUSE_SHAPE_* protocol codes
     uint8_t background[3];
     uint8_t foreground[3];
@@ -276,7 +277,7 @@ int gmux_engine_theme(GmuxEngine *engine, const uint8_t *background,
 bool gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
 int gmux_engine_cursor_style(GmuxEngine *engine, uint8_t style);
 int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch);
-int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags);
+int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, bool pty_password_input, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags);
 GmuxHistory gmux_engine_history_state(GmuxEngine *engine);
 int gmux_engine_styled_rows(GmuxEngine *engine, uint32_t start, size_t rows, GmuxCellFn write, void *userdata, size_t cols, uint8_t *flags);
 // Targets first (end == 0), then sorted spans, borrowed for each callback.

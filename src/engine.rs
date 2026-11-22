@@ -536,6 +536,7 @@ pub struct Engine {
     find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
+    pty_password_input: bool,
 }
 
 pub(crate) const MAX_VIEWS: usize = 256;
@@ -1039,6 +1040,7 @@ impl Engine {
             find: crate::search::HistorySearch::default(),
             find_row: Vec::new(),
             retention_revision: 0,
+            pty_password_input: false,
             held_cells: Vec::new(),
             held_row_flags: Vec::new(),
             held_hyperlinks: Default::default(),
@@ -1114,12 +1116,24 @@ impl Engine {
         }
         Ok(())
     }
+    pub(crate) fn set_pty_password_input(&mut self, active: bool) -> bool {
+        std::mem::replace(&mut self.pty_password_input, active) != active
+    }
+
     /// Refresh frame metadata and changed rows, returning whether cells changed.
     pub fn snapshot(&mut self) -> anyhow::Result<bool> {
+        self.snapshot_with_password_input(self.pty_password_input)
+    }
+
+    pub(crate) fn snapshot_with_password_input(
+        &mut self,
+        pty_password_input: bool,
+    ) -> anyhow::Result<bool> {
         let result = unsafe {
             gmux_engine_snapshot(
                 self.raw.as_ptr(),
                 &mut self.frame,
+                pty_password_input,
                 Some(capture_cell),
                 (&mut self.cells.as_mut_slice() as *mut &mut [Cell]).cast(),
                 self.cells.len(),

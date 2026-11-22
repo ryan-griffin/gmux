@@ -70,7 +70,7 @@ static void snapshot(GmuxEngine *engine, GmuxView *view, SavedCell *cells, char 
     GmuxFrame frame = {0};
     uint8_t row_flags[48] = {0};
     assert(gmux_engine_view_enter(engine, view));
-    assert(gmux_engine_snapshot(engine, &frame, save_cell, cells, 160 * 48, row_flags) >= 0);
+    assert(gmux_engine_snapshot(engine, &frame, false, save_cell, cells, 160 * 48, row_flags) >= 0);
     assert(frame.cols == 160 && frame.rows == 48);
     assert(cells[0].text[0] == expected);
     gmux_engine_view_leave(engine, view);

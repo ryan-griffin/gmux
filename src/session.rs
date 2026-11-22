@@ -133,6 +133,26 @@ impl TerminalSession {
     pub(crate) fn progress_deadline(&self) -> Option<Instant> {
         self.engine.progress_deadline()
     }
+    fn pty_password_input(&self) -> bool {
+        !self.exited
+            && self
+                .pty
+                .as_ref()
+                .and_then(|pty| pty.master.as_raw_fd())
+                .is_some_and(|fd| {
+                    let mut termios = std::mem::MaybeUninit::<libc::termios>::zeroed();
+                    // Canonical input with echo disabled is commonly used for passwords.
+                    unsafe {
+                        libc::tcgetattr(fd, termios.as_mut_ptr()) == 0
+                            && termios.assume_init().c_lflag & (libc::ICANON | libc::ECHO)
+                                == libc::ICANON
+                    }
+                })
+    }
+    pub(crate) fn refresh_password_input(&mut self) -> bool {
+        self.engine
+            .set_pty_password_input(self.pty_password_input())
+    }
     pub(crate) fn use_view_appearance(
         &mut self,
         view: &crate::engine::EngineView,
@@ -140,7 +160,8 @@ impl TerminalSession {
         self.engine.use_view_appearance(view)
     }
     pub(crate) fn links(&mut self) -> anyhow::Result<gmux_protocol::control::PaneLinks> {
-        self.engine.snapshot()?;
+        self.engine
+            .snapshot_with_password_input(self.pty_password_input())?;
         Ok(gmux_protocol::control::PaneLinks {
             frame: self.engine.frame,
             hyperlinks: self.engine.hyperlinks.clone(),
@@ -589,6 +610,7 @@ impl TerminalSession {
             self.exited |= pty.child.is_none() && !read_budget_exhausted;
         }
         if self.exited {
+            update.changed |= self.engine.set_pty_password_input(false);
             self.engine.discard_read();
             self.engine.clear_grants();
             self.read_responding = false;

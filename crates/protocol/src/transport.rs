@@ -16,7 +16,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 46;
+pub const VERSION: u32 = 47;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -566,6 +566,7 @@ mod tests {
                     cols: 2,
                     rows: 3,
                     cursor_blink: 1,
+                    cursor_password_input: true,
                     mouse_shape: mouse_shape::ZOOM_OUT,
                     scrollback: crate::Scrollback {
                         total: 500,

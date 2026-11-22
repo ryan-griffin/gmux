@@ -52,7 +52,9 @@ changes restart the local delay; only effective default enablement changes send
 a daemon style update. Only mapped, focused panes in the active window
 schedule a blink source, and program cursor visibility and blink modes stop it.
 Block cursor transitions rebuild only the cursor row; bar and underline cursors
-reuse all row nodes. OSC 22 pointer shapes apply to the terminal canvas through
+reuse all row nodes. During detected password entry, GTK draws a steady Adwaita lock
+at the cursor when it is in view and sets the input method's purpose to password
+with the private hint. OSC 22 pointer shapes apply to the terminal canvas through
 GTK's native W3C cursor names. OSC 8 hover uses the
 same pointer owner, so leaving a link restores the current OSC 22 request even
 when the frame's pointer code is unchanged. Sparse hyperlink maps sit beside

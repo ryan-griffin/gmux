@@ -154,6 +154,9 @@ pub fn run() -> anyhow::Result<()> {
             daemon.sessions.len() + daemon.frontends.len(),
         );
         let attached = daemon.frontends.values().any(|f| f.attached);
+        if !attached {
+            daemon.password_poll = None;
+        }
         let held = daemon.sessions.values().any(TerminalSession::render_held);
         let compression_deadline = daemon
             .sessions
@@ -182,6 +185,7 @@ pub fn run() -> anyhow::Result<()> {
                 .any(Frontend::input_pending)
                 .then_some(now),
             attached.then_some(next_metadata),
+            daemon.password_poll,
             daemon.next_update(),
             compression_budget
                 .deadline(compression_deadline)
@@ -475,6 +479,7 @@ pub fn run() -> anyhow::Result<()> {
             daemon.git_dirty |= daemon.git.is_some();
             next_metadata = Instant::now() + Duration::from_secs(1);
         }
+        daemon.poll_password_input();
         drop(pty_cost);
         daemon.sync_git(&wake);
         if let Some(git) = &mut daemon.git

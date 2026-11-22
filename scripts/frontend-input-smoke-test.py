@@ -119,6 +119,56 @@ cadence = args.frame_interval_us / 1_000_000
 binary = args.binary or cargo_binary("gmux")
 results = []
 
+with scenario("password state follows headless snapshots, new views and live output"), AppFixture(
+        prefix="gmux-password-viewport-") as fixture:
+    raw = fixture.path / "raw"
+    worker = fixture.path / "password.py"
+    worker.write_text('''
+import os, sys, termios, time, tty
+from pathlib import Path
+raw = Path(sys.argv[1])
+mode = termios.tcgetattr(0)
+mode[3] = (mode[3] | termios.ICANON) & ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, mode)
+os.write(1, b"PASSWORD_MODE")
+while not raw.exists():
+    time.sleep(.005)
+tty.setraw(0)
+raw.with_name(f"raw-{os.getpid()}").touch()
+while not raw.with_name("prompt").exists():
+    time.sleep(.005)
+termios.tcsetattr(0, termios.TCSANOW, mode)
+os.write(1, b"\\r\\nPassword: ")
+while True:
+    time.sleep(1)
+''')
+    (fixture.path / "shell").write_text(
+        f"#!/bin/sh\nexec python3 {shlex.quote(str(worker))} {shlex.quote(str(raw))}\n")
+    fixture.start(binary, "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for(lambda: fixture.rpc("status"))
+    pane = fixture.rpc("new")["pane"]
+    other = fixture.rpc("split", pane=pane)["pane"]
+    for target in (pane, other):
+        wait_for(lambda: "PASSWORD_MODE" in fixture.rpc("read", pane=target)["text"])
+    assert fixture.rpc("links", pane=pane)["frame"].get("cursor_password_input", False)
+    client = Client(fixture, pane)
+    try:
+        for target, visible in ((pane, [pane]), (other, [pane, other])):
+            client.send("subscribe", panes=visible)
+            header = client.until(lambda h, _: h["meta"]["id"] == target and h["frame"])
+            assert header["frame"].get("cursor_password_input", False), header
+        raw.touch()
+        wait_for(lambda: len(list(fixture.path.glob("raw-*"))) == 2)
+        assert not fixture.rpc("links", pane=other)["frame"].get("cursor_password_input", False)
+        header = client.until(lambda h, _: h["meta"]["id"] == other and h["frame"]
+                              and not h["frame"].get("cursor_password_input", False))
+        assert header["rows"] == [], header
+        (fixture.path / "prompt").touch()
+        header = client.until(lambda h, text: h["meta"]["id"] == other and "Password:" in text)
+        assert header["frame"].get("cursor_password_input", False), header
+    finally:
+        client.close()
+
 with scenario("empty and metadata-only updates leave the viewport deadline available"), AppFixture(
         prefix="gmux-frame-deadline-") as fixture:
     worker = fixture.path / "probe.py"

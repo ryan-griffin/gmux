@@ -63,18 +63,18 @@ int main(int argc,char **argv) {
     if (linked) { memcpy(rewrite+n,"\x1b]8;;\x07",6); n+=6; }
     for (int i=0;i<5;i++) {
         if (output) gmux_engine_write(e,(uint8_t *)rewrite,n);
-        assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
+        assert(gmux_engine_snapshot(e,&frame,false,discard_cell,NULL,80*24,flags)>=0);
     }
     calls=lookups=0;
     double start=cpu();
     for (int i=0;i<iterations;i++) {
         if (output) gmux_engine_write(e,(uint8_t *)rewrite,n);
-        assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
+        assert(gmux_engine_snapshot(e,&frame,false,discard_cell,NULL,80*24,flags)>=0);
     }
     double duration=cpu()-start;
     size_t before_clear=retained(e), allocations=calls, uri_lookups=lookups;
     gmux_engine_write(e,(uint8_t *)"\x1b[H\x1b[2Jplain",12);
-    assert(gmux_engine_snapshot(e,&frame,discard_cell,NULL,80*24,flags)>=0);
+    assert(gmux_engine_snapshot(e,&frame,false,discard_cell,NULL,80*24,flags)>=0);
     printf("{\"workload\":\"%s\",\"iterations\":%d,\"cpu_ns_per_snapshot\":%.1f,\"bridge_allocations\":%zu,\"uri_lookups\":%zu,\"link_retained_bytes\":%zu,\"post_clear_bytes\":%zu,\"engine_bytes\":%zu,\"view_bytes\":%zu,\"cell_bytes\":%zu,\"frame_bytes\":%zu}\n",
         workload,iterations,duration*1e9/iterations,allocations,uri_lookups,before_clear,retained(e),sizeof(*e),sizeof(GmuxView),sizeof(GmuxCell),sizeof(GmuxFrame));
     gmux_engine_free(e);
