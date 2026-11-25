@@ -624,6 +624,13 @@ Native restore installs the decoded terminal and compresses history as pages
 load. Restoration runs one pane at a time before the daemon's interactive
 loop starts.
 
+With 32 panes containing short text, batching checkpoint directory syncs took
+median Stop latency from 88.2 ms to 56.0 ms across six release runs per build
+on a local Linux filesystem. Each Stop synced 33 files and two directories,
+including the layout. The per-pane sync path made 33 directory sync calls,
+which took a median of 35.4 ms in total. The batched path spent 2.2 ms in
+directory sync calls.
+
 ## Idle scrollback compression
 
 The daemon starts compressing a pane after its libghostty compression activity

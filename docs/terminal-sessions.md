@@ -124,9 +124,10 @@ reject snapshots older than their last accepted revision.
 Scrollback settings save before the owner publishes and applies the policy.
 A failed save cannot prune history. During shutdown, exiting processes remain
 in restart topology and do not advance its revision. Stop waits for its checkpoint
-write and reports omissions and failures. A failed layout commit gets one final
-attempt before exit. Signal shutdown waits for an outstanding explicit save, then
-checkpoints. The worker drains queued writes before the daemon releases its execution lock.
+write and reports omissions and failures. A failed checkpoint directory or layout
+commit gets one final attempt before exit. Signal shutdown waits for an outstanding
+explicit save, then checkpoints. The worker drains queued writes before the daemon
+releases its execution lock.
 
 A separate client request worker persists workspace definitions and assignments
 together in one atomic write. Slow client disk writes leave the UI free to read
@@ -210,16 +211,17 @@ checkpoints. Export text with `gmux read` before upgrading if you need to keep i
 Limits are 8 MiB per pane, 64 MiB per layout, and 128 panes. The decoder has a
 64 MiB allocation budget per pane and applies the current
 [runtime retention limits](scrollback.md) before loading older history pages.
-Capture streams each pane into the remaining checkpoint budget. The current
+Capture streams each pane into the remaining checkpoint budget. When completed
+Kitty images push a capture over budget, Gmux retries without images. The current
 retention limit can omit older pages during decoding or when the fresh shell
 needs another row.
 A pane that exceeds a checkpoint limit opens with an empty terminal. A crash
 or power loss can lose output since the last orderly shutdown.
 
-The worker syncs checkpoints before publishing the layout that references them.
-Until publication, the previous generation remains available. Stop retries
-checkpoint write failures during final shutdown. Cleanup removes unreferenced
-checkpoints after a successful save. Removing `scrollback/` clears saved
+The worker retries failed pane writes once and syncs the checkpoint files and
+their directory before publishing the layout that references them. Until
+publication, the previous generation remains available. Cleanup removes
+unreferenced checkpoints after a successful save. Removing `scrollback/` clears saved
 terminal contents and state while keeping tabs and pane layout.
 
 ## Frontend transport

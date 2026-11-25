@@ -781,12 +781,16 @@ impl TerminalSession {
         Ok(true)
     }
 
-    pub(crate) fn checkpoint(&self, limit: usize) -> anyhow::Result<PaneCheckpoint> {
-        Ok(PaneCheckpoint {
-            snapshot: self.engine.checkpoint(limit)?,
-            pixel_size: (self.size.pixel_width, self.size.pixel_height),
-            cell_size: self.cell_size,
-        })
+    pub(crate) fn checkpoint(&self, limit: usize) -> anyhow::Result<(PaneCheckpoint, bool)> {
+        let (snapshot, omitted_images) = self.engine.capture_checkpoint(limit)?;
+        Ok((
+            PaneCheckpoint {
+                snapshot,
+                pixel_size: (self.size.pixel_width, self.size.pixel_height),
+                cell_size: self.cell_size,
+            },
+            omitted_images,
+        ))
     }
 
     pub(crate) fn text(&mut self) -> anyhow::Result<String> {

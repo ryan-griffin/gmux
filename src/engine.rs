@@ -789,7 +789,11 @@ impl Engine {
     pub(crate) fn dimensions(&self) -> (u16, u16) {
         self.size
     }
+    #[cfg(test)]
     pub(crate) fn checkpoint(&self, limit: usize) -> anyhow::Result<Vec<u8>> {
+        self.capture_checkpoint(limit).map(|(bytes, _)| bytes)
+    }
+    pub(crate) fn capture_checkpoint(&self, limit: usize) -> anyhow::Result<(Vec<u8>, bool)> {
         struct Output {
             bytes: Vec<u8>,
             limit: usize,
@@ -825,20 +829,37 @@ impl Engine {
             limit: limit.min(MAX_PANE_BYTES),
             over_budget: false,
         };
-        let result = unsafe {
+        let mut has_images = false;
+        let mut result = unsafe {
             gmux_engine_checkpoint(
                 self.raw.as_ptr(),
                 Some(write),
                 (&mut out as *mut Output).cast(),
+                true,
+                &mut has_images,
             )
         };
+        let omitted_images = out.over_budget && has_images;
+        if omitted_images {
+            out.bytes.clear();
+            out.over_budget = false;
+            result = unsafe {
+                gmux_engine_checkpoint(
+                    self.raw.as_ptr(),
+                    Some(write),
+                    (&mut out as *mut Output).cast(),
+                    false,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
         anyhow::ensure!(
             !out.over_budget,
             "Terminal snapshot exceeds checkpoint byte budget"
         );
         anyhow::ensure!(result == 0, "Ghostty snapshot encoding failed ({result})");
         out.bytes.shrink_to_fit();
-        Ok(out.bytes)
+        Ok((out.bytes, omitted_images))
     }
 
     pub(crate) fn restore(
@@ -2510,6 +2531,23 @@ mod tests {
         fresh.events.replies.clear();
         fresh.write(b"\x1b_Ga=p,i=6122,c=1,r=1\x1b\\");
         assert_eq!(fresh.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
+    }
+
+    #[test]
+    fn oversized_image_checkpoint_preserves_text() {
+        let mut old = Engine::new().unwrap();
+        old.write(b"saved text\r\n\x1b_Ga=t,f=32,s=1,v=1,i=6122;BwcH/w==\x1b\\");
+        assert_eq!(old.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
+        let full = old.checkpoint(MAX_PANE_BYTES).unwrap();
+
+        let (checkpoint, omitted_images) = old.capture_checkpoint(full.len() - 1).unwrap();
+        assert!(omitted_images);
+        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+        assert!(fresh.text().unwrap().contains("saved text"));
+        fresh.write(b"\x1b_Ga=p,i=6122,c=1,r=1\x1b\\");
+        assert!(fresh.events.replies.starts_with(b"\x1b_Gi=6122;ENOENT:"));
+
+        assert_eq!(old.checkpoint(MAX_PANE_BYTES).unwrap(), full);
     }
 
     #[test]

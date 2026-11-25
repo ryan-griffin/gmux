@@ -116,8 +116,20 @@ pub fn atomic_write_at(
     write: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
     validate: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    atomic_write_file_at(path, write, validate)?;
+    std::fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    Ok(())
+}
+
+/// Sync and atomically rename a file. The caller must sync the directory
+/// before publishing references to the file.
+pub fn atomic_write_file_at(
+    path: &Path,
+    write: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
+    validate: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     use std::{
-        fs::{File, OpenOptions},
+        fs::OpenOptions,
         io::Write,
         os::unix::fs::OpenOptionsExt,
         sync::atomic::{AtomicU64, Ordering},
@@ -162,7 +174,6 @@ pub fn atomic_write_at(
     // Recheck after writing, too, in case an external editor damaged the file.
     validate()?;
     std::fs::rename(&temp.0, path)?;
-    File::open(parent)?.sync_all()?;
     Ok(())
 }
 

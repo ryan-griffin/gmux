@@ -54,10 +54,14 @@ impl Checkpoint {
     // Called only by the ordered disk worker. Layout publication is the commit
     // point. A crash before it leaves the previous layout and snapshots usable.
     pub(crate) fn write(self) -> anyhow::Result<Option<String>> {
-        storage::with_state_lock("execution.json", |path| self.write_locked(path))
+        storage::with_state_lock("execution.json", |path| self.write_locked(path, write_pane))
     }
 
-    fn write_locked(mut self, path: &Path) -> anyhow::Result<Option<String>> {
+    fn write_locked(
+        mut self,
+        path: &Path,
+        mut write_snapshot: impl FnMut(&Path, u64, &PaneCheckpoint) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<String>> {
         use std::os::unix::fs::DirBuilderExt;
         let directory = path.parent().unwrap().join("scrollback");
         // Reclaim interrupted publications before adding another generation.
@@ -84,38 +88,47 @@ impl Checkpoint {
             }
             Ok(())
         });
-        let mut write_failed = false;
+        let directory_failed = ready.is_err();
         if let Err(error) = ready {
-            write_failed = true;
             self.session.scrollback.clear();
             self.warnings.push(format!("Scrollback directory: {error}"));
             self.panes.clear();
         }
+        let mut failed = Vec::new();
         for (id, pane) in self.panes {
-            let name = &self.session.scrollback[&id];
-            let result = storage::atomic_write_at(
-                &directory.join(name),
-                |writer| {
-                    writer.write_all(&header(id, &pane)?)?;
-                    writer.write_all(&pane.snapshot)?;
-                    Ok(())
-                },
-                || Ok(()),
-            );
-            if let Err(error) = result {
-                write_failed = true;
+            let target = directory.join(&self.session.scrollback[&id]);
+            if write_snapshot(&target, id, &pane).is_err() {
+                failed.push((target, id, pane));
+            }
+        }
+        for (target, id, pane) in failed {
+            if let Err(error) = write_snapshot(&target, id, &pane) {
                 self.session.scrollback.remove(&id);
                 self.warnings.push(format!("Pane {id}: {error}"));
             }
         }
-        // Publish the layout even when some pane writes need a retry.
+        if !self.session.scrollback.is_empty() {
+            std::fs::File::open(&directory)?.sync_all()?;
+        }
         storage::save_locked_at(path, &self.session)?;
         if let Err(error) = prune_at(&self.session, &directory) {
             self.warnings.push(format!("Checkpoint cleanup: {error}"));
         }
-        anyhow::ensure!(!write_failed, "{}", self.warnings.join("; "));
+        anyhow::ensure!(!directory_failed, "{}", self.warnings.join("; "));
         Ok((!self.warnings.is_empty()).then(|| self.warnings.join("; ")))
     }
+}
+
+fn write_pane(path: &Path, id: u64, pane: &PaneCheckpoint) -> anyhow::Result<()> {
+    storage::atomic_write_file_at(
+        path,
+        |writer| {
+            writer.write_all(&header(id, pane)?)?;
+            writer.write_all(&pane.snapshot)?;
+            Ok(())
+        },
+        || Ok(()),
+    )
 }
 
 fn header(id: u64, pane: &PaneCheckpoint) -> anyhow::Result<[u8; HEADER]> {
@@ -328,7 +341,8 @@ mod tests {
                             vec![],
                         )
                         .unwrap();
-                        storage::with_lock_at(path, || checkpoint.write_locked(path)).unwrap();
+                        storage::with_lock_at(path, || checkpoint.write_locked(path, write_pane))
+                            .unwrap();
                         storage::with_lock_at(path, || {
                             let committed: SavedExecution = storage::load_at(path)?;
                             prune_at(&committed, cache)?;
@@ -348,7 +362,9 @@ mod tests {
         std::fs::write(&path, b"{damaged layout").unwrap();
         let checkpoint =
             Checkpoint::new(saved_pane(), vec![(2, test_checkpoint(vec![]))], vec![]).unwrap();
-        assert!(storage::with_lock_at(&path, || checkpoint.write_locked(&path)).is_err());
+        assert!(
+            storage::with_lock_at(&path, || checkpoint.write_locked(&path, write_pane)).is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"{damaged layout");
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         std::fs::remove_dir_all(directory).unwrap();
@@ -369,17 +385,65 @@ mod tests {
             .unwrap()
         };
 
-        assert!(storage::with_lock_at(&path, || checkpoint().write_locked(&path)).is_err());
+        assert!(
+            storage::with_lock_at(&path, || checkpoint().write_locked(&path, write_pane)).is_err()
+        );
         let saved: SavedExecution = storage::load_at(&path).unwrap();
         assert_eq!(saved.tabs[0].layout.ids(), [2]);
         assert!(saved.scrollback.is_empty());
 
         std::fs::remove_file(&cache).unwrap();
-        storage::with_lock_at(&path, || checkpoint().write_locked(&path)).unwrap();
+        storage::with_lock_at(&path, || checkpoint().write_locked(&path, write_pane)).unwrap();
         let saved: SavedExecution = storage::load_at(&path).unwrap();
         let name = &saved.scrollback[&2];
         let pane = load_at(2, name, &cache.join(name), MAX_PANE_BYTES).unwrap();
         assert_eq!(pane.snapshot, b"payload");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_retries_only_failed_panes_and_publishes_successes() {
+        let directory = test_directory();
+        let path = directory.join("execution.json");
+        let cache = directory.join("scrollback");
+        let mut session = saved_pane();
+        for id in [3, 4] {
+            session.tabs.push(ExecutionTab {
+                id: id + 10,
+                layout: PaneTree::Pane(id),
+                ..session.tabs[0].clone()
+            });
+        }
+        let checkpoint = Checkpoint::new(
+            session,
+            [2, 3, 4]
+                .into_iter()
+                .map(|id| (id, test_checkpoint(vec![id as u8])))
+                .collect(),
+            vec![],
+        )
+        .unwrap();
+        let mut attempts = Vec::new();
+        let warning = storage::with_lock_at(&path, || {
+            checkpoint.write_locked(&path, |target, id, pane| {
+                let retry = attempts.contains(&id);
+                attempts.push(id);
+                if id == 4 || (id == 3 && !retry) {
+                    anyhow::bail!("write failed");
+                }
+                write_pane(target, id, pane)
+            })
+        })
+        .unwrap();
+        assert_eq!(attempts, [2, 3, 4, 3, 4]);
+        assert_eq!(warning.as_deref(), Some("Pane 4: write failed"));
+        let saved: SavedExecution = storage::load_at(&path).unwrap();
+        assert_eq!(saved.scrollback.len(), 2);
+        for id in [2, 3] {
+            let name = &saved.scrollback[&id];
+            let pane = load_at(id, name, &cache.join(name), MAX_PANE_BYTES).unwrap();
+            assert_eq!(pane.snapshot, [id as u8]);
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 

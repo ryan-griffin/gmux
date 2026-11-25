@@ -52,7 +52,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
              .kitty_image_storage_limit = if (decoder.kitty_image_storage_limit) |limit|
                  std.math.cast(usize, limit) orelse std.math.maxInt(usize)
              else
-@@ -711,6 +717,28 @@
+@@ -711,6 +717,43 @@
      if (continuation.result != .success) return continuation.result;
      defer native.gpa().free(continuation.bytes);
 
@@ -63,13 +63,28 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 +pub fn encode_state(
 +    terminal: terminal_c.Terminal,
 +    writer: io_c.Writer,
++    include_images: bool,
++    has_images: ?*bool,
 +) callconv(lib.calling_conv) Result {
 +    if (comptime !lib.feature(.snapshot)) return .unsupported;
 +    const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
 +    if (writer.write == null) return .invalid_value;
++    if (has_images) |found| {
++        found.* = false;
++        if (comptime build_options.kitty_graphics) {
++            var screens = native.screens.all.iterator();
++            while (screens.next()) |entry| {
++                if (entry.value.*.kitty_images.images.count() != 0) {
++                    found.* = true;
++                    break;
++                }
++            }
++        }
++    }
 +    return encodeToWriter(native, writer, .{
 +        .continuation = .ground,
 +        .retain_loading_image = false,
++        .include_kitty_images = include_images,
 +    });
 +}
 +
@@ -81,7 +96,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
      // Stream the snapshot through the callback adapter, batching the
      // encoder's writes into few callback invocations.
      var buffer: [io_c.WriterAdapter.recommended_buffer_len]u8 = undefined;
-@@ -719,10 +747,84 @@
+@@ -719,10 +762,84 @@
          native.gpa(),
          &adapter.interface,
          native,
@@ -206,11 +221,13 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 
    GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
  } GhosttySnapshotDecoderOption;
-@@ -419,6 +427,18 @@
+@@ -419,6 +427,22 @@
                                                    GhosttyWriter writer);
 
  /**
 + * Stream committed terminal state without parser or image transfer continuation.
++ * Completed images are optional. If non-null, has_images reports whether
++ * either screen contains completed images, even if the writer rejects data.
 + *
 + * Uses the same synchronous writer contract as ghostty_snapshot_encode().
 + * A rejecting writer stops encoding immediately.
@@ -219,13 +236,15 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 + */
 +GHOSTTY_API GhosttyResult ghostty_snapshot_encode_state(
 +    GhosttyTerminal terminal,
-+    GhosttyWriter writer);
++    GhosttyWriter writer,
++    bool include_images,
++    bool* has_images);
 +
 +/**
   * Encode a complete terminal snapshot to a caller-provided buffer.
   *
   * Pass NULL for buf with buf_len zero to query the required size. If the
-@@ -472,6 +492,14 @@
+@@ -472,6 +496,14 @@
      const GhosttyAllocator* allocator,
      uint8_t** out_ptr,
      size_t* out_len);
@@ -448,15 +467,25 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
      );
 --- a/src/terminal/snapshot/snapshot.zig
 +++ b/src/terminal/snapshot/snapshot.zig
-@@ -35,6 +35,7 @@
+@@ -35,6 +35,8 @@
 
  pub const EncodeOptions = struct {
      continuation: Continuation,
 +    retain_loading_image: bool = true,
++    include_kitty_images: bool = true,
  };
 
  /// Encode one complete terminal snapshot.
-@@ -74,6 +75,7 @@
+@@ -69,7 +71,7 @@
+             if (plan.*) |*p| p.deinit();
+         }
+     };
+-    if (comptime build_options.kitty_graphics) {
++    if (build_options.kitty_graphics and options.include_kitty_images) {
+         for (std.enums.values(TerminalScreenKey)) |key| {
+             const s = t.screens.get(key) orelse continue;
+             kitty_plans.set(key, try kitty.ScreenPlan.init(
+@@ -74,6 +76,7 @@
                  alloc,
                  s,
                  key,
@@ -464,7 +493,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
              ));
          }
      }
-@@ -185,6 +187,7 @@
+@@ -185,6 +188,7 @@
      /// The snapshot format is unchanged, so this works with any snapshot.
      /// It has no effect on platforms that do not support compression.
      compress_history: bool = false,
@@ -472,7 +501,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 
      /// The Kitty graphics image storage limit, in bytes, for each restored
      /// screen, or null for the default limit of a new screen.
-@@ -487,12 +490,13 @@
+@@ -487,12 +491,13 @@
          for (0..screen_count) |_| {
              // Decode the screen and move it into the slot for its key.
              const key = key: {
@@ -487,7 +516,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
                  );
                  errdefer decoded.deinit();
 
-@@ -568,7 +572,10 @@
+@@ -568,7 +573,10 @@
              .pending = screen_count,
              .current = null,
              .cols = result.cols,
