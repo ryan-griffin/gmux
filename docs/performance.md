@@ -595,6 +595,35 @@ Neither detached daemon woke its main thread during the final 5.5-second idle
 observation. Byte zero erased remaining history while preserving active-page
 allocations, so native page bytes did not fall further in that step.
 
+## Checkpoint restart
+
+A Linux x86-64 release-build comparison on an Intel i7-13700H used 12 samples
+per build and workload. The [history fixture](../scripts/history_test_support.py)
+generated indexed colors, Unicode, and OSC 8 links across four panes. The
+6,500-line workload produced 13.7 MiB of snapshots. The 25,000-line workload
+hit the default retention budget and produced 21.4 MiB.
+
+Startup ran from launching `gmux serve` to the first successful control
+handshake. Both builds read identical Ghostty payloads with their respective Gmux
+headers. Stop ran from the control request to the durable reply after generating
+the same live history on each build. Peak RSS came from `/proc/<pid>/status` at
+each endpoint.
+
+| Generated lines per pane | Checkpoint path | Median Stop | Median startup | Median peak RSS at Stop | Median peak RSS at startup | Rows per pane after restart |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 6,500 | Two-pass capture and history replay | 77.2 ms | 154.0 ms | 45.0 MiB | 32.9 MiB | 6,502 |
+| 6,500 | Streaming capture and native restore | 57.0 ms | 117.6 ms | 45.5 MiB | 15.3 MiB | 6,502 |
+| 25,000 | Two-pass capture and history replay | 101.7 ms | 182.4 ms | 65.2 MiB | 40.0 MiB | 7,812 |
+| 25,000 | Streaming capture and native restore | 71.6 ms | 170.8 ms | 66.1 MiB | 19.4 MiB | 10,104 |
+
+The 25,000-line workload had 10,103 saved rows per pane. Sizing the decoded
+hyperlink tables preserved all of them within the same retention limit, and
+the new shell added one row.
+
+Native restore installs the decoded terminal and compresses history as pages
+load. Restoration runs one pane at a time before the daemon's interactive
+loop starts.
+
 ## Idle scrollback compression
 
 The daemon starts compressing a pane after its libghostty compression activity

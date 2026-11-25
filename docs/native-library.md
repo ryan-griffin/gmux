@@ -31,7 +31,8 @@ functional codes still absent in the release. It changes no public headers or
 ABI. The [clipboard-read patch](../scripts/patches/ghostty-clipboard-reads.patch)
 adds owned deferred requests for asynchronous desktop access. The
 [snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) adds
-checkpoint encoding that omits unfinished parser input. The
+streaming checkpoint encoding without parser or image transfer continuation,
+a fresh-shell handoff, and filtering of control characters in decoded text cells. The
 [glyph patch](../scripts/patches/ghostty-glyphs.patch) exposes pane-local outlines
 and updates Glyph Protocol placement and responses. An external `GHOSTTY_PREFIX`
 must provide this exact revision with the integration patches.
@@ -45,15 +46,17 @@ own release cycle, independent of the Ghostty desktop app.
 
 [Saved checkpoints](terminal-sessions.md#scrollback-checkpoints) require the exact
 source revision. Upstream versions snapshot bytes separately from its C ABI and
-may change them in any release. History from another pin is rejected with a
-warning. Layout, directories, and retention settings still restore. Export
-needed text with `gmux read` before restarting the old daemon. No snapshot
-migration or cross-revision decoding is provided. The current formatter's
-hyperlinks are discarded and its blank-cell operations become bounded spaces
-before replay. Only validated UTF-8, CRLF, and whitelisted SGR reach the fresh
-terminal. Text/SGR-only history reuses the formatted buffer. Content that needs
-normalization uses at most another 8 MiB of temporary output per pane. The 8 MiB
-formatted-input/replay and 64 MiB decoder limits remain in force.
+may change them in any release. Checkpoints from another pin are rejected with
+a warning. Export needed text with `gmux read` before replacing the old daemon.
+
+The decoder restores both native screen buffers directly. Gmux accepts only
+empty parser continuations, applies current retention limits before prepending
+older pages, and compresses history as it loads. For buffered pages, Gmux
+sizes hyperlink storage from the entries and cell references present
+in the snapshot. A pane is installed only after the decoder validates the final
+record and consumes the entire payload. The allocator is bounded during decoding
+and remains valid for the restored terminal's lifetime. The bridge installs
+fresh host callbacks and Rust sizes the viewport from the validated grid.
 
 ## Grapheme storage
 
@@ -93,7 +96,7 @@ follows Gmux's daemon-owned terminal and separate GTK/GSK frontend.
 | [w9q4-5jvv-mcv4](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-w9q4-5jvv-mcv4), cursor-page corruption during clear | Applies to native terminal output with small scrollback limits. The release migrates cursor style and hyperlink ownership before pruning. |
 | [qjfx-r533-6vx3](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-qjfx-r533-6vx3), one-row line-limit use-after-free | Applies because Gmux supports line limits and one-row terminals. The release rebuilds cursor state after pruning. |
 | [2r63-vmw6-3m3c](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-2r63-vmw6-3m3c), shell directory escape injection | Applies to the vendored Bash/Zsh scripts. Release scripts strip control characters from directory and hostname reports; Zsh prints backslashes literally. |
-| [jqr7-69mm-v35h](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-jqr7-69mm-v35h), narrowing very wide pages | The native decoder and resize fix is included. Gmux already bounds live grids to 1,000 cells per axis and validates snapshot dimensions before replay. |
+| [jqr7-69mm-v35h](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-jqr7-69mm-v35h), narrowing very wide pages | The native decoder and resize fix is included. Gmux already bounds live grids to 1,000 cells per axis and validates decoded dimensions before installing the terminal. |
 | [3r5j-c6rj-xq2v](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-3r5j-c6rj-xq2v), Kitty clipboard alias growth | Relevant when Gmux enables its clipboard-write callback for attached clients. Native Kitty transactions now have bounded alias storage; Gmux separately bounds its supported text, HTML, PNG, and clear offers. |
 | [mhff-mv4q-fp63](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-mhff-mv4q-fp63), Kitty graphics validation | Native parsing fixes are included. Gmux uses the library's direct-data loading defaults and does not enable file, temporary-file, or shared-memory loading. Its GTK renderer does not draw Kitty images. |
 | [4hwh-wx3w-3fqg](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-4hwh-wx3w-3fqg), carriage-return paste checks | The native safety predicate is fixed. Gmux's explicit paste/send path allows unsafe text intentionally and has no Ghostty paste-confirmation UI, so this update does not add a confirmation policy. |

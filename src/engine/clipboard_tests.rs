@@ -28,9 +28,8 @@ fn fragmented_clipboard_writes_own_unicode_and_preserve_destinations_and_clear()
     assert!(engine.take_events().0.is_empty());
     engine.snapshot().unwrap();
     assert!(engine.text().unwrap().contains("after"));
-    let checkpoint = engine.checkpoint().unwrap();
-    let mut restored = Engine::new().unwrap();
-    restored.restore_history(&checkpoint).unwrap();
+    let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+    let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
     assert!(restored.take_clipboard_writes().is_empty());
     engine.set_clipboard_enabled(false);
     engine.write(b"\x1b]52;c;dGV4dA==\x07");
@@ -420,18 +419,18 @@ fn checkpoints_exclude_partial_requests_pending_data_and_paste_grants() {
     let mut engine = Engine::new().unwrap();
     engine.set_read_enabled(true);
     engine.write(b"saved history\r\n\x1b[?5522h");
-    let before = engine.checkpoint().unwrap();
+    let before = engine.checkpoint(MAX_PANE_BYTES).unwrap();
     let paste = engine
         .user_paste(Destination::Clipboard, &["text/plain".into()])
         .unwrap();
     assert!(!paste.is_empty());
-    assert_eq!(engine.checkpoint().unwrap(), before);
+    assert_eq!(engine.checkpoint(MAX_PANE_BYTES).unwrap(), before);
 
     engine.feed(b"\x1b]5522;type=read:name=cHJvZ3JhbQ==:pw=cHJpdmF0ZS1wYXNzd29yZA==");
-    assert_eq!(engine.checkpoint().unwrap(), before);
+    assert_eq!(engine.checkpoint(MAX_PANE_BYTES).unwrap(), before);
     engine.feed(b";dGV4dC9wbGFpbg==\x1b\\");
     let request = engine.take_read_request().unwrap();
-    assert_eq!(engine.checkpoint().unwrap(), before);
+    assert_eq!(engine.checkpoint(MAX_PANE_BYTES).unwrap(), before);
     let data = b"private clipboard contents";
     engine
         .complete_read(
@@ -448,18 +447,18 @@ fn checkpoints_exclude_partial_requests_pending_data_and_paste_grants() {
             data,
         )
         .unwrap();
-    let snapshot = engine.checkpoint().unwrap();
+    let snapshot = engine.checkpoint(MAX_PANE_BYTES).unwrap();
     assert_eq!(snapshot, before);
     // Checkpointing must leave the live owned reply and parser untouched.
     assert!(!engine.step_read().unwrap().1.is_empty());
     engine.feed(b"\\after");
     assert!(engine.text().unwrap().contains("after"));
 
-    let mut fresh = Engine::new().unwrap();
-    fresh.restore_history(&snapshot).unwrap();
+    let mut fresh = Engine::restore(&snapshot, Default::default()).unwrap();
     assert_eq!(fresh.read_pending(), 0);
     assert!(fresh.take_read_request().is_none());
     assert!(fresh.take_events().0.is_empty());
+    fresh.prepare_shell((0, 0)).unwrap();
     assert!(!fresh.mode(5522));
     fresh.write(b"fresh shell");
     let text = fresh.text().unwrap();

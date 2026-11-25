@@ -146,8 +146,6 @@ struct GmuxEngine {
     uint32_t cell_width, cell_height;
     bool dark;
     bool held;
-    bool status_sequence;
-    bool status_escape;
     bool status_reported;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
     OutputAnchor output_anchor;
@@ -721,15 +719,18 @@ void gmux_engine_free(GmuxEngine *e) {
     links_scratch_free(&e->link_scratch);
     free(e);
 }
-GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
+static GmuxEngine *engine_new(GhosttyTerminal terminal, void *ud, GmuxEventFn cb) {
     GmuxEngine *e = calloc(1, sizeof(*e));
-    if (!e) return NULL;
+    if (!e) {
+        ghostty_terminal_free(terminal);
+        return NULL;
+    }
+    e->terminal = terminal;
     e->userdata = ud;
     e->callback = cb;
     e->text_generation = 1;
     e->applied.cursor_style = UINT8_MAX;
-    if (ghostty_terminal_new(NULL, &e->terminal, 80, 24) ||
-        ghostty_render_state_new(NULL, &e->render) ||
+    if (ghostty_render_state_new(NULL, &e->render) ||
         ghostty_render_state_row_iterator_new(NULL, &e->iterator) ||
         ghostty_render_state_row_cells_new(NULL, &e->cells) ||
         ghostty_key_encoder_new(NULL, &e->encoder) ||
@@ -766,6 +767,21 @@ GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES,
         &clipboard_max)) { gmux_engine_free(e); return NULL; }
     return e;
+}
+
+GmuxEngine *gmux_engine_new(void *ud, GmuxEventFn cb) {
+    GhosttyTerminal terminal = NULL;
+    if (ghostty_terminal_new(NULL, &terminal, 80, 24)) return NULL;
+    return engine_new(terminal, ud, cb);
+}
+
+static int terminal_retention(GhosttyTerminal terminal, const GmuxRetentionLimits *limits) {
+    // SIZE_MAX is unlimited; NULL restores the library defaults.
+    const size_t max_bytes = limits->max_bytes.unlimited ? SIZE_MAX : limits->max_bytes.value;
+    const size_t max_lines = limits->max_lines.unlimited ? SIZE_MAX : limits->max_lines.value;
+    int result = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &max_bytes);
+    if (!result) result = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &max_lines);
+    return result;
 }
 
 static bool retention_in_history(GhosttyTrackedGridRef ref) {
@@ -806,13 +822,7 @@ int gmux_engine_retention(GmuxEngine *e, const GmuxRetentionLimits *limits) {
             swap_view(e, v);
         }
     }
-    // The pinned setters only set limits and prune. They allocate nothing and
-    // cannot fail for these valid options and an owned terminal.
-    // In 1.0, NULL restores the library default rather than removing a limit.
-    const size_t max_bytes = limits->max_bytes.unlimited ? SIZE_MAX : limits->max_bytes.value;
-    const size_t max_lines = limits->max_lines.unlimited ? SIZE_MAX : limits->max_lines.value;
-    int result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &max_bytes);
-    if (!result) result = ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &max_lines);
+    int result = terminal_retention(e->terminal, limits);
     // Pruning is terminal activity even without a VT write. Retain tracked
     // references so surviving selections and each view's viewport stay put.
     e->text_generation++;
@@ -862,48 +872,85 @@ int gmux_engine_compress(GmuxEngine *e, int *out) {
 }
 
 // Serialized terminal state, distinct from gmux_engine_snapshot's viewport.
-int gmux_engine_checkpoint(GmuxEngine *e, uint8_t *out, size_t cap, size_t *written) {
-    // Restoring history never resumes parser input. Exclude unfinished OSCs,
-    // which can contain clipboard data or program-supplied passwords.
-    GhosttyResult result = ghostty_snapshot_encode_buf_state(e->terminal, out, cap, written);
-    return result == GHOSTTY_OUT_OF_SPACE ? 1 : (result == GHOSTTY_SUCCESS ? 0 : -1);
+int gmux_engine_checkpoint(GmuxEngine *e, GmuxWriterFn write, void *userdata) {
+    GhosttyWriter writer = {.write = write, .userdata = userdata};
+    return ghostty_snapshot_encode_state(e->terminal, writer);
 }
 
-// A file-size bound alone cannot bound allocations declared by a damaged file.
-// This allocator lives until the temporary decoded terminal and formatter die.
-typedef struct { size_t used, limit; } SnapshotBudget;
+// Zig retains the allocator descriptor on the terminal and its tracked refs.
+// Charge allocations only during the synchronous decode, without lending
+// the live terminal any pointer to the current restore's stack.
+static _Thread_local size_t *snapshot_usage;
+static const size_t snapshot_limit = 64 * 1024 * 1024;
+
 static void *snapshot_alloc(void *ctx, size_t len, uint8_t alignment, uintptr_t ra) {
-    (void)ra;
-    SnapshotBudget *budget = ctx;
-    if (len > budget->limit - budget->used) return NULL;
-    // The pinned Zig adapter passes log2 alignment, including aligned pages.
+    (void)ctx; (void)ra;
+    if (snapshot_usage && len > snapshot_limit - *snapshot_usage) return NULL;
     if (alignment >= sizeof(size_t) * 8) return NULL;
-    size_t bytes_alignment = (size_t)1 << alignment;
-    if (bytes_alignment < sizeof(void *)) bytes_alignment = sizeof(void *);
+    size_t align = (size_t)1 << alignment;
     void *ptr = NULL;
-    if (posix_memalign(&ptr, bytes_alignment, len)) return NULL;
-    if (ptr) budget->used += len;
+    if (align <= _Alignof(max_align_t)) ptr = malloc(len);
+    else if (posix_memalign(&ptr, align, len)) return NULL;
+    if (ptr && snapshot_usage) *snapshot_usage += len;
     return ptr;
 }
-static bool snapshot_resize(void *ctx, void *ptr, size_t len, uint8_t alignment,
-    size_t new_len, uintptr_t ra) {
-    (void)ctx; (void)ptr; (void)len; (void)alignment; (void)new_len; (void)ra;
-    return false;
-}
-static void *snapshot_remap(void *ctx, void *ptr, size_t len, uint8_t alignment,
-    size_t new_len, uintptr_t ra) {
-    (void)ctx; (void)ptr; (void)len; (void)alignment; (void)new_len; (void)ra;
-    return NULL;
-}
 static void snapshot_free(void *ctx, void *ptr, size_t len, uint8_t alignment, uintptr_t ra) {
-    (void)alignment; (void)ra;
-    ((SnapshotBudget *)ctx)->used -= len;
+    (void)ctx; (void)alignment; (void)ra;
+    if (snapshot_usage) *snapshot_usage -= len;
     free(ptr);
 }
 static const GhosttyAllocatorVtable snapshot_vtable = {
-    .alloc = snapshot_alloc, .resize = snapshot_resize,
-    .remap = snapshot_remap, .free = snapshot_free,
+    .alloc = snapshot_alloc, .free = snapshot_free,
 };
+static const GhosttyAllocator snapshot_allocator = {.vtable = &snapshot_vtable};
+
+int gmux_engine_restore(const uint8_t *data, size_t len, const GmuxRetentionLimits *limits,
+    void *userdata, GmuxEventFn callback, GmuxEngine **out, uint16_t *cols, uint16_t *rows) {
+    GhosttySnapshotDecoder decoder = NULL;
+    GhosttyTerminal terminal = NULL;
+    const bool enabled = true;
+    const size_t continuation_max = 0;
+    size_t used = 0, consumed = 0;
+    snapshot_usage = &used;
+    int result = ghostty_snapshot_decoder_new_buf(&snapshot_allocator, &decoder, data, len);
+    if (!result) result = ghostty_snapshot_decoder_set(decoder,
+        GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES, &continuation_max);
+    if (!result) result = ghostty_snapshot_decoder_set(decoder,
+        GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY, &enabled);
+    if (!result) result = ghostty_snapshot_decoder_set(decoder,
+        GHOSTTY_SNAPSHOT_DECODER_OPT_FIT_HYPERLINKS, &enabled);
+    if (!result) result = ghostty_snapshot_decoder_ready(decoder, &terminal);
+    if (!result) result = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLS, cols);
+    if (!result) result = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ROWS, rows);
+    if (!result && (!*cols || !*rows || *cols > GMUX_MAX_GRID_AXIS || *rows > GMUX_MAX_GRID_AXIS ||
+        (size_t)*cols * *rows > GMUX_MAX_GRID_CELLS)) result = GHOSTTY_INVALID_VALUE;
+    // Apply the current policy before older pages are prepended, in newest-first order.
+    if (!result) result = terminal_retention(terminal, limits);
+    if (!result) {
+        do {
+            result = ghostty_snapshot_decoder_next(decoder);
+        } while (result == GHOSTTY_SUCCESS);
+        if (result == GHOSTTY_NO_VALUE) result = ghostty_snapshot_decoder_get(decoder,
+            GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET, &consumed);
+        if (!result && consumed != len) result = GHOSTTY_INVALID_VALUE;
+    }
+    ghostty_snapshot_decoder_free(decoder);
+    snapshot_usage = NULL;
+    if (result) {
+        ghostty_terminal_free(terminal);
+        return result;
+    }
+    *out = engine_new(terminal, userdata, callback);
+    return *out ? GHOSTTY_SUCCESS : GHOSTTY_OUT_OF_MEMORY;
+}
+
+int gmux_engine_prepare_shell(GmuxEngine *e, uint32_t cw, uint32_t ch) {
+    int result = ghostty_snapshot_prepare_shell(e->terminal);
+    if (result) return result;
+    e->cell_width = cw;
+    e->cell_height = ch;
+    return 0;
+}
 
 static int formatter_new(const GhosttyAllocator *allocator, GhosttyTerminal terminal,
     GhosttyFormatterFormat emit, bool unwrap, bool trim, GhosttyFormatter *out) {
@@ -927,58 +974,6 @@ static int format_terminal_range(GhosttyFormatter formatter,
     return ghostty_formatter_format(formatter, writer) == GHOSTTY_SUCCESS ? 0 : -1;
 }
 
-// Keep stream-boundary details inside the native bridge. Only insert host
-// operations once both the VT parser and UTF-8 decoder have returned to ground.
-static GhosttyResult write_until_ground(GhosttyTerminal terminal,
-    const uint8_t *data, size_t len, size_t *consumed) {
-    GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
-    GhosttyResult result = ghostty_terminal_vt_write_until(terminal, data, len,
-        GHOSTTY_TERMINAL_BOUNDARY_GROUND, &stop);
-    *consumed = stop.consumed;
-    return result;
-}
-
-// Decode into a temporary terminal. Export only primary-screen rendition so the
-// new engine never inherits modes, metadata, graphics, or parser continuation.
-int gmux_checkpoint_history(const uint8_t *data, size_t len, GmuxWriterFn write,
-    void *userdata, uint16_t *cols, uint16_t *rows) {
-    SnapshotBudget budget = {.limit = 64 * 1024 * 1024};
-    GhosttyAllocator allocator = {.ctx = &budget, .vtable = &snapshot_vtable};
-    GhosttySnapshotDecoder decoder = NULL;
-    GhosttyTerminal terminal = NULL;
-    GhosttyFormatter formatter = NULL;
-    size_t continuation_max = 64 * 1024, consumed = 0;
-    int result = -1;
-    if (ghostty_snapshot_decoder_new_buf(&allocator, &decoder, data, len) ||
-        ghostty_snapshot_decoder_set(decoder, GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES,
-            &continuation_max) ||
-        ghostty_snapshot_decoder_decode(decoder, &terminal) ||
-        ghostty_snapshot_decoder_get(decoder, GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET, &consumed) ||
-        consumed != len ||
-        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLS, cols) ||
-        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ROWS, rows)) goto done;
-    // Never replay a full-screen program into the new shell's primary screen.
-    // terminal_set(MODE) changes flags without running screen-switch effects.
-    // Cancel continuation on this disposable terminal before sending DECRST.
-    const uint8_t cancel[] = {0x18, 0x1b, '\\'};
-    size_t cancelled = 0;
-    if (write_until_ground(terminal, cancel, sizeof(cancel), &cancelled)) goto done;
-    const char primary[] = "\x1b[?1049l\x1b[?1047l\x1b[?47l";
-    ghostty_terminal_vt_write(terminal, (const uint8_t *)primary, sizeof(primary) - 1);
-    // Keep every extra disabled, including palette and cursor style. The pinned
-    // formatter emits indexed SGR references and RGB. Rust normalizes per-cell
-    // OSC 8 and blank-cell controls before validating text/SGR-only replay.
-    // Indexed/default colors therefore use the new terminal's current theme.
-    GhosttyWriter writer = {.write = write, .userdata = userdata};
-    if (formatter_new(&allocator, terminal, GHOSTTY_FORMATTER_FORMAT_VT,
-        true, true, &formatter)) goto done;
-    result = format_terminal_range(formatter, NULL, writer);
-done:
-    ghostty_formatter_free(formatter);
-    ghostty_snapshot_decoder_free(decoder);
-    ghostty_terminal_free(terminal);
-    return result;
-}
 int gmux_engine_theme(GmuxEngine *e, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *ansi, bool dark) {
     Appearance appearance=e->appearance;
@@ -987,10 +982,10 @@ int gmux_engine_theme(GmuxEngine *e, const uint8_t *background,
     memcpy(appearance.cursor, cursor, 3);
     memcpy(appearance.ansi, ansi, sizeof(appearance.ansi));
     appearance.dark=dark;
+    bool changed = e->applied.cursor_style != UINT8_MAX && e->dark != dark;
     int result=apply_appearance(e, &appearance);
     if (result) return result;
     e->appearance=appearance;
-    bool changed = e->dark != dark;
     e->dark = dark;
     GhosttyTerminalModeConfig mode = {.mode = ghostty_mode_new(2031, false)};
     if (changed && !ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_MODE, &mode) && mode.value) {
@@ -1034,74 +1029,6 @@ int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
     if ((result = gmux_engine_cursor_style(e, v->appearance.cursor_style))) return result;
     return gmux_engine_cursor_blink(e, v->appearance.cursor_blink);
 }
-bool gmux_engine_write(GmuxEngine *e, const uint8_t *data, size_t len) {
-    bool changed = false;
-    if (e->clear_pending) {
-        size_t consumed = 0;
-        if (write_until_ground(e->terminal, data, len, &consumed)) return true;
-        gmux_engine_clear_screen(e);
-        e->status_sequence = false;
-        e->status_escape = false;
-        changed = true;
-        data += consumed;
-        len -= consumed;
-    }
-    // Let the upstream stream find sequence boundaries. A chunk containing only
-    // status callbacks cannot change cells, selection, history or search. No
-    // OSC body is parsed here, and mixed output takes the ordinary path.
-    if (e->status_escape && len) {
-        e->status_escape = false;
-        if (data[0] == ']') {
-            ghostty_terminal_vt_write(e->terminal, data, 1);
-            data++; len--;
-            e->status_sequence = true;
-            e->status_reported = false;
-        } else {
-            ghostty_terminal_vt_write(e->terminal, data, len);
-            changed = true;
-            len = 0;
-        }
-    }
-    while (len) {
-        if (!e->status_sequence) {
-            bool ground = false;
-            if (data[0] != 0x1b || (len >= 2 && data[1] != ']') ||
-                ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) || !ground) {
-                ghostty_terminal_vt_write(e->terminal, data, len);
-                changed = true;
-                break;
-            }
-            if (len == 1) {
-                // A read can split even the OSC introducer. ESC alone has no
-                // grid effect; let the next byte decide which path to take.
-                ghostty_terminal_vt_write(e->terminal, data, 1);
-                e->status_escape = true;
-                break;
-            }
-            ghostty_terminal_vt_write(e->terminal, data, 2);
-            data += 2; len -= 2;
-            e->status_sequence = true;
-            e->status_reported = false;
-        }
-        size_t consumed = 0;
-        GhosttyResult result = write_until_ground(e->terminal, data, len, &consumed);
-        if (result == GHOSTTY_NO_VALUE) break;
-        if (result != GHOSTTY_SUCCESS) {
-            changed = true;
-            e->status_sequence = false;
-            break;
-        }
-        data += consumed; len -= consumed;
-        // SUCCESS already guarantees ground, including the terminating byte.
-        changed |= !e->status_reported;
-        e->status_sequence = false;
-    }
-    if (changed) {
-        e->text_generation++;
-        if (e->prompt_count || e->output.point || e->completed_output.point) shell_prune(e);
-    }
-    return changed;
-}
 bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *consumed) {
     *consumed = 0;
     if (e->read_id) return false;
@@ -1124,7 +1051,7 @@ bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *co
         e->feed_escape = false;
         bool was_ground = false;
         ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &was_ground);
-        if (e->clear_pending && was_ground) gmux_engine_clear_screen(e);
+        if (e->clear_pending && was_ground) changed |= gmux_engine_clear_screen(e) == 0;
         GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
         uint32_t boundaries = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
         if (e->clear_pending && !was_ground) boundaries |= GHOSTTY_TERMINAL_BOUNDARY_GROUND;
@@ -1150,7 +1077,7 @@ bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *co
     if (e->clear_pending && !e->read_id) {
         bool ground = false;
         ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground);
-        if (ground) gmux_engine_clear_screen(e);
+        if (ground) changed |= gmux_engine_clear_screen(e) == 0;
     }
     if (changed) {
         e->text_generation++;
@@ -1171,6 +1098,7 @@ int gmux_engine_clear_screen(GmuxEngine *e) {
         e->clear_pending = true;
         return 0;
     }
+    e->feed_osc = e->feed_escape = e->feed_st = false;
     GhosttyTerminalModeConfig hold = {.mode = GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, .value = false};
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_MODE, &hold);
     end_render_hold(e);

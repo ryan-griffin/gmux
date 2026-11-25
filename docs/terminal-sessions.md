@@ -124,9 +124,9 @@ reject snapshots older than their last accepted revision.
 Scrollback settings save before the owner publishes and applies the policy.
 A failed save cannot prune history. During shutdown, exiting processes remain
 in restart topology and do not advance its revision. Stop waits for its checkpoint
-write and reports failures; a failed checkpoint gets one final attempt before
-exit. Signal shutdown waits for an outstanding explicit save, then checkpoints.
-The worker drains queued writes before the daemon releases its execution lock.
+write and reports omissions and failures. A failed layout commit gets one final
+attempt before exit. Signal shutdown waits for an outstanding explicit save, then
+checkpoints. The worker drains queued writes before the daemon releases its execution lock.
 
 A separate client request worker persists workspace definitions and assignments
 together in one atomic write. Slow client disk writes leave the UI free to read
@@ -150,7 +150,7 @@ State lives under `$XDG_CONFIG_HOME/gmux/`, normally `~/.config/gmux/`:
 - `connections.json`: client-owned local alias, remote names, addresses,
   authentication file paths, and pinned identities.
 - `remote-access.json`: daemon-owned TCP listener settings.
-- `scrollback/`: daemon-owned history checkpoints.
+- `scrollback/`: daemon-owned terminal checkpoints.
 - `daemon.log`: startup and runtime errors.
 
 Missing state files use defaults. Invalid or unreadable JSON produces an error
@@ -177,34 +177,50 @@ Build and install the frontend and daemon from the same revision.
 
 ## Scrollback checkpoints
 
-[Runtime retention limits](scrollback.md) apply before restored text enters a
-fresh terminal. They do not change the checkpoint safety budgets below.
+Quit, `gmux stop`, and orderly signal shutdown save each pane's native terminal
+state. A restart opens new login shells in the saved directories, with new PTYs
+sized to the saved grids and pixel dimensions. Terminal size reports use the
+saved cell dimensions. Each new process starts a fresh shell job table.
 
-Explicit Quit and orderly daemon shutdown checkpoint primary-screen text history.
-A restart restores tabs and directories with fresh shells. Commands, jobs,
-terminal modes, progress, hyperlinks, and alternate-screen contents do not resume.
-Unicode, wrapped lines, colors, and text attributes survive. Indexed and default
-colors follow the current theme; explicit RGB colors retain their values.
+Both screen buffers and primary scrollback survive, including cell placement,
+wide and wrapped text, rendition, hyperlinks, and program color overrides.
+Configured theme defaults follow the current frontend theme. The fresh shell
+starts on a clean line after the restored primary content. This may scroll one
+row into history. DEC mode 47 switches to the saved alternate screen.
+
+The handoff keeps display settings such as reverse video, custom tab stops,
+cursor blinking, and the primary cursor's shape. The shell gets a visible cursor
+and default text rendition. The new shell negotiates keyboard, paste, mouse, and
+reporting modes itself. The handoff resets editing modes, margins, saved cursor
+slots, and synchronized output. Terminal title and working-directory reports
+come from the new process. Pending input and replies, incomplete escape
+sequences and Kitty image transfers, clipboard transactions and paste grants,
+progress and status reports, and frontend view state start fresh. Text already
+written to the grid, including pasted text, is part of the snapshot. Glyph
+Protocol registrations are outside the snapshot format.
 
 Each checkpoint contains a Ghostty snapshot with Gmux's format version, exact
-Ghostty source revision, pane ID, and payload length. `GHOSTTY_PREFIX` must point
-to a build matching the pin in `scripts/bootstrap-ghostty.py`.
-Missing, mismatched, or damaged checkpoints log a warning and leave that pane
-with empty history. Other panes still restore. Updating the Ghostty pin, including
-the update to libghostty-vt 1.0.0, invalidates history saved by the previous
-revision. Tabs, directories, and saved scrollback limits still restore with fresh
-shells. To keep text before an upgrade, export it with `gmux read` while the old
-daemon is running.
+Ghostty source revision, pane ID, PTY and cell dimensions, and payload length.
+`GHOSTTY_PREFIX` must point to a build matching the pin in
+`scripts/bootstrap-ghostty.py`. Missing, incompatible, or damaged checkpoints
+log a warning and that pane opens with an empty terminal. Other panes still
+restore. Changes to the checkpoint format or Ghostty pin invalidate earlier
+checkpoints. Export text with `gmux read` before upgrading if you need to keep it.
 
-Limits are 8 MiB per pane, 64 MiB per layout, and 128 panes. Snapshot decoding has
-a 64 MiB allocation budget per pane; formatted history replay has an 8 MiB limit.
-A pane that exceeds a limit may lose its saved history. A crash or power loss can
-lose output since the last orderly shutdown.
+Limits are 8 MiB per pane, 64 MiB per layout, and 128 panes. The decoder has a
+64 MiB allocation budget per pane and applies the current
+[runtime retention limits](scrollback.md) before loading older history pages.
+Capture streams each pane into the remaining checkpoint budget. The current
+retention limit can omit older pages during decoding or when the fresh shell
+needs another row.
+A pane that exceeds a checkpoint limit opens with an empty terminal. A crash
+or power loss can lose output since the last orderly shutdown.
 
-The worker syncs checkpoint files before publishing the layout that references
-them. A failed publication leaves the previous generation usable. Cleanup
-removes unreferenced checkpoints after a successful save. Removing `scrollback/`
-clears saved history without changing tabs.
+The worker syncs checkpoints before publishing the layout that references them.
+Until publication, the previous generation remains available. Stop retries
+checkpoint write failures during final shutdown. Cleanup removes unreferenced
+checkpoints after a successful save. Removing `scrollback/` clears saved
+terminal contents and state while keeping tabs and pane layout.
 
 ## Frontend transport
 

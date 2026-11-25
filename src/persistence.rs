@@ -36,14 +36,17 @@ pub(crate) enum Save {
     Checkpoint(Checkpoint),
     Prune,
 }
+pub(crate) type SaveResult = Result<Option<String>, String>;
+
 impl Save {
-    fn write(self) -> anyhow::Result<()> {
+    fn write(self) -> anyhow::Result<Option<String>> {
         match self {
             Self::Settings(value) => storage::save("daemon-settings.json", &value),
             Self::Execution(value) => crate::scrollback::save_execution(&value),
-            Self::Checkpoint(value) => value.write(),
+            Self::Checkpoint(value) => return value.write(),
             Self::Prune => crate::scrollback::prune_committed(),
-        }
+        }?;
+        Ok(None)
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,7 +67,7 @@ struct Jobs {
 }
 pub(crate) struct Worker {
     jobs: Arc<(Mutex<Jobs>, Condvar)>,
-    completed: mpsc::Receiver<(u64, Result<(), String>)>,
+    completed: mpsc::Receiver<(u64, SaveResult)>,
     next: Cell<u64>,
     thread: Option<JoinHandle<()>>,
 }
@@ -74,7 +77,7 @@ impl Worker {
     }
     pub(crate) fn with_save(
         wake: gmux_platform::unix::ipc::Wake,
-        save: impl Fn(Save) -> anyhow::Result<()> + Send + 'static,
+        save: impl Fn(Save) -> anyhow::Result<Option<String>> + Send + 'static,
     ) -> Self {
         let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
         let worker = jobs.clone();
@@ -128,7 +131,7 @@ impl Worker {
         ready.notify_one();
         Ok(id)
     }
-    pub(crate) fn results(&self) -> impl Iterator<Item = (u64, Result<(), String>)> + '_ {
+    pub(crate) fn results(&self) -> impl Iterator<Item = (u64, SaveResult)> + '_ {
         self.completed.try_iter()
     }
     pub(crate) fn finish(&mut self) {
@@ -228,7 +231,7 @@ mod tests {
                     Save::Prune => seen.send(6).unwrap(),
                     _ => panic!("Expected execution"),
                 }
-                Ok(())
+                Ok(None)
             },
         );
         let session = |last_id| {

@@ -1,108 +1,596 @@
-Encode history checkpoints without unfinished VT parser input.
+Save committed terminal state and prepare a restored grid for a new shell.
 Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 
 --- a/src/terminal/c/snapshot.zig
 +++ b/src/terminal/c/snapshot.zig
-@@ -660,11 +660,13 @@
-     };
- }
- 
--/// Export the allocator-owned continuation required by snapshot encoding.
--fn continuationOwned(terminal: terminal_c.Terminal) struct {
-+const OwnedContinuation = struct {
-     result: Result,
-     bytes: []u8,
--} {
-+};
-+
-+/// Export the allocator-owned continuation required by snapshot encoding.
-+fn continuationOwned(terminal: terminal_c.Terminal) OwnedContinuation {
-     // The terminal allocator also owns the temporary continuation copy.
-     const native = terminal_c.zigTerminal(terminal) orelse return .{
-         .result = .invalid_value,
-@@ -733,13 +735,38 @@
-     buf_len: usize,
-     out_written_: ?*usize,
- ) callconv(lib.calling_conv) Result {
-+    return encodeBuf(terminal, buf, buf_len, out_written_, true);
+@@ -26,13 +26,14 @@
+     retain_continuation = 2,
+     compress_history = 3,
+     kitty_image_storage_limit = 4,
++    fit_hyperlinks = 5,
+     _,
+
+     /// The type that a `decoder_set` value points to.
+     pub fn InType(comptime self: DecoderOption) type {
+         return switch (self) {
+             .max_continuation_bytes => usize,
+-            .retain_continuation, .compress_history => bool,
++            .retain_continuation, .compress_history, .fit_hyperlinks => bool,
+             .kitty_image_storage_limit => u64,
+             .invalid, _ => void,
+         };
+@@ -150,6 +151,7 @@
+     max_continuation_bytes: usize,
+     retain_continuation: bool,
+     compress_history: bool,
++    fit_hyperlinks: bool,
+
+     /// The Kitty graphics image storage limit for restored screens, or null
+     /// for the default limit of a new screen.
+@@ -226,6 +228,7 @@
+     wrapper.max_continuation_bytes = default_max_continuation_bytes;
+     wrapper.retain_continuation = false;
+     wrapper.compress_history = false;
++    wrapper.fit_hyperlinks = false;
+     wrapper.kitty_image_storage_limit = null;
+     wrapper.decoder = .init(wrapper.source.reader());
+     out.* = wrapper;
+@@ -271,6 +274,8 @@
+             if (value_) |v| @as(*const DecoderOption.retain_continuation.InType(), @ptrCast(@alignCast(v))).* else false,
+         .compress_history => decoder.compress_history =
+             if (value_) |v| @as(*const DecoderOption.compress_history.InType(), @ptrCast(@alignCast(v))).* else false,
++        .fit_hyperlinks => decoder.fit_hyperlinks =
++            if (value_) |v| @as(*const DecoderOption.fit_hyperlinks.InType(), @ptrCast(@alignCast(v))).* else false,
+         .kitty_image_storage_limit => decoder.kitty_image_storage_limit =
+             if (value_) |v| @as(*const DecoderOption.kitty_image_storage_limit.InType(), @ptrCast(@alignCast(v))).* else null,
+         .invalid, _ => unreachable,
+@@ -606,6 +611,7 @@
+         .{
+             .max_continuation_bytes = decoder.max_continuation_bytes,
+             .compress_history = decoder.compress_history,
++            .fit_hyperlinks = decoder.fit_hyperlinks,
+             .kitty_image_storage_limit = if (decoder.kitty_image_storage_limit) |limit|
+                 std.math.cast(usize, limit) orelse std.math.maxInt(usize)
+             else
+@@ -711,6 +717,28 @@
+     if (continuation.result != .success) return continuation.result;
+     defer native.gpa().free(continuation.bytes);
+
++    return encodeToWriter(native, writer, .{ .continuation = continuationValue(continuation.bytes) });
 +}
 +
 +/// Encode committed terminal state without retaining unfinished parser input.
-+/// Hosts that restore only history need no parser continuation, which may
-+/// contain sensitive clipboard protocol metadata or data.
-+pub fn encode_buf_state(
++pub fn encode_state(
 +    terminal: terminal_c.Terminal,
-+    buf: ?[*]u8,
-+    buf_len: usize,
-+    out_written: ?*usize,
++    writer: io_c.Writer,
 +) callconv(lib.calling_conv) Result {
-+    return encodeBuf(terminal, buf, buf_len, out_written, false);
++    if (comptime !lib.feature(.snapshot)) return .unsupported;
++    const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
++    if (writer.write == null) return .invalid_value;
++    return encodeToWriter(native, writer, .{
++        .continuation = .ground,
++        .retain_loading_image = false,
++    });
 +}
 +
-+fn encodeBuf(
-+    terminal: terminal_c.Terminal,
-+    buf: ?[*]u8,
-+    buf_len: usize,
-+    out_written_: ?*usize,
-+    include_continuation: bool,
++fn encodeToWriter(
++    native: *terminal_c.ZigTerminal,
++    writer: io_c.Writer,
++    options: snapshot_core.EncodeOptions,
 +) Result {
-     if (comptime !lib.feature(.snapshot)) return .unsupported;
-     // Validate output storage and preflight the terminal continuation.
-     const out_written = out_written_ orelse return .invalid_value;
-     out_written.* = 0;
-     if (buf == null and buf_len != 0) return .invalid_value;
-     const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
--    const continuation = continuationOwned(terminal);
-+    const continuation: OwnedContinuation = if (include_continuation) continuationOwned(terminal) else .{
-+        .result = Result.success,
-+        .bytes = @as([]u8, &.{}),
-+    };
-     if (continuation.result != .success) return continuation.result;
-     defer native.gpa().free(continuation.bytes);
- 
+     // Stream the snapshot through the callback adapter, batching the
+     // encoder's writes into few callback invocations.
+     var buffer: [io_c.WriterAdapter.recommended_buffer_len]u8 = undefined;
+@@ -719,10 +747,84 @@
+         native.gpa(),
+         &adapter.interface,
+         native,
+-        .{ .continuation = continuationValue(continuation.bytes) },
++        options,
+     ) catch |err| return mapEncodeError(err, &adapter);
+     adapter.interface.flush() catch
+         return mapEncodeError(error.WriteFailed, &adapter);
++    return .success;
++}
++
++/// Start a fresh shell without erasing either screen or scrollback.
++pub fn prepare_shell(terminal: terminal_c.Terminal) callconv(lib.calling_conv) Result {
++    const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
++    const primary = t.screens.get(.primary).?;
++    var screens = t.screens.all.iterator();
++    while (screens.next()) |entry| {
++        const screen = entry.value.*;
++        screen.endHyperlink();
++        screen.saved_cursor = null;
++        screen.charset = .{};
++        screen.kitty_keyboard = .{};
++        screen.protected_mode = .off;
++        screen.semantic_prompt.click = .none;
++        screen.cursor.semantic_content = .output;
++        screen.cursor.semantic_content_clear_eol = false;
++        screen.cursor.protected = false;
++        screen.cursor.pending_wrap = false;
++        screen.setAttribute(.unset) catch unreachable;
++        if (comptime build_options.kitty_graphics) {
++            if (screen.kitty_images.loading) |loading| loading.destroy(t.gpa());
++            screen.kitty_images.loading = null;
++        }
++    }
++    t.screens.switchTo(.primary);
++
++    // The new process starts with default input and editing protocols.
++    // Retain display modes and the explicitly selected cursor appearance.
++    const previous = t.modes;
++    // Cursor shape is per-screen, but the default flag and blink are global.
++    if (primary.cursor.cursor_style != t.cursor.default_style or
++        previous.values.cursor_blinking != (t.cursor.default_blink orelse true))
++    {
++        t.cursor.is_default = false;
++    }
++    t.modes = .{ .values = .{
++        .reverse_colors = previous.values.reverse_colors,
++        .cursor_blinking = previous.values.cursor_blinking,
++        .grapheme_cluster = previous.values.grapheme_cluster,
++    } };
++    t.flags.mouse_event = .none;
++    t.flags.mouse_format = .x10;
++    t.flags.mouse_shift_capture = .null;
++    t.flags.modify_other_keys_2 = false;
++    t.flags.password_input = false;
++    t.flags.shell_redraws_prompt = .true;
++    t.flags.dirty.clear = true;
++    t.mouse_shape = .text;
++    t.previous_char = null;
++    t.status_display = .main;
++    t.scrolling_region = .{ .top = 0, .bottom = t.rows - 1, .left = 0, .right = t.cols - 1 };
++    t.title.clearAndFree(t.gpa());
++    t.pwd.clearAndFree(t.gpa());
++
++    // Find the last occupied active row, including text below the cursor.
++    // Reuse an empty trailing row or scroll once to make room for the shell.
++    const Cell = @import("../page.zig").Cell;
++    var y = t.rows - 1;
++    var rows = primary.pages.rowIterator(.left_up, .{ .active = .{} }, null);
++    while (rows.next()) |row| {
++        const metadata = row.rowAndCell().row;
++        if (metadata.wrap_continuation or metadata.semantic_prompt != .none or
++            !Cell.isEmptyAll(row.cells(.all)))
++        {
++            primary.cursorAbsolute(0, y);
++            t.index() catch return .out_of_memory;
++            return .success;
++        }
++        if (y == 0) break;
++        y -= 1;
++    }
++    primary.cursorAbsolute(0, 0);
+     return .success;
+ }
+
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
-@@ -247,6 +247,7 @@
- 
+@@ -247,6 +247,8 @@
+
  pub const snapshot_encode = snapshot.encode;
  pub const snapshot_encode_buf = snapshot.encode_buf;
-+pub const snapshot_encode_buf_state = snapshot.encode_buf_state;
++pub const snapshot_encode_state = snapshot.encode_state;
++pub const snapshot_prepare_shell = snapshot.prepare_shell;
  pub const snapshot_encode_alloc = snapshot.encode_alloc;
  pub const snapshot_decoder_new = snapshot.decoder_new;
  pub const snapshot_decoder_new_buf = snapshot.decoder_new_buf;
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -365,6 +365,7 @@
+@@ -365,6 +365,8 @@
          @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
          @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
          @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
-+        @export(&c.snapshot_encode_buf_state, .{ .name = "ghostty_snapshot_encode_buf_state" });
++        @export(&c.snapshot_encode_state, .{ .name = "ghostty_snapshot_encode_state" });
++        @export(&c.snapshot_prepare_shell, .{ .name = "ghostty_snapshot_prepare_shell" });
          @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
          @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
          @export(&c.snapshot_decoder_new_buf, .{ .name = "ghostty_snapshot_decoder_new_buf" });
 --- a/include/ghostty/vt/snapshot.h
 +++ b/include/ghostty/vt/snapshot.h
-@@ -442,6 +442,23 @@
-  * @ingroup snapshot
-  */
- GHOSTTY_API GhosttyResult ghostty_snapshot_encode_buf(
-+    GhosttyTerminal terminal,
-+    uint8_t* buf,
-+    size_t buf_len,
-+    size_t* out_written);
+@@ -144,6 +144,14 @@
+    * Input type: uint64_t *
+    */
+   GHOSTTY_SNAPSHOT_DECODER_OPT_KITTY_IMAGE_STORAGE_LIMIT = 4,
 +
-+/**
-+ * Encode committed terminal state, omitting unfinished VT parser input.
++  /**
++   * Size hyperlink storage for the contents of buffered pages.
++   *
++   * This is false by default, and a NULL value restores false.
++   * Input type: bool *
++   */
++  GHOSTTY_SNAPSHOT_DECODER_OPT_FIT_HYPERLINKS = 5,
+
+   GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ } GhosttySnapshotDecoderOption;
+@@ -419,6 +427,18 @@
+                                                   GhosttyWriter writer);
+
+ /**
++ * Stream committed terminal state without parser or image transfer continuation.
 + *
-+ * This has the same buffer, size-query and error contract as
-+ * ghostty_snapshot_encode_buf(), but records an empty continuation without
-+ * requiring continuation tracking. It does not change the live terminal or
-+ * parser. Use this when only committed state or history will be restored, to
-+ * avoid persisting clipboard protocol data from an unfinished control string.
++ * Uses the same synchronous writer contract as ghostty_snapshot_encode().
++ * A rejecting writer stops encoding immediately.
 + *
 + * @ingroup snapshot
 + */
-+GHOSTTY_API GhosttyResult ghostty_snapshot_encode_buf_state(
-     GhosttyTerminal terminal,
-     uint8_t* buf,
-     size_t buf_len,
++GHOSTTY_API GhosttyResult ghostty_snapshot_encode_state(
++    GhosttyTerminal terminal,
++    GhosttyWriter writer);
++
++/**
+  * Encode a complete terminal snapshot to a caller-provided buffer.
+  *
+  * Pass NULL for buf with buf_len zero to query the required size. If the
+@@ -472,6 +492,14 @@
+     const GhosttyAllocator* allocator,
+     uint8_t** out_ptr,
+     size_t* out_len);
++
++/**
++ * Prepare a decoded terminal for a new login shell. Preserves both grids
++ * and starts the shell on a clean primary-screen line.
++ *
++ * @ingroup snapshot
++ */
++GHOSTTY_API GhosttyResult ghostty_snapshot_prepare_shell(GhosttyTerminal terminal);
+
+ /**
+  * Create a snapshot decoder that reads from a caller-provided reader.
+--- a/src/terminal/snapshot/hyperlink.zig
++++ b/src/terminal/snapshot/hyperlink.zig
+@@ -163,6 +163,16 @@
+             };
+         },
+     };
++}
++
++/// Consume a hyperlink entry while sizing a buffered PAGE.
++pub fn skip(reader: *std.Io.Reader) DecodePageError!void {
++    switch (try reader.takeByte()) {
++        @backingInt(Kind.implicit) => try reader.discardAll(@sizeOf(u32)),
++        @backingInt(Kind.explicit) => try reader.discardAll(try io.readInt(reader, u32)),
++        else => return error.InvalidKind,
++    }
++    try reader.discardAll(try io.readInt(reader, u32));
+ }
+
+ /// Decode one hyperlink directly into page-owned storage.
+--- a/src/terminal/snapshot/grid.zig
++++ b/src/terminal/snapshot/grid.zig
+@@ -820,6 +820,31 @@
+ /// Maps encoded hyperlink table IDs to page-assigned hyperlink IDs.
+ pub const HyperlinkRemap = Remap(TerminalHyperlinkId);
+
++/// Count encoded hyperlink references without decoding the cell contents.
++pub fn countLinks(data: []const u8, cols: u16, rows: u16) DecodeError!usize {
++    var rest = data;
++    var links: usize = 0;
++    for (0..rows) |_| {
++        if (rest.len < 3) return error.EndOfStream;
++        const row: Row = @bitCast(rest[0]);
++        const cells = std.mem.readInt(u16, rest[1..3], .little);
++        if (cells > cols) return error.InvalidRowCellCount;
++        const end = 3 + @as(usize, cells) * row.cell_width.size();
++        if (end > rest.len) return error.EndOfStream;
++        const bytes = rest[3..end];
++        rest = rest[end..];
++        if (row.cell_width != .eight) continue;
++
++        // Only full-width cells carry an ID, in the most significant 16 bits.
++        const offset = @bitOffsetOf(Cell, "hyperlink_id") / 8;
++        for (0..cells) |i| {
++            const id = std.mem.readInt(u16, bytes[i * 8 + offset ..][0..2], .little);
++            links += @intFromBool(id != 0);
++        }
++    }
++    return links;
++}
++
+ /// Decode every row, cell, and grapheme suffix directly into an
+ /// initialized, empty page.
+ ///
+@@ -1068,6 +1093,16 @@
+         ));
+     }
+
++    // Saved cells can be copied as text. Strip terminal controls from all
++    // wire widths, keeping NUL as the empty cell.
++    const Int = width.Int();
++    const Vec = @Vector(step, Int);
++    const values: Vec = @bitCast(in);
++    const replacement: Vec = @splat(if (width == .one) '?' else 0xFFFD);
++    const low = @select(Int, values == @as(Vec, @splat(0)), values, replacement);
++    const high = @select(Int, (values -% @as(Vec, @splat(0x7F))) <= @as(Vec, @splat(0x20)), replacement, values);
++    in = @bitCast(@select(Int, values < @as(Vec, @splat(0x20)), low, high));
++
+     const zero: @Vector(16, u8) = @splat(0);
+     inline for (0..step / 2) |pair| {
+         const mask: @Vector(16, i32) = comptime mask: {
+@@ -1101,7 +1136,11 @@
+     if (comptime width != .one) {
+         if (!validScalar(value)) return 0xFFFD;
+     }
+-    return value;
++    return if (isControl(value)) (if (width == .one) '?' else 0xFFFD) else value;
++}
++
++inline fn isControl(cp: u32) bool {
++    return (cp > 0 and cp < 0x20) or (cp >= 0x7F and cp <= 0x9F);
+ }
+
+ /// Decode one row of width-four or fallback full-width cells through the
+@@ -1230,7 +1269,7 @@
+         // entry, which reattaches through the native grapheme APIs later.
+         .codepoint, .codepoint_grapheme => {
+             wire.kind = @backingInt(Cell.Kind.codepoint);
+-            if (!validScalar(wire.content)) wire.content = 0xFFFD;
++            if (!validScalar(wire.content) or isControl(wire.content)) wire.content = 0xFFFD;
+
+             // Kitty image and placement state is not part of this snapshot
+             // version, but the placeholder is still a valid Unicode scalar.
+@@ -1408,7 +1447,7 @@
+     cp: u32,
+ ) void {
+     if (!accept.*) return;
+-    if (cp == 0 or !validScalar(cp)) return;
++    if (cp == 0 or !validScalar(cp) or isControl(cp)) return;
+
+     page.appendGrapheme(row, cell, @intCast(cp)) catch {
+         if (cell.hasGrapheme()) {
+--- a/src/terminal/snapshot/page.zig
++++ b/src/terminal/snapshot/page.zig
+@@ -193,6 +193,7 @@
+ /// PageList.Builder so you can build up a proper PageList with
+ /// valid memory ownership.
+ pub const Decoder = struct {
++    page_capacity: TerminalPageCapacity,
+     record_reader: record.Reader,
+     header: Header,
+
+@@ -221,12 +222,25 @@
+         }
+
+         self.header = try Header.decode(self.record_reader.payloadReader());
+-        _ = try self.header.pageCapacity();
+-    }
+-
+-    /// Return the exact native capacity advertised by the PAGE header.
++        self.page_capacity = try self.header.pageCapacity();
++    }
++
++    /// Return the native capacity needed for the decoded page.
+     pub fn capacity(self: *const Decoder) TerminalPageCapacity {
+-        return self.header.pageCapacity() catch unreachable;
++        return self.page_capacity;
++    }
++
++    /// Fit hyperlink tables to the contents of a buffered page.
++    pub fn fitHyperlinks(self: *Decoder) DecodeError!void {
++        const remaining = self.record_reader.header.payload_len - Header.len;
++        const buffered = self.record_reader.payloadReader().buffered();
++        const linked_cells = if (self.header.hyperlink_count == 0)
++            0
++        else if (buffered.len < remaining)
++            return
++        else
++            try self.header.bufferedLinkCount(buffered[0..remaining]);
++        self.page_capacity = try self.header.pageCapacityWithLinks(linked_cells);
+     }
+
+     /// Largest remaining PAGE payload staged into one contiguous buffer.
+@@ -631,8 +645,23 @@
+         PageTooLarge,
+     };
+
+-    /// Validate native allocation requirements and produce the page capacity.
++    fn bufferedLinkCount(self: Header, body: []const u8) PayloadDecodeError!usize {
++        var reader: std.Io.Reader = .fixed(body);
++        try reader.discardAll(@as(usize, self.style_count) * (@sizeOf(TerminalStyleId) + style.len));
++        for (0..self.hyperlink_count) |_| {
++            try reader.discardAll(@sizeOf(TerminalHyperlinkId));
++            try hyperlink.skip(&reader);
++        }
++        return grid.countLinks(reader.buffered(), self.columns, self.rows);
++    }
++
+     fn pageCapacity(self: Header) CapacityError!TerminalPageCapacity {
++        return self.pageCapacityWithLinks(null);
++    }
++
++    /// Use separate capacities for the set and map when the payload is buffered.
++    /// The wire hint combines both and can substantially overallocate the map.
++    fn pageCapacityWithLinks(self: Header, linked_cells: ?usize) CapacityError!TerminalPageCapacity {
+         if (self.columns == 0 or self.rows == 0) {
+             return error.InvalidDimensions;
+         }
+@@ -646,7 +675,7 @@
+             @as(usize, self.hyperlink_capacity_bytes),
+             hyperlink_item_size,
+         );
+-        const hyperlink_cells: usize = if (hyperlink_items >= max_hinted_hyperlink_items)
++        const hyperlink_cells: usize = linked_cells orelse if (hyperlink_items >= max_hinted_hyperlink_items)
+             @as(usize, self.columns) * @as(usize, self.rows)
+         else
+             hyperlink_items * terminal_page.hyperlink_cell_multiplier;
+@@ -654,7 +683,10 @@
+             .cols = self.columns,
+             .rows = self.rows,
+             .styles = self.style_capacity,
+-            .hyperlink_bytes = self.hyperlink_capacity_bytes,
++            .hyperlink_bytes = if (linked_cells != null)
++                @intCast(@min(self.hyperlink_capacity_bytes, TerminalPage.hyperlinkBytesForCount(self.hyperlink_count)))
++            else
++                self.hyperlink_capacity_bytes,
+             .hyperlink_cells = @intCast(@min(hyperlink_cells, std.math.maxInt(u16))),
+             .grapheme_bytes = self.grapheme_capacity_bytes,
+             .string_bytes = self.string_capacity_bytes,
+--- a/src/terminal/snapshot/history.zig
++++ b/src/terminal/snapshot/history.zig
+@@ -216,6 +216,7 @@
+     /// that is visible in the viewport stays uncompressed. This is the
+     /// same as `PageList.PageAllocation.FinalizeOptions.compress`.
+     compress: bool = false,
++    fit_hyperlinks: bool = false,
+ };
+
+ /// Errors possible while restoring one history PAGE into a native Screen.
+@@ -248,6 +249,7 @@
+     // the destination PageList to allocate the final backing memory once.
+     var decoder: page.Decoder = undefined;
+     try decoder.init(source, record_header);
++    if (options.fit_hyperlinks) try decoder.fitHyperlinks();
+     var allocation = try terminal_screen.pages.allocatePage(
+         decoder.capacity(),
+     );
+--- a/src/terminal/snapshot/snapshot.zig
++++ b/src/terminal/snapshot/snapshot.zig
+@@ -35,6 +35,7 @@
+
+ pub const EncodeOptions = struct {
+     continuation: Continuation,
++    retain_loading_image: bool = true,
+ };
+
+ /// Encode one complete terminal snapshot.
+@@ -74,6 +75,7 @@
+                 alloc,
+                 s,
+                 key,
++                options.retain_loading_image,
+             ));
+         }
+     }
+@@ -185,6 +187,7 @@
+     /// The snapshot format is unchanged, so this works with any snapshot.
+     /// It has no effect on platforms that do not support compression.
+     compress_history: bool = false,
++    fit_hyperlinks: bool = false,
+
+     /// The Kitty graphics image storage limit, in bytes, for each restored
+     /// screen, or null for the default limit of a new screen.
+@@ -487,12 +490,13 @@
+         for (0..screen_count) |_| {
+             // Decode the screen and move it into the slot for its key.
+             const key = key: {
+-                var decoded = try screen.decode(
++                var decoded = try screen.decodeWithHyperlinkSizing(
+                     reader,
+                     header,
+                     io_,
+                     alloc,
+                     screen_options,
++                    options.fit_hyperlinks,
+                 );
+                 errdefer decoded.deinit();
+
+@@ -568,7 +572,10 @@
+             .pending = screen_count,
+             .current = null,
+             .cols = result.cols,
+-            .page_options = .{ .compress = options.compress_history },
++            .page_options = .{
++                .compress = options.compress_history,
++                .fit_hyperlinks = options.fit_hyperlinks,
++            },
+             .kitty_generations = kitty_generations,
+         } };
+         return .{
+--- a/src/terminal/snapshot/screen.zig
++++ b/src/terminal/snapshot/screen.zig
+@@ -343,6 +343,17 @@
+     alloc: Allocator,
+     options: TerminalScreen.Options,
+ ) DecodeError!Decoded {
++    return decodeWithHyperlinkSizing(source, record_header, io_, alloc, options, false);
++}
++
++pub fn decodeWithHyperlinkSizing(
++    source: *std.Io.Reader,
++    record_header: record.Header,
++    io_: std.Io,
++    alloc: Allocator,
++    options: TerminalScreen.Options,
++    fit_hyperlinks: bool,
++) DecodeError!Decoded {
+     // Decode and finish the self-contained SCREEN record before consuming any
+     // of the PAGE records which follow it.
+     var record_reader: record.Reader = undefined;
+@@ -399,6 +410,7 @@
+         for (0..header.page_count) |_| {
+             var decoder: page.Decoder = undefined;
+             try decoder.init(source, try record.nextHeader(source));
++            if (fit_hyperlinks) try decoder.fitHyperlinks();
+             const native_page = try builder.allocatePage(decoder.capacity());
+             try decoder.decode(native_page, alloc);
+         }
+--- a/src/terminal/snapshot/kitty.zig
++++ b/src/terminal/snapshot/kitty.zig
+@@ -600,7 +600,7 @@
+ /// records existed.
+ ///
+ /// ```zig
+-/// var plan = (try kitty.ScreenPlan.init(alloc, screen, .primary)) orelse return;
++/// var plan = (try kitty.ScreenPlan.init(alloc, screen, .primary, true)) orelse return;
+ /// defer plan.deinit();
+ /// try plan.encodeStorage(&stream);
+ /// // ... after READY ...
+@@ -614,6 +614,7 @@
+     alloc: Allocator,
+     screen: *const TerminalScreen,
+     key: TerminalScreenKey,
++    loading: ?*const LoadingImage,
+
+     /// Every image, oldest first.
+     images: []*const Image,
+@@ -655,9 +656,11 @@
+         alloc: Allocator,
+         screen: *const TerminalScreen,
+         key: TerminalScreenKey,
++        retain_loading: bool,
+     ) Allocator.Error!?ScreenPlan {
+         const storage = &screen.kitty_images;
+-        if (storage.images.count() == 0 and storage.loading == null) {
++        const loading = if (retain_loading) storage.loading else null;
++        if (storage.images.count() == 0 and loading == null) {
+             return null;
+         }
+
+@@ -745,6 +748,7 @@
+             .alloc = alloc,
+             .screen = screen,
+             .key = key,
++            .loading = loading,
+             .images = images,
+             .resident = resident_slice,
+             .history = history_slice,
+@@ -850,7 +854,7 @@
+         try io.writeInt(writer, u32, storage.next_internal_placement_id);
+         try io.writeInt(writer, u32, @intCast(self.images.len));
+         try io.writeInt(writer, u32, @intCast(self.resident.len));
+-        try writer.writeByte(@intFromBool(storage.loading != null));
++        try writer.writeByte(@intFromBool(self.loading != null));
+
+         for (self.images) |img| try encodeImage(writer, img);
+         for (self.resident) |planned| {
+@@ -860,7 +864,7 @@
+                 .{ .storage = self.first_resident },
+             );
+         }
+-        if (storage.loading) |loading| try encodeLoading(writer, loading);
++        if (self.loading) |loading| try encodeLoading(writer, loading);
+
+         try destination.finish();
+     }
+@@ -3099,7 +3103,7 @@
+     try @import("envelope.zig").encode(stream.writer());
+     try @import("terminal.zig").encode(&t, &stream);
+     try @import("screen.zig").encode(primary, .primary, &stream);
+-    var plan = (try ScreenPlan.init(testing.allocator, primary, .alternate)).?;
++    var plan = (try ScreenPlan.init(testing.allocator, primary, .alternate, true)).?;
+     defer plan.deinit();
+     try plan.encodeStorage(&stream);
+     try @import("continuation.zig").encode(.ground, &stream);

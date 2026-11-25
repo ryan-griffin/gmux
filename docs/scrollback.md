@@ -85,8 +85,6 @@ application unexpectedly fails after publication, the response has `saved:true`,
 force for new terminals. Retrying the update reapplies the policy; reverting it
 cannot restore discarded history.
 
-Restoration applies the policy before replaying saved text into a fresh engine.
-Existing checkpoint safety budgets still apply: 8 MiB per pane, 64 MiB per
-layout, 128 panes, and a bounded decoder. Larger runtime retention does not
-increase those budgets or resume shell processes or terminal modes. See
-[scrollback checkpoints](terminal-sessions.md#scrollback-checkpoints).
+Restoration applies the current policy before loading older native history pages.
+Checkpoint safety budgets are 8 MiB per pane, 64 MiB per layout, 128 panes, and a
+bounded decoder. See [scrollback checkpoints](terminal-sessions.md#scrollback-checkpoints).

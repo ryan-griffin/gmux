@@ -10,25 +10,37 @@ pub(crate) const MAX_PANE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PANES: usize = 128;
 const MAGIC: &[u8; 8] = b"GMUXSNP\0";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const SOURCE: &str = env!("GMUX_GHOSTTY_REVISION");
-const HEADER: usize = 8 + 4 + 40 + 8 + 8;
+const HEADER: usize = 8 + 4 + 40 + 8 + 8 + 2 + 2 + 4 + 4;
+
+pub(crate) struct PaneCheckpoint {
+    pub(crate) snapshot: Vec<u8>,
+    pub(crate) pixel_size: (u16, u16),
+    pub(crate) cell_size: (u32, u32),
+}
 
 pub(crate) struct Checkpoint {
     pub(crate) session: SavedExecution,
-    pub(crate) panes: Vec<(u64, Vec<u8>)>,
+    pub(crate) panes: Vec<(u64, PaneCheckpoint)>,
     pub(crate) warnings: Vec<String>,
 }
 impl Checkpoint {
     pub(crate) fn new(
         mut session: SavedExecution,
-        panes: Vec<(u64, Vec<u8>)>,
+        panes: Vec<(u64, PaneCheckpoint)>,
         warnings: Vec<String>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             panes.len() <= MAX_PANES
-                && panes.iter().all(|(_, bytes)| bytes.len() <= MAX_PANE_BYTES)
-                && panes.iter().map(|(_, bytes)| bytes.len()).sum::<usize>() <= MAX_TOTAL_BYTES,
+                && panes
+                    .iter()
+                    .all(|(_, pane)| pane.snapshot.len() <= MAX_PANE_BYTES)
+                && panes
+                    .iter()
+                    .map(|(_, pane)| pane.snapshot.len())
+                    .sum::<usize>()
+                    <= MAX_TOTAL_BYTES,
             "Checkpoint exceeds aggregate budget"
         );
         session.scrollback.clear();
@@ -41,11 +53,11 @@ impl Checkpoint {
 
     // Called only by the ordered disk worker. Layout publication is the commit
     // point. A crash before it leaves the previous layout and snapshots usable.
-    pub(crate) fn write(self) -> anyhow::Result<()> {
+    pub(crate) fn write(self) -> anyhow::Result<Option<String>> {
         storage::with_state_lock("execution.json", |path| self.write_locked(path))
     }
 
-    fn write_locked(mut self, path: &Path) -> anyhow::Result<()> {
+    fn write_locked(mut self, path: &Path) -> anyhow::Result<Option<String>> {
         use std::os::unix::fs::DirBuilderExt;
         let directory = path.parent().unwrap().join("scrollback");
         // Reclaim interrupted publications before adding another generation.
@@ -72,35 +84,42 @@ impl Checkpoint {
             }
             Ok(())
         });
+        let mut write_failed = false;
         if let Err(error) = ready {
+            write_failed = true;
             self.session.scrollback.clear();
             self.warnings.push(format!("Scrollback directory: {error}"));
             self.panes.clear();
         }
-        for (id, bytes) in self.panes {
+        for (id, pane) in self.panes {
             let name = &self.session.scrollback[&id];
             let result = storage::atomic_write_at(
                 &directory.join(name),
                 |writer| {
-                    writer.write_all(&header(id, bytes.len())?)?;
-                    writer.write_all(&bytes)?;
+                    writer.write_all(&header(id, &pane)?)?;
+                    writer.write_all(&pane.snapshot)?;
                     Ok(())
                 },
                 || Ok(()),
             );
             if let Err(error) = result {
+                write_failed = true;
                 self.session.scrollback.remove(&id);
                 self.warnings.push(format!("Pane {id}: {error}"));
             }
         }
+        // Publish the layout even when some pane writes need a retry.
         storage::save_locked_at(path, &self.session)?;
-        prune_at(&self.session, &directory)?;
-        anyhow::ensure!(self.warnings.is_empty(), "{}", self.warnings.join("; "));
-        Ok(())
+        if let Err(error) = prune_at(&self.session, &directory) {
+            self.warnings.push(format!("Checkpoint cleanup: {error}"));
+        }
+        anyhow::ensure!(!write_failed, "{}", self.warnings.join("; "));
+        Ok((!self.warnings.is_empty()).then(|| self.warnings.join("; ")))
     }
 }
 
-fn header(id: u64, len: usize) -> anyhow::Result<[u8; HEADER]> {
+fn header(id: u64, pane: &PaneCheckpoint) -> anyhow::Result<[u8; HEADER]> {
+    let len = pane.snapshot.len();
     anyhow::ensure!(len <= MAX_PANE_BYTES, "Snapshot exceeds 8 MiB");
     let mut header = [0u8; HEADER];
     header[..8].copy_from_slice(MAGIC);
@@ -108,6 +127,10 @@ fn header(id: u64, len: usize) -> anyhow::Result<[u8; HEADER]> {
     header[12..52].copy_from_slice(SOURCE.as_bytes());
     header[52..60].copy_from_slice(&id.to_le_bytes());
     header[60..68].copy_from_slice(&(len as u64).to_le_bytes());
+    header[68..70].copy_from_slice(&pane.pixel_size.0.to_le_bytes());
+    header[70..72].copy_from_slice(&pane.pixel_size.1.to_le_bytes());
+    header[72..76].copy_from_slice(&pane.cell_size.0.to_le_bytes());
+    header[76..80].copy_from_slice(&pane.cell_size.1.to_le_bytes());
     Ok(header)
 }
 fn payload_len(id: u64, header: &[u8], max_bytes: usize) -> anyhow::Result<usize> {
@@ -134,38 +157,22 @@ fn payload_len(id: u64, header: &[u8], max_bytes: usize) -> anyhow::Result<usize
     );
     Ok(len as usize)
 }
-#[cfg(test)]
-fn encode(id: u64, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut file = header(id, bytes.len())?.to_vec();
-    file.extend_from_slice(bytes);
-    Ok(file)
-}
-#[cfg(test)]
-fn decode(id: u64, file: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(file.len() >= HEADER, "Truncated snapshot header");
-    let len = payload_len(id, &file[..HEADER], MAX_PANE_BYTES)?;
-    anyhow::ensure!(
-        len == file.len() - HEADER,
-        "Truncated snapshot or trailing bytes"
-    );
-    Ok(file[HEADER..].to_vec())
-}
 fn owned_name(name: &str) -> Option<u64> {
     let (id, token) = name.strip_suffix(".snapshot")?.split_once('-')?;
     let id: u64 = id.parse().ok()?;
     (id > 0 && token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
 }
 
-pub(crate) fn load(id: u64, name: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn load(id: u64, name: &str, max_bytes: usize) -> anyhow::Result<PaneCheckpoint> {
     let path = storage::config_dir().join("scrollback").join(name);
     load_at(id, name, &path, max_bytes).with_context(|| {
         format!(
-            "Could not restore scrollback for pane {id} from {}",
+            "Could not load terminal checkpoint for pane {id} from {}",
             path.display()
         )
     })
 }
-fn load_at(id: u64, name: &str, path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+fn load_at(id: u64, name: &str, path: &Path, max_bytes: usize) -> anyhow::Result<PaneCheckpoint> {
     anyhow::ensure!(owned_name(name) == Some(id), "Invalid snapshot reference");
     let mut file = OpenOptions::new()
         .read(true)
@@ -188,7 +195,17 @@ fn load_at(id: u64, name: &str, path: &Path, max_bytes: usize) -> anyhow::Result
     bytes.resize(len, 0);
     file.read_exact(&mut bytes)?;
     anyhow::ensure!(file.read(&mut [0])? == 0, "Trailing snapshot bytes");
-    Ok(bytes)
+    Ok(PaneCheckpoint {
+        snapshot: bytes,
+        pixel_size: (
+            u16::from_le_bytes(header[68..70].try_into()?),
+            u16::from_le_bytes(header[70..72].try_into()?),
+        ),
+        cell_size: (
+            u32::from_le_bytes(header[72..76].try_into()?),
+            u32::from_le_bytes(header[76..80].try_into()?),
+        ),
+    })
 }
 
 pub(crate) fn save_execution(session: &SavedExecution) -> anyhow::Result<()> {
@@ -286,6 +303,14 @@ mod tests {
         }
     }
 
+    fn test_checkpoint(snapshot: Vec<u8>) -> PaneCheckpoint {
+        PaneCheckpoint {
+            snapshot,
+            pixel_size: (341, 205),
+            cell_size: (120_000_000, 400_000_000),
+        }
+    }
+
     #[test]
     fn concurrent_checkpoints_keep_committed_history_and_preserve_damaged_layouts() {
         let directory = test_directory();
@@ -297,15 +322,21 @@ mod tests {
                 let cache = &cache;
                 scope.spawn(move || {
                     for _ in 0..8 {
-                        let checkpoint =
-                            Checkpoint::new(saved_pane(), vec![(2, vec![writer])], vec![]).unwrap();
+                        let checkpoint = Checkpoint::new(
+                            saved_pane(),
+                            vec![(2, test_checkpoint(vec![writer]))],
+                            vec![],
+                        )
+                        .unwrap();
                         storage::with_lock_at(path, || checkpoint.write_locked(path)).unwrap();
                         storage::with_lock_at(path, || {
                             let committed: SavedExecution = storage::load_at(path)?;
                             prune_at(&committed, cache)?;
                             let name = &committed.scrollback[&2];
-                            let bytes = load_at(2, name, &cache.join(name), MAX_PANE_BYTES)?;
-                            assert!(bytes.len() == 1 && bytes[0] < 4);
+                            let pane = load_at(2, name, &cache.join(name), MAX_PANE_BYTES)?;
+                            assert!(pane.snapshot.len() == 1 && pane.snapshot[0] < 4);
+                            assert_eq!(pane.pixel_size, (341, 205));
+                            assert_eq!(pane.cell_size, (120_000_000, 400_000_000));
                             Ok(())
                         })
                         .unwrap();
@@ -315,7 +346,8 @@ mod tests {
         });
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         std::fs::write(&path, b"{damaged layout").unwrap();
-        let checkpoint = Checkpoint::new(saved_pane(), vec![(2, vec![])], vec![]).unwrap();
+        let checkpoint =
+            Checkpoint::new(saved_pane(), vec![(2, test_checkpoint(vec![]))], vec![]).unwrap();
         assert!(storage::with_lock_at(&path, || checkpoint.write_locked(&path)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{damaged layout");
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
@@ -323,30 +355,70 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_storage_failure_preserves_layout_and_reports_failure() {
+        let directory = test_directory();
+        let path = directory.join("execution.json");
+        let cache = directory.join("scrollback");
+        std::fs::write(&cache, b"unavailable").unwrap();
+        let checkpoint = || {
+            Checkpoint::new(
+                saved_pane(),
+                vec![(2, test_checkpoint(b"payload".to_vec()))],
+                vec![],
+            )
+            .unwrap()
+        };
+
+        assert!(storage::with_lock_at(&path, || checkpoint().write_locked(&path)).is_err());
+        let saved: SavedExecution = storage::load_at(&path).unwrap();
+        assert_eq!(saved.tabs[0].layout.ids(), [2]);
+        assert!(saved.scrollback.is_empty());
+
+        std::fs::remove_file(&cache).unwrap();
+        storage::with_lock_at(&path, || checkpoint().write_locked(&path)).unwrap();
+        let saved: SavedExecution = storage::load_at(&path).unwrap();
+        let name = &saved.scrollback[&2];
+        let pane = load_at(2, name, &cache.join(name), MAX_PANE_BYTES).unwrap();
+        assert_eq!(pane.snapshot, b"payload");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn snapshot_envelopes_reject_incompatible_sources_ownership_and_lengths() {
-        let file = encode(2, b"payload").unwrap();
-        assert_eq!(decode(2, file.clone()).unwrap(), b"payload");
-        assert!(decode(3, file.clone()).is_err());
+        let directory = test_directory();
+        let name = format!("2-{}.snapshot", "a".repeat(32));
+        let path = directory.join(&name);
+        let pane = test_checkpoint(b"payload".to_vec());
+        let mut file = header(2, &pane).unwrap().to_vec();
+        file.extend_from_slice(&pane.snapshot);
+        let load = |file: &[u8]| {
+            std::fs::write(&path, file).unwrap();
+            load_at(2, &name, &path, MAX_PANE_BYTES)
+        };
+        assert_eq!(load(&file).unwrap().snapshot, b"payload");
         for offset in [0, 8, 12, 52, 60] {
             let mut changed = file.clone();
             changed[offset] ^= 1;
-            assert!(decode(2, changed).is_err());
+            assert!(load(&changed).is_err());
         }
         for len in [0, 1, HEADER - 1, file.len() - 1] {
-            assert!(decode(2, file[..len].to_vec()).is_err());
+            assert!(load(&file[..len]).is_err());
         }
         let mut trailing = file;
         trailing.push(0);
-        assert!(decode(2, trailing).is_err());
-        assert!(encode(2, &vec![0; MAX_PANE_BYTES + 1]).is_err());
+        assert!(load(&trailing).is_err());
+        assert!(header(2, &test_checkpoint(vec![0; MAX_PANE_BYTES + 1])).is_err());
         assert!(
             Checkpoint::new(
                 SavedExecution::default(),
-                (1..=MAX_PANES as u64 + 1).map(|id| (id, vec![])).collect(),
+                (1..=MAX_PANES as u64 + 1)
+                    .map(|id| (id, test_checkpoint(vec![])))
+                    .collect(),
                 vec![]
             )
             .is_err()
         );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -356,8 +428,11 @@ mod tests {
         let deleted = format!("3-{}.snapshot", "b".repeat(32));
         let orphan = format!("4-{}.snapshot", "c".repeat(32));
         let temporary = format!(".{orphan}.123-0.tmp");
+        let pane = test_checkpoint(b"payload".to_vec());
+        let mut file = header(2, &pane).unwrap().to_vec();
+        file.extend_from_slice(&pane.snapshot);
         for name in [&live, &deleted, &orphan] {
-            std::fs::write(directory.join(name), encode(2, b"payload").unwrap()).unwrap();
+            std::fs::write(directory.join(name), &file).unwrap();
         }
         std::fs::write(directory.join("unrelated"), b"keep").unwrap();
         std::fs::write(directory.join(&temporary), b"incomplete write").unwrap();
@@ -371,7 +446,9 @@ mod tests {
         assert!(directory.join("unrelated").exists());
         assert!(!directory.join(temporary).exists());
         assert_eq!(
-            load_at(2, &live, &directory.join(&live), MAX_PANE_BYTES).unwrap(),
+            load_at(2, &live, &directory.join(&live), MAX_PANE_BYTES)
+                .unwrap()
+                .snapshot,
             b"payload"
         );
         assert!(load_at(2, &live, &directory.join(&live), 3).is_err());

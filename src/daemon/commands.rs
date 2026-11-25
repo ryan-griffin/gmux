@@ -1,6 +1,6 @@
 //! Control commands and their ordered persistence.
 use super::*;
-use crate::persistence::SaveMode;
+use crate::persistence::{SaveMode, SaveResult};
 use gmux_protocol::control::*;
 
 pub(super) struct ControlRequest {
@@ -126,34 +126,34 @@ impl PendingControl {
     pub(super) fn id(&self) -> u64 {
         self.effects.id
     }
-    pub(super) fn complete(self, daemon: &mut Daemon, result: Result<(), String>) {
+    pub(super) fn complete(self, daemon: &mut Daemon, result: SaveResult) {
         let completion = self.effects.complete(daemon, result);
         self.reply.complete(completion).send(daemon);
     }
 }
 impl ControlReply {
     fn complete(mut self, completion: Completion) -> Self {
-        match completion {
-            Completion::Saved => (),
+        let warning = match completion {
+            Completion::Saved => return self,
             Completion::Scrollback(reply) => {
                 self.result = Ok(ControlValue::Execution(ExecutionReply::Scrollback(reply)));
+                return self;
             }
+            Completion::SavedWithWarning(warning) => warning,
             Completion::SaveFailed(error) => {
-                let warning = format!("Could not save execution or scrollback: {error}");
-                let target = match &mut self.result {
-                    Ok(ControlValue::Command(result)) => &mut result.warning,
-                    Ok(ControlValue::Execution(ExecutionReply::Stopped(reply))) => {
-                        &mut reply.warning
-                    }
-                    _ => unreachable!("Only execution mutations and shutdown save before replying"),
-                };
-                if let Some(previous) = target {
-                    previous.push_str("; ");
-                    previous.push_str(&warning);
-                } else {
-                    *target = Some(warning);
-                }
+                format!("Could not save execution or scrollback: {error}")
             }
+        };
+        let target = match &mut self.result {
+            Ok(ControlValue::Command(result)) => &mut result.warning,
+            Ok(ControlValue::Execution(ExecutionReply::Stopped(reply))) => &mut reply.warning,
+            _ => unreachable!("Only execution mutations and shutdown save before replying"),
+        };
+        if let Some(previous) = target {
+            previous.push_str("; ");
+            previous.push_str(&warning);
+        } else {
+            *target = Some(warning);
         }
         self
     }
@@ -621,7 +621,7 @@ mod tests {
         let mut daemon = daemon();
         let limits = daemon.limits;
         let mut worker =
-            Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| Ok(()));
+            Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| Ok(None));
         worker.finish();
         let (rename, reply) = request(json!({"method":"rename", "tab":1, "name":"Live"}));
         assert!(PendingControl::start(rename, &mut daemon, &worker).is_none());
@@ -665,8 +665,9 @@ mod tests {
         assert!(!daemon.checkpointed);
         assert_eq!(daemon.revision, 0);
 
-        let mut retry =
-            Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| Ok(()));
+        let mut retry = Worker::with_save(gmux_platform::unix::ipc::Wake::new().unwrap(), |_| {
+            Ok(Some("Pane omitted".into()))
+        });
         let Progress::Saving(pending) =
             daemon
                 .shutdown()
@@ -679,7 +680,7 @@ mod tests {
         let (_, result) = retry.results().next().unwrap();
         assert!(matches!(
             pending.complete(&mut daemon, result),
-            Completion::Saved
+            Completion::SavedWithWarning(warning) if warning == "Pane omitted"
         ));
         assert!(daemon.checkpointed);
     }

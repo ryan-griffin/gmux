@@ -1,6 +1,6 @@
 //! Effects of owner-thread mutations, separate from control reply delivery.
 use super::*;
-use crate::persistence::SaveMode;
+use crate::persistence::{SaveMode, SaveResult};
 use gmux_protocol::{
     control::{PaneFailure, ScrollbackReply, StopReply},
     retention::ScrollbackLimits,
@@ -39,6 +39,7 @@ enum AfterSave {
 }
 pub(super) enum Completion {
     Saved,
+    SavedWithWarning(String),
     SaveFailed(String),
     Scrollback(ScrollbackReply),
 }
@@ -77,15 +78,15 @@ impl Effects {
     }
 }
 impl PendingEffects {
-    pub(super) fn complete(self, daemon: &mut Daemon, result: Result<(), String>) -> Completion {
+    pub(super) fn complete(self, daemon: &mut Daemon, result: SaveResult) -> Completion {
         self.after_save.complete(daemon, result)
     }
 }
 impl AfterSave {
-    fn complete(self, daemon: &mut Daemon, result: Result<(), String>) -> Completion {
+    fn complete(self, daemon: &mut Daemon, result: SaveResult) -> Completion {
         match self {
             Self::ScrollbackSettings(limits) => Completion::Scrollback(match result {
-                Ok(()) => daemon.apply_scrollback_limits(limits),
+                Ok(_) => daemon.apply_scrollback_limits(limits),
                 Err(error) => ScrollbackReply {
                     limits: daemon.limits,
                     saved: Some(false),
@@ -103,7 +104,8 @@ impl AfterSave {
                     daemon.checkpointed = result.is_ok();
                 }
                 match result {
-                    Ok(()) => Completion::Saved,
+                    Ok(Some(warning)) => Completion::SavedWithWarning(warning),
+                    Ok(None) => Completion::Saved,
                     Err(error) => Completion::SaveFailed(error),
                 }
             }

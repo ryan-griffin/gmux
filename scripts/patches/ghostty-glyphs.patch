@@ -1122,7 +1122,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 +
  pub const snapshot_encode = snapshot.encode;
  pub const snapshot_encode_buf = snapshot.encode_buf;
- pub const snapshot_encode_buf_state = snapshot.encode_buf_state;
+ pub const snapshot_encode_state = snapshot.encode_state;
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
 @@ -362,6 +362,7 @@

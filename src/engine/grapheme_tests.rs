@@ -151,10 +151,8 @@ fn complete_native_clusters_survive_views_history_transport_copy_search_and_refl
             engine.poll_find();
         }
         assert_eq!(engine.find_state().total, 1);
-        // Saved state uses Ghostty's checkpoint and formatter, with no cell cap.
-        let saved = engine.checkpoint().unwrap();
-        let mut restored = Engine::new().unwrap();
-        restored.restore_history(&saved).unwrap();
+        let saved = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut restored = Engine::restore(&saved, Default::default()).unwrap();
         restored.set_theme(&Theme::adwaita(true)).unwrap();
         for cols in [4, 12, 8] {
             restored.resize(cols, 3, 8, 16).unwrap();

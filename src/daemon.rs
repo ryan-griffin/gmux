@@ -196,8 +196,8 @@ impl Daemon {
             git_dirty: false,
         };
         let mut used = HashSet::new();
-        let mut history_bytes = 0;
-        let mut history_panes = 0;
+        let mut checkpoint_bytes = 0;
+        let mut checkpoint_panes = 0;
         for tab in saved.tabs {
             if let Err(e) = tab.validate() {
                 eprintln!("Skipping invalid saved tab: {e}");
@@ -217,25 +217,25 @@ impl Daemon {
                         .filter(|p| p.is_dir())
                         .cloned()
                         .unwrap_or_else(gmux_platform::unix::paths::home);
-                    let history = scrollback.get(id).and_then(|name| {
-                        if history_panes >= crate::scrollback::MAX_PANES {
+                    let checkpoint = scrollback.get(id).and_then(|name| {
+                        if checkpoint_panes >= crate::scrollback::MAX_PANES {
                             eprintln!(
-                                "Skipping scrollback for pane {id}: restore pane limit reached"
+                                "Skipping terminal checkpoint for pane {id}: restore pane limit reached"
                             );
                             return None;
                         }
-                        history_panes += 1;
+                        checkpoint_panes += 1;
                         match crate::scrollback::load(
                             *id,
                             name,
-                            crate::scrollback::MAX_TOTAL_BYTES - history_bytes,
+                            crate::scrollback::MAX_TOTAL_BYTES - checkpoint_bytes,
                         ) {
-                            Ok(bytes) => {
-                                history_bytes += bytes.len();
-                                Some(bytes)
+                            Ok(pane) => {
+                                checkpoint_bytes += pane.snapshot.len();
+                                Some(pane)
                             }
                             Err(error) => {
-                                eprintln!("{error:#}. Starting with empty history");
+                                eprintln!("{error:#}");
                                 None
                             }
                         }
@@ -246,10 +246,10 @@ impl Daemon {
                         directory,
                         CursorStyle::default(),
                         &Theme::adwaita(true),
-                        history.as_deref(),
+                        checkpoint.as_ref(),
                         daemon.limits,
                     )?;
-                    if history.is_some()
+                    if checkpoint.is_some()
                         && let Some(name) = scrollback.get(id)
                     {
                         daemon.state.scrollback.insert(*id, name.clone());
@@ -395,13 +395,17 @@ impl Daemon {
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
             };
+            let remaining = crate::scrollback::MAX_TOTAL_BYTES - bytes;
+            if remaining == 0 {
+                warnings.push("Further panes omitted: checkpoint byte budget reached".into());
+                break;
+            }
             session.poll();
-            match session.checkpoint() {
-                Ok(snapshot) if bytes + snapshot.len() <= crate::scrollback::MAX_TOTAL_BYTES => {
-                    bytes += snapshot.len();
+            match session.checkpoint(remaining) {
+                Ok(snapshot) => {
+                    bytes += snapshot.snapshot.len();
                     panes.push((id, snapshot));
                 }
-                Ok(_) => warnings.push(format!("Pane {id}: checkpoint budget reached")),
                 Err(error) => warnings.push(format!("Pane {id}: {error}")),
             }
         }

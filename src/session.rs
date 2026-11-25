@@ -2,6 +2,7 @@
 
 use crate::{
     engine::Engine,
+    scrollback::PaneCheckpoint,
     title::{ForegroundProcess, PaneTitle},
 };
 use gmux_protocol::{
@@ -17,6 +18,12 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+fn grid_pixels(cells: u16, cell_size: u32) -> u16 {
+    u32::from(cells)
+        .saturating_mul(cell_size)
+        .min(u32::from(u16::MAX)) as u16
+}
 
 struct Pty {
     master: Box<dyn MasterPty + Send>,
@@ -195,7 +202,7 @@ impl TerminalSession {
         directory: PathBuf,
         cursor_style: CursorStyle,
         theme: &Theme,
-        history: Option<&[u8]>,
+        checkpoint: Option<&PaneCheckpoint>,
         limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -204,7 +211,15 @@ impl TerminalSession {
         command.arg("-l");
         command.env("GMUX_TAB", tab.to_string());
         command.env("GMUX_PANE", id.to_string());
-        Self::spawn_command(id, directory, cursor_style, theme, command, history, limits)
+        Self::spawn_command(
+            id,
+            directory,
+            cursor_style,
+            theme,
+            command,
+            checkpoint,
+            limits,
+        )
     }
 
     fn spawn_command(
@@ -213,32 +228,43 @@ impl TerminalSession {
         cursor_style: CursorStyle,
         theme: &Theme,
         mut command: CommandBuilder,
-        history: Option<&[u8]>,
+        checkpoint: Option<&PaneCheckpoint>,
         limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<Self> {
         // Complete fallible setup before spawning a process we must clean up.
-        let mut engine = Engine::new()?;
-        engine.set_scrollback_limits(limits)?;
-        if let Some(history) = history
-            && let Err(error) = engine.restore_history(history)
-        {
-            eprintln!(
-                "Could not restore scrollback for pane {id}: {error}. Starting with empty history"
-            );
-            engine = Engine::new()?;
-            engine.set_scrollback_limits(limits)?;
-        }
+        let restored = checkpoint.and_then(|pane| {
+            match Engine::restore(&pane.snapshot, limits).and_then(|mut engine| {
+                engine.prepare_shell(pane.cell_size)?;
+                Ok((engine, pane.cell_size, pane.pixel_size))
+            }) {
+                Ok(engine) => Some(engine),
+                Err(error) => {
+                    eprintln!("Could not restore terminal state for pane {id}: {error}");
+                    None
+                }
+            }
+        });
+        let (mut engine, cell_size, (pixel_width, pixel_height)) = match restored {
+            Some(restored) => restored,
+            None => {
+                let mut engine = Engine::new()?;
+                engine.set_scrollback_limits(limits)?;
+                (engine, (0, 0), (0, 0))
+            }
+        };
         engine.set_cursor_style(cursor_style)?;
+        engine.set_cursor_blink(true)?;
         engine.set_theme(theme)?;
         let mut compression = crate::compression::IdleCompression::default();
         compression.observe(engine.compression_activity()?, Instant::now());
         let (cols, rows) = engine.dimensions();
-        let pair = native_pty_system().openpty(PtySize {
+        let size = PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+            pixel_width,
+            pixel_height,
+        };
+        let pair = native_pty_system().openpty(size)?;
         let fd = pair
             .master
             .as_raw_fd()
@@ -281,13 +307,8 @@ impl TerminalSession {
             }),
             pid,
             directory,
-            size: PtySize {
-                cols,
-                rows,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            cell_size: (0, 0),
+            size,
+            cell_size,
             exited: false,
             title: PaneTitle::default(),
             title_polled: Instant::now(),
@@ -708,20 +729,15 @@ impl TerminalSession {
 
     pub(crate) fn resize_detached(&mut self, cols: u16, rows: u16) -> anyhow::Result<bool> {
         let (cw, ch) = self.cell_size;
-        let pixels = |cells: u16, cell_size: u32| {
-            u32::from(cells)
-                .saturating_mul(cell_size)
-                .min(u32::from(u16::MAX)) as u16
-        };
         let width = if cols == self.size.cols {
             self.size.pixel_width
         } else {
-            pixels(cols, cw)
+            grid_pixels(cols, cw)
         };
         let height = if rows == self.size.rows {
             self.size.pixel_height
         } else {
-            pixels(rows, ch)
+            grid_pixels(rows, ch)
         };
         self.resize(cols, rows, cw, ch, width, height)
     }
@@ -765,8 +781,12 @@ impl TerminalSession {
         Ok(true)
     }
 
-    pub(crate) fn checkpoint(&self) -> anyhow::Result<Vec<u8>> {
-        self.engine.checkpoint()
+    pub(crate) fn checkpoint(&self, limit: usize) -> anyhow::Result<PaneCheckpoint> {
+        Ok(PaneCheckpoint {
+            snapshot: self.engine.checkpoint(limit)?,
+            pixel_size: (self.size.pixel_width, self.size.pixel_height),
+            cell_size: self.cell_size,
+        })
     }
 
     pub(crate) fn text(&mut self) -> anyhow::Result<String> {

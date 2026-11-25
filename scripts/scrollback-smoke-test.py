@@ -16,6 +16,7 @@ root = Path(__file__).resolve().parent.parent
 artifacts = root / "artifacts"
 artifacts.mkdir(exist_ok=True)
 ghostty_revision = runpy.run_path(str(root / "scripts/bootstrap-ghostty.py"))["REVISION"]
+snapshot_header_bytes = 80
 unicode_line = "你好 e\u0301 🦀 wrapped history " * 6
 colored_output = ("\\033[31;44mINDEX\\033[38;5;201;48;5;22mEXTENDED\\033[0m\\n"
                   "\\033[1;3;4;9;38;2;12;34;56;48;2;78;90;123m" + unicode_line + "\\033[0m\\n"
@@ -70,9 +71,6 @@ class History:
                         cell = cells[start]
                         text = cell[0]
                         fg, bg, flags = cell[1:4]
-                        # The formatter emits background-only blanks as spaces.
-                        if not text and bg != bytes(frame["background"]) and flags & 64 == 0:
-                            text = " "
                         self.cells[row, col] = (text, fg, bg, flags, cell[4], cell[5])
             if header["meta"]["id"] == self.pane and predicate(header):
                 return header
@@ -100,9 +98,11 @@ class History:
 
 with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (artifacts / "scrollback-smoke.log").open("w") as log:
     fixture.env.update(DISPLAY="", WAYLAND_DISPLAY="", GMUX_TEST_DIR=str(fixture.path))
-    (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY\\n'\nexec /bin/bash --noprofile --norc -i\n")
+    (fixture.path / "shell").write_text("#!/bin/sh\nexport PS1=''\nstty -echo\necho $$ > \"$GMUX_TEST_DIR/$GMUX_PANE.pid\"\nprintf 'SHELL_READY %s\\n' \"$$\"\nexec /bin/bash --noprofile --norc -i\n")
 
     def start():
+        for marker in fixture.path.glob("*.pid"):
+            marker.unlink()
         daemon = fixture.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
         wait_for(lambda: fixture.rpc("status"))
         assert daemon.poll() is None
@@ -124,7 +124,8 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
             probe.close()
 
     def ready(pane):
-        wait_for(lambda: "SHELL_READY" in fixture.rpc("read", pane=pane)["text"])
+        pid = wait_for(lambda: (fixture.path / f"{pane}.pid").read_text().strip())
+        wait_for(lambda: f"SHELL_READY {pid}" in fixture.rpc("read", pane=pane)["text"])
 
     def rendition(pane):
         probe = History(fixture, pane)
@@ -240,12 +241,12 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
 
     def truncated_payload():
         changed = bytearray(valid[:-1])
-        changed[60:68] = struct.pack("<Q", len(changed) - 68)
+        changed[60:68] = struct.pack("<Q", len(changed) - snapshot_header_bytes)
         return changed
 
     for name, damaged in [
         ("Gmux format version", flip(8)),
-        ("Ghostty format version", flip(68 + 8)),
+        ("Ghostty format version", flip(snapshot_header_bytes + 8)),
         ("Ghostty source revision", flip(12)),
         ("pane ownership", flip(52)),
         ("record CRC", flip(len(valid) // 2)),
@@ -302,6 +303,60 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         assert "SIGTERM_HISTORY" not in history(new_pane)
         stop(daemon)
 
+    with scenario("restored grids, cursor appearance and links reach the fresh PTY and stream"):
+        daemon = start()
+        pane = fixture.rpc("new", directory=str(root))["pane"]
+        ready(pane)
+        probe = History(fixture, pane)
+        probe.send("resize", cols=42, rows=12, cw=120_000_000, ch=400_000_000,
+                   width=341, height=205)
+        probe.packet(lambda header: header["frame"] is not None and header["frame"]["cols"] == 42)
+        probe.close()
+        send(pane, r"printf '\033[2J\033[H\033[?12l\033]4;1;rgb:0c/22/38\007"
+                   r"\033[2;6H\033]8;;https://example.com/primary\007\033[31mPRIMARY_GRID"
+                   r"\033]8;;\007\033[8;6HBELOW_CURSOR\033[2;1H"
+                   r"\033[?1;1000;1004;1006h\033[?1049h\033[4;9H"
+                   r"\033]8;;https://example.com/alternate\007ALT_GRID\033]8;;\007'"
+                   r"; printf '\033[?2026h\033]52;c;Y2xpcGJvYXJk'")
+        wait_for(lambda: "ALT_GRID" in fixture.rpc("read", pane=pane)["text"])
+        stop(daemon)
+        daemon = start()
+        ready(pane)
+        probe = History(fixture, pane)
+        header = probe.packet(lambda header: header["frame"] is not None)
+        frame = header["frame"]
+        assert (frame["cols"], frame["rows"], frame["cursor_style"], frame["cursor_blink"]) == (42, 12, 1, 0), frame
+        assert frame["cursor_visible"]
+        assert header["meta"]["modes"] == [False, False]
+        assert probe.cells[1, 5][0:2] == ("P", bytes([12, 34, 56]))
+        assert probe.cells[7, 5][0] == "B"
+        reply = fixture.rpc("links", pane=pane)
+        assert reply["hyperlinks"]["targets"] == ["https://example.com/primary"], reply
+        # Query both the new PTY and the terminal's in-band cell-size report.
+        send(pane, "python3 -c 'import fcntl, os, struct, termios, tty; "
+                   'size = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8))); '
+                   'attrs = termios.tcgetattr(0); tty.setraw(0); os.write(1, b"\\x1b[16t"); '
+                   'response = b"".join(iter(lambda: os.read(0, 1), b"t")); '
+                   'termios.tcsetattr(0, termios.TCSANOW, attrs); '
+                   'print(repr(response + b"t")); print("RESTART_INPUT", size)' + "'")
+        def new_shell_output():
+            text = fixture.rpc("read", pane=pane)["text"]
+            return text if "RESTART_INPUT" in text else None
+        text = wait_for(new_shell_output)
+        assert "(12, 42, 341, 205)" in text and "clipboard" not in text and "ALT_GRID" not in text, text
+        assert r"\x1b[6;400000000;120000000t" in text, text
+        # The old shell's alternate-screen entry saved its red pen and row 2.
+        send(pane, r"printf '\0338RESET_CURSOR'")
+        probe.packet(lambda header: probe.cells.get((0, 0), ("",))[0] == "R")
+        assert probe.cells[0, 0][1] == bytes([255, 255, 255])
+        send(pane, r"printf '\033[?47h'")
+        probe.packet(lambda header: probe.cells.get((3, 8), ("",))[0] == "A")
+        assert fixture.rpc("links", pane=pane)["hyperlinks"]["targets"] == ["https://example.com/alternate"]
+        send(pane, r"printf '\033[?47l'")
+        probe.close()
+        fixture.rpc("close", pane=pane)
+        stop(daemon)
+
     with scenario("snapshot directory failure still saves the layout and quits"):
         cache = fixture.config / "scrollback"
         # The prior Stop left one referenced snapshot; replace the cache with
@@ -322,4 +377,4 @@ with AppFixture({"appearance": "dark"}, prefix="gmux-scrollback-") as fixture, (
         ready(new_pane)
         stop(daemon)
 
-print("PASS: durable Stop/SIGTERM colored history, exact indexed/RGB cells and attributes, resets without prompt bleed, new shell PIDs and input, Unicode wraps, snapshot permissions, disk backpressure, version/CRC/truncation/oversize recovery, startup recovery, and deleted-pane cleanup")
+print("PASS: durable Stop/SIGTERM colored history, native grids, links, cursor appearance, rendition without prompt bleed, new shell PIDs and input, Unicode wraps, snapshot permissions, disk backpressure, version/CRC/truncation/oversize recovery, startup recovery, and deleted-pane cleanup")

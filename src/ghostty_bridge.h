@@ -245,11 +245,12 @@ typedef bool (*GmuxWriterFn)(void *userdata, const uint8_t *data, size_t len);
 GmuxEngine *gmux_engine_new(void *userdata, GmuxEventFn callback);
 void gmux_engine_free(GmuxEngine *engine);
 // Serialized terminal state, distinct from the viewport snapshot below.
-int gmux_engine_checkpoint(GmuxEngine *engine, uint8_t *out, size_t cap, size_t *written);
-// Format primary text/rendition without terminal extras. Before replay, the
-// caller must validate the complete output, including untrusted cell text.
-int gmux_checkpoint_history(const uint8_t *data, size_t len, GmuxWriterFn write,
-    void *userdata, uint16_t *cols, uint16_t *rows);
+int gmux_engine_checkpoint(GmuxEngine *engine, GmuxWriterFn write, void *userdata);
+#define GMUX_MAX_GRID_AXIS 1000
+#define GMUX_MAX_GRID_CELLS 131072
+int gmux_engine_restore(const uint8_t *data, size_t len, const GmuxRetentionLimits *limits,
+    void *userdata, GmuxEventFn callback, GmuxEngine **out, uint16_t *cols, uint16_t *rows);
+int gmux_engine_prepare_shell(GmuxEngine *engine, uint32_t cw, uint32_t ch);
 int gmux_engine_history_size(GmuxEngine *engine, uint16_t *cols, size_t *rows);
 int gmux_engine_history_row(GmuxEngine *engine, uint32_t row, GmuxCellFn write, void *userdata,
     size_t cols, bool *wrapped);
@@ -273,8 +274,18 @@ int gmux_engine_copy(GmuxEngine *engine, bool html, GmuxWriterFn write,
     void *userdata, GmuxCopyColors *colors);
 int gmux_engine_theme(GmuxEngine *engine, const uint8_t *background,
     const uint8_t *foreground, const uint8_t *cursor, const uint8_t *palette, bool dark);
-// False for status-only input or an unfinished OSC introducer/body.
-bool gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len);
+// Drain a complete fixture input using the PTY feed.
+static inline bool gmux_engine_write(GmuxEngine *engine, const uint8_t *data, size_t len) {
+    bool changed = false;
+    while (len) {
+        size_t consumed;
+        changed |= gmux_engine_feed(engine, data, len, &consumed);
+        if (!consumed) break;
+        data += consumed;
+        len -= consumed;
+    }
+    return changed;
+}
 int gmux_engine_cursor_style(GmuxEngine *engine, uint8_t style);
 int gmux_engine_resize(GmuxEngine *engine, uint16_t cols, uint16_t rows, uint32_t cw, uint32_t ch);
 int gmux_engine_snapshot(GmuxEngine *engine, GmuxFrame *frame, bool pty_password_input, GmuxCellFn write, void *userdata, size_t cap, uint8_t *row_flags);

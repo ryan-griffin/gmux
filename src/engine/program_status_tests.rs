@@ -187,9 +187,8 @@ fn prompt_exit_ack_reset_screen_and_restore_lifetimes() {
     e.write(b"\x1b[?1049h\x1b]133;A\x07");
     assert_eq!(ids(&e), [""]);
     report(&mut e, "state=done");
-    let checkpoint = e.checkpoint().unwrap();
-    let mut fresh = Engine::new().unwrap();
-    fresh.restore_history(&checkpoint).unwrap();
+    let checkpoint = e.checkpoint(MAX_PANE_BYTES).unwrap();
+    let fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
     assert!(ids(&fresh).is_empty());
     e.write(b"\x1bc");
     flush(&mut e);

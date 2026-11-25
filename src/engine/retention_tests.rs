@@ -170,13 +170,12 @@ fn byte_and_line_limits_are_independent_zero_is_native_and_active_application_su
 }
 
 #[test]
-fn restored_history_obeys_limits_before_replay_and_keeps_fresh_shell_state() {
+fn restored_history_obeys_current_limits_and_keeps_fresh_shell_state() {
     let source = history();
-    let checkpoint = source.checkpoint().unwrap();
+    let checkpoint = source.checkpoint(MAX_PANE_BYTES).unwrap();
     for policy in [limits(None, Some(80)), limits(Some(0), None)] {
-        let mut fresh = Engine::new().unwrap();
-        fresh.set_scrollback_limits(policy).unwrap();
-        fresh.restore_history(&checkpoint).unwrap();
+        let mut fresh = Engine::restore(&checkpoint, policy).unwrap();
+        fresh.prepare_shell((0, 0)).unwrap();
         fresh.snapshot().unwrap();
         assert!(fresh.frame.scrollback.total < 350);
         if policy.max_bytes == Limit::Count(0) {
@@ -189,6 +188,37 @@ fn restored_history_obeys_limits_before_replay_and_keeps_fresh_shell_state() {
         );
         assert_eq!(fresh.memory_usage().unwrap().prompt_anchors, 0);
     }
+}
+
+#[test]
+fn linked_pages_fit_the_same_byte_limit_after_restore() {
+    let policy = ScrollbackLimits::default();
+    let mut source = Engine::new().unwrap();
+    source.set_scrollback_limits(policy).unwrap();
+    for row in 0..12_000 {
+        source.write(
+            format!(
+                "\x1b[38;5;{}m{row:06} build src/module_{:02}.rs compiled successfully 界é \x1b[0m\x1b]8;;https://example.com/log/{}\x07details\x1b]8;;\x07\r\n",
+                row % 16, row % 97, row % 32,
+            )
+            .as_bytes(),
+        );
+    }
+    let checkpoint = source.checkpoint(MAX_PANE_BYTES).unwrap();
+    source.scroll_to(0);
+    source.snapshot().unwrap();
+    assert!(source.frame.scrollback.total < 12_000);
+
+    let mut restored = Engine::restore(&checkpoint, policy).unwrap();
+    restored.scroll_to(0);
+    restored.snapshot().unwrap();
+    assert_eq!(
+        restored.frame.scrollback.total,
+        source.frame.scrollback.total
+    );
+    assert_eq!(restored.text().unwrap(), source.text().unwrap());
+    assert!(!restored.hyperlinks.targets.is_empty());
+    assert_eq!(restored.hyperlinks, source.hyperlinks);
 }
 
 #[test]

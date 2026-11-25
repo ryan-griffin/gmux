@@ -205,9 +205,9 @@ fn retained_anchors_are_bounded_pruned_and_do_not_restart_idle_compression() {
 fn restoration_has_text_but_no_old_commands_or_semantic_anchors() {
     let mut e = terminal();
     command(&mut e, "saved output");
-    let history = e.checkpoint().unwrap();
-    let mut fresh = terminal();
-    fresh.restore_history(&history).unwrap();
+    let history = e.checkpoint(MAX_PANE_BYTES).unwrap();
+    let mut fresh = Engine::restore(&history, Default::default()).unwrap();
+    fresh.prepare_shell((0, 0)).unwrap();
     assert_eq!(fresh.command_state().phase, Unknown);
     assert_eq!(fresh.memory_usage().unwrap().prompt_anchors, 0);
     assert!(fresh.select_output(None).is_err());

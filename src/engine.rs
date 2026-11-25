@@ -1,3 +1,4 @@
+use crate::scrollback::MAX_PANE_BYTES;
 use gmux_protocol::{
     glyphs::Glyphs,
     model::CursorStyle,
@@ -70,163 +71,8 @@ pub(crate) enum CompressionResult {
     Complete,
 }
 
-// Accept only the pinned cell formatter's rendition operations. Validate the
-// whole UTF-8 stream before touching the fresh terminal, including controls in
-// damaged cell/grapheme data. Never accept OSC, modes, cursor movement or an
-// unfinished parser sequence just because it came from a validated checkpoint.
-fn validate_history_replay(bytes: &[u8]) -> anyhow::Result<()> {
-    let mut text = std::str::from_utf8(bytes)?;
-    while !text.is_empty() {
-        if let Some(parameters) = text.strip_prefix("\x1b[") {
-            let end = parameters.find('m').filter(|&end| end <= 18);
-            let end = end.ok_or_else(|| anyhow::anyhow!("Invalid history rendition"))?;
-            let parameters = &parameters[..end];
-            let valid = match parameters {
-                "0" | "1" | "2" | "3" | "4" | "5" | "7" | "8" | "9" | "53" | "4:2" | "4:3"
-                | "4:4" | "4:5" => true,
-                _ => {
-                    let mut parts = parameters.split(';');
-                    let color_value = |s: &str| {
-                        !s.is_empty()
-                            && s.bytes().all(|byte| byte.is_ascii_digit())
-                            && s.parse::<u8>().is_ok()
-                    };
-                    matches!(parts.next(), Some("38" | "48" | "58"))
-                        && match parts.next() {
-                            Some("5") => parts.next().is_some_and(color_value),
-                            Some("2") => (0..3).all(|_| parts.next().is_some_and(color_value)),
-                            _ => false,
-                        }
-                        && parts.next().is_none()
-                }
-            };
-            anyhow::ensure!(valid, "Invalid history rendition");
-            text = &text[end + 3..];
-        } else if let Some(rest) = text.strip_prefix("\r\n") {
-            text = rest;
-        } else {
-            let character = text.chars().next().unwrap();
-            anyhow::ensure!(!character.is_control(), "Invalid history text");
-            text = &text[character.len_utf8()..];
-        }
-    }
-    Ok(())
-}
-
-// Convert the current formatter's OSC 8 and blank-cell operations to the
-// text/SGR-only replay format. No cursor, erase, or OSC operation reaches the
-// fresh shell. Both the formatted input and normalized output are bounded.
-fn normalize_history_replay(data: Vec<u8>, cols: u16) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        data.len() <= crate::scrollback::MAX_PANE_BYTES,
-        "History exceeds restore budget"
-    );
-    // Ordinary text and SGR already meet the replay contract. Keep their
-    // allocation instead of copying up to 8 MiB into a second buffer.
-    if validate_history_replay(&data).is_ok() {
-        return Ok(data);
-    }
-    let mut input = data.as_slice();
-    fn append(out: &mut Vec<u8>, data: &[u8]) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            data.len() <= crate::scrollback::MAX_PANE_BYTES - out.len(),
-            "History exceeds restore budget"
-        );
-        let required = out.len() + data.len();
-        if required > out.capacity() {
-            let capacity = required
-                .max(out.capacity().saturating_mul(2))
-                .clamp(4096, crate::scrollback::MAX_PANE_BYTES);
-            out.try_reserve_exact(capacity - out.len())?;
-        }
-        out.extend_from_slice(data);
-        Ok(())
-    }
-    let mut out = Vec::new();
-    let mut pen = [0; 128];
-    let mut pen_len = 0;
-    while !input.is_empty() {
-        if input.starts_with(b"\x1b]8;") {
-            let end = input[4..]
-                .windows(2)
-                .position(|p| p == b"\x1b\\")
-                .ok_or_else(|| anyhow::anyhow!("Invalid history hyperlink"))?
-                + 4;
-            anyhow::ensure!(
-                input[4..end].contains(&b';')
-                    && !input[4..end].iter().any(|b| b.is_ascii_control()),
-                "Invalid history hyperlink"
-            );
-            input = &input[end + 2..];
-        } else if input.starts_with(b"\x1b[") {
-            let end = input[2..]
-                .iter()
-                .take(19)
-                .position(|b| (0x40..=0x7e).contains(b))
-                .ok_or_else(|| anyhow::anyhow!("Invalid history rendition"))?
-                + 2;
-            let sequence = &input[..end + 1];
-            let parameters = &input[2..end];
-            input = &input[end + 1..];
-            match sequence[end] {
-                b'm' => {
-                    validate_history_replay(sequence)?;
-                    append(&mut out, sequence)?;
-                    if parameters == b"0" {
-                        pen_len = 0;
-                    } else {
-                        anyhow::ensure!(
-                            pen_len + sequence.len() <= pen.len(),
-                            "Invalid history pen"
-                        );
-                        pen[pen_len..pen_len + sequence.len()].copy_from_slice(sequence);
-                        pen_len += sequence.len();
-                    }
-                }
-                b'C' | b'X' => {
-                    anyhow::ensure!(
-                        !parameters.is_empty() && parameters.iter().all(u8::is_ascii_digit),
-                        "Invalid history blank count"
-                    );
-                    let count: usize = std::str::from_utf8(parameters)?.parse()?;
-                    anyhow::ensure!(
-                        (1..=usize::from(cols)).contains(&count),
-                        "Invalid history blank count"
-                    );
-                    if sequence[end] == b'X' {
-                        // Background-only blanks use ECH followed by CUF with
-                        // the same count. Materialize them in the current pen.
-                        input = input
-                            .strip_prefix(b"\x1b[")
-                            .and_then(|rest| rest.strip_prefix(parameters))
-                            .and_then(|rest| rest.strip_prefix(b"C"))
-                            .ok_or_else(|| anyhow::anyhow!("Invalid history blank pair"))?;
-                    } else {
-                        // CUF alone skips unwritten cells. Their rendition is
-                        // default even when the surrounding text is styled.
-                        append(&mut out, b"\x1b[0m")?;
-                    }
-                    let spaces = [b' '; gmux_protocol::viewport::MAX_AXIS];
-                    append(&mut out, &spaces[..count])?;
-                    if sequence[end] == b'C' {
-                        append(&mut out, &pen[..pen_len])?;
-                    }
-                }
-                _ => anyhow::bail!("Invalid history operation"),
-            }
-        } else {
-            let len = input
-                .iter()
-                .position(|&b| b == 0x1b)
-                .unwrap_or(input.len())
-                .max(1);
-            append(&mut out, &input[..len])?;
-            input = &input[len..];
-        }
-    }
-    validate_history_replay(&out)?;
-    Ok(out)
-}
+const _: () = assert!(GMUX_MAX_GRID_AXIS as usize == gmux_protocol::viewport::MAX_AXIS);
+const _: () = assert!(GMUX_MAX_GRID_CELLS as usize == gmux_protocol::viewport::MAX_CELLS);
 
 #[derive(Default)]
 struct Events {
@@ -647,6 +493,20 @@ impl Drop for EngineView {
         unsafe { gmux_engine_view_free(self.raw.as_ptr()) }
     }
 }
+fn native_retention_limits(
+    limits: gmux_protocol::retention::ScrollbackLimits,
+) -> anyhow::Result<GmuxRetentionLimits> {
+    let (max_bytes, max_lines) = limits.resolve_values()?;
+    let limit = |value: Option<usize>| GmuxRetentionLimit {
+        value: value.unwrap_or(0),
+        unlimited: value.is_none(),
+    };
+    Ok(GmuxRetentionLimits {
+        max_bytes: limit(max_bytes),
+        max_lines: limit(max_lines),
+    })
+}
+
 impl Engine {
     pub(crate) fn command_state(&self) -> gmux_protocol::shell::CommandState {
         let mut state = self.events.command.clone();
@@ -694,15 +554,7 @@ impl Engine {
         &mut self,
         limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<()> {
-        let (max_bytes, max_lines) = limits.resolve_values()?;
-        let limit = |value: Option<usize>| GmuxRetentionLimit {
-            value: value.unwrap_or(0),
-            unlimited: value.is_none(),
-        };
-        let limits = GmuxRetentionLimits {
-            max_bytes: limit(max_bytes),
-            max_lines: limit(max_lines),
-        };
+        let limits = native_retention_limits(limits)?;
         let result = unsafe { gmux_engine_retention(self.raw.as_ptr(), &limits) };
         self.revision = self.revision.wrapping_add(1);
         self.retention_revision = self.retention_revision.wrapping_add(1);
@@ -937,94 +789,111 @@ impl Engine {
     pub(crate) fn dimensions(&self) -> (u16, u16) {
         self.size
     }
-    pub(crate) fn checkpoint(&self) -> anyhow::Result<Vec<u8>> {
-        let mut len = 0;
-        let result =
-            unsafe { gmux_engine_checkpoint(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut len) };
-        anyhow::ensure!(
-            result >= 0,
-            "Ghostty snapshot could not capture terminal state"
-        );
-        anyhow::ensure!(
-            len <= crate::scrollback::MAX_PANE_BYTES,
-            "Terminal snapshot exceeds 8 MiB"
-        );
-        let mut bytes = vec![0; len];
-        let result = unsafe {
-            gmux_engine_checkpoint(self.raw.as_ptr(), bytes.as_mut_ptr(), bytes.len(), &mut len)
-        };
-        anyhow::ensure!(
-            result == 0 && len == bytes.len(),
-            "Ghostty snapshot encoding failed"
-        );
-        Ok(bytes)
-    }
-
-    pub(crate) fn restore_history(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            bytes.len() <= crate::scrollback::MAX_PANE_BYTES,
-            "Snapshot exceeds 8 MiB"
-        );
-        // Stream one decode/format pass into bounded storage. The callback is
-        // synchronous and borrows this Vec only until the C function returns.
-        unsafe extern "C" fn collect(ud: *mut c_void, data: *const u8, len: usize) -> bool {
-            let text = unsafe { &mut *ud.cast::<Vec<u8>>() };
-            if len > crate::scrollback::MAX_PANE_BYTES - text.len()
-                || text.try_reserve(len).is_err()
-            {
+    pub(crate) fn checkpoint(&self, limit: usize) -> anyhow::Result<Vec<u8>> {
+        struct Output {
+            bytes: Vec<u8>,
+            limit: usize,
+            over_budget: bool,
+        }
+        unsafe extern "C" fn write(ud: *mut c_void, data: *const u8, len: usize) -> bool {
+            let out = unsafe { &mut *ud.cast::<Output>() };
+            if len > out.limit - out.bytes.len() {
+                out.over_budget = true;
                 return false;
             }
-            text.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+            let required = out.bytes.len() + len;
+            if required > out.bytes.capacity() {
+                let capacity = required.max(out.bytes.capacity() * 2).min(out.limit);
+                if out
+                    .bytes
+                    .try_reserve_exact(capacity - out.bytes.len())
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            out.bytes
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
             true
         }
-        let (mut cols, mut rows) = (0, 0);
-        let mut text = Vec::<u8>::new();
+        anyhow::ensure!(
+            limit != 0,
+            "Terminal snapshot exceeds checkpoint byte budget"
+        );
+        let mut out = Output {
+            bytes: Vec::new(),
+            limit: limit.min(MAX_PANE_BYTES),
+            over_budget: false,
+        };
         let result = unsafe {
-            gmux_checkpoint_history(
-                bytes.as_ptr(),
-                bytes.len(),
-                Some(collect),
-                (&mut text as *mut Vec<u8>).cast(),
-                &mut cols,
-                &mut rows,
+            gmux_engine_checkpoint(
+                self.raw.as_ptr(),
+                Some(write),
+                (&mut out as *mut Output).cast(),
             )
         };
         anyhow::ensure!(
-            result == 0,
-            "Invalid Ghostty snapshot or history exceeds restore budget"
+            !out.over_budget,
+            "Terminal snapshot exceeds checkpoint byte budget"
         );
-        anyhow::ensure!(
-            gmux_protocol::viewport::valid(cols as u64, rows as u64),
-            "Invalid snapshot dimensions"
-        );
-        text = normalize_history_replay(text, cols)?;
-        // Include the clean ending in the replay budget. Reset before CRLF so
-        // a saved background cannot fill the new prompt's row during scrolling.
-        if !text.is_empty() {
-            let ending = b"\x1b[0m\r\n";
-            anyhow::ensure!(
-                text.len() <= crate::scrollback::MAX_PANE_BYTES - ending.len(),
-                "History exceeds restore budget"
-            );
-            text.try_reserve(ending.len())?;
-            text.extend_from_slice(ending);
-        }
-        self.resize(cols, rows, 0, 0)?;
-        self.write(&text);
+        anyhow::ensure!(result == 0, "Ghostty snapshot encoding failed ({result})");
+        out.bytes.shrink_to_fit();
+        Ok(out.bytes)
+    }
+
+    pub(crate) fn restore(
+        bytes: &[u8],
+        limits: gmux_protocol::retention::ScrollbackLimits,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(bytes.len() <= MAX_PANE_BYTES, "Snapshot exceeds 8 MiB");
+        let limits = native_retention_limits(limits)?;
+        let mut events = Box::<Events>::default();
+        let mut raw = std::ptr::null_mut();
+        let mut size = (0, 0);
+        let result = unsafe {
+            gmux_engine_restore(
+                bytes.as_ptr(),
+                bytes.len(),
+                &limits,
+                (&mut *events as *mut Events).cast(),
+                Some(event),
+                &mut raw,
+                &mut size.0,
+                &mut size.1,
+            )
+        };
+        anyhow::ensure!(result == 0, "Ghostty restore failed ({result})");
+        Self::from_raw(raw, events, size)
+    }
+
+    pub(crate) fn prepare_shell(&mut self, (cw, ch): (u32, u32)) -> anyhow::Result<()> {
+        let result = unsafe { gmux_engine_prepare_shell(self.raw.as_ptr(), cw, ch) };
+        anyhow::ensure!(result == 0, "Ghostty shell handoff failed ({result})");
         Ok(())
     }
 
     pub fn new() -> anyhow::Result<Self> {
         let mut events = Box::<Events>::default();
-        let raw = NonNull::new(unsafe {
-            gmux_engine_new((&mut *events as *mut Events).cast(), Some(event))
-        })
-        .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
+        let raw = unsafe { gmux_engine_new((&mut *events as *mut Events).cast(), Some(event)) };
+        let mut engine = Self::from_raw(raw, events, (80, 24))?;
+        engine.set_theme(&Theme::adwaita(true))?;
+        engine.set_cursor_style(CursorStyle::default())?;
+        engine.set_cursor_blink(true)?;
+        Ok(engine)
+    }
+
+    fn from_raw(
+        raw: *mut GmuxEngine,
+        events: Box<Events>,
+        size: (u16, u16),
+    ) -> anyhow::Result<Self> {
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| anyhow::anyhow!("Could not initialize libghostty-vt"))?;
         unsafe {
             gmux_engine_read_callback(raw.as_ptr(), Some(clipboard_read));
             gmux_engine_glyph_hold_callback(raw.as_ptr(), Some(glyph_hold));
         }
-        let mut engine = Self {
+        Ok(Self {
             revision: 1,
             history: GmuxHistory {
                 generation: 0,
@@ -1033,10 +902,10 @@ impl Engine {
             raw,
             events,
             frame: Frame::default(),
-            cells: vec![Cell::default(); 80 * 24],
-            row_flags: vec![0; 24],
+            cells: vec![Cell::default(); usize::from(size.0) * usize::from(size.1)],
+            row_flags: vec![0; usize::from(size.1)],
             hyperlinks: Default::default(),
-            size: (80, 24),
+            size,
             find: crate::search::HistorySearch::default(),
             find_row: Vec::new(),
             retention_revision: 0,
@@ -1046,11 +915,7 @@ impl Engine {
             held_hyperlinks: Default::default(),
             link_revision: 0,
             held_link_revision: 0,
-        };
-        engine.set_theme(&Theme::adwaita(true))?;
-        engine.set_cursor_style(CursorStyle::default())?;
-        engine.set_cursor_blink(true)?;
-        Ok(engine)
+        })
     }
     pub fn set_cursor_blink(&mut self, blink: bool) -> anyhow::Result<()> {
         let result = unsafe { gmux_engine_cursor_blink(self.raw.as_ptr(), blink) };
@@ -1094,11 +959,17 @@ impl Engine {
     pub(crate) fn take_progress_changed(&mut self) -> bool {
         self.events.progress.take_changed(std::time::Instant::now())
     }
-    pub fn write(&mut self, bytes: &[u8]) -> bool {
-        let changed = unsafe { gmux_engine_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) };
-        if changed {
-            self.revision = self.revision.wrapping_add(1);
-            self.find.invalidate();
+    #[cfg(test)]
+    pub fn write(&mut self, mut bytes: &[u8]) -> bool {
+        let mut changed = false;
+        while !bytes.is_empty() {
+            let (updated, consumed) = self.feed(bytes);
+            assert!(
+                consumed != 0,
+                "Terminal stopped before consuming the fixture input"
+            );
+            changed |= updated;
+            bytes = &bytes[consumed..];
         }
         changed
     }
@@ -1683,12 +1554,12 @@ mod tests {
         let (cached, flags) = engine.cache_rows(20..24).unwrap();
         let query: String = cached.iter().take(8).map(Cell::text).collect();
         assert!(query.starts_with("row "));
-        // Recovery replays into a fresh terminal with its own page limits.
-        // Compare the same recovery path before and after compression.
-        let mut reference = Engine::new().unwrap();
-        reference
-            .restore_history(&engine.checkpoint().unwrap())
-            .unwrap();
+        // Compare checkpoints captured before and after compression.
+        let mut reference = Engine::restore(
+            &engine.checkpoint(MAX_PANE_BYTES).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
         reference.snapshot().unwrap();
         let recovered_cache = reference.cache_rows(20..24).unwrap();
         let recovered_query: String = recovered_cache.0.iter().take(8).map(Cell::text).collect();
@@ -1769,10 +1640,11 @@ mod tests {
             );
         }
         finish_compression(&mut engine);
-        let mut fresh = Engine::new().unwrap();
-        fresh
-            .restore_history(&engine.checkpoint().unwrap())
-            .unwrap();
+        let mut fresh = Engine::restore(
+            &engine.checkpoint(MAX_PANE_BYTES).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
         fresh.snapshot().unwrap();
         let (restored_cache, restored_flags) = fresh.cache_rows(20..24).unwrap();
         assert!(restored_cache == recovered_cache.0);
@@ -1954,10 +1826,11 @@ mod tests {
         assert!(engine.mode(2004));
         assert_eq!(engine.metadata(false), "Keep title");
         assert_eq!(engine.metadata(true), "file:///tmp");
-        let mut restored = Engine::new().unwrap();
-        restored
-            .restore_history(&engine.checkpoint().unwrap())
-            .unwrap();
+        let mut restored = Engine::restore(
+            &engine.checkpoint(MAX_PANE_BYTES).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(restored.text().unwrap(), "");
 
         engine.write(b"old\x1b[6n");
@@ -1986,6 +1859,16 @@ mod tests {
             assert_eq!(engine.text().unwrap(), "NEW");
             assert_eq!(engine.take_events().0, b"");
         }
+    }
+
+    #[test]
+    fn feed_marks_a_deferred_clear_when_only_the_osc_terminator_arrives() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"visible\x1b]9;4;1;50");
+        engine.clear_screen().unwrap();
+        engine.write(b"\x1b");
+        assert_eq!(engine.feed(b"\\"), (true, 1));
+        assert_eq!(engine.text().unwrap(), "");
     }
 
     #[test]
@@ -2310,10 +2193,9 @@ mod tests {
             )
             .as_bytes(),
         );
-        let snapshot = old.checkpoint().unwrap();
+        let snapshot = old.checkpoint(MAX_PANE_BYTES).unwrap();
         let expected = rendered_history(&mut old);
-        let mut fresh = Engine::new().unwrap();
-        fresh.restore_history(&snapshot).unwrap();
+        let mut fresh = Engine::restore(&snapshot, Default::default()).unwrap();
         fresh.set_theme(&Theme::adwaita(true)).unwrap();
         for cols in [12, 19, 9] {
             fresh.resize(cols, 3, 0, 0).unwrap();
@@ -2338,6 +2220,7 @@ mod tests {
             assert_eq!(fresh.find_state().total, 1);
         }
         fresh.scroll(0, true);
+        fresh.prepare_shell((0, 0)).unwrap();
         fresh.write(b"Z");
         fresh.snapshot().unwrap();
         let new = fresh.cells.iter().find(|cell| cell.text() == "Z").unwrap();
@@ -2354,19 +2237,20 @@ mod tests {
     }
 
     #[test]
-    fn restored_indices_and_defaults_follow_current_theme_and_discard_saved_palette() {
+    fn restored_colors_keep_program_overrides_and_use_current_theme_defaults() {
         let mut old = Engine::new().unwrap();
         old.set_theme(&Theme::adwaita(true)).unwrap();
-        old.write(b"\x1b]4;1;rgb:01/02/03\x1b\\\x1b]10;rgb:04/05/06\x1b\\\x1b[31mI\x1b[0mD\x1b[38;2;7;8;9mR");
-        let mut fresh = Engine::new().unwrap();
-        fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
+        old.write(b"\x1b]4;1;rgb:01/02/03\x1b\\\x1b]10;rgb:04/05/06\x1b\\\x1b[31mI\x1b[0mD\x1b[38;2;7;8;9mR\x1b[32mT");
+        let mut fresh =
+            Engine::restore(&old.checkpoint(MAX_PANE_BYTES).unwrap(), Default::default()).unwrap();
         for dark in [false, true] {
             let theme = Theme::adwaita(dark);
             fresh.set_theme(&theme).unwrap();
             fresh.snapshot().unwrap();
-            assert_eq!(fresh.cells[0].fg, theme.palette[1]);
-            assert_eq!(fresh.cells[1].fg, theme.foreground);
+            assert_eq!(fresh.cells[0].fg, [1, 2, 3]);
+            assert_eq!(fresh.cells[1].fg, [4, 5, 6]);
             assert_eq!(fresh.cells[2].fg, [7, 8, 9]);
+            assert_eq!(fresh.cells[3].fg, theme.palette[2]);
             assert_eq!(fresh.cells[0].bg, theme.background);
         }
     }
@@ -2377,8 +2261,8 @@ mod tests {
         old.resize(12, 3, 0, 0).unwrap();
         old.set_theme(&Theme::adwaita(true)).unwrap();
         old.write("\x1b[31;44mA\x1b[0m\x1b[4CB\x1b[32;45mC\x1b[0m\x1b[2CD\r\n\r\n\x1b[31;44m你好 e\u{301} 🦀\x1b[0m\x1b[2CZ wrapped\r\n".as_bytes());
-        let mut fresh = Engine::new().unwrap();
-        fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
+        let mut fresh =
+            Engine::restore(&old.checkpoint(MAX_PANE_BYTES).unwrap(), Default::default()).unwrap();
         fresh.set_theme(&Theme::adwaita(true)).unwrap();
         old.scroll_to(0);
         fresh.scroll_to(0);
@@ -2409,79 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn current_formatter_controls_normalize_to_bounded_text_and_rendition() {
-        let mut formatted = b"\x1b[0m".to_vec();
-        formatted.extend_from_slice(b"\x1b[38;5;1mA\x1b[3CB\x1b]8;id=test;https://example/\x1b\\C\x1b]8;;\x1b\\\x1b[0m\x1b[48;5;4m\x1b[2X\x1b[2C");
-        let expected = b"\x1b[0m\x1b[38;5;1mA\x1b[0m   \x1b[38;5;1mBC\x1b[0m\x1b[48;5;4m  ";
-        assert_eq!(normalize_history_replay(formatted, 80).unwrap(), expected);
-        for invalid in [
-            b"\x1b]52;c;YQ==\x07".as_slice(),
-            b"\x1b[2J",
-            b"\x1b[H",
-            b"\x1b[0C",
-            b"\x1b[81C",
-            b"\x1b[+2C",
-            b"\x1b[2X",
-            b"\x1b[2X\x1b[3C",
-            b"\x1b]8;;unterminated",
-            b"\x1b]8;;bad\x07\x1b\\",
-        ] {
-            assert!(
-                normalize_history_replay(invalid.to_vec(), 80).is_err(),
-                "{invalid:?}"
-            );
-        }
-        // CUF expansion cannot bypass the replay budget with compact input.
-        let expansion = b"\x1b[1000C".repeat(crate::scrollback::MAX_PANE_BYTES / 1000 + 1);
-        assert!(normalize_history_replay(expansion, 1000).is_err());
-        let oversized = vec![b'a'; crate::scrollback::MAX_PANE_BYTES + 1];
-        assert!(normalize_history_replay(oversized, 80).is_err());
-    }
-
-    #[test]
-    fn history_replay_accepts_only_complete_utf8_crlf_and_cell_rendition() {
-        for valid in [
-            "你好 e\u{301} 🦀\r\n",
-            "\x1b[0m\x1b[4:3m\x1b[58;2;255;255;255m",
-            "\x1b[38;5;201m\x1b[48;2;1;2;3m",
-        ] {
-            validate_history_replay(valid.as_bytes()).unwrap();
-            let data = valid.as_bytes().to_vec();
-            let allocation = data.as_ptr();
-            let normalized = normalize_history_replay(data, 80).unwrap();
-            assert_eq!(normalized, valid.as_bytes());
-            assert_eq!(
-                normalized.as_ptr(),
-                allocation,
-                "Text/SGR replay must reuse its buffer"
-            );
-        }
-        for invalid in [
-            b"\x1b]4;1;rgb:01/02/03\x1b\\".as_slice(),
-            b"\x1b[?1049h",
-            b"\x1b[2J",
-            b"\x1b[1;2H",
-            b"\x1b[",
-            b"\x1b[0m\xf0\x9f",
-            b"\x1b[38;2;256;0;0m",
-            b"\x1b[38;2;1;2m",
-            b"\x1b[38;5;1;2m",
-            b"\x1b[9999999999999999999m",
-            b"\x1b[0\x07m",
-            b"\x1b[+1m",
-            b"\x1b[38;5;+1m",
-            b"\n",
-            b"\r",
-            b"\t",
-            b"\x07",
-            b"\xc2\x9b31m",
-        ] {
-            assert!(validate_history_replay(invalid).is_err(), "{invalid:?}");
-        }
-    }
-
-    #[test]
-    fn styled_history_expansion_is_bounded_before_installation() {
+    fn compact_styled_snapshot_restores_without_replay_expansion() {
         let mut old = Engine::new().unwrap();
         old.resize(1000, 131, 0, 0).unwrap();
         let line = concat!(
@@ -2495,25 +2307,24 @@ mod tests {
         }
         // A compact style table and cell grid can expand beyond the replay
         // budget when every cell switches styles. The valid file stays small.
-        let snapshot = old.checkpoint().unwrap();
-        let mut fresh = Engine::new().unwrap();
-        assert!(fresh.restore_history(&snapshot).is_err());
-        assert_eq!(fresh.dimensions(), (80, 24));
-        fresh.write(b"fresh");
-        assert_eq!(fresh.text().unwrap(), "fresh");
-        assert!(
-            fresh
-                .restore_history(&vec![0; crate::scrollback::MAX_PANE_BYTES + 1])
-                .is_err()
-        );
+        let snapshot = old.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut fresh = Engine::restore(&snapshot, Default::default()).unwrap();
+        assert_eq!(fresh.dimensions(), (1000, 131));
+        fresh.scroll_to(0);
+        fresh.snapshot().unwrap();
+        assert_eq!(fresh.cells[0].text(), "A");
+        assert_eq!(fresh.cells[0].fg, [4, 5, 6]);
+        assert_eq!(fresh.cells[1].text(), "B");
+        assert_eq!(fresh.cells[1].fg, [10, 11, 12]);
+        assert!(Engine::restore(&vec![0; MAX_PANE_BYTES + 1], Default::default()).is_err());
     }
 
     #[test]
-    fn crc_valid_snapshots_with_control_cells_or_excessive_page_dimensions_are_rejected() {
+    fn snapshot_controls_are_sanitized_and_invalid_page_dimensions_are_rejected() {
         let mut old = Engine::new().unwrap();
         old.resize(2, 1, 0, 0).unwrap();
         old.write(b"X");
-        let snapshot = old.checkpoint().unwrap();
+        let snapshot = old.checkpoint(MAX_PANE_BYTES).unwrap();
         // Pinned v1 envelope is 10 bytes; records have tag/length/CRC32C.
         // Locate the first PAGE, whose 20-byte header precedes this fixture's
         // empty style/hyperlink tables and one row of bare one-byte cells.
@@ -2546,14 +2357,15 @@ mod tests {
                 }
             }
             damaged[record + 6..record + 10].copy_from_slice(&(!crc).to_le_bytes());
-            let mut fresh = Engine::new().unwrap();
-            assert!(
-                fresh.restore_history(&damaged).is_err(),
-                "offset {offset}, {replacement:?}"
-            );
-            assert_eq!(fresh.dimensions(), (80, 24));
-            fresh.write(b"fresh");
-            assert_eq!(fresh.text().unwrap(), "fresh");
+            let result = Engine::restore(&damaged, Default::default());
+            if offset == page {
+                assert!(result.is_err());
+                continue;
+            }
+            let mut fresh = result.unwrap();
+            assert_eq!(fresh.text().unwrap(), "?");
+            fresh.write(b"Y");
+            assert_eq!(fresh.text().unwrap(), "?Y");
             assert!(fresh.events.replies.is_empty());
             assert!(fresh.events.notifications.is_empty());
         }
@@ -2565,9 +2377,8 @@ mod tests {
         old.resize(12, 3, 0, 0).unwrap();
         let line = "before 你好 e\u{301} 🦀 after a long wrapped line";
         old.write(format!("{line}\r\nsecond hard line\r\nthird\r\nfourth\r\n").as_bytes());
-        let snapshot = old.checkpoint().unwrap();
-        let mut fresh = Engine::new().unwrap();
-        fresh.restore_history(&snapshot).unwrap();
+        let snapshot = old.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut fresh = Engine::restore(&snapshot, Default::default()).unwrap();
         assert_eq!(fresh.dimensions(), (12, 3));
         for cols in [12, 19] {
             fresh.resize(cols, 3, 0, 0).unwrap();
@@ -2588,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_history_discards_alternate_screen_modes_and_unfinished_input() {
+    fn checkpoint_restores_native_state_before_clean_shell_handoff() {
         for unfinished in [
             b"\x1b[".as_slice(),
             b"\x1b]2;unfinished",
@@ -2597,12 +2408,32 @@ mod tests {
             b"\x1b_Ga=T;unfinished",
         ] {
             let mut old = Engine::new().unwrap();
-            old.write(b"\x1b]2;old title\x07\x1b]8;;https://example.com\x07primary history\x1b]8;;\x07\r\n\x1b[?1h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?1049halternate content\x1b[>31u");
+            old.write(b"\x1b]2;old title\x07\x1b]8;;https://example.com\x07primary history\x1b]8;;\x07\r\n\x1b[?1h\x1b[?1004h\x1b[?2004h\x1b[?1000h\x1b[?5;2031h\x1b[?1049halternate content\x1b[>31u\x1b[4 q\x1b[?2026h");
             old.write(unfinished);
-            let mut fresh = Engine::new().unwrap();
-            fresh.restore_history(&old.checkpoint().unwrap()).unwrap();
+            old.snapshot().unwrap();
+            let mut fresh =
+                Engine::restore(&old.checkpoint(MAX_PANE_BYTES).unwrap(), Default::default())
+                    .unwrap();
+            assert!(fresh.mode(0));
+            assert!(fresh.mode(1004));
+            assert!(fresh.mode(2004));
+            assert!(fresh.mode(2026));
+            assert!(fresh.mode(2031));
+            assert!(fresh.events.replies.is_empty());
+            assert_eq!(fresh.metadata(false), "old title");
+            assert!(fresh.text().unwrap().contains("alternate content"));
+            fresh.snapshot().unwrap();
+            assert_eq!(fresh.frame.cursor_style, CursorStyle::Underline as u8);
+            assert_eq!(
+                (fresh.frame.cursor_x, fresh.frame.cursor_y),
+                (old.frame.cursor_x, old.frame.cursor_y)
+            );
+            assert_eq!(fresh.frame.cursor_blink, 0);
+            fresh.prepare_shell((0, 0)).unwrap();
             assert!(!fresh.mode(0));
             assert!(!fresh.mode(1004));
+            assert!(!fresh.mode(2026));
+            assert!(fresh.mode(5));
             assert_eq!(
                 fresh.key("Up", layout(0), 0, KeyAction::Press, ""),
                 b"\x1b[A"
@@ -2616,35 +2447,86 @@ mod tests {
                 "{text:?}"
             );
             assert!(!text.contains("alternate content") && !text.contains("unfinished"));
+            fresh.snapshot().unwrap();
+            assert_eq!(fresh.hyperlinks.targets, ["https://example.com"]);
+            fresh.write(b"\x1b[?47h");
+            assert!(fresh.text().unwrap().contains("alternate content"));
         }
+    }
+
+    #[test]
+    fn checkpoint_keeps_primary_cursor_shape_after_alternate_selects_default() {
+        let mut old = Engine::new().unwrap();
+        old.write(b"\x1b[3 q\x1b[?1049h\x1b[0 q");
+        let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+        fresh.prepare_shell((0, 0)).unwrap();
+        fresh.set_cursor_style(CursorStyle::default()).unwrap();
+        fresh.set_cursor_blink(true).unwrap();
+        fresh.snapshot().unwrap();
+        assert_eq!(fresh.frame.cursor_style, CursorStyle::Underline as u8);
     }
 
     #[test]
     fn checkpoints_omit_large_unfinished_input_without_mutating_the_live_parser() {
         let mut old = Engine::new().unwrap();
         old.write(b"primary history\r\n");
-        let before = old.checkpoint().unwrap();
+        let before = old.checkpoint(MAX_PANE_BYTES).unwrap();
         old.write(b"\x1b]2;");
         old.write(&vec![b'a'; 64 * 1024 + 1]);
-        let snapshot = old.checkpoint().unwrap();
+        let snapshot = old.checkpoint(MAX_PANE_BYTES).unwrap();
         assert_eq!(snapshot, before);
         // The oversized title is discarded by the parser's own limits. A
         // smaller continuation still completes normally after checkpointing.
         old.write(b"\x07\x1b]2;live ");
-        old.checkpoint().unwrap();
+        old.checkpoint(MAX_PANE_BYTES).unwrap();
         old.write(b"parser\x07");
         assert_eq!(old.metadata(false), "live parser");
-        let mut fresh = Engine::new().unwrap();
-        fresh.restore_history(&snapshot).unwrap();
+        let mut fresh = Engine::restore(&snapshot, Default::default()).unwrap();
         fresh.write(b"fresh shell");
         assert!(fresh.text().unwrap().contains("fresh shell"));
+    }
+
+    #[test]
+    fn checkpoints_keep_complete_kitty_images_and_omit_unfinished_transfers() {
+        let mut old = Engine::new().unwrap();
+        old.write(b"\x1b_Ga=t,f=32,s=1,v=1,i=6122;BwcH/w==\x1b\\");
+        old.write(b"\x1b_Ga=T,f=32,s=2,v=2,i=6123,c=1,r=1,m=1;CVF8A9Na\x1b\\");
+        assert_eq!(old.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
+        let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+        assert!(
+            !checkpoint
+                .windows(6)
+                .any(|bytes| bytes == [9, 81, 124, 3, 211, 90])
+        );
+        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+        fresh.prepare_shell((0, 0)).unwrap();
+        let last_chunk = b"\x1b_Gm=0;B/8HBwf/BwcH/w==\x1b\\";
+        old.events.replies.clear();
+        old.write(last_chunk);
+        assert_eq!(old.events.replies, b"\x1b_Gi=6123;OK\x1b\\");
+        fresh.write(last_chunk);
+        assert!(!fresh.events.replies.windows(4).any(|part| part == b"6123"));
+        fresh.events.replies.clear();
+        fresh.write(b"\x1b_Ga=p,i=6122,c=1,r=1\x1b\\");
+        assert_eq!(fresh.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
+    }
+
+    #[test]
+    fn checkpoint_writer_enforces_its_byte_limit() {
+        let mut engine = Engine::new().unwrap();
+        engine.write(b"checkpoint sample\r\n");
+        let snapshot = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+        assert!(engine.checkpoint(0).is_err());
+        assert!(engine.checkpoint(snapshot.len() - 1).is_err());
+        assert_eq!(engine.checkpoint(snapshot.len()).unwrap(), snapshot);
     }
 
     #[test]
     fn damaged_ghostty_snapshots_never_install_partial_history() {
         let mut old = Engine::new().unwrap();
         old.write(b"saved history");
-        let snapshot = old.checkpoint().unwrap();
+        let snapshot = old.checkpoint(MAX_PANE_BYTES).unwrap();
         let mut damaged = snapshot.clone();
         let middle = damaged.len() / 2;
         damaged[middle] ^= 0xff;
@@ -2658,10 +2540,7 @@ mod tests {
             &damaged,
             &trailing,
         ] {
-            let mut fresh = Engine::new().unwrap();
-            assert!(fresh.restore_history(bytes).is_err());
-            fresh.write(b"fresh");
-            assert_eq!(fresh.text().unwrap(), "fresh");
+            assert!(Engine::restore(bytes, Default::default()).is_err());
         }
     }
     #[test]
@@ -4067,9 +3946,8 @@ mod progress_tests {
         engine.snapshot().unwrap();
         assert_eq!(engine.progress().percentage(), 42);
         assert!(engine.text().unwrap().contains("mixed text"));
-        let checkpoint = engine.checkpoint().unwrap();
-        let mut fresh = Engine::new().unwrap();
-        fresh.restore_history(&checkpoint).unwrap();
+        let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
         assert_eq!(fresh.progress(), Progress::default());
         assert!(fresh.progress_deadline().is_none());
         fresh.snapshot().unwrap();
