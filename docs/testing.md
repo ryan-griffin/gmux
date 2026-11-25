@@ -2,12 +2,13 @@
 
 Run commands from the repository root. The [README](../README.md#build-and-run)
 lists build prerequisites. Bootstrap the pinned Ghostty library before the first
-build, or set `GHOSTTY_PREFIX` to a build of the same source revision with all
-three bundled integration patches applied:
+build, or set `GHOSTTY_PREFIX` to a build of the same source revision with the
+bundled integration patches applied:
 
 - The [media-key patch](../scripts/patches/ghostty-media-keys.patch) supplies Kitty media/audio encoding.
 - The [clipboard-read patch](../scripts/patches/ghostty-clipboard-reads.patch) supplies the owned deferred-read APIs.
-- The [snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) omits unfinished parser input from history checkpoints.
+- The [snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) omits unfinished parser input and image transfers, prepares restored state for a fresh shell, and filters decoded text cells.
+- The [glyph patch](../scripts/patches/ghostty-glyphs.patch) exposes pane-local Glyph Protocol outlines.
 
 The bootstrap uses the architecture's baseline CPU target so cached libraries
 remain portable between machines. Ghostty's SIMD dispatch remains enabled.
@@ -121,7 +122,8 @@ The `mutation` headless suite blocks execution writes to check live revision
 publication through reads and streams, ordered command replies, responsive PTYs,
 process exits during pending saves, warnings without rollback, abandoned callers,
 Stop topology preservation, and SIGTERM during a command save. Daemon unit tests
-cover submission failures and checkpoint retry completion. Worker tests check
+cover submission failures, checkpoint retry after a failed commit, and
+successful commits with checkpoint warnings. Worker tests check
 that automatic saves coalesce without crossing explicit writes. GTK connection
 tests reject stale topology and metadata after newer stream snapshots.
 
@@ -144,10 +146,13 @@ and engine extraction at the wire boundary.
 
 Engine retention tests exercise scroll-clear cursor migration with zero and small
 byte/line limits, bold RGB text, OSC 8, and both explicit and shell-prompt clears.
-They also check one-row line-limit pruning after reflow. Saved-history tests
-check colors and gaps across reflow, current formatter normalization, buffer
-reuse, expansion budgets, and rejection of other terminal operations. Destructive-erasure shell
-fixtures put non-prompt text on the bottom row so ED 2 discards the active screen;
+They also check one-row line-limit pruning after reflow and restoration of
+link-heavy history within the original byte limit. Checkpoint tests cover
+native state and colors across reflow, compact styled grids, parser isolation,
+bounded capture, and rejection of damaged records. The `scrollback` suite
+checks both screen buffers, preserved links and palette overrides, the fresh
+PTY size and shell input, durable Stop and SIGTERM, and per-pane failure
+isolation. Destructive-erasure shell fixtures put non-prompt text on the bottom row so ED 2 discards the active screen;
 prompt-preserving clears separately verify that captured output survives. Native
 coordinate fixtures erase history after ED 2 so its prompt-preserving behavior
 cannot shift their absolute row-zero assertions. The shell suite runs

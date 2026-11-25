@@ -554,10 +554,15 @@ pub fn run() -> anyhow::Result<()> {
     persistence.finish();
     for (id, result) in persistence.results() {
         if shutdown.as_ref().is_some_and(|pending| pending.id == id) {
-            if let Completion::SaveFailed(error) =
-                shutdown.take().unwrap().complete(&mut daemon, result)
-            {
-                eprintln!("Could not save during shutdown: {error}");
+            match shutdown.take().unwrap().complete(&mut daemon, result) {
+                Completion::Saved => (),
+                Completion::SavedWithWarning(warning) => {
+                    eprintln!("Shutdown checkpoint: {warning}")
+                }
+                Completion::SaveFailed(error) => {
+                    eprintln!("Could not save during shutdown: {error}")
+                }
+                Completion::Scrollback(_) => unreachable!(),
             }
         } else if let Err(error) = result {
             eprintln!("Could not save layout during shutdown: {error}");
