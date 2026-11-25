@@ -486,8 +486,9 @@ mod tests {
 
     #[test]
     fn control_requests_reject_invalid_fields() {
+        assert!(Request::decode(json!({"method":"focus","tab":1})).is_ok());
         for wire in [
-            json!({"method":"_focus","tab":"invalid"}),
+            json!({"method":"focus","tab":"invalid"}),
             json!({"method":"_read","pane":-1}),
             json!({"method":"_busy","panes":["invalid"]}),
             json!({"method":"_command","command":{"method":"move"}}),

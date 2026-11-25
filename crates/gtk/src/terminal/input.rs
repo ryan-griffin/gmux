@@ -881,15 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_modifiers_include_caps_lock_state() {
-        assert_eq!(mods(gdk::ModifierType::LOCK_MASK), 16);
-        assert_eq!(
-            mods(gdk::ModifierType::LOCK_MASK | gdk::ModifierType::CONTROL_MASK),
-            18
-        );
-    }
-
-    #[test]
     fn num_lock_is_protocol_state_and_never_an_action_only_modifier() {
         let mut keyboard = KeyboardState {
             encoded: NUM_LOCK,
@@ -972,7 +963,8 @@ mod tests {
     fn caps_lock_events_report_the_lock_state_after_each_toggle() {
         let mut keyboard = KeyboardState::default();
         let control = gdk::ModifierType::CONTROL_MASK;
-        let locked = control | gdk::ModifierType::LOCK_MASK;
+        let lock = gdk::ModifierType::LOCK_MASK;
+        let locked = control | lock;
         assert_eq!(
             keyboard.update(gdk::Key::Caps_Lock, control, KeyAction::Press),
             18
@@ -981,6 +973,7 @@ mod tests {
             keyboard.update(gdk::Key::Caps_Lock, locked, KeyAction::Release),
             18
         );
+        assert_eq!(keyboard.update(gdk::Key::a, lock, KeyAction::Press), 16);
         assert_eq!(
             keyboard.update(gdk::Key::Caps_Lock, locked, KeyAction::Press),
             2

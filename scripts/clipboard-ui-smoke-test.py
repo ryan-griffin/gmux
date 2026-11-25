@@ -89,11 +89,14 @@ with (artifacts / "clipboard-ui-smoke.log").open("w") as log, \
             wait_for(lambda: native.clipboard_formats == [])
 
         with scenario(f"{connection} explicit command-output copy still publishes styled text"):
+            text = "styled <&>界🙂e\u0301"
             emit("\x1b[3J\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07"
-                 "\x1b[1;31mstyled <&>界\x1b[0m\r\n\x1b]133;D;0\x07")
+                 + "\x1b[1;38;2;17;34;51m" + text + "\x1b[0m\r\n\x1b]133;D;0\x07")
             desktop.rpc("action", name="copy-output")
-            wait_for(lambda: native.clipboard_text() == "styled <&>界")
-            check_html(dict(text="styled <&>界", html=native.clipboard_text("text/html")))
+            wait_for(lambda: native.clipboard_text() == text)
+            html = native.clipboard_text("text/html")
+            check_html(dict(text=text, html=html))
+            assert "rgb(17, 34, 51)" in html and "font-weight: bold" in html, html
 
         desktop.rpc("close-tab", connection=connection, tab=created["tab"])
 

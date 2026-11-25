@@ -18,12 +18,13 @@ artifacts = Path(__file__).resolve().parent.parent / "artifacts"
 artifacts.mkdir(exist_ok=True)
 
 
-def launch(fixture, *args, success=True):
-    process = fixture.start(binary, "serve", "--background", *args,
+def launch(fixture, *args, success=True, background=True, timeout=12):
+    mode = ("--background",) if background else ()
+    process = fixture.start(binary, "serve", *mode, *args,
                             cwd=fixture.path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    # Waiting for EOF also verifies that the daemon did not inherit these pipes.
-    stdout, stderr = process.communicate(timeout=12)
-    assert (process.returncode == 0) == success, (process.returncode, stdout, stderr)
+    # A detached daemon must close the launcher's pipes.
+    stdout, stderr = process.communicate(timeout=timeout)
+    assert (process.returncode == 0) == success, (mode, args, process.returncode, stdout, stderr)
     return process.pid, stderr
 
 
@@ -42,9 +43,7 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         assert not Path(fixture.env["GMUX_SOCKET"]).exists()
 
     with scenario("background serve returns with a ready daemon detached from its launcher"):
-        started = time.monotonic()
         launcher, _ = launch(fixture)
-        startup_ms = (time.monotonic() - started) * 1000
         info = fixture.rpc("status")
         pid = info["pid"]
         assert pid != launcher
@@ -55,22 +54,16 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         log = fixture.config / "daemon.log"
         assert Path(f"/proc/{pid}/fd/2").readlink() == log
         assert log.stat().st_mode & 0o777 == 0o600
-        before = sum(map(int, fields[11:13]))
-        time.sleep(.5)
-        after = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        status = Path(f"/proc/{pid}/status").read_text().splitlines()
-        (artifacts / "serve-background-resources.json").write_text(json.dumps(dict(
-            startup_ms=startup_ms, idle_cpu_ticks=sum(map(int, after[11:13])) - before,
-            resources=[line for line in status if line.startswith(("VmRSS:", "Threads:"))]), indent=2) + "\n")
         tab = subprocess.check_output([str(binary), "new", "--name", "Background job"], env=fixture.env, text=True)
         tab = json.loads(tab)
         assert fixture.rpc("list")["tabs"][0]["id"] == tab["tab"]
 
     with scenario("duplicate starts fail and concurrent starts produce exactly one successful launcher"):
-        _, error = launch(fixture, success=False)
-        assert "already running or starting" in error and "connection edit local" in error, error
-        assert fixture.rpc("status")["pid"] == pid
-        assert fixture.rpc("list")["tabs"][0]["id"] == tab["tab"]
+        for background in (False, True):
+            _, error = launch(fixture, success=False, background=background)
+            assert "already running or starting" in error and "connection edit local" in error, error
+            assert fixture.rpc("status")["pid"] == pid
+            assert fixture.rpc("list")["tabs"][0]["id"] == tab["tab"]
         stop_daemon(fixture.env["GMUX_SOCKET"])
         children = [fixture.start(binary, "serve", "--background", stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True) for _ in range(4)]
@@ -100,11 +93,9 @@ with AppFixture(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) as fixture, AppFixtu
         stop_daemon(fixture.env["GMUX_SOCKET"])
         with Path(fixture.env["GMUX_SOCKET"] + ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            for args in ((), ("--background",)):
-                child = fixture.start(binary, "serve", *args, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True)
-                stdout, stderr = child.communicate(timeout=3)
-                assert child.returncode != 0 and "already running or starting" in stderr, (stdout, stderr)
+            for background in (False, True):
+                _, error = launch(fixture, success=False, background=background, timeout=3)
+                assert "already running or starting" in error, error
             assert not Path(fixture.env["GMUX_SOCKET"]).exists()
         launch(fixture)
         assert fixture.rpc("status")["daemon"] == info["daemon"]

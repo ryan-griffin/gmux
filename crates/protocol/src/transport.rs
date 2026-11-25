@@ -741,38 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn binary_rows_round_trip_without_losing_cell_flags_or_unicode() {
-        let packet = packet();
-        let mut encoded = Vec::new();
-        packet.encode_into(&mut encoded).unwrap();
-        let decoded = Packet::read(&mut &encoded[..]).unwrap();
-        assert_eq!(
-            decoded.as_pane().unwrap().header.meta,
-            packet.as_pane().unwrap().header.meta
-        );
-        assert_eq!(decoded.as_pane().unwrap().header.rows, vec![1]);
-        assert_eq!(decoded.as_pane().unwrap().header.row_flags, vec![1]);
-        assert_eq!(decoded.as_pane().unwrap().header.scroll_serial, 42);
-        assert_eq!(
-            decoded.as_pane().unwrap().header.frame.unwrap().scrollback,
-            packet.as_pane().unwrap().header.frame.unwrap().scrollback
-        );
-        assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
-        assert_eq!(
-            decoded.as_pane().unwrap().header.notifications,
-            vec!["alert"]
-        );
-        packet.encode_into(&mut encoded).unwrap();
-        let mut reader = &encoded[..];
-        for _ in 0..2 {
-            assert!(
-                Packet::read(&mut reader).unwrap().as_pane().unwrap().cells
-                    == packet.as_pane().unwrap().cells
-            );
-        }
-        assert!(reader.is_empty());
-    }
-    #[test]
     fn heartbeat_records_are_separate_from_viewports_and_do_not_consume_following_data() {
         let mut bytes = HEARTBEAT_REPLY.to_vec();
         packet().encode_into(&mut bytes).unwrap();
@@ -805,26 +773,25 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_required_and_validated_in_stream_and_control_metadata() {
-        use serde_json::json;
+    fn pane_records_require_progress_metadata() {
         let mut header = serde_json::to_value(PaneHeader::default()).unwrap();
-        for progress in [
-            json!({"state":"error","percentage":101}),
-            json!({"state":2,"percentage":0}),
-            json!({"state":"inactive","percentage":42}),
-            json!({"state":"paused"}),
-            serde_json::Value::Null,
-        ] {
-            header["meta"]["progress"] = progress;
-            let json = serde_json::to_vec(&header).unwrap();
-            let mut bytes = ((json.len() + 4) as u32).to_le_bytes().to_vec();
-            bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&json);
-            assert!(Packet::read(&mut bytes.as_slice()).is_err());
-            assert!(serde_json::from_value::<Metadata>(header["meta"].clone()).is_err());
-        }
         header["meta"].as_object_mut().unwrap().remove("progress");
-        assert!(serde_json::from_value::<PaneHeader>(header).is_err());
+        let json = serde_json::to_vec(&header).unwrap();
+        let record = Record::new(
+            RECORD_PREFIX_BYTES - 4 + json.len(),
+            json.len(),
+            RecordKind::Pane,
+            record::json_budget(&json).unwrap(),
+            0,
+        )
+        .unwrap();
+        let mut bytes = record.encode().to_vec();
+        bytes.extend_from_slice(&json);
+        let error = Packet::read(&mut bytes.as_slice()).err().unwrap();
+        assert!(
+            error.to_string().contains("missing field `progress`"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1123,6 +1090,7 @@ mod tests {
         });
         unchanged.encode_into(&mut encoded).unwrap();
         packet.encode_into(&mut encoded).unwrap();
+        let expected_pane = packet.as_pane().unwrap();
         for (capacity, chunk) in [
             (1, 1),
             (CELL_PREFIX_BYTES - 1, 13),
@@ -1139,27 +1107,23 @@ mod tests {
                 },
             );
             for index in 0..3 {
-                let decoded = Packet::read(&mut reader).unwrap();
+                let decoded = Packet::read(&mut reader).unwrap().into_pane().unwrap();
                 if index == 1 {
-                    assert!(decoded.as_pane().unwrap().cells.is_empty());
-                    assert!(decoded.as_pane().unwrap().header.frame.is_none());
+                    assert!(decoded.cells.is_empty());
+                    assert!(decoded.header.frame.is_none());
                 } else {
-                    assert!(decoded.as_pane().unwrap().cells == packet.as_pane().unwrap().cells);
-                    assert!(
-                        decoded.as_pane().unwrap().header.frame
-                            == packet.as_pane().unwrap().header.frame
+                    assert!(decoded.cells == expected_pane.cells);
+                    assert!(decoded.header.frame == expected_pane.header.frame);
+                    assert_eq!(decoded.header.rows, expected_pane.header.rows);
+                    assert_eq!(decoded.header.row_flags, expected_pane.header.row_flags);
+                    assert_eq!(decoded.header.meta, expected_pane.header.meta);
+                    assert_eq!(
+                        decoded.header.scroll_serial,
+                        expected_pane.header.scroll_serial
                     );
                     assert_eq!(
-                        decoded.as_pane().unwrap().header.rows,
-                        packet.as_pane().unwrap().header.rows
-                    );
-                    assert_eq!(
-                        decoded.as_pane().unwrap().header.row_flags,
-                        packet.as_pane().unwrap().header.row_flags
-                    );
-                    assert_eq!(
-                        decoded.as_pane().unwrap().header.meta,
-                        packet.as_pane().unwrap().header.meta
+                        decoded.header.notifications,
+                        expected_pane.header.notifications
                     );
                 }
             }

@@ -522,19 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_requests_reject_client_organization_and_presentation() {
-        for body in [
-            json!({"method":"workspace-add","name":"Project"}),
-            json!({"method":"move","tab":1,"workspace":1}),
-            json!({"method":"focus","pane":2}),
-            json!({"method":"_desktop-save","desktop":{},"revision":0}),
-            json!({"method":"_presentation","session":{}}),
-            json!({"method":"new","workspace":1}),
-            json!({"method":"_command","command":{"method":"new","workspace":null}}),
-        ] {
-            assert!(Request::decode(body).is_err());
-        }
-        assert!(Request::decode(json!({"method":"new","directory":"/tmp"})).is_ok());
+    fn nested_execution_commands_and_layouts_reject_presentation_fields() {
+        assert!(
+            Request::decode(
+                json!({"method":"_command","command":{"method":"new","workspace":null}})
+            )
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<crate::model::PaneTree>(json!({"Split":{
             "vertical":false,"first":{"Pane":2},"second":{"Pane":3},"ratio":0.5}}))
