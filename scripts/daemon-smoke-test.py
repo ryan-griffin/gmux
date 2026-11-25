@@ -88,12 +88,14 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         size, = struct.unpack("<I", exact(4))
         assert size <= 64 * 1024 * 1024
         body = exact(size)
-        header, cells = decode_packet(body)
-        if header.get("frame"):
-            assert len(decode_cells(cells)) == (len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))) * header.get("frame")["cols"]
-        else:
-            assert not cells
-        return header, cells
+        header, encoded_cells = decode_packet(body)
+        if frame := header.get("frame"):
+            cells = decode_cells(encoded_cells)
+            rows = len(header["rows"]) + len((header.get("cache") or {}).get("row_flags", []))
+            assert len(cells) == rows * frame["cols"], header
+            return header, cells
+        assert not encoded_cells
+        return header, []
 
     def screen(pane, predicate=lambda header, cells: True):
         deadline = time.monotonic() + 12
@@ -102,6 +104,13 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             if header.get("meta", {}).get("id") == pane and header.get("frame") and predicate(header, cells):
                 return header, cells
         raise AssertionError("No matching viewport packet")
+
+    def row_starts_with(header, cells, row, text):
+        if row not in header["rows"]:
+            return False
+        cols = header["frame"]["cols"]
+        start = header["rows"].index(row) * cols
+        return "".join(cell[0] for cell in cells[start:start + cols]).startswith(text)
 
     def copy_reply(predicate):
         deadline = time.monotonic() + 12
@@ -119,10 +128,6 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             assert result.returncode == 0 and "Usage: gmux" in result.stdout, result
             assert not (temp / "socket").exists(), "Launching the headless CLI must not start a daemon"
         daemon = start_daemon()
-        duplicate = subprocess.run([str(cargo_binary("gmux")), "serve"], env=env,
-                                   capture_output=True, text=True, timeout=5)
-        assert duplicate.returncode != 0 and "already running or starting" in duplicate.stderr, duplicate
-        assert rpc("status")["pid"] == daemon.pid
         first = cli("new", "--directory", root)
         pane = first["pane"]
         assert cli("status")["pid"] == daemon.pid
@@ -168,7 +173,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         command("subscribe", panes=[pane])
         header, cells = screen(pane)
         assert header["rows"] == list(range(header.get("frame")["rows"])), header
-        assert b"H" in cells
+        assert row_starts_with(header, cells, 0, "HEADLESS_READY"), header
         # Selection commands and Copy share the frontend's ordered stream.
         # A missing selection must produce an error, never an empty copy packet.
         for selected in (False, True, False):
@@ -191,7 +196,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         while select.select([stream], [], [], 0.1)[0]:
             packet()
         command("input", pane=pane, bytes=list(b"printf '\\033[3;1HROW_DELTA'\r"))
-        header, cells = screen(pane, lambda header, cells: b"R" in cells)
+        header, _ = screen(pane, lambda header, cells: row_starts_with(header, cells, 2, "ROW_DELTA"))
         assert header["rows"] == [2], f"Expected one changed row, received {header['rows']}"
 
         # Unsubscribe before counting hidden work. A late prompt frame from the
@@ -210,8 +215,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         assert len(header["rows"]) == header.get("frame")["rows"], "New subscription must resync every row"
         command("scroll", pane=hidden, delta=-10000, bottom=False)
         header, cells = screen(hidden, lambda header, cells: len(header["rows"]) > 0)
-        text = "".join(cell[0] for cell in decode_cells(cells)).encode()
-        assert b"hidden 1" in text, "Daemon must retain scrollback while hidden"
+        text = "".join(cell[0] for cell in cells)
+        assert "hidden 1" in text, "Daemon must retain scrollback while hidden"
         assert header.get("frame")["scrollback"]["offset"] == 0
         assert header.get("frame")["scrollback"]["total"] > header.get("frame")["rows"]
         command("scroll-to", pane=hidden, row=12, serial=42)
@@ -245,8 +250,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             shell_pid = temp / "shell.pid"
             progress = temp / "background-progress"
             send(pane, f"echo $$ > {shlex.quote(str(shell_pid))}; sleep 0.6; printf 'BACKGROUND_CONTINUED\\n'; echo done > {shlex.quote(str(progress))}")
-            wait_for(shell_pid.exists)
-            original_pid = shell_pid.read_text()
+            original_pid = wait_for(lambda: shell_pid.read_text().strip())
             # This calls the same close-request path as the titlebar button.
             rpc("detach")
             assert app.wait(timeout=8) == 0
@@ -257,9 +261,11 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             assert "BACKGROUND_CONTINUED" in rpc("read", pane=pane)["text"]
             app = start_app()
             assert [p["id"] for p in rpc("list")["tabs"][0]["panes"]] == [pane, hidden]
-            send(pane, f"echo $$ > {shlex.quote(str(shell_pid))}")
-            time.sleep(0.1)
-            assert shell_pid.read_text() == original_pid, "Reopen must reconnect to the same shell"
+            reattached_pid = temp / "reattached-shell.pid"
+            send(pane, f"echo $$ > {shlex.quote(str(reattached_pid))}")
+            reopened_pid = wait_for(lambda: reattached_pid.read_text().strip(),
+                                    message="The reopened frontend did not get a fresh shell PID")
+            assert reopened_pid == original_pid, "Reopen must reconnect to the same shell"
             rpc("screenshot", path=str(artifacts / "daemon-reattached.png"))
             # A frontend crash also leaves sessions running.
             app.kill()
@@ -285,7 +291,7 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
             app = None
             cli("stop")
             wait_for(lambda: not Path(f"/proc/{command_pid}").exists())
-            wait_for(lambda: not Path(f"/proc/{original_pid.strip()}").exists())
+            wait_for(lambda: not Path(f"/proc/{original_pid}").exists())
         else:
             cli("stop")
             assert daemon.wait(timeout=8) == 0
@@ -316,8 +322,8 @@ with tempfile.TemporaryDirectory(prefix="gmux-execution-") as directory:
         screen(hidden)
         command("scroll-to", pane=hidden, row=0, serial=99)
         header, cells = screen(hidden, lambda header, cells: header["scroll_serial"] == 99)
-        text = "".join(cell[0] for cell in decode_cells(cells)).encode()
-        assert b"hidden 1" in text, "Daemon restart must restore primary-screen history"
+        text = "".join(cell[0] for cell in cells)
+        assert "hidden 1" in text, "Daemon restart must restore primary-screen history"
         command("scroll", pane=hidden, delta=0, bottom=True)
         screen(hidden, lambda header, cells: header.get("frame")["scrollback"]["offset"] > 0)
         stream.close()

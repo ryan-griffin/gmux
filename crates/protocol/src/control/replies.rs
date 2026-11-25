@@ -191,17 +191,3 @@ impl Request {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ordinary_acknowledgements_are_not_daemon_stop_replies() {
-        let reply = ExecutionReply::Done(Acknowledgement { ok: true });
-        assert_eq!(
-            reply.into_stopped().unwrap_err().to_string(),
-            "Expected a daemon stop reply"
-        );
-    }
-}

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check direct dispatch, pipelined ordering, cancellation, and shared admission."""
+from contextlib import ExitStack, closing
 import json
 from pathlib import Path
 import socket
@@ -67,31 +68,46 @@ with AppFixture(prefix='gmux-direct-transport-') as fixture:
         wait_for(lambda: fixture.rpc('status')['frontend_resources']['streams'] == 0)
 
     with scenario('local and remote streams share aggregate admission and release slots'):
+        def frontend_resources():
+            return fixture.rpc('status')['frontend_resources']
+
+        limit = frontend_resources()['stream_limit']
+        remote_count = min(24, limit // 2)
+        local_count = limit - remote_count
+        unix_path = fixture.env['GMUX_SOCKET'] + '.stream'
+        attach = (json.dumps(dict(method='attach', version=PROTOCOL_VERSION, daemon=identity)) + '\n').encode()
         local, remote = [], []
         try:
-            for _ in range(40):
+            for _ in range(local_count):
                 peer = socket.socket(socket.AF_UNIX)
-                peer.connect(fixture.env['GMUX_SOCKET']+'.stream')
+                peer.settimeout(3)
+                peer.connect(unix_path)
                 local.append(peer)
-            for _ in range(24):
-                peer, reader = connect('stream', (json.dumps(dict(method='attach', version=PROTOCOL_VERSION, daemon=identity))+'\n').encode())
+            for _ in range(remote_count):
+                peer, reader = connect('stream', attach)
                 reader.close()
                 remote.append(peer)
-            wait_for(lambda: fixture.rpc('status')['frontend_resources']['streams'] == 64)
-            rejected, reader = connect('stream', (json.dumps(dict(method='attach', version=PROTOCOL_VERSION, daemon=identity))+'\n').encode())
-            assert reader.read(1) == b''
-            reader.close()
-            rejected.close()
-            remote.pop().close()
-            wait_for(lambda: fixture.rpc('status')['frontend_resources']['streams'] == 63)
-            recovered = Client(fixture, pane, address=address)
-            recovered.send('paste', text="printf 'ADMISSION_DIRECT_OK\\n'", enter=True)
-            recovered.output('ADMISSION_DIRECT_OK')
-            recovered.close()
-            fixture.rpc('remote-access-set', remote_access=dict(enabled=False, listen_address=address, authentication=dict(mode='none')))
-            wait_for(lambda: fixture.rpc('status')['frontend_resources']['streams'] == 40)
+            wait_for(lambda: frontend_resources()['streams'] == limit)
+            with socket.socket(socket.AF_UNIX) as rejected:
+                rejected.settimeout(3)
+                rejected.connect(unix_path)
+                assert rejected.recv(1) == b'', 'Excess Unix stream was admitted'
+            rejected, reader = connect('stream', attach)
+            with rejected, reader:
+                assert reader.read(1) == b'', 'Excess TCP stream was admitted'
+
+            with ExitStack() as recovered:
+                for peers, endpoint, transport in ((local, None, 'UNIX'), (remote, address, 'TCP')):
+                    peers.pop().close()
+                    wait_for(lambda: frontend_resources()['streams'] == limit - 1)
+                    client = recovered.enter_context(closing(Client(fixture, pane, address=endpoint)))
+                    client.send('paste', text=f"printf 'ADMISSION_%s_OK\\n' {transport}", enter=True)
+                    client.output(f'ADMISSION_{transport}_OK')
+                assert fixture.rpc('status')['local_clients'] == 1
+                fixture.rpc('remote-access-set', remote_access=dict(enabled=False, listen_address=address, authentication=dict(mode='none')))
+                wait_for(lambda: frontend_resources()['streams'] == local_count)
         finally:
-            for peer in local+remote:
+            for peer in local + remote:
                 peer.close()
-        wait_for(lambda: fixture.rpc('status')['frontend_resources']['streams'] == 0)
+        wait_for(lambda: frontend_resources()['streams'] == 0)
 print('Direct remote transport smoke test passed')

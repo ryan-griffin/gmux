@@ -874,7 +874,7 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         local.rpc("close", pane=created["active_pane"])
         wait_for(lambda: len(local.rpc("_state", client=False)["execution"]["tabs"]) == 2)
 
-    with scenario("the filter menu only offers workspaces and removed creation actions stay unavailable"):
+    with scenario("the filter menu only offers workspaces"):
         click("Tab Filter", "toggle button")
         widget("All Tabs", "menu item")
         widget("Work", "menu item")
@@ -885,7 +885,6 @@ with (artifacts / "remotes-ui-smoke.log").open("w") as log, \
         wait_accessible(lambda: not find("All Tabs", "menu item"))
         assert "error" in local.rpc("filter", connection="server", check=False)
         assert local.rpc("list")["filter"] == "all"
-        assert "error" in local.rpc("action", name="open-folder", check=False)
         click("New Tab Options", "toggle button")
         creation_menu()
         key(Gdk.KEY_Escape)

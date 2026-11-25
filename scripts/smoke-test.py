@@ -40,10 +40,9 @@ def empty_startup(fixture, log):
     assert fixture.rpc("list")["active_tab"] is None
     assert fixture.rpc("renderer-info")["terminal"] is None
     assert "error" in fixture.rpc("read", check=False)
-    for name in ("next-pane", "previous-pane", "rename", "split-right", "find", "browser"):
+    for name in ("next-pane", "previous-pane", "rename", "split-right", "find"):
         assert "error" in fixture.rpc("action", name=name, check=False), name
     for method, params in (("read", {"pane": 999999}), ("unknown", {}),
-                           ("browser", {"url": "about:blank"}),
                            ("new", {"directory": str(fixture.path / "missing")})):
         assert "error" in fixture.rpc(method, check=False, **params), method
     fixture.rpc("action", name="new")

@@ -181,13 +181,12 @@ or a following clear event. The `shell` suite also
 checks rich command-output requests and the CLI.
 The native `terminal-input` suite reads both MIME representations from actual
 GTK clipboard offers, checks Unicode OSC 52 writes, and pastes primary selection
-in the private Wayland session. `multi-window` verifies each window's selection;
-`remote-window` reads a remote rich copy through GTK. These reads outlive the
-transient daemon packet and exercise provider ownership.
+in the private Wayland session. `multi-window` verifies each window's selection.
+These reads outlive the transient daemon packet and exercise provider ownership.
 The `clipboard-ui` suite uses the same native Wayland fixture to read exact PNG,
 HTML and plain bytes from local and remote GTK offers. It checks atomic rejection,
-no invented text, empty versus clear, and command-output copy. It does not render
-application clipboard data.
+no invented text, empty versus clear, and command-output copy with RGB color and
+bold text.
 
 The `clipboard-read` headless suite exercises real PTYs over local and remote
 frontend streams. It checks asynchronous ordering, 4 MiB binary results,

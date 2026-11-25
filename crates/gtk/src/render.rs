@@ -189,9 +189,11 @@ pub fn cursor_rects(style: u8, focused: bool, (x, y, w, h): Rect, mut paint: imp
 mod tests {
     use super::*;
 
+    const CELL: Rect = (0.0, 0.0, 9.0, 21.0);
+
     fn rects(text: &str) -> Vec<Rect> {
         let mut result = Vec::new();
-        assert!(graphic_rects(text, (0.0, 0.0, 9.0, 21.0), |rect| result.push(rect)));
+        assert!(graphic_rects(text, CELL, |rect| result.push(rect)));
         result
     }
 
@@ -227,18 +229,37 @@ mod tests {
 
     #[test]
     fn box_arms_connect_at_cell_edges_without_overpainting() {
-        for text in [
-            "─", "━", "│", "┃", "┌", "┏", "┐", "┓", "└", "┗", "┘", "┛", "├", "┣", "┤", "┫", "┬",
-            "┳", "┴", "┻", "┼", "╋",
+        let (left, top, width, height) = CELL;
+        // Expected edges in left, right, top, bottom order.
+        for (glyphs, expected) in [
+            (["─", "━"], [true, true, false, false]),
+            (["│", "┃"], [false, false, true, true]),
+            (["┌", "┏"], [false, true, false, true]),
+            (["┐", "┓"], [true, false, false, true]),
+            (["└", "┗"], [false, true, true, false]),
+            (["┘", "┛"], [true, false, true, false]),
+            (["├", "┣"], [false, true, true, true]),
+            (["┤", "┫"], [true, false, true, true]),
+            (["┬", "┳"], [true, true, false, true]),
+            (["┴", "┻"], [true, true, true, false]),
+            (["┼", "╋"], [true, true, true, true]),
+            (["╴", "╸"], [true, false, false, false]),
+            (["╶", "╺"], [false, true, false, false]),
+            (["╵", "╹"], [false, false, true, false]),
+            (["╷", "╻"], [false, false, false, true]),
         ] {
-            assert_disjoint(&rects(text));
+            for text in glyphs {
+                let rects = rects(text);
+                assert_disjoint(&rects);
+                let edges = [
+                    rects.iter().any(|&(x, _, _, _)| x == left),
+                    rects.iter().any(|&(x, _, w, _)| x + w == left + width),
+                    rects.iter().any(|&(_, y, _, _)| y == top),
+                    rects.iter().any(|&(_, y, _, h)| y + h == top + height),
+                ];
+                assert_eq!(edges, expected, "{text}");
+            }
         }
-        let vertical = rects("┃");
-        assert!(vertical.iter().any(|r| r.1 == 0.0));
-        assert!(vertical.iter().any(|r| r.1 + r.3 == 21.0));
-        let horizontal = rects("─");
-        assert!(horizontal.iter().any(|r| r.0 == 0.0));
-        assert!(horizontal.iter().any(|r| r.0 + r.2 == 9.0));
     }
 
     #[test]
