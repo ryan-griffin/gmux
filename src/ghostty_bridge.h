@@ -245,7 +245,8 @@ typedef bool (*GmuxWriterFn)(void *userdata, const uint8_t *data, size_t len);
 GmuxEngine *gmux_engine_new(void *userdata, GmuxEventFn callback);
 void gmux_engine_free(GmuxEngine *engine);
 // Serialized terminal state, distinct from the viewport snapshot below.
-int gmux_engine_checkpoint(GmuxEngine *engine, GmuxWriterFn write, void *userdata);
+int gmux_engine_checkpoint(GmuxEngine *engine, GmuxWriterFn write, void *userdata,
+    bool include_images, bool *has_images);
 #define GMUX_MAX_GRID_AXIS 1000
 #define GMUX_MAX_GRID_CELLS 131072
 int gmux_engine_restore(const uint8_t *data, size_t len, const GmuxRetentionLimits *limits,

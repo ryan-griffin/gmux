@@ -872,9 +872,10 @@ int gmux_engine_compress(GmuxEngine *e, int *out) {
 }
 
 // Serialized terminal state, distinct from gmux_engine_snapshot's viewport.
-int gmux_engine_checkpoint(GmuxEngine *e, GmuxWriterFn write, void *userdata) {
+int gmux_engine_checkpoint(GmuxEngine *e, GmuxWriterFn write, void *userdata,
+    bool include_images, bool *has_images) {
     GhosttyWriter writer = {.write = write, .userdata = userdata};
-    return ghostty_snapshot_encode_state(e->terminal, writer);
+    return ghostty_snapshot_encode_state(e->terminal, writer, include_images, has_images);
 }
 
 // Zig retains the allocator descriptor on the terminal and its tracked refs.

@@ -402,9 +402,14 @@ impl Daemon {
             }
             session.poll();
             match session.checkpoint(remaining) {
-                Ok(snapshot) => {
+                Ok((snapshot, omitted_images)) => {
                     bytes += snapshot.snapshot.len();
                     panes.push((id, snapshot));
+                    if omitted_images {
+                        warnings.push(format!(
+                            "Pane {id}: Kitty images omitted to fit checkpoint budget"
+                        ));
+                    }
                 }
                 Err(error) => warnings.push(format!("Pane {id}: {error}")),
             }
