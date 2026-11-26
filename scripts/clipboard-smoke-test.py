@@ -8,7 +8,7 @@ import subprocess
 import socket
 import time
 
-from clipboard_test_support import PNG, check_html, kitty_write
+from clipboard_test_support import PNG, ReadProbe, check_html, kitty_write
 from cargo_test_support import cargo_binary
 from progress_test_support import ProgressProbe
 from stream_test_support import clipboard_value, Client
@@ -34,6 +34,47 @@ with (artifacts / "clipboard-smoke.log").open("w") as log, AppFixture() as fixtu
         enabled=True, listen_address="127.0.0.1:0", authentication=dict(mode="none")))
     process = fixture.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
     address = wait_for(lambda: fixture.rpc("status")["bound_address"])
+
+    with scenario("VT replies advertise OSC 52 only with an eligible clipboard recipient"):
+        tab = fixture.rpc("new", directory=str(fixture.path))
+        query_probe = ReadProbe(fixture, tab["pane"])
+
+        def check_replies(clipboard=False):
+            before = len(query_probe.bytes())
+            query_probe.write("\x1b]2;QUERY_TITLE\x07\x05\x1b[21t"
+                              "\x1b[HX\x1b[31#y\x1b[7;1;1;1;1;1*y"
+                              "\x1b]7400;unknown-osc\x07\x1b_unknown-apc\x1b\\"
+                              "\x1b[c\x1b[>c\x1b[=c\x1b[5n")
+
+            def completed():
+                data = query_probe.bytes()[before:]
+                return data if data.endswith(b"\x1b[0n") else None
+
+            actual = wait_for(completed, message="PTY did not receive the final status reply")
+            primary = b"\x1b[?62;22;52c" if clipboard else b"\x1b[?62;22c"
+            expected = primary + b"\x1b[>1;0;0c\x1bP!|00000000\x1b\\\x1b[0n"
+            assert actual == expected, (actual, expected)
+
+        check_replies()
+        assert fixture.rpc("_metadata", pane=query_probe.pane)["meta"]["title"] == "QUERY_TITLE"
+        for endpoint in (None, address):
+            peer = Client(fixture, query_probe.pane, address=endpoint)
+            try:
+                peer.barrier(1)
+                check_replies()
+                peer.send("clipboard-writes", enabled=True)
+                peer.barrier(2)
+                check_replies(clipboard=True)
+                query_probe.write(osc("default clipboard", destination=""))
+                peer.until(lambda h: clipboard_value(h) == dict(
+                    destination="clipboard", content=dict(text="default clipboard")))
+                peer.send("subscribe", panes=[])
+                peer.barrier(3)
+                check_replies()
+            finally:
+                peer.close()
+        fixture.rpc("close-tab", tab=tab["tab"])
+
     pane = fixture.rpc("new", directory=str(fixture.path))["pane"]
     probe = ProgressProbe(fixture, pane)
     clients = []

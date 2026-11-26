@@ -498,6 +498,18 @@ static GhosttyString xtversion(GhosttyTerminal t, void *ud) {
     static const uint8_t version[] = "gmux " GMUX_VERSION;
     return (GhosttyString){.ptr = version, .len = sizeof(version) - 1};
 }
+static bool device_attributes(GhosttyTerminal t, void *ud, GhosttyDeviceAttributes *attrs) {
+    (void)t;
+    GmuxEngine *e = ud;
+    // The write callback is installed only while the pane has an eligible recipient.
+    if (!e->clipboard) return false;
+    attrs->primary.conformance_level = GHOSTTY_DA_CONFORMANCE_VT220;
+    attrs->primary.features[0] = GHOSTTY_DA_FEATURE_ANSI_COLOR;
+    attrs->primary.features[1] = GHOSTTY_DA_FEATURE_CLIPBOARD;
+    attrs->primary.num_features = 2;
+    attrs->secondary.device_type = GHOSTTY_DA_DEVICE_TYPE_VT220;
+    return true;
+}
 static void clipboard_write(GhosttyTerminal t, void *ud, const GhosttyClipboardWrite *write) {
     (void)t;
     // No request or reply pointer may escape this callback.
@@ -760,6 +772,7 @@ static GmuxEngine *engine_new(GhosttyTerminal terminal, void *ud, GmuxEventFn cb
     if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SIZE, terminal_size) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RESIZE_WINDOW, resize_window) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_XTVERSION, xtversion) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, device_attributes) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &terminfo_name)) {
         gmux_engine_free(e); return NULL;
     }

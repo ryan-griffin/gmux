@@ -167,9 +167,13 @@ longer than the five-second compression delay without sending daemon requests.
 See [performance measurements](performance.md#idle-scrollback-compression) for
 release-build comparisons and larger retained-history workloads.
 
-The `clipboard` headless suite checks OSC 52, iTerm2 Copy and atomic Kitty writes through local and remote streams,
-recipient focus and visibility, explicit copy ordering, decoded size limits,
-detach/reconnect without replay, and bounded output when a frontend stops
+The `clipboard` headless suite checks exact DA1, DA2, and DA3 replies on real PTYs.
+It checks DA1 clipboard detection without a frontend and with visible and hidden
+panes on local and remote streams. ENQ, title and checksum queries, and
+unrecognized OSC/APC sequences must be silent. The suite also checks OSC 52,
+iTerm2 Copy and atomic Kitty writes through both transports, recipient focus and
+visibility, explicit copy ordering, decoded size limits, detach/reconnect without
+replay, and bounded output when a frontend stops
 reading. Binary cases preserve actual PNG bytes with NUL, HTML/plain alternatives,
 empty values, clear, unsupported/oversized whole-request rejection and expanded
 alias budgets. It also compiles the native normalized-request policy and reply check.

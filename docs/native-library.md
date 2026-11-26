@@ -58,6 +58,21 @@ record and consumes the entire payload. The allocator is bounded during decoding
 and remains valid for the restored terminal's lifetime. The bridge installs
 fresh host callbacks and Rust sizes the viewport from the validated grid.
 
+## Optional VT replies
+
+The daemon sends replies to the querying pane's PTY. Local and remote frontends
+follow the same rules.
+
+| Request | Behavior |
+| --- | --- |
+| DA1 (`CSI c`) | `CSI ? 62 ; 22 c` reports VT220 with ANSI color. With an eligible clipboard recipient, `CSI ? 62 ; 22 ; 52 c` lets applications such as Neovim detect OSC 52 writes. Clipboard reads have their own permission policy. [Recipient rules](clipboard.md#application-writes) · [Feature 52](https://github.com/contour-terminal/vt-extensions/blob/master/clipboard-extension.md) · [Neovim](https://github.com/neovim/neovim/pull/34860) |
+| DA2 (`CSI > c`) | `CSI > 1 ; 0 ; 0 c` gives the VT220 model with zero firmware and ROM fields. DEC-aware applications use the model to select terminal behavior. XTVERSION (`CSI > q`) identifies Gmux and its version. [Terminal identification example](https://github.com/D-Modem/bbs/wiki/Terminal-Identification) |
+| DA3 (`CSI = c`) | `DCS ! \| 00000000 ST` gives a zero unit ID. The query serves hardware inventory on DEC terminals, so the reply contains no host or pane identifier. [DEC VT520 manual](https://vt100.net/dec/ek-vt520-rm.pdf) |
+| ENQ (`0x05`) | Silent, matching xterm's default empty answerback. Legacy hosts use answerback for terminal identification. [DEC VT101 guide](https://vt100.net/dec/ek-vt101-ug-002.pdf) · [xterm manual](https://invisible-island.net/xterm/manpage/xterm.html) |
+| Window title (`CSI 21 t`) | Silent. VTTEST uses this query to verify xterm title reporting. Reporting it would send program-controlled text back as PTY input. [VTTEST window reports](https://github.com/ThomasDickey/vttest-snapshots/blob/master/xterm.c#L513-L609) |
+| DECRQCRA and XTCHECKSUM | Reporting is off because checksums can reveal screen contents. VTTEST uses rectangular checksums to verify rendered cells. With reporting off, XTCHECKSUM is ignored and the checksum extension stays at the library default of zero. [VTTEST checksums](https://invisible-island.net/vttest/vttest-checksums.html) |
+| Unrecognized OSC and APC | Discarded. The hook is for specific extensions, such as handling APC commands in a Kermit client. Gmux leaves the callback unset and the capture limit at zero. [Libghostty hook](https://lib.ghostty.org/vt/guide-custom-sequences.html) · [Kermit APC](https://www.kermitproject.org/ck10commandref.html) |
+
 ## Grapheme storage
 
 The pinned engine retains one base codepoint and at most 64 suffix codepoints
