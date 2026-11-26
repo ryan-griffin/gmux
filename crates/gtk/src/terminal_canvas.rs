@@ -2,6 +2,7 @@ use gmux_protocol::Scrollback;
 use gtk::{glib, prelude::*, subclass::prelude::*};
 use std::{
     cell::{Cell, RefCell},
+    rc::Rc,
     sync::OnceLock,
 };
 
@@ -285,6 +286,7 @@ impl TerminalCanvas {
         &self,
         screen: &gmux_protocol::session::ScreenSnapshot<'_>,
         selection: Option<gmux_protocol::selection::Selection>,
+        bidi: Option<Rc<crate::bidi::Grid>>,
     ) {
         let imp = self.imp();
         let key = (
@@ -293,7 +295,7 @@ impl TerminalCanvas {
             screen.frame.rows,
             screen.frame.scrollback.offset,
         );
-        let next = if imp.text_revision.get() != Some(key) {
+        let mut next = if imp.text_revision.get() != Some(key) {
             // Keep the old text readable until GTK's removal notification has
             // completed, then reuse its allocations for the next rebuild.
             if let Some(mut text) = imp.spare_text.borrow_mut().take() {
@@ -304,6 +306,7 @@ impl TerminalCanvas {
             }
         } else {
             let mut old = imp.text.borrow_mut();
+            old.bidi = bidi;
             let caret = old.caret;
             let selection_changed = old.update_positions(screen.frame, selection);
             let caret_changed = old.caret != caret;
@@ -316,6 +319,7 @@ impl TerminalCanvas {
             }
             return;
         };
+        next.bidi = bidi;
         let (content_changed, caret_changed, selection_changed, old_len) = {
             let old = imp.text.borrow();
             (
@@ -331,7 +335,8 @@ impl TerminalCanvas {
             imp.text_buffer.borrow_mut().take();
         }
         let used_bytes = next.used_bytes();
-        let old = imp.text.replace(next);
+        let mut old = imp.text.replace(next);
+        old.bidi = None;
         let spare = (!old.has_excess_capacity(used_bytes)).then_some(old);
         imp.spare_text.replace(spare);
         imp.text_revision.set(Some(key));

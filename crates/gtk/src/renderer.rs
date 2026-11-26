@@ -1,7 +1,10 @@
 #[path = "renderer/glyphs.rs"]
 mod glyphs;
 
-use crate::render::{self, Rect};
+use crate::{
+    bidi,
+    render::{self, Rect},
+};
 use gmux_protocol::{
     Cell, Frame,
     cells::{decoration, flags, underline},
@@ -18,6 +21,7 @@ use std::{
 pub struct Scene<'a> {
     pub frame: Frame,
     pub cells: &'a [Cell],
+    pub bidi: Option<&'a bidi::Grid>,
     pub metrics: (f64, f64),
     pub scale: f64,
     pub origin: (f64, f64),
@@ -60,14 +64,28 @@ impl Scene<'_> {
         }
     }
 
+    pub fn cursor_column(&self) -> usize {
+        let x = self.frame.cursor_x as usize;
+        self.bidi
+            .and_then(|grid| grid.row(self.frame.cursor_y as usize))
+            .map_or(x, |row| row.visual(x))
+    }
+
     fn cursor_rect(&self) -> Rect {
         let (cw, ch) = self.metrics;
-        (
-            self.frame.cursor_x as f64 * cw,
-            self.frame.cursor_y as f64 * ch,
-            cw * self.cursor_width() as f64,
-            ch,
-        )
+        let column = self.cursor_column();
+        let width = cw * self.cursor_width() as f64;
+        let mut x = column as f64 * cw;
+        if self.frame.cursor_style == 0
+            && !self.frame.cursor_password_input
+            && self
+                .bidi
+                .and_then(|grid| grid.row(self.frame.cursor_y as usize))
+                .is_some_and(|row| row.rtl(column))
+        {
+            x += (width - 2.0).max(0.0);
+        }
+        (x, self.frame.cursor_y as f64 * ch, width, ch)
     }
 
     fn highlight(&self, index: usize) -> u8 {
@@ -78,14 +96,21 @@ impl Scene<'_> {
 /// Color lookups use the selection and cursor spans resolved for the row.
 struct RowColors<'a, 'b> {
     scene: &'a Scene<'b>,
+    bidi: Option<&'a bidi::Row>,
+    base: usize,
     selection: Option<(usize, usize)>,
     cursor: Option<std::ops::Range<usize>>,
 }
 
 impl RowColors<'_, '_> {
-    fn selected(&self, index: usize) -> bool {
+    fn logical(&self, visual: usize) -> usize {
+        self.bidi
+            .map_or(visual, |row| self.base + row.logical(visual - self.base))
+    }
+
+    fn selected(&self, logical: usize) -> bool {
         self.selection
-            .is_some_and(|(start, end)| (start..=end).contains(&index))
+            .is_some_and(|(start, end)| (start..=end).contains(&logical))
     }
 
     fn foreground(&self, index: usize, cell: &Cell) -> ([u8; 3], f32) {
@@ -94,6 +119,7 @@ impl RowColors<'_, '_> {
             .cursor
             .as_ref()
             .is_some_and(|span| span.contains(&index));
+        let index = self.logical(index);
         (
             if under_cursor {
                 cell.bg
@@ -112,6 +138,7 @@ impl RowColors<'_, '_> {
 
     fn backgrounds(&self, index: usize, cell: &Cell) -> [Option<([u8; 3], f32)>; 2] {
         let scene = self.scene;
+        let index = self.logical(index);
         if self.selected(index) || scene.highlight(index) == 2 {
             [Some((scene.theme.selection_background, 1.0)), None]
         } else if scene.highlight(index) == 1 {
@@ -296,6 +323,7 @@ struct CachedRow {
     blink: bool,
     blink_start: Option<u16>,
     glyphs_changed: bool,
+    bidi: bool,
 }
 
 /// Retain both phases with shared nodes. Segment boundaries preserve paint
@@ -358,6 +386,8 @@ pub struct Renderer {
     font: Option<FontKey>,
     shapes: ShapeCache,
     text: String,
+    rtl: RtlScratch,
+    visual_cells: Vec<Cell>,
     batches: TextBatches,
     appearance: Option<Appearance>,
     rows: Vec<CachedRow>,
@@ -375,6 +405,8 @@ impl Renderer {
     pub fn clear(&mut self) {
         self.shapes = ShapeCache::default();
         self.text = String::new();
+        self.rtl = RtlScratch::default();
+        self.visual_cells = Vec::new();
         self.batches = TextBatches::default();
         self.font = None;
         self.baseline = None;
@@ -511,7 +543,7 @@ impl Renderer {
             && !scene.frame.cursor_password_input)
             .then(|| {
                 (
-                    scene.frame.cursor_x as usize,
+                    scene.cursor_column(),
                     scene.cursor_width(),
                     scene.frame.cursor,
                 )
@@ -519,37 +551,54 @@ impl Renderer {
         self.reuse_scrolled_rows(scene.cells, cols);
         let mut stats = RenderStats::default();
         let batch = &mut self.batches;
-        for (y, cells) in scene.cells.chunks(cols).enumerate() {
+        for (y, logical_cells) in scene.cells.chunks(cols).enumerate() {
             let base = y * cols;
-            let highlights = scene.matches.get(base..base + cells.len()).unwrap_or(&[]);
+            let bidi = scene.bidi.and_then(|grid| grid.row(y));
+            let highlights = scene
+                .matches
+                .get(base..base + logical_cells.len())
+                .unwrap_or(&[]);
             let selection = scene
                 .selection
-                .and_then(|selection| selection.row(base, cells, scene.frame.cols));
+                .and_then(|selection| selection.row(base, logical_cells, scene.frame.cols));
             let cursor = block_cursor.filter(|_| scene.frame.cursor_y as usize == y);
             let colors = RowColors {
                 scene,
+                bidi,
+                base,
                 selection: selection.map(|(start, end)| (base + start, base + end)),
                 cursor: cursor.map(|(start, width, _)| base + start..base + start + width),
             };
             let row = &mut self.rows[y];
             // Rectangle snapping depends on the row's position in device pixels.
             let pixel_phase = (y as f64 * scene.metrics.1 * scene.scale).fract();
-            let rebuild = row.cells != cells
+            let rebuild = row.cells != logical_cells
+                || row.bidi != bidi.is_some()
                 || row.highlights != highlights
                 || row.selection != selection
                 || row.cursor != cursor
                 || row.pixel_phase != pixel_phase
                 || row.glyphs_changed;
             let hovered_link = scene.hovered_link.and_then(|(start, end)| {
-                (start < base + cells.len() && end > base).then(|| {
+                (start < base + logical_cells.len() && end > base).then(|| {
                     (
                         // Both row-local endpoints fit Frame::cols, including
                         // the half-open end at the maximum 65535 columns.
                         start.saturating_sub(base) as u16,
-                        end.saturating_sub(base).min(cells.len()) as u16,
+                        end.saturating_sub(base).min(logical_cells.len()) as u16,
                     )
                 })
             });
+            let cells =
+                if let Some(bidi) = bidi.filter(|_| rebuild || row.hovered_link != hovered_link) {
+                    self.visual_cells.clear();
+                    self.visual_cells.extend(
+                        (0..logical_cells.len()).map(|x| logical_cells[bidi.logical(x)].clone()),
+                    );
+                    &self.visual_cells[..]
+                } else {
+                    logical_cells
+                };
             let mut flags = 0;
             if rebuild || row.hovered_link != hovered_link {
                 let background = gtk::Snapshot::new();
@@ -615,7 +664,8 @@ impl Renderer {
                                     || cell.overline()
                                     || cell.flags & 16 != 0
                                     || hovered_link.is_some_and(|(start, end)| {
-                                        (start as usize..end as usize).contains(&x)
+                                        (start as usize..end as usize)
+                                            .contains(&(colors.logical(base + x) - base))
                                     }))
                         })
                     })
@@ -650,13 +700,37 @@ impl Renderer {
                 stats.background_rows += 1;
             }
             if rebuild {
+                let row_y = y as f64 * scene.metrics.1;
                 let mut foreground = RowPhases::new(row.blink);
                 let mut x = 0;
                 while x < cells.len() {
                     let cell = &cells[x];
                     let text = cell.text();
-                    let has_glyph = !text.is_empty() && text != " ";
-                    if cell.flags & 32 != 0 || !has_glyph {
+                    if let Some(bidi) = bidi.filter(|row| row.rtl(x))
+                        && can_shape_rtl(cells, x, &self.glyphs)
+                    {
+                        let mut end = x + 1;
+                        while end < cells.len()
+                            && bidi.rtl(end)
+                            && bidi.logical(end) + 1 == bidi.logical(end - 1)
+                            && can_shape_rtl(cells, end, &self.glyphs)
+                        {
+                            end += 1;
+                        }
+                        stats.text_nodes += batch.flush(&mut foreground);
+                        stats.text_nodes += append_rtl(
+                            &mut foreground,
+                            cells,
+                            x..end,
+                            &colors,
+                            font,
+                            context,
+                            &mut self.rtl,
+                        );
+                        x = end;
+                        continue;
+                    }
+                    if cell.flags & 32 != 0 || text.is_empty() || text == " " {
                         x += 1;
                         continue;
                     }
@@ -704,7 +778,7 @@ impl Renderer {
                                 glyph,
                                 glyphs::RasterCell {
                                     bounds,
-                                    row_y: y as f64 * scene.metrics.1,
+                                    row_y,
                                     origin: scene.origin,
                                     scale: scene.scale,
                                     span,
@@ -719,25 +793,55 @@ impl Renderer {
                         x += 1;
                         continue;
                     }
-                    let mut first_rect = true;
-                    let graphic = has_glyph
-                        && render::graphic_rects(text, rect, |rect| {
-                            // Flush once before graphics to preserve glyph order.
-                            if first_rect {
-                                stats.text_nodes += batch.flush(&mut foreground);
-                                foreground.set_blink(cell.blink());
-                                first_rect = false;
-                            }
-                            append_row_rect(
-                                &foreground.current,
-                                scene,
-                                y as f64 * scene.metrics.1,
-                                rgb,
-                                alpha,
+                    if let Some(graphic) = render::Graphic::from_text(text) {
+                        stats.text_nodes += batch.flush(&mut foreground);
+                        foreground.set_blink(cell.blink());
+                        let snapshot = &foreground.current;
+                        match graphic {
+                            render::Graphic::Block(mask) => render::block_rects(mask, rect, |r| {
+                                append_row_rect(snapshot, scene, row_y, rgb, alpha, r);
+                            }),
+                            render::Graphic::Box(drawing) => drawing.paint(
                                 rect,
-                            )
-                        });
-                    if has_glyph && !graphic {
+                                (scene.origin.0, scene.origin.1 + row_y),
+                                scene.scale,
+                                |part| match part {
+                                    render::BoxPart::Rect(r) => {
+                                        append_rect(snapshot, rgb, alpha, r)
+                                    }
+                                    render::BoxPart::Diagonals {
+                                        bounds,
+                                        stroke,
+                                        rising,
+                                        falling,
+                                    } => {
+                                        append_box_diagonals(
+                                            snapshot,
+                                            bounds,
+                                            stroke,
+                                            rising,
+                                            falling,
+                                            &rgba(rgb, alpha),
+                                        );
+                                    }
+                                    render::BoxPart::Corner {
+                                        center,
+                                        reach,
+                                        half_stroke,
+                                        radius,
+                                    } => append_box_corner(
+                                        snapshot,
+                                        center,
+                                        reach,
+                                        half_stroke,
+                                        radius,
+                                        &rgba(rgb, alpha),
+                                    ),
+                                },
+                            ),
+                        }
+                        x += 1;
+                    } else {
                         let mut end = x + 1;
                         let text = if ascii_cell(cell) {
                             self.text.clear();
@@ -746,7 +850,7 @@ impl Renderer {
                             // boundaries even when foreground colors match.
                             let mut limit = cells.len();
                             for (start, last) in [
-                                selection,
+                                selection.filter(|_| bidi.is_none()),
                                 cursor.map(|(start, width, _)| (start, start + width - 1)),
                             ]
                             .into_iter()
@@ -763,6 +867,11 @@ impl Renderer {
                             // split shaping. Unicode clusters keep their own
                             // layout, baseline, and terminal-defined visual order.
                             while end < limit
+                                && bidi.is_none_or(|row| {
+                                    !row.rtl(end)
+                                        && colors.selected(base + row.logical(x))
+                                            == colors.selected(base + row.logical(end))
+                                })
                                 && ascii_cell(&cells[end])
                                 && cells[end].flags & (1 | 2 | 4 | flags::BLINK)
                                     == cell.flags & (1 | 2 | 4 | flags::BLINK)
@@ -789,8 +898,6 @@ impl Renderer {
                             );
                         }
                         x = end;
-                    } else {
-                        x += 1;
                     }
                 }
                 stats.text_nodes += batch.flush(&mut foreground);
@@ -807,7 +914,8 @@ impl Renderer {
                 }
                 (row.foreground, row.hidden_foreground) = foreground.finish();
                 row.cells.clear();
-                row.cells.extend_from_slice(cells);
+                row.cells.extend_from_slice(logical_cells);
+                row.bidi = bidi.is_some();
                 row.highlights.clear();
                 row.highlights.extend_from_slice(highlights);
                 row.selection = selection;
@@ -867,10 +975,210 @@ impl Renderer {
                 );
             }
         }
+        self.visual_cells.clear();
         stats.cached_shapes = self.shapes.order.len();
         stats.cached_shape_bytes = self.shapes.bytes;
         stats
     }
+}
+
+fn can_shape_rtl(cells: &[Cell], x: usize, glyphs: &Glyphs) -> bool {
+    let cell = &cells[x];
+    cell.flags & 64 == 0
+        && !cells.get(x + 1).is_some_and(|cell| cell.flags & 64 != 0)
+        && render::Graphic::from_text(cell.text()).is_none()
+        && cell_codepoint(cell.text()).is_none_or(|cp| glyphs.get(cp).is_none())
+}
+
+#[derive(Default)]
+struct RtlScratch {
+    text: String,
+    offsets: Vec<usize>,
+    layout: Option<pango::Layout>,
+    cluster: Option<pango::GlyphString>,
+}
+
+// Shape a visual RTL run in logical order so Pango sees the joining context.
+// Paint is resolved afterwards: a cursor, selection, or blinking cell must
+// not split the run and change the shapes of its neighbors.
+fn append_rtl(
+    phases: &mut RowPhases,
+    cells: &[Cell],
+    span: std::ops::Range<usize>,
+    colors: &RowColors<'_, '_>,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+    scratch: &mut RtlScratch,
+) -> usize {
+    use gtk::pango::IsAttribute;
+
+    let run = &cells[span.clone()];
+    let RtlScratch {
+        text,
+        offsets,
+        layout,
+        cluster,
+    } = scratch;
+    // A run inherited from the bidi algorithm can contain only neutral
+    // characters. Force RTL for mirroring and strip the empty prefix glyph.
+    text.clear();
+    text.push('\u{200f}');
+    offsets.clear();
+    offsets.reserve(run.len() + 1);
+    let mut attrs = None;
+    let mut logical = 0;
+    while logical < run.len() {
+        let style = run[run.len() - 1 - logical].flags & 3;
+        let start = text.len() as u32;
+        while logical < run.len() {
+            let cell = &run[run.len() - 1 - logical];
+            if cell.flags & 3 != style {
+                break;
+            }
+            offsets.push(text.len());
+            let glyph = cell.text();
+            text.push_str(if glyph.is_empty() { " " } else { glyph });
+            logical += 1;
+        }
+        for mut attr in [
+            (style & 1 != 0).then(|| pango::AttrInt::new_weight(pango::Weight::Bold).upcast()),
+            (style & 2 != 0).then(|| pango::AttrInt::new_style(pango::Style::Italic).upcast()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            attr.set_start_index(start);
+            attr.set_end_index(text.len() as u32);
+            attrs.get_or_insert_with(pango::AttrList::new).insert(attr);
+        }
+    }
+    offsets.push(text.len());
+    let layout = layout.get_or_insert_with(|| {
+        // Renderer::clear drops the layout when its font or context changes.
+        let layout = pango::Layout::new(context);
+        layout.set_single_paragraph_mode(true);
+        layout.set_font_description(Some(font));
+        layout
+    });
+    layout.set_attributes(attrs.as_ref());
+    layout.set_text(text);
+    let cluster = cluster.get_or_insert_with(pango::GlyphString::new);
+    let (cw, ch) = colors.scene.metrics;
+    let mut iter = layout.iter();
+    let mut nodes = 0;
+    loop {
+        if let Some(shaped) = iter.run_readonly() {
+            let glyphs = shaped.glyph_string();
+            let item = shaped.item();
+            let item_offset = item.offset() as usize;
+            let item_end = item_offset + item.length() as usize;
+            let rtl = item.analysis().level() % 2 != 0;
+            let font = item.analysis().font();
+            let baseline = (iter.run_baseline() + pango::SCALE) as f32 / pango::SCALE as f32;
+            let mut last_byte = item_end;
+            let mut i = 0;
+            while i < glyphs.glyph_info().len() {
+                let start = i;
+                let byte = item_offset + glyphs.log_clusters()[i] as usize;
+                i += 1;
+                while glyphs.log_clusters().get(i) == glyphs.log_clusters().get(start) {
+                    i += 1;
+                }
+                let next_byte = if rtl {
+                    last_byte
+                } else {
+                    glyphs
+                        .log_clusters()
+                        .get(i)
+                        .map_or(item_end, |&b| item_offset + b as usize)
+                };
+                last_byte = byte;
+                let ink = &glyphs.glyph_info()[start..i];
+                if byte < offsets[0] || ink.iter().all(|glyph| glyph.glyph() == pango::GLYPH_EMPTY)
+                {
+                    continue;
+                }
+                let first = offsets.partition_point(|&p| p <= byte) - 1;
+                let after = offsets
+                    .partition_point(|&p| p < next_byte)
+                    .max(first + 1)
+                    .min(run.len());
+                let visual = span.end - after..span.end - first;
+                let advance: i64 = ink
+                    .iter()
+                    .map(|glyph| i64::from(glyph.geometry().width()))
+                    .sum();
+                let scale = if advance > 0 {
+                    (cw * visual.len() as f64 * f64::from(pango::SCALE) / advance as f64) as f32
+                } else {
+                    1.0
+                };
+                cluster.set_size(ink.len() as i32);
+                cluster.glyph_info_mut().clone_from_slice(ink);
+                cluster.log_clusters_mut().fill(0);
+                let paint = |i: usize| {
+                    let cell = &cells[i];
+                    (
+                        cell.flags & 32 == 0,
+                        cell.blink(),
+                        colors.foreground(colors.base + i, cell),
+                    )
+                };
+                let mut col = visual.start;
+                while col < visual.end {
+                    let key = paint(col);
+                    let mut end = col + 1;
+                    while end < visual.end && paint(end) == key {
+                        end += 1;
+                    }
+                    let (visible, blink, (rgb, alpha)) = key;
+                    if visible
+                        && let Some(node) = gsk::TextNode::new(
+                            &font,
+                            cluster,
+                            &rgba(rgb, 1.0),
+                            &graphene::Point::new(0.0, baseline),
+                        )
+                    {
+                        phases.set_blink(blink);
+                        let snapshot = &phases.current;
+                        let clip = col != visual.start || end != visual.end;
+                        if clip {
+                            snapshot.push_clip(&graphene::Rect::new(
+                                (col as f64 * cw) as f32,
+                                0.0,
+                                ((end - col) as f64 * cw) as f32,
+                                ch as f32,
+                            ));
+                        }
+                        if alpha < 1.0 {
+                            snapshot.push_opacity(alpha as f64);
+                        }
+                        snapshot.save();
+                        snapshot.translate(&graphene::Point::new(
+                            (visual.start as f64 * cw) as f32,
+                            0.0,
+                        ));
+                        snapshot.scale(scale, 1.0);
+                        snapshot.append_node(&node);
+                        snapshot.restore();
+                        if alpha < 1.0 {
+                            snapshot.pop();
+                        }
+                        if clip {
+                            snapshot.pop();
+                        }
+                        nodes += 1;
+                    }
+                    col = end;
+                }
+            }
+        }
+        if !iter.next_run() {
+            break;
+        }
+    }
+    nodes
 }
 
 fn ascii_cell(cell: &Cell) -> bool {
@@ -1010,6 +1318,65 @@ fn append_rect(snapshot: &gtk::Snapshot, rgb: [u8; 3], alpha: f32, (x, y, w, h):
     }
 }
 
+fn append_box_diagonals(
+    snapshot: &gtk::Snapshot,
+    (x, y, w, h): Rect,
+    stroke: f64,
+    rising: bool,
+    falling: bool,
+    color: &gdk::RGBA,
+) {
+    let (x, y, w, h) = (x as f32, y as f32, w as f32, h as f32);
+    let path = gsk::PathBuilder::new();
+    // Extend past the corners and clip to the grid, so a diagonal doesn't
+    // taper at its ends. Both strokes of a cross use one opacity.
+    if rising {
+        path.move_to(x - w * 0.5, y + h * 1.5);
+        path.line_to(x + w * 1.5, y - h * 0.5);
+    }
+    if falling {
+        path.move_to(x - w * 0.5, y - h * 0.5);
+        path.line_to(x + w * 1.5, y + h * 1.5);
+    }
+    snapshot.push_clip(&graphene::Rect::new(x, y, w, h));
+    snapshot.append_stroke(&path.to_path(), &gsk::Stroke::new(stroke as f32), color);
+    snapshot.pop();
+}
+
+fn append_box_corner(
+    snapshot: &gtk::Snapshot,
+    (cx, cy): (f64, f64),
+    (dx, dy): (f64, f64),
+    half: f64,
+    radius: f64,
+    color: &gdk::RGBA,
+) {
+    let builder = gsk::PathBuilder::new();
+    // Reflect a single quarter-circle outline into the four orientations.
+    // Both legs and the bend share one fill, even for faint cells.
+    let point = |(x, y): (f64, f64)| ((cx + x * dx.signum()) as f32, (cy + y * dy.signum()) as f32);
+    let line_to = |p| {
+        let (x, y) = point(p);
+        builder.line_to(x, y);
+    };
+    let quarter_arc_to = |control, end| {
+        let (x1, y1) = point(control);
+        let (x2, y2) = point(end);
+        builder.conic_to(x1, y1, x2, y2, std::f32::consts::FRAC_1_SQRT_2);
+    };
+    let (x, y) = point((dx.abs(), -half));
+    builder.move_to(x, y);
+    line_to((radius, -half));
+    quarter_arc_to((-half, -half), (-half, radius));
+    line_to((-half, dy.abs()));
+    line_to((half, dy.abs()));
+    line_to((half, radius));
+    quarter_arc_to((half, half), (radius, half));
+    line_to((dx.abs(), half));
+    builder.close();
+    snapshot.append_fill(&builder.to_path(), gsk::FillRule::Winding, color);
+}
+
 // Snap shared rectangle boundaries in surface device coordinates. Snapping
 // locally would leave seams when a row or pane starts between device pixels.
 fn append_row_rect(
@@ -1093,7 +1460,7 @@ fn decoration(
         DecorationKind::Underline => {
             if scene
                 .hovered_link
-                .is_some_and(|(start, end)| (start..end).contains(&index))
+                .is_some_and(|(start, end)| (start..end).contains(&colors.logical(index)))
             {
                 // Pinned Ghostty uses a double line only for an existing single
                 // underline. Other styles become single while the link is active.

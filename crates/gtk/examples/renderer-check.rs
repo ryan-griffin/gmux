@@ -30,6 +30,9 @@ mod text_blink {
     }
 }
 #[allow(dead_code)]
+#[path = "../src/bidi.rs"]
+mod bidi;
+#[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
 #[allow(dead_code)]
@@ -98,6 +101,7 @@ fn scene(cells: &[Cell], theme: Theme) -> Scene<'_> {
             ..Frame::default()
         },
         cells,
+        bidi: None,
         metrics: (10.0, 24.0),
         scale: 1.0,
         origin: (0.0, 0.0),
@@ -1879,6 +1883,331 @@ fn validate_scroll_cache(
     }
 }
 
+fn validate_rtl(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
+    fn glyphs(node: &gsk::RenderNode, result: &mut Vec<u32>) {
+        if let Some(text) = node.downcast_ref::<gsk::TextNode>() {
+            result.extend(text.glyphs().into_iter().map(|g| g.glyph()));
+        }
+        for child in node.children() {
+            glyphs(&child, result);
+        }
+    }
+    let theme = Theme::adwaita(true);
+    let mut cells = vec![cell(" ", theme, 0); 320];
+    for (i, text) in ["سَ", "ل", "ا", "م"].into_iter().enumerate() {
+        cells[i] = cell(text, theme, 0);
+    }
+    let bidi = bidi::Grid::update(40, &cells, None).unwrap();
+    let mut scene = scene(&cells, theme);
+    scene.bidi = Some(&bidi);
+    scene.scale = 2.0;
+    let mut renderer = Renderer::new();
+    let (joined, _) = node(&mut renderer, &scene, font, context);
+    // Independent Pango drawing supplies the expected contextual glyphs,
+    // including the vowel mark and lam-alef ligature.
+    let layout = pango::Layout::new(context);
+    layout.set_font_description(Some(font));
+    layout.set_text("سَلام");
+    let expected = gtk::Snapshot::new();
+    expected.append_layout(&layout, &rgba(theme.foreground, 1.0));
+    let mut want = Vec::new();
+    glyphs(&expected.to_node().unwrap(), &mut want);
+    let mut actual = Vec::new();
+    glyphs(&joined, &mut actual);
+    assert_eq!(
+        actual, want,
+        "Arabic must retain contextual shaping in visual order"
+    );
+    let (cached, stats) = node(&mut renderer, &scene, font, context);
+    assert_eq!(stats.rebuilt_rows, 0);
+    assert_eq!(joined.serialize(), cached.serialize());
+
+    scene.selection = Some(gmux_protocol::selection::Selection::linear(0, 0));
+    scene.frame.cursor_x = 1;
+    scene.frame.cursor_style = 1;
+    scene.frame.cursor_visible = 1;
+    let (chosen, _) = node(&mut renderer, &scene, font, context);
+    let mut with_selection = Vec::new();
+    glyphs(&chosen, &mut with_selection);
+    with_selection.dedup();
+    want.dedup();
+    assert_eq!(
+        with_selection, want,
+        "Selection and cursor must not change joining forms"
+    );
+    let texture = render(gpu, &chosen, &scene);
+    let pixels = pixels(&texture);
+    let stripe = |col: usize| &pixels[(col * 20 + 1) * 4..][..4];
+    let bgra = |[r, g, b]: [u8; 3]| [b, g, r, 255];
+    assert_eq!(stripe(0), bgra(theme.background));
+    assert_eq!(stripe(2), bgra(scene.frame.cursor));
+    assert_eq!(stripe(3), bgra(theme.selection_background));
+
+    if layout.unknown_glyphs_count() == 0 {
+        scene.selection = None;
+        scene.frame.cursor_visible = 0;
+        let mut letters = cells.clone();
+        for target in &mut letters[..3] {
+            *target = cell("ب", theme, 0);
+        }
+        letters[3] = cell(" ", theme, 0);
+        let order = bidi::Grid::update(40, &letters, None).unwrap();
+        let scene = Scene {
+            cells: &letters,
+            bidi: Some(&order),
+            ..scene
+        };
+        let (joined, _) = node(&mut renderer, &scene, font, context);
+        let texture = render(gpu, &joined, &scene);
+        let data = self::pixels(&texture);
+        let ink = |x, y| data[(y * texture.width() as usize + x) * 4] > theme.background[2] + 40;
+        for seam in [20, 40] {
+            assert!(
+                (0..48).any(|y| ink(seam - 1, y) && ink(seam, y)),
+                "Cursive strokes should reach across the cell edge at {seam}"
+            );
+        }
+    }
+}
+
+fn validate_box_drawing(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    let theme = Theme {
+        foreground: [255; 3],
+        background: [0; 3],
+        ..Theme::adwaita(true)
+    };
+    let cells: Vec<_> = [
+        "         ",
+        " ╭─╮ ┏━┓ ",
+        " │ │ ┃ ┃ ",
+        " ╰─╯ ┗━┛ ",
+        "         ",
+    ]
+    .iter()
+    .flat_map(|row| {
+        row.chars()
+            .map(|ch| cell(ch.encode_utf8(&mut [0; 4]), theme, 4))
+    })
+    .collect();
+    let mut scene = scene(&cells, theme);
+    scene.frame.cols = 9;
+    scene.frame.rows = 5;
+    scene.metrics = (9.0, 21.0);
+    scene.width = 81;
+    scene.height = 105;
+    let mut renderer = Renderer::new();
+    for (scale, light, heavy) in [(1.0, 1, 2), (1.25, 1, 3), (1.5, 2, 3), (2.0, 2, 5)] {
+        for origin in [(0.0, 0.0), (0.25, 0.5), (-0.25, -0.5)] {
+            scene.scale = scale;
+            scene.origin = origin;
+            let (node, stats) = node(&mut renderer, &scene, font, context);
+            assert_eq!(stats.text_nodes, 0, "Box drawing must not use font glyphs");
+            let texture = render(gpu, &node, &scene);
+            let data = pixels(&texture);
+            assert!(
+                data.as_chunks::<4>().0.iter().all(|pixel| pixel[0] <= 129),
+                "Faint strokes overlap"
+            );
+            let sample = |x, y| data[(y * texture.width() as usize + x) * 4];
+            let x = |col: usize| ((col as f64 * 9.0 + origin.0) * scale).round() as usize;
+            let y = |row: usize| ((row as f64 * 21.0 + origin.1) * scale).round() as usize;
+            let horizontal = |px, row| {
+                (y(row)..y(row + 1))
+                    .map(|py| sample(px, py))
+                    .collect::<Vec<_>>()
+            };
+            let vertical = |py, col| {
+                (x(col)..x(col + 1))
+                    .map(|px| sample(px, py))
+                    .collect::<Vec<_>>()
+            };
+            let check_width = |stroke: &[u8], thickness| {
+                assert_eq!(
+                    stroke.iter().filter(|&&a| a >= 126).count(),
+                    thickness,
+                    "{scale}× at {origin:?}: {stroke:?}"
+                );
+                assert!(
+                    stroke.iter().all(|&a| a <= 2 || a >= 126),
+                    "Stroke not pixel-aligned: {stroke:?}"
+                );
+            };
+            let check_join = |stroke: &[u8], join: &[u8]| {
+                assert!(
+                    stroke.iter().zip(join).all(|(&a, &b)| a.abs_diff(b) <= 8),
+                    "Broken box join at {scale}×, {origin:?}: {stroke:?} vs {join:?}",
+                );
+            };
+            for (left, thickness) in [(1, light), (5, heavy)] {
+                let right = left + 2;
+                for row in [1, 3] {
+                    let h = horizontal((x(left + 1) + x(right)) / 2, row);
+                    check_width(&h, thickness);
+                    for seam in [x(left + 1), x(right)] {
+                        for px in [seam - 1, seam] {
+                            check_join(&h, &horizontal(px, row));
+                        }
+                    }
+                    for col in [left, right] {
+                        let v = vertical((y(2) + y(3)) / 2, col);
+                        check_width(&v, thickness);
+                        let seam = y(if row == 1 { 2 } else { 3 });
+                        for py in [seam - 1, seam] {
+                            check_join(&v, &vertical(py, col));
+                        }
+                        if left == 1 && scale == 2.0 {
+                            // The bend cuts off the outside of a square elbow,
+                            // but must still cross its inward diagonal.
+                            let outside = |stroke: &[u8], reverse| {
+                                if reverse {
+                                    stroke.iter().rposition(|&a| a > 64)
+                                } else {
+                                    stroke.iter().position(|&a| a > 64)
+                                }
+                                .unwrap()
+                            };
+                            let px = x(col) + outside(&v, col == right);
+                            let py = y(row) + outside(&h, row == 3);
+                            assert!(sample(px, py) < 32, "Rounded corner is square");
+                            assert!(
+                                (1..=5).any(|d| sample(
+                                    if col == right { px - d } else { px + d },
+                                    if row == 3 { py - d } else { py + d },
+                                ) > 64),
+                                "Rounded corner has no bend"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_extended_boxes(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    const COLS: usize = 16;
+    let theme = Theme {
+        foreground: [255; 3],
+        background: [0; 3],
+        ..Theme::adwaita(true)
+    };
+    let lines = [
+        " ─╼━ ━╾─ ",
+        " ╔═╦═╗   ",
+        " ║ ║ ║   ",
+        " ╠═╬═╣   ",
+        " ║ ║ ║   ",
+        " ╚═╩═╝   ",
+        " ╌┄┈ ╱╲╳ ",
+    ];
+    let cells: Vec<_> = lines
+        .iter()
+        .flat_map(|line| line.chars().chain(std::iter::repeat(' ')).take(COLS))
+        .chain((0x2500..=0x257f).map(|cp| char::from_u32(cp).unwrap()))
+        .map(|ch| cell(ch.encode_utf8(&mut [0; 4]), theme, 4))
+        .collect();
+    let mut scene = scene(&cells, theme);
+    scene.frame.cols = COLS as u16;
+    scene.frame.rows = (cells.len() / COLS) as u16;
+    scene.metrics = (9.0, 21.0);
+    scene.width = 9 * i32::from(scene.frame.cols);
+    scene.height = 21 * i32::from(scene.frame.rows);
+    scene.origin = (0.25, 0.5);
+    let mut renderer = Renderer::new();
+    for scale in [1.0, 1.25, 2.0] {
+        scene.scale = scale;
+        let (node, stats) = node(&mut renderer, &scene, font, context);
+        assert_eq!(
+            stats.text_nodes, 0,
+            "The full box drawing block must be font-independent"
+        );
+        let texture = render(gpu, &node, &scene);
+        let data = pixels(&texture);
+        assert!(
+            data.as_chunks::<4>().0.iter().all(|p| p[0] <= 129),
+            "Faint junctions must not be painted twice"
+        );
+        let sample = |x, y| data[(y * texture.width() as usize + x) * 4];
+        let x = |col: usize| ((col as f64 * 9.0 + scene.origin.0) * scale).round() as usize;
+        let y = |row: usize| ((row as f64 * 21.0 + scene.origin.1) * scale).round() as usize;
+        let same = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        for seam in [2, 3, 6, 7] {
+            for py in y(0)..y(1) {
+                assert!(
+                    same(sample(x(seam) - 1, py), sample(x(seam), py)),
+                    "Mixed-weight seam at column {seam}, scale {scale}"
+                );
+            }
+        }
+        for col in [1, 3, 5] {
+            let profile = |py| (x(col)..x(col + 1)).map(move |px| sample(px, py));
+            let middle = (y(2) + y(3)) / 2;
+            let mut last = false;
+            let mut rails = 0;
+            for sample in profile(middle) {
+                let lit = sample > 64;
+                rails += usize::from(lit && !last);
+                last = lit;
+            }
+            assert_eq!(rails, 2, "The double border needs two distinct rails");
+            for row in 2..=5 {
+                for py in [y(row) - 1, y(row)] {
+                    assert!(
+                        profile(py).zip(profile(middle)).all(|(a, b)| same(a, b)),
+                        "Double vertical seam on {} in column {col}, row {row}, scale {scale}: {:?} vs {:?}",
+                        gpu.type_().name(),
+                        profile(py).collect::<Vec<_>>(),
+                        profile(middle).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        for row in [1, 3, 5] {
+            for col in 2..=5 {
+                assert!(
+                    (y(row)..y(row + 1)).all(|py| same(sample(x(col) - 1, py), sample(x(col), py))),
+                    "Double horizontal seam in column {col}, row {row}, scale {scale}"
+                );
+            }
+        }
+        for col in 1..=3 {
+            let py = (y(6)..y(7))
+                .find(|&py| (x(col)..x(col + 1)).any(|px| sample(px, py) > 64))
+                .unwrap();
+            let strokes = (x(col)..x(col + 1))
+                .filter(|&px| sample(px, py) > 64 && (px == x(col) || sample(px - 1, py) <= 64))
+                .count();
+            assert_eq!(strokes, col + 1, "Wrong dash count at scale {scale}");
+        }
+        if scale == 2.0 {
+            let seam = x(6);
+            assert!(
+                sample(seam - 1, y(6)) > 64 && sample(seam, y(6)) > 64,
+                "Diagonals do not reach their shared corner"
+            );
+        }
+        for offset in 0..128 {
+            let col = offset % COLS;
+            let row = lines.len() + offset / COLS;
+            assert!(
+                (y(row)..y(row + 1).min(texture.height() as usize)).any(|py| {
+                    (x(col)..x(col + 1).min(texture.width() as usize)).any(|px| sample(px, py) > 32)
+                }),
+                "Empty box glyph U+{:04X} at scale {scale}",
+                0x2500 + offset
+            );
+        }
+    }
+}
+
 fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
     let theme = Theme::adwaita(true);
     for scale in [1.0, 1.25, 1.5, 2.0] {
@@ -2242,6 +2571,14 @@ fn main() -> anyhow::Result<()> {
     validate_cache(cache_gpu, &font, &context, &options.output);
     validate_scroll_cache(cache_gpu, &font, &context, &options.output);
     validate_geometry(&gpu, &font, &context);
+    validate_rtl(&cairo.0, &font, &context);
+    validate_box_drawing(&cairo.0, &font, &context);
+    validate_extended_boxes(&cairo.0, &font, &context);
+    if gpu.type_() != cairo.0.type_() {
+        validate_rtl(&gpu, &font, &context);
+        validate_box_drawing(&gpu, &font, &context);
+        validate_extended_boxes(&gpu, &font, &context);
+    }
     validate_decorations(cache_gpu, &context, &options.output);
     validate_decoration_patterns(cache_gpu, &font, &context);
     validate_batched_patterns(cache_gpu, &font, &context, &options.output);
@@ -2255,9 +2592,9 @@ fn main() -> anyhow::Result<()> {
             "cursor_lifecycle": options.cursor_lifecycle,
             "glyph_cases": cases,
             "checks": ["exact cache pixels", "independent layout agreement", "row invalidation", "scroll cache reuse", "bounded shape cache",
-                       "font and context changes", "fractional blocks", "linear and rectangular selection and search", "link hover SGR pixels and glyph cache retention",
+                       "font and context changes", "fractional blocks", "all 128 box glyphs, stroke widths and joins", "linear and rectangular selection and search", "link hover SGR pixels and glyph cache retention",
                        "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
-                       "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts",
+                       "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts", "Arabic joining and visual selection geometry",
                        "text blink phases, decorations, cursor and selection pixels", "text blink retains row and glyph nodes"]
         }))?,
     )?;

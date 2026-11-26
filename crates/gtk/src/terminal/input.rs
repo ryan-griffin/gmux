@@ -325,7 +325,7 @@ impl Terminal {
                 let (x, y) = if keyboard {
                     let frame = displayed.frame;
                     (
-                        frame.cursor_x as f64 * displayed.metrics.0,
+                        displayed.cursor_column() as f64 * displayed.metrics.0,
                         frame.cursor_y as f64 * displayed.metrics.1,
                     )
                 } else {
@@ -462,7 +462,10 @@ impl Terminal {
                 let displayed = t.displayed_links.borrow();
                 let (cw, ch) = displayed.metrics;
                 let frame = displayed.frame;
-                let position = (frame.cursor_x as f64 * cw, frame.cursor_y as f64 * ch);
+                let position = (
+                    displayed.cursor_column() as f64 * cw,
+                    frame.cursor_y as f64 * ch,
+                );
                 drop(displayed);
                 t.show_context_menu(position.0, position.1);
                 return glib::Propagation::Stop;

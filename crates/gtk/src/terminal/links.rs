@@ -8,11 +8,25 @@ pub(super) struct DisplayedLinks {
     pub revision: Option<u64>,
     pub frame: Frame,
     pub metrics: (f64, f64),
+    pub bidi: Option<Rc<bidi::Grid>>,
 }
 impl DisplayedLinks {
+    pub fn logical(&self, index: usize) -> usize {
+        self.bidi.as_ref().map_or(index, |bidi| bidi.logical(index))
+    }
+
+    pub fn cursor_column(&self) -> usize {
+        let x = self.frame.cursor_x as usize;
+        self.bidi
+            .as_ref()
+            .and_then(|grid| grid.row(self.frame.cursor_y as usize))
+            .map_or(x, |row| row.visual(x))
+    }
+
     pub fn target_at(&self, x: f64, y: f64) -> Option<&str> {
-        self.links
-            .target_at_point((self.frame.cols, self.frame.rows), self.metrics, (x, y))
+        let index =
+            Hyperlinks::cell_at_point((self.frame.cols, self.frame.rows), self.metrics, (x, y))?;
+        self.links.target_at(self.logical(index))
     }
 }
 
@@ -27,12 +41,18 @@ impl Terminal {
         links: &Hyperlinks,
         frame: Frame,
         metrics: (f64, f64),
+        bidi: Option<&bidi::Grid>,
     ) -> Option<(usize, usize)> {
-        (self.pointer_inside.get() && !self.context_menu.is_visible())
-            .then(|| {
-                links.span_at_point((frame.cols, frame.rows), metrics, self.mouse_position.get())
-            })
-            .flatten()
+        if !self.pointer_inside.get() || self.context_menu.is_visible() {
+            return None;
+        }
+        let visual = Hyperlinks::cell_at_point(
+            (frame.cols, frame.rows),
+            metrics,
+            self.mouse_position.get(),
+        )?;
+        links
+            .span_at(bidi.map_or(visual, |bidi| bidi.logical(visual)))
             .filter(|span| links.targets.get(span[2] as usize).is_some())
             .map(|[start, end, _]| (start as usize, end as usize))
     }
@@ -42,10 +62,11 @@ impl Terminal {
         links: &Hyperlinks,
         frame: Frame,
         metrics: (f64, f64),
+        bidi: Option<&bidi::Grid>,
     ) -> Option<(usize, usize)> {
         self.link_modifiers
             .get()
-            .then(|| self.link_span(links, frame, metrics))
+            .then(|| self.link_span(links, frame, metrics, bidi))
             .flatten()
     }
 
@@ -56,7 +77,12 @@ impl Terminal {
 
     pub(super) fn refresh_link_hover(&self) {
         let displayed = self.displayed_links.borrow();
-        let span = self.link_span(&displayed.links, displayed.frame, displayed.metrics);
+        let span = self.link_span(
+            &displayed.links,
+            displayed.frame,
+            displayed.metrics,
+            displayed.bidi.as_deref(),
+        );
         self.cursor.set_link_hover(span.is_some());
         let span = span.filter(|_| self.link_modifiers.get());
         if self.link_hover.replace(span) != span {
@@ -91,10 +117,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rtl_link_and_cursor_follow_the_visual_cell() {
+        let cells = ["م", "ن", "X"].map(|glyph| {
+            let mut cell = gmux_protocol::Cell::default();
+            cell.set_text(glyph).unwrap();
+            cell
+        });
+        let displayed = DisplayedLinks {
+            metrics: (10.0, 20.0),
+            bidi: bidi::Grid::update(3, &cells, None),
+            frame: Frame {
+                cols: 3,
+                rows: 1,
+                cursor_x: 0,
+                ..Frame::default()
+            },
+            links: Hyperlinks {
+                targets: vec!["test:rtl".into()],
+                spans: vec![[0, 1, 0]],
+            },
+            ..DisplayedLinks::default()
+        };
+        assert_eq!(displayed.cursor_column(), 1);
+        assert_eq!(displayed.target_at(1.0, 1.0), None);
+        assert_eq!(displayed.target_at(11.0, 1.0), Some("test:rtl"));
+    }
+
+    #[test]
     fn displayed_link_geometry_rejects_margins_and_maps_fractional_cells() {
         let displayed = DisplayedLinks {
             metrics: (7.5, 13.25),
             revision: Some(1),
+            bidi: None,
             frame: Frame {
                 cols: 4,
                 rows: 2,

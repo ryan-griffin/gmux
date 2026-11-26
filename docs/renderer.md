@@ -41,8 +41,19 @@ shape together, enabling the selected font's default ligatures and contextual
 substitutions. Whitespace, style and foreground color changes, text blink boundaries,
 selection boundaries, block cursors, and row ends separate these runs. Background colors paint separately
 and do not split shaping. Each shaped cluster starts at its terminal column, so
-ligatures preserve cursor and selection geometry. Unicode cells retain independent
-shaping for combining characters, fallback fonts, and wide glyphs.
+ligatures preserve cursor and selection geometry. Other left-to-right Unicode
+cells retain independent shaping for combining characters, fallback fonts, and
+wide glyphs.
+
+The GTK frontend automatically applies Unicode bidirectional ordering within each
+physical row, with a left-to-right base direction. Right-to-left runs shape as
+joined text through Pango, so Arabic letters keep their joining forms even when
+selection, cursor, or color changes cross the run. The daemon, Find, clipboard,
+and accessible text retain logical order; painted cursor positions, hit
+regions, and accessibility bounds use visual order. Selection ranges, including
+rectangles, refer to logical cells. Rows that need reordering retain their
+visual map across unchanged text layouts;
+ordinary left-to-right rows allocate no map.
 
 Output, selection, search highlights, and block cursors invalidate affected rows.
 Cursor blinking uses GTK's blink cycle, enable preference, and inactivity timeout.
@@ -95,7 +106,10 @@ glyph arrays, and entry payloads. Larger shapes render without entering the cach
 Shared Pango fonts and spare hash-table capacity are outside that payload budget.
 
 Borders, blocks, decorations, and cursor edges snap to device pixels, including
-fractional scales and pane positions. Block cursors span both cells of a wide
+fractional scales and pane positions. All Unicode Box Drawing characters
+(U+2500–U+257F) use cell geometry rather than the font. Mixed-weight and rounded
+joins share their stroke placement with the straight lines. Double borders keep
+both rails aligned to the cell edges. Block cursors span both cells of a wide
 glyph. Faint text uses node opacity so color emoji dim with other text.
 
 `TerminalCanvas` implements `GtkScrollable` inside a `GtkScrolledWindow`.
@@ -121,7 +135,10 @@ GSK_RENDERER=gl python3 scripts/check.py --native --skip-build --only renderer
 
 `renderer-check` compares text nodes against independent Pango layout drawing
 and checks cell graphics, styles, selection, cursors, fractional alignment,
-and retained rows. Cache comparisons use exact pixels from a Cairo renderer.
+and retained rows. Box drawing checks cover the entire block, including mixed
+and double joins, dash counts, diagonal corners, and faint coverage at integer
+and fractional scales on Cairo and the selected backend. Cache comparisons use
+exact pixels from a Cairo renderer.
 Blink checks compare both phases, decorated blanks, concealment, colored emoji,
 wide/combining glyphs, selection, search, hover and all cursor shapes. An independent
 concealment transformation checks hidden-phase pixels with the independent Pango
@@ -134,6 +151,9 @@ activation, activity deadlines, timing preferences, default notifications, input
 burst source reuse, and blink timeout teardown. Independent rectangle scenes
 check dotted/dashed phase, clipping, colors and faint opacity at fractional scales
 on Cairo and the selected GPU backend.
+The renderer also checks Arabic glyph forms against independent Pango shaping
+and verifies that cursive strokes cross cell boundaries. The native input suite
+checks visual drag selection and logical clipboard output in the real frontend.
 An included synthetic OpenType font checks multi-cell ligatures, contextual
 substitutions, and boundaries without relying on installed programming fonts.
 The selected GTK backend still handles the glyph and geometry checks.
@@ -169,8 +189,10 @@ GTK_A11Y=none GSK_RENDERER=vulkan dbus-run-session -- \
 
 Use `--font 'JetBrains Mono 12'` to measure an installed ligature font. The code
 fixture includes common programming operators alongside the other workloads.
-The unique-text fixture changes identifiers on every update to measure shaping
-when the text is absent from the cache. The decoration fixture draws all five
+The TUI fixture includes a rounded box border. The RTL fixture measures joined
+Arabic runs and reuse of their visual cell maps. The unique-text fixture changes
+identifiers on every update to measure shaping when the text is absent from the
+cache. The decoration fixture draws all five
 underline styles with independent colors and overlines. The cursor-blink workload
 alternates block cursor visibility without changing terminal cells.
 Use `--blink` for no-blink, one-cell, full-screen and alternating-cell text

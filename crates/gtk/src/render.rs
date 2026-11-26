@@ -1,3 +1,8 @@
+#[path = "render/box_drawing.rs"]
+mod box_drawing;
+
+pub use box_drawing::{BoxDrawing, BoxPart};
+
 pub type Rect = (f64, f64, f64, f64);
 
 // Block elements are terminal graphics, not font glyphs. Their geometry must
@@ -56,87 +61,25 @@ fn block_mask(ch: char) -> Option<u64> {
     Some(mask)
 }
 
-pub fn graphic_rects(text: &str, rect: Rect, mut paint: impl FnMut(Rect)) -> bool {
-    let mut chars = text.chars();
-    let Some(ch) = chars.next() else {
-        return false;
-    };
-    if chars.next().is_some() {
-        return false;
-    }
-    box_rects(ch, rect, &mut paint) || block_rects(ch, rect, &mut paint)
+pub enum Graphic {
+    Box(BoxDrawing),
+    Block(u64),
 }
 
-fn box_rects(ch: char, (x, y, width, height): Rect, paint: &mut impl FnMut(Rect)) -> bool {
-    // Connections: left, right, up, down. Common single and heavy borders
-    // share the same stroke width and centers in every neighboring cell.
-    let (arms, heavy) = match ch {
-        '─' => (3, false),
-        '━' => (3, true),
-        '│' => (12, false),
-        '┃' => (12, true),
-        '┌' => (10, false),
-        '┏' => (10, true),
-        '┐' => (9, false),
-        '┓' => (9, true),
-        '└' => (6, false),
-        '┗' => (6, true),
-        '┘' => (5, false),
-        '┛' => (5, true),
-        '├' => (14, false),
-        '┣' => (14, true),
-        '┤' => (13, false),
-        '┫' => (13, true),
-        '┬' => (11, false),
-        '┳' => (11, true),
-        '┴' => (7, false),
-        '┻' => (7, true),
-        '┼' => (15, false),
-        '╋' => (15, true),
-        '╴' => (1, false),
-        '╸' => (1, true),
-        '╶' => (2, false),
-        '╺' => (2, true),
-        '╵' => (4, false),
-        '╹' => (4, true),
-        '╷' => (8, false),
-        '╻' => (8, true),
-        _ => return false,
-    };
-    let stroke = (width / if heavy { 4.0 } else { 8.0 }).ceil().max(1.0);
-    let cx = x + width / 2.0;
-    let cy = y + height / 2.0;
-    // Non-overlapping arms also preserve faint colors in the GPU path.
-    paint((cx - stroke / 2.0, cy - stroke / 2.0, stroke, stroke));
-    if arms & 1 != 0 {
-        paint((x, cy - stroke / 2.0, (width - stroke) / 2.0, stroke));
+impl Graphic {
+    pub fn from_text(text: &str) -> Option<Self> {
+        let mut chars = text.chars();
+        let ch = chars.next()?;
+        if !chars.as_str().is_empty() {
+            return None;
+        }
+        BoxDrawing::from_char(ch)
+            .map(Self::Box)
+            .or_else(|| block_mask(ch).map(Self::Block))
     }
-    if arms & 2 != 0 {
-        paint((
-            cx + stroke / 2.0,
-            cy - stroke / 2.0,
-            (width - stroke) / 2.0,
-            stroke,
-        ));
-    }
-    if arms & 4 != 0 {
-        paint((cx - stroke / 2.0, y, stroke, (height - stroke) / 2.0));
-    }
-    if arms & 8 != 0 {
-        paint((
-            cx - stroke / 2.0,
-            cy + stroke / 2.0,
-            stroke,
-            (height - stroke) / 2.0,
-        ));
-    }
-    true
 }
 
-fn block_rects(ch: char, (x, y, width, height): Rect, paint: &mut impl FnMut(Rect)) -> bool {
-    let Some(mask) = block_mask(ch) else {
-        return false;
-    };
+pub fn block_rects(mask: u64, (x, y, width, height): Rect, mut paint: impl FnMut(Rect)) {
     let mut row = 0;
     while row < 8 {
         let bits = (mask >> (row * 8)) as u8;
@@ -163,7 +106,6 @@ fn block_rects(ch: char, (x, y, width, height): Rect, paint: &mut impl FnMut(Rec
         }
         row = end;
     }
-    true
 }
 
 pub fn cursor_rects(style: u8, focused: bool, (x, y, w, h): Rect, mut paint: impl FnMut(Rect)) {
@@ -193,7 +135,15 @@ mod tests {
 
     fn rects(text: &str) -> Vec<Rect> {
         let mut result = Vec::new();
-        assert!(graphic_rects(text, CELL, |rect| result.push(rect)));
+        match Graphic::from_text(text).unwrap() {
+            Graphic::Block(mask) => block_rects(mask, CELL, |rect| result.push(rect)),
+            Graphic::Box(drawing) => drawing.paint(CELL, (0.0, 0.0), 1.0, |part| {
+                let BoxPart::Rect(rect) = part else {
+                    panic!("{text} is not a square box glyph");
+                };
+                result.push(rect);
+            }),
+        }
         result
     }
 
@@ -265,7 +215,7 @@ mod tests {
     #[test]
     fn cluster_text_uses_font_fallback_instead_of_graphic_geometry() {
         for text in ["", "A", "界", "█\u{fe0f}", "──"] {
-            assert!(!graphic_rects(text, (0.0, 0.0, 9.0, 21.0), |_| panic!()));
+            assert!(Graphic::from_text(text).is_none());
         }
     }
 

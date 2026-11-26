@@ -818,9 +818,6 @@ Path(done).touch()
             assert (selected.start_offset, selected.end_offset) == (0, cols), (selected.start_offset, selected.end_offset, cols)
             assert "\n" not in Atspi.Text.get_text(text_iface, selected.start_offset, selected.end_offset)
 
-            # No daemon reply is available while recognizing and reversing a drag.
-            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[Hone café_界é two\\n  line two\\n'", paste=True, enter=True)
-            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one café_界é two"))
             ch = rpc("renderer-info", pane=pane)["viewport"]["cell_height"]
 
             def move_cell(col, row):
@@ -866,6 +863,22 @@ Path(done).touch()
                     time.sleep(.005)
                 proxy.delay = 0
 
+            # Logical accessible text and copy stay in reading order while a
+            # drag targets the visual positions of the Arabic glyphs.
+            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[Hسلام X\\n'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("سلام X"))
+            def character_x(offset):
+                return Atspi.Text.get_character_extents(text_iface, offset, Atspi.CoordType.WINDOW).x
+            wait_for(lambda: character_x(0) > character_x(3), message="RTL accessible extents must follow visual order")
+            repeat_click(2, 0, 1, hold=True)
+            move_cell(3, 0)
+            wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(0, 1))
+            native.button(False)
+            copied("سل")
+
+            # No daemon reply is available while recognizing and reversing a drag.
+            rpc("send", pane=pane, text="printf '\\033[2J\\033[3J\\033[Hone café_界é two\\n  line two\\n'", paste=True, enter=True)
+            wait_for(lambda: Atspi.Text.get_text(text_iface, 0, -1).startswith("one café_界é two"))
             proxy.pause()
             repeat_click(10, 0, 2, hold=True)
             wait_for(lambda: rpc("renderer-info", pane=pane)["viewport"]["selection"] == selection(4, 11),
@@ -1415,7 +1428,7 @@ finally:
             print("PASS: native Wayland keyboard input, Kitty press/repeat/release and focus resets, composition and shortcut holds, Kitty modifier presses/releases with both sides, Caps Lock and focus-entry Num Lock, active/inactive keypad input and shifted punctuation/ISO identity, "
                   "OSC 8 hover/copy/Ctrl-click through an isolated URI handler with held and delayed frames, "
                   "unchanged-query search retries after resource limits, "
-                  "accessible terminal text, caret and selection, composited output, "
+                  "accessible terminal text, caret and selection, RTL visual hit-testing and logical copy, composited output, "
                   "color-only text reuse without notifications and repeated Unicode row replacement notifications, "
                   "wide-glyph geometry, double/triple-click selection, rectangular Unicode/blank/soft-wrap copy with accessible row ranges, "
                   "line dragging, Ctrl+Shift rectangle override in mouse-reporting applications, "

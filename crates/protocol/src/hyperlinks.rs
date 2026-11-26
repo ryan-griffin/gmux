@@ -70,6 +70,15 @@ impl Hyperlinks {
         metrics: (f64, f64),
         point: (f64, f64),
     ) -> Option<[u32; 3]> {
+        self.span_at(Self::cell_at_point(grid, metrics, point)?)
+    }
+
+    /// Return the grid index under a point, without clamping into margins.
+    pub fn cell_at_point(
+        grid: (u16, u16),
+        metrics: (f64, f64),
+        point: (f64, f64),
+    ) -> Option<usize> {
         let (x, y) = point;
         let (cw, ch) = metrics;
         if !cw.is_finite()
@@ -88,7 +97,7 @@ impl Hyperlinks {
         if col >= grid.0 as usize || row >= grid.1 as usize {
             return None;
         }
-        self.span_at(row * grid.0 as usize + col)
+        Some(row * grid.0 as usize + col)
     }
 
     pub fn target_at(&self, cell: usize) -> Option<&str> {
@@ -96,7 +105,7 @@ impl Hyperlinks {
         self.targets.get(span[2] as usize).map(String::as_str)
     }
 
-    fn span_at(&self, cell: usize) -> Option<[u32; 3]> {
+    pub fn span_at(&self, cell: usize) -> Option<[u32; 3]> {
         let index = self.spans.partition_point(|span| span[1] as usize <= cell);
         let span = self.spans.get(index)?;
         (cell >= span[0] as usize).then_some(*span)
