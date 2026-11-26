@@ -3,7 +3,7 @@ use gmux_protocol::{
     Cell, Frame,
     selection::{Selection, Shape},
 };
-use std::ops::Range;
+use std::{ops::Range, rc::Rc};
 
 #[derive(Default)]
 pub struct Text {
@@ -12,6 +12,7 @@ pub struct Text {
     pub caret: u32,
     pub selection: Vec<(u32, u32)>,
     pub cols: usize,
+    pub bidi: Option<Rc<crate::bidi::Grid>>,
     cell_ends: Vec<u32>,
     spans: Vec<Range<usize>>,
 }
@@ -156,13 +157,30 @@ impl Text {
             let (x, y) = if cell > 0 && cell == self.offsets.len() - 1 {
                 (self.cols, (cell - 1) / self.cols)
             } else {
+                let cell = self.bidi.as_ref().map_or(cell, |bidi| bidi.visual(cell));
                 (cell % self.cols, cell / self.cols)
             };
             return Some((x as f32 * cw, y as f32 * ch, 0.0, ch));
         }
-        let first = self.spans[start as usize].start;
-        let last = self.spans[end as usize - 1].end - 1;
+        let mut first = self.spans[start as usize].start;
+        let mut last = self.spans[end as usize - 1].end - 1;
         let same_row = first / self.cols == last / self.cols;
+        if same_row
+            && let Some(row) = self
+                .bidi
+                .as_ref()
+                .and_then(|bidi| bidi.row(first / self.cols))
+        {
+            let base = first / self.cols * self.cols;
+            let mut low = self.cols;
+            let mut high = 0;
+            for span in &self.spans[start as usize..end as usize] {
+                low = low.min(row.visual(span.start - base));
+                high = high.max(row.visual(span.end - 1 - base));
+            }
+            first = base + low;
+            last = base + high;
+        }
         Some((
             if same_row {
                 (first % self.cols) as f32 * cw
@@ -194,15 +212,43 @@ impl Text {
         {
             return None;
         }
-        self.offsets
-            .get((y / ch) as usize * self.cols + (x / cw) as usize)
-            .copied()
+        let index = (y / ch) as usize * self.cols + (x / cw) as usize;
+        let logical = self.bidi.as_ref().map_or(index, |bidi| bidi.logical(index));
+        self.offsets.get(logical).copied()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtl_hit_testing_and_extents_use_display_order_without_reordering_text() {
+        let cells: Vec<_> = ["س", "ل", "ا", "م", " ", "X"]
+            .map(|glyph| {
+                let mut cell = Cell::default();
+                cell.set_text(glyph).unwrap();
+                cell
+            })
+            .into();
+        let frame = Frame {
+            cols: 6,
+            rows: 1,
+            cursor_x: 1,
+            ..Frame::default()
+        };
+        let mut text = Text::from_frame(frame, &cells, Some(Selection::linear(0, 1)));
+        text.bidi = crate::bidi::Grid::update(6, &cells, None);
+        assert_eq!(text.value, "سلام X");
+        assert_eq!(text.caret, 1);
+        assert_eq!(text.selection, [(0, 2)]);
+        assert_eq!(text.offset_at(1.0, 0.0, 10.0, 22.0), Some(3));
+        assert_eq!(text.offset_at(39.0, 0.0, 10.0, 22.0), Some(0));
+        assert_eq!(
+            text.extents(0, 2, 10.0, 22.0),
+            Some((20.0, 0.0, 20.0, 22.0))
+        );
+    }
 
     #[test]
     fn long_wide_cluster_maps_every_character_to_the_native_cell_span() {

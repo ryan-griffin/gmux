@@ -3,6 +3,7 @@ mod client;
 mod accessible_terminal;
 mod activity;
 mod app;
+mod bidi;
 mod clipboard;
 mod commands;
 mod find_field;

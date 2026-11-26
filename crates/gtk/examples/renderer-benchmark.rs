@@ -2,6 +2,9 @@
 //! Run on a native display with `cargo run --release --example renderer-benchmark`.
 
 #[allow(dead_code)]
+#[path = "../src/bidi.rs"]
+mod bidi;
+#[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
 #[allow(dead_code)]
@@ -176,6 +179,7 @@ fn main() -> anyhow::Result<()> {
         "ligatures",
         "unique",
         "decorations",
+        "rtl",
     ] {
         let workloads: &[&str] = if options.blink {
             &[
@@ -197,7 +201,29 @@ fn main() -> anyhow::Result<()> {
         };
         for &workload in workloads {
             let mut renderer = Renderer::new();
-            let mut cells = fixture(options.cols, options.rows, theme, fixture_name != "ascii");
+            let tui = fixture_name == "tui";
+            let mut cells = fixture(
+                options.cols,
+                options.rows,
+                theme,
+                !tui && !matches!(fixture_name, "ascii" | "rtl"),
+            );
+            if fixture_name == "rtl" {
+                for row in cells.chunks_exact_mut(options.cols as usize) {
+                    for (target, ch) in row
+                        .iter_mut()
+                        .skip(4)
+                        .zip("العربية 123 السلام عليكم".chars())
+                    {
+                        *target = cell(
+                            ch.encode_utf8(&mut [0; 4]),
+                            theme.foreground,
+                            theme.background,
+                            0,
+                        );
+                    }
+                }
+            }
             if fixture_name == "ligatures" {
                 let code = b"fn main() -> bool { a != b && c <= d || x === y; foo => bar; } ";
                 for (index, target) in cells.iter_mut().enumerate() {
@@ -223,19 +249,31 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            if fixture_name == "tui" {
-                for (index, cell) in cells.iter_mut().enumerate() {
-                    let x = index % options.cols as usize;
-                    let y = index / options.cols as usize;
-                    cell.bg = if y == 0 || y == options.rows as usize - 1 {
+            if tui {
+                let cols = options.cols as usize;
+                let rows = options.rows as usize;
+                for (index, target) in cells.iter_mut().enumerate() {
+                    let x = index % cols;
+                    let y = index / cols;
+                    target.bg = if y == 0 || y == rows - 1 {
                         theme.palette[4]
                     } else if y.is_multiple_of(10) {
                         theme.palette[8]
-                    } else if x < options.cols as usize / 3 {
+                    } else if x < cols / 3 {
                         [30, 45, 55]
                     } else {
                         theme.background
                     };
+                    let border = match (x, y) {
+                        (0, 0) => "╭",
+                        (0, y) if y == rows - 1 => "╰",
+                        (x, 0) if x == cols - 1 => "╮",
+                        (x, y) if x == cols - 1 && y == rows - 1 => "╯",
+                        (_, y) if y == 0 || y == rows - 1 => "─",
+                        (x, _) if x == 0 || x == cols - 1 => "│",
+                        _ => continue,
+                    };
+                    *target = cell(border, theme.foreground, target.bg, 0);
                 }
             }
             if fixture_name == "decorations" {
@@ -267,22 +305,24 @@ fn main() -> anyhow::Result<()> {
             let mut cached_shape_bytes = 0;
             let mut allocations = 0;
             let mut allocated_bytes = 0;
+            let mut bidi = None;
             let mut pixels = vec![0; width as usize * height as usize * 4];
             for iteration in 0..options.frames + 5 {
-                if !options.blink
+                let text_changed = !options.blink
                     && !options.selection
-                    && !matches!(workload, "static" | "cursor-blink")
-                {
+                    && !matches!(workload, "static" | "cursor-blink");
+                if text_changed {
                     if workload == "full-screen" {
                         cells.rotate_left(options.cols as usize);
                     }
+                    let inset = usize::from(tui);
                     let y = if workload == "single-row" {
-                        0
+                        inset
                     } else {
                         options.rows as usize - 1
                     };
                     {
-                        let index = y * options.cols as usize + options.cols as usize - 1;
+                        let index = y * options.cols as usize + options.cols as usize - 1 - inset;
                         // Keep updates distinct when a scrolled row returns
                         // after the alphabet's 26-character cycle.
                         let mut fg = theme.foreground;
@@ -296,7 +336,11 @@ fn main() -> anyhow::Result<()> {
                     }
                     if workload == "all-rows" {
                         for y in 0..options.rows as usize {
-                            let index = y * options.cols as usize;
+                            let index = y * options.cols as usize + inset;
+                            if tui && (y == 0 || y == options.rows as usize - 1) {
+                                cells[index].fg[0] = iteration as u8;
+                                continue;
+                            }
                             cells[index] = cell(
                                 &((b'a' + (iteration % 26) as u8) as char).to_string(),
                                 theme.foreground,
@@ -332,9 +376,18 @@ fn main() -> anyhow::Result<()> {
                     frame.cursor_y = options.rows / 2;
                 }
                 let selection_column = 2 + iteration % (options.cols as usize - 3);
+                let started = Instant::now();
+                let snapshot = gtk::Snapshot::new();
+                ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+                ALLOCATED_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+                COUNT_ALLOCATIONS.store(true, std::sync::atomic::Ordering::Relaxed);
+                if iteration == 0 || text_changed {
+                    bidi = bidi::Grid::update(options.cols as usize, &cells, bidi.as_ref());
+                }
                 let scene = Scene {
                     frame,
                     cells: &cells,
+                    bidi: bidi.as_deref(),
                     metrics,
                     scale: 1.0,
                     origin: (0.0, 0.0),
@@ -358,11 +411,6 @@ fn main() -> anyhow::Result<()> {
                     exited: false,
                     text_blink_visible: !options.blink || iteration % 2 == 0,
                 };
-                let started = Instant::now();
-                let snapshot = gtk::Snapshot::new();
-                ALLOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
-                ALLOCATED_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
-                COUNT_ALLOCATIONS.store(true, std::sync::atomic::Ordering::Relaxed);
                 let stats = renderer.snapshot(&snapshot, &scene, &font, &context);
                 let node = snapshot.to_node().unwrap();
                 COUNT_ALLOCATIONS.store(false, std::sync::atomic::Ordering::Relaxed);

@@ -1,5 +1,6 @@
 use crate::model::PaneRef;
 use crate::{
+    bidi,
     renderer::{Renderer, Scene},
     settings::Settings,
     terminal_canvas::TerminalCanvas,
@@ -63,6 +64,12 @@ impl SearchHighlights {
     }
 }
 
+#[derive(Default)]
+struct BidiLayout {
+    key: Option<(u64, u64, u16, u16)>,
+    grid: Option<Rc<bidi::Grid>>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DragSelectionRequest {
     endpoint: (u16, u32),
@@ -113,6 +120,7 @@ pub struct Terminal {
     zoom: ValueCell<f64>,
     settings: Rc<RefCell<Settings>>,
     renderer: RefCell<Renderer>,
+    bidi: RefCell<BidiLayout>,
     cursor: Rc<cursor::Cursor>,
     text_blink: Rc<text_blink::TextBlink>,
     render_font: RefCell<Option<(pango::FontDescription, pango::Context, u32)>>,
@@ -333,6 +341,7 @@ impl Terminal {
             settings,
             zoom: ValueCell::new(0.0),
             renderer: RefCell::new(Renderer::new()),
+            bidi: RefCell::default(),
             cursor,
             text_blink,
             render_font: RefCell::new(None),
@@ -452,7 +461,27 @@ impl Terminal {
                 screen.cells.len(),
             )
         });
-        self.area.update_text(&screen, selection);
+        self.area
+            .update_text(&screen, selection, self.bidi_layout(&screen));
+    }
+    fn bidi_layout(
+        &self,
+        screen: &gmux_protocol::session::ScreenSnapshot<'_>,
+    ) -> Option<Rc<bidi::Grid>> {
+        let mut cached = self.bidi.borrow_mut();
+        let frame = screen.frame;
+        let key = (
+            screen.text_revision,
+            frame.scrollback.offset,
+            frame.cols,
+            frame.rows,
+        );
+        if cached.key != Some(key) {
+            cached.grid =
+                bidi::Grid::update(frame.cols as usize, screen.cells, cached.grid.as_ref());
+            cached.key = Some(key);
+        }
+        cached.grid.clone()
     }
     fn selection_scroll_delta(&self) -> f64 {
         let Some((_, y)) = self.drag_position.get() else {
@@ -520,10 +549,11 @@ impl Terminal {
         if frame.cols > 0 && frame.rows > 0 {
             let column = (x / displayed.metrics.0).max(0.0) as u16;
             let row = (y / displayed.metrics.1).max(0.0) as u32;
+            let row = row.min(u32::from(frame.rows - 1));
+            let index = row as usize * frame.cols as usize + column.min(frame.cols - 1) as usize;
             let point = (
-                column.min(frame.cols - 1),
-                (frame.scrollback.offset + u64::from(row.min(u32::from(frame.rows - 1))))
-                    .min(u64::from(u32::MAX)) as u32,
+                (displayed.logical(index) % frame.cols as usize) as u16,
+                (frame.scrollback.offset + u64::from(row)).min(u64::from(u32::MAX)) as u32,
             );
             let _ = self.session.borrow().anchor_output(point);
         }
@@ -571,8 +601,20 @@ impl Terminal {
         }
     }
     fn mouse(&self, action: i32, button: i32, modifiers: gdk::ModifierType) {
-        let (x, y) = self.mouse_position.get();
+        let (mut x, y) = self.mouse_position.get();
         let (cw, ch) = self.metrics.get();
+        {
+            let displayed = self.displayed_links.borrow();
+            if displayed.bidi.is_some()
+                && let Some(visual) = gmux_protocol::hyperlinks::Hyperlinks::cell_at_point(
+                    (displayed.frame.cols, displayed.frame.rows),
+                    displayed.metrics,
+                    (x, y),
+                )
+            {
+                x += (displayed.logical(visual) as f64 - visual as f64) * displayed.metrics.0;
+            }
+        }
         let result = self.session.borrow().mouse(
             (x.max(0.0) as f32, y.max(0.0) as f32),
             (cw as u32, ch as u32),
@@ -925,7 +967,19 @@ impl Terminal {
         let (cols, rows) = (frame.cols.max(1), frame.rows.max(1));
         let x = (x / cw).floor().max(0.0) as usize;
         let y = (y / ch).floor().max(0.0) as usize;
-        y.min(rows as usize - 1) * cols as usize + x.min(cols as usize - 1)
+        let index = y.min(rows as usize - 1) * cols as usize + x.min(cols as usize - 1);
+        let displayed = self.displayed_links.borrow();
+        if (frame.cols, frame.rows, frame.scrollback.offset)
+            == (
+                displayed.frame.cols,
+                displayed.frame.rows,
+                displayed.frame.scrollback.offset,
+            )
+        {
+            displayed.logical(index)
+        } else {
+            index
+        }
     }
     fn paint(
         self: &Rc<Self>,
@@ -1002,6 +1056,7 @@ impl Terminal {
             }
         }
         let e = session.snapshot();
+        let bidi = self.bidi_layout(&e);
         let mut search = self.search.borrow_mut();
         let find = session.find_state();
         let matches = search.update(e.cells.len(), &find.highlights);
@@ -1015,6 +1070,7 @@ impl Terminal {
                 ..e.frame
             },
             cells: e.cells,
+            bidi: bidi.as_deref(),
             metrics: (cw, ch),
             scale,
             origin,
@@ -1022,7 +1078,7 @@ impl Terminal {
             height,
             theme: self.theme.get(),
             selection,
-            hovered_link: self.hovered_link(e.hyperlinks, e.frame, (cw, ch)),
+            hovered_link: self.hovered_link(e.hyperlinks, e.frame, (cw, ch), bidi.as_deref()),
             matches,
             focused: self.area.has_focus(),
             exited,
@@ -1049,13 +1105,19 @@ impl Terminal {
             let mut displayed = self.displayed_links.borrow_mut();
             let changed = displayed.revision != Some(e.hyperlink_revision);
             let geometry_changed = displayed.metrics != (cw, ch)
-                || (displayed.frame.cols, displayed.frame.rows) != (e.frame.cols, e.frame.rows);
+                || (displayed.frame.cols, displayed.frame.rows) != (e.frame.cols, e.frame.rows)
+                || match (&displayed.bidi, &bidi) {
+                    (Some(old), Some(new)) => !Rc::ptr_eq(old, new),
+                    (None, None) => false,
+                    _ => true,
+                };
             if changed {
                 displayed.links.clone_from(e.hyperlinks);
                 displayed.revision = Some(e.hyperlink_revision);
             }
             displayed.frame = e.frame;
             displayed.metrics = (cw, ch);
+            displayed.bidi = bidi.clone();
             changed || geometry_changed
         };
         self.refresh_link_hover();
@@ -1064,7 +1126,7 @@ impl Terminal {
         }
         if scene.cursor_visible() {
             self.im.set_cursor_location(&gdk::Rectangle::new(
-                (e.frame.cursor_x as f64 * cw) as i32,
+                (scene.cursor_column() as f64 * cw) as i32,
                 (e.frame.cursor_y as f64 * ch) as i32,
                 cw as i32,
                 ch as i32,

@@ -4,6 +4,9 @@
 #[allow(dead_code)]
 #[path = "../src/accessible_terminal.rs"]
 mod accessible_terminal;
+#[allow(dead_code)]
+#[path = "../src/bidi.rs"]
+mod bidi;
 
 use accessible_terminal::Text;
 use gmux_protocol::{Cell, Frame};
