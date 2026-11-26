@@ -21,6 +21,25 @@ changes. On Cairo it also caches up to 2 MiB of glyph textures per renderer.
 A pane can hold 512 KiB of decoded outlines, with up to 64 KiB of points
 per glyph. Registrations may be replaced or cleared to free space.
 
+## Kitty graphics
+
+The GTK terminal supports [Kitty graphics](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+over direct PTY transfers, including chunked RGB, RGBA and PNG data, zlib
+compression, animations, and Unicode and relative placements. Use
+`kitten icat --transfer-mode=stream image.png` to display an image. The daemon
+accepts inline data from local or remote shells. File, temporary-file, and
+shared-memory transfers are disabled. GTK renders the PNG samples from
+Ghostty's Wuffs decoder as sRGB.
+
+Images follow their placements when scrolling and switching screens. Animations
+advance while visible in a subscribed viewport. Cached scroll previews show
+text until the daemon sends the requested viewport.
+The daemon retains up to 10 MB of image pixels per screen and sends up to 4,096
+placements per viewport. A frontend receives pixel data only when a visible
+image generation is absent from its previous viewport. The GTK renderer reuses
+textures for retained generations and draws placements at their protocol layer
+and z-index.
+
 ## Implementation
 
 `crates/gtk/src/renderer.rs` retains row nodes and shapes text through Pango. Compatible

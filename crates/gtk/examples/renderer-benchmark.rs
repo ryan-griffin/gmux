@@ -387,6 +387,7 @@ fn main() -> anyhow::Result<()> {
                 let scene = Scene {
                     frame,
                     cells: &cells,
+                    graphics: None,
                     bidi: bidi.as_deref(),
                     metrics,
                     scale: 1.0,

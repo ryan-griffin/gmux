@@ -81,6 +81,7 @@ impl OutputBudget {
 pub(super) struct OutputStorage {
     pub(super) bytes: Vec<u8>,
     pub(super) offset: usize,
+    graphics_end: usize,
     closed: bool,
     blocked: bool,
 }
@@ -92,6 +93,7 @@ impl OutputStorage {
         self.closed = true;
         self.bytes = Vec::new();
         self.offset = 0;
+        self.graphics_end = 0;
         self.blocked = false;
     }
     fn compact(&mut self, additional: usize) {
@@ -102,6 +104,7 @@ impl OutputStorage {
                 || self.bytes.len().saturating_add(additional) >= MAX_STREAM_OUTPUT)
         {
             self.bytes.drain(..self.offset);
+            self.graphics_end = self.graphics_end.saturating_sub(self.offset);
             self.offset = 0;
         }
     }
@@ -124,6 +127,10 @@ impl Output {
     pub(super) fn closed(&self) -> bool {
         self.storage.borrow().closed
     }
+    pub(super) fn graphics_pending(&self) -> bool {
+        let storage = self.storage.borrow();
+        storage.offset < storage.graphics_end
+    }
     pub(super) fn backlogged(&self) -> bool {
         let storage = self.storage.borrow();
         storage.blocked && storage.pending() != 0
@@ -131,6 +138,7 @@ impl Output {
     fn enqueue(
         &mut self,
         additional: usize,
+        graphics: bool,
         encode: impl FnOnce(&mut Vec<u8>, usize) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let result = {
@@ -144,6 +152,9 @@ impl Output {
                 // A failed enqueue closes the stream, never skips a record.
                 storage.close();
             } else {
+                if graphics {
+                    storage.graphics_end = storage.bytes.len();
+                }
                 // Packet sizes become known during encoding. Keep the full
                 // pending-byte allowance even when a consumed prefix remained.
                 storage.compact(0);
@@ -159,13 +170,17 @@ impl Output {
         Ok(())
     }
     pub(super) fn queue(&mut self, packet: Packet) -> anyhow::Result<()> {
-        self.enqueue(0, |bytes, limit| {
+        let graphics = packet
+            .as_pane()
+            .and_then(|update| update.header.graphics.as_ref())
+            .is_some_and(|graphics| !graphics.images.is_empty());
+        self.enqueue(0, graphics, |bytes, limit| {
             let _cost = super::profile::scope(super::profile::Stage::Encode, 1);
             packet.encode_into_limit(bytes, limit)
         })
     }
     pub(super) fn queue_encoded(&mut self, encoded: &[u8]) -> anyhow::Result<()> {
-        self.enqueue(encoded.len(), |bytes, limit| {
+        self.enqueue(encoded.len(), false, |bytes, limit| {
             anyhow::ensure!(encoded.len() <= limit, "Frontend is too slow");
             bytes.extend_from_slice(encoded);
             Ok(())
@@ -195,6 +210,7 @@ impl Output {
                 storage.bytes.clear();
             }
             storage.offset = 0;
+            storage.graphics_end = 0;
             storage.blocked = false;
         }
         Ok(())
@@ -273,7 +289,7 @@ mod tests {
         });
         assert!(
             output
-                .enqueue(0, |bytes, _| packet.encode_into_limit(bytes, 1024))
+                .enqueue(0, false, |bytes, _| packet.encode_into_limit(bytes, 1024))
                 .is_err()
         );
         assert!(output.closed());

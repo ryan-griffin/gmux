@@ -68,7 +68,7 @@ static GhosttyColorRgb resolve_color(GhosttyStyleColor color, GhosttyColorRgb fa
     }
 }
 static inline void cell_style(GmuxCell *cell, const GhosttyStyle *style,
-    const GhosttyRenderStateColors *colors) {
+    const GhosttyRenderStateColors *colors, bool explicit_bg) {
     cell->flags = ((style->flags & GHOSTTY_STYLE_FLAG_BOLD) != 0) |
         (((style->flags & GHOSTTY_STYLE_FLAG_ITALIC) != 0) << 1) |
         (((style->flags & GHOSTTY_STYLE_FLAG_FAINT) != 0) << 2) |
@@ -76,7 +76,8 @@ static inline void cell_style(GmuxCell *cell, const GhosttyStyle *style,
         (((style->flags & GHOSTTY_STYLE_FLAG_STRIKETHROUGH) != 0) << 4) |
         (((style->flags & GHOSTTY_STYLE_FLAG_INVISIBLE) != 0) << 5);
     cell->decoration = underline_code(GHOSTTY_STYLE_UNDERLINE(*style)) |
-        ((style->flags & GHOSTTY_STYLE_FLAG_OVERLINE) ? GMUX_DECORATION_OVERLINE : 0);
+        ((style->flags & GHOSTTY_STYLE_FLAG_OVERLINE) ? GMUX_DECORATION_OVERLINE : 0) |
+        ((explicit_bg || style->flags & GHOSTTY_STYLE_FLAG_INVERSE) ? GMUX_DECORATION_EXPLICIT_BACKGROUND : 0);
     const GhosttyColorRgb *underline = NULL;
     switch (style->underline_color.tag) {
         case GHOSTTY_STYLE_COLOR_PALETTE:
@@ -132,6 +133,7 @@ struct GmuxEngine {
     GhosttyTerminalScrollbar scrollbar;
     GhosttyRenderStateRowIterator iterator;
     GhosttyRenderStateRowCells cells;
+    GhosttyRenderStateImageIterator images;
     GhosttyKeyEncoder encoder;
     GhosttyKeyEvent key;
     GhosttyMouseEncoder mouse_encoder;
@@ -140,6 +142,7 @@ struct GmuxEngine {
     GmuxClipboardFn clipboard;
     GmuxClipboardReadFn clipboard_read;
     GmuxGlyphHoldFn glyph_hold;
+    GmuxGraphicsHoldFn graphics_hold;
     uint64_t read_id;
     bool feed_osc, feed_escape, feed_st;
     void *userdata;
@@ -234,6 +237,7 @@ struct GmuxView {
     bool selection_rectangle;
     GhosttyTerminalScreen selection_screen;
     Links links;
+    void *graphics_data;
     bool held_used;
     bool captured;
     bool active;
@@ -387,6 +391,8 @@ void gmux_engine_view_leave(GmuxEngine *e, GmuxView *v) {
     gmux_engine_scroll(e, 0, true);
 }
 
+static const uint64_t RENDER_HOLD_TIMEOUT_MS = 1000;
+
 static uint64_t now_ms(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -400,12 +406,148 @@ uint64_t gmux_engine_glyphs(const GmuxEngine *e, uint64_t known, void *userdata,
     return ghostty_terminal_gmux_glyphs(e->terminal, known, userdata, callback);
 }
 
+static GhosttyKittyGraphics kitty_graphics(const GmuxEngine *e) {
+    GhosttyKittyGraphics graphics = NULL;
+    ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics);
+    return graphics;
+}
+
+uint64_t gmux_engine_graphics(const GmuxEngine *e, const GmuxView *v, uint64_t known,
+    uint32_t cell_pixels[2], void *userdata, GmuxImagePlacementFn callback) {
+    GhosttyRenderState render = v ? v->render : e->render;
+    uint64_t generation = 0;
+    bool same_geometry = cell_pixels[0] == e->cell_width && cell_pixels[1] == e->cell_height;
+    cell_pixels[0] = e->cell_width;
+    cell_pixels[1] = e->cell_height;
+    if (!e->cell_width || !e->cell_height ||
+        ghostty_render_state_get(render, GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION, &generation) ||
+        (generation == known && (same_geometry || !generation))) return generation;
+
+    GhosttyRenderStateImageIterator iterator = e->images;
+    if (ghostty_render_state_get(render, GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR, &iterator))
+        return 0;
+    static const GhosttyRenderStateImageData keys[] = {
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID, GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION,
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_Z, GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER,
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL, GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW,
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X, GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y,
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH, GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT,
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X, GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y,
+        GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH, GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT,
+    };
+    for (size_t n = 0; n < GMUX_GRAPHICS_MAX_PLACEMENTS &&
+        ghostty_render_state_image_iterator_next(iterator); n++) {
+        GmuxImagePlacement p;
+        GhosttyImageLayer layer;
+        void *values[] = {
+            &p.id, &p.generation, &p.z, &layer, &p.cell[0], &p.cell[1],
+            &p.offset[0], &p.offset[1], &p.size[0], &p.size[1],
+            &p.source[0], &p.source[1], &p.source[2], &p.source[3],
+        };
+        if (ghostty_render_state_image_get_multi(iterator, sizeof(keys) / sizeof(keys[0]),
+            keys, values, NULL)) continue;
+        switch (layer) {
+            case GHOSTTY_IMAGE_LAYER_BELOW_BACKGROUND: p.layer = 0; break;
+            case GHOSTTY_IMAGE_LAYER_BELOW_TEXT: p.layer = 1; break;
+            case GHOSTTY_IMAGE_LAYER_ABOVE_TEXT: p.layer = 2; break;
+            default: continue;
+        }
+        if (p.size[0] && p.size[1] && p.source[2] && p.source[3]) callback(userdata, &p);
+    }
+    return generation;
+}
+
+bool gmux_engine_image(const GmuxEngine *e, uint32_t id, uint64_t generation, GmuxImage *out) {
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(kitty_graphics(e), id);
+    if (!image) return false;
+    static const GhosttyKittyGraphicsImageData keys[] = {
+        GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH,
+        GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT,
+        GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS,
+    };
+    uint64_t actual;
+    GhosttyKittyImageFormat format;
+    GhosttyString pixels;
+    void *values[] = { &actual, &out->width, &out->height, &format, &pixels };
+    if (ghostty_kitty_graphics_image_get_multi(image, sizeof(keys) / sizeof(keys[0]),
+        keys, values, NULL) || actual != generation) return false;
+    switch (format) {
+        case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY: out->channels = 1; break;
+        case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA: out->channels = 2; break;
+        case GHOSTTY_KITTY_IMAGE_FORMAT_RGB: out->channels = 3; break;
+        case GHOSTTY_KITTY_IMAGE_FORMAT_RGBA: out->channels = 4; break;
+        default: return false;
+    }
+    out->pixels = (GmuxText){pixels.ptr, pixels.len};
+    return true;
+}
+
+extern GhosttyResult ghostty_kitty_graphics_gmux_animation_tick(GhosttyKittyGraphics,
+    uint64_t, uint64_t *, uint32_t (*)(void *), void *);
+
+typedef struct {
+    const GmuxView *view;
+    GmuxGraphicsIdsFn get_ids;
+    const uint32_t *ids;
+    size_t remaining;
+} AnimationVisibility;
+
+static uint32_t next_visible_image(void *data) {
+    AnimationVisibility *visibility = data;
+    while (!visibility->remaining) {
+        const GmuxView *view = visibility->view;
+        if (!view) return 0;
+        visibility->view = view->next;
+        if (view->active && !view->failed && view->graphics_data)
+            visibility->remaining = visibility->get_ids(view->graphics_data, &visibility->ids);
+    }
+    visibility->remaining--;
+    return *visibility->ids++;
+}
+
+bool gmux_engine_graphics_tick(GmuxEngine *e, uint64_t *delay_ms, GmuxGraphicsIdsFn ids) {
+    *delay_ms = UINT64_MAX;
+    if (e->held) {
+        uint64_t end = e->hold_started_ms + RENDER_HOLD_TIMEOUT_MS;
+        uint64_t now = now_ms();
+        *delay_ms = end > now ? end - now : 1;
+        return false;
+    }
+    GhosttyKittyGraphics graphics = kitty_graphics(e);
+    uint64_t before = 0, after = 0, next;
+    if (ghostty_kitty_graphics_get(graphics, GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION, &before) || !before)
+        return false;
+    GmuxView *view = e->views;
+    while (view && (!view->active || view->failed)) view = view->next;
+    if (!view) return false;
+    AnimationVisibility visibility = {.view = view, .get_ids = ids};
+    uint64_t now = now_ms();
+    if (ghostty_kitty_graphics_gmux_animation_tick(graphics, now, &next, next_visible_image,
+        &visibility) == GHOSTTY_SUCCESS)
+        *delay_ms = next > now ? next - now : 1;
+    return !ghostty_kitty_graphics_get(graphics, GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION, &after) &&
+        after != before;
+}
+
+void gmux_engine_graphics_hold_callback(GmuxEngine *e, GmuxGraphicsHoldFn callback) {
+    e->graphics_hold = callback;
+}
+
+void gmux_engine_view_graphics_data(GmuxView *v, void *viewdata) {
+    v->graphics_data = viewdata;
+}
+
+bool gmux_engine_view_held_render(const GmuxView *v) {
+    return v->held_used;
+}
+
 void gmux_engine_glyph_hold_callback(GmuxEngine *e, GmuxGlyphHoldFn callback) {
     e->glyph_hold = callback;
 }
 
 static void end_render_hold(GmuxEngine *e) {
     if (e->held && e->glyph_hold) e->glyph_hold(e->userdata, e, false);
+    if (e->held && e->graphics_hold) e->graphics_hold(e->userdata, e, NULL, NULL, false);
     e->held=false;
     e->links.valid=false;
     links_free(&e->link_scratch.spare);
@@ -422,6 +564,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         // contains the next frame. Keep it visible until that frame is complete.
         if (ghostty_render_state_update(e->render, terminal)) return;
         if (e->glyph_hold) e->glyph_hold(e->userdata, e, true);
+        if (e->graphics_hold) e->graphics_hold(e->userdata, e, NULL, NULL, true);
         e->links.valid=false;
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
         links_capture(terminal, e->render, e->iterator, &e->held_links, &e->link_scratch, ++e->link_revision, false);
@@ -452,6 +595,8 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
                 !ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &v->scrollbar)) {
                 links_capture(terminal, v->render, e->iterator, &v->links, &e->link_scratch, ++e->link_revision, false);
                 v->captured=true;
+                if (e->graphics_hold && v->graphics_data)
+                    e->graphics_hold(e->userdata, e, v, v->graphics_data, true);
             } else {
                 v->failed=true;
                 // An unsuccessful update may leave an incomplete cache.
@@ -473,7 +618,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
 }
 
 bool gmux_engine_expire_render_hold(GmuxEngine *e) {
-    if (!e->held || now_ms() - e->hold_started_ms < 1000) return false;
+    if (!e->held || now_ms() - e->hold_started_ms < RENDER_HOLD_TIMEOUT_MS) return false;
     GhosttyTerminalModeConfig mode = {.mode = GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, .value = false};
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_MODE, &mode);
     end_render_hold(e);
@@ -723,6 +868,7 @@ void gmux_engine_free(GmuxEngine *e) {
     ghostty_mouse_encoder_free(e->mouse_encoder);
     ghostty_key_encoder_free(e->encoder);
     ghostty_render_state_row_cells_free(e->cells);
+    ghostty_render_state_image_iterator_free(e->images);
     ghostty_render_state_row_iterator_free(e->iterator);
     ghostty_render_state_free(e->render);
     ghostty_terminal_free(e->terminal);
@@ -745,6 +891,7 @@ static GmuxEngine *engine_new(GhosttyTerminal terminal, void *ud, GmuxEventFn cb
     if (ghostty_render_state_new(NULL, &e->render) ||
         ghostty_render_state_row_iterator_new(NULL, &e->iterator) ||
         ghostty_render_state_row_cells_new(NULL, &e->cells) ||
+        ghostty_render_state_image_iterator_new(NULL, &e->images) ||
         ghostty_key_encoder_new(NULL, &e->encoder) ||
         ghostty_key_event_new(NULL, &e->key) ||
         ghostty_mouse_encoder_new(NULL, &e->mouse_encoder) ||
@@ -761,7 +908,9 @@ static GmuxEngine *engine_new(GhosttyTerminal terminal, void *ud, GmuxEventFn cb
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, render_hold);
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, progress_report);
     const bool glyph_protocol = true;
-    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyph_protocol) ||
+    const uint64_t image_limit = GMUX_GRAPHICS_MAX_PIXEL_BYTES;
+    if (ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &image_limit) ||
+        ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyph_protocol) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, program_status) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, semantic_prompt) ||
         ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_RESET, shell_reset)) {
@@ -1347,12 +1496,13 @@ int gmux_engine_snapshot(GmuxEngine *e, GmuxFrame *frame, bool pty_password_inpu
             GmuxCell *cell = &value;
             GhosttyColorRgb fg = colors.foreground, bg = colors.background;
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg);
-            ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg);
+            bool explicit_bg = ghostty_render_state_row_cells_get(
+                e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS;
             GhosttyStyle style = {0};
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
             if (style.flags & GHOSTTY_STYLE_FLAG_INVERSE) { GhosttyColorRgb swap = fg; fg = bg; bg = swap; }
             memcpy(cell->fg, &fg, 3); memcpy(cell->bg, &bg, 3);
-            cell_style(cell, &style, &colors);
+            cell_style(cell, &style, &colors, explicit_bg);
             GhosttyCell raw;
             GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
             ghostty_render_state_row_cells_get(e->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
@@ -1675,7 +1825,8 @@ int gmux_engine_styled_rows(GmuxEngine *e, uint32_t start, size_t rows,
             }
             if (style.flags & GHOSTTY_STYLE_FLAG_INVERSE) { GhosttyColorRgb swap = fg; fg = bg; bg = swap; }
             memcpy(cell->fg, &fg, 3); memcpy(cell->bg, &bg, 3);
-            cell_style(cell, &style, &colors);
+            cell_style(cell, &style, &colors, style.bg_color.tag != GHOSTTY_STYLE_COLOR_NONE ||
+                tag == GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE || tag == GHOSTTY_CELL_CONTENT_BG_COLOR_RGB);
             if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) cell->flags |= 64;
             if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) cell->flags |= 128;
             if (grid_text(&ref, cell, text) || !write(userdata, index * cols + x, cell)) return -1;

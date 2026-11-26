@@ -1,5 +1,7 @@
 #[path = "renderer/glyphs.rs"]
 mod glyphs;
+#[path = "renderer/graphics.rs"]
+mod graphics;
 
 use crate::{
     bidi,
@@ -9,6 +11,7 @@ use gmux_protocol::{
     Cell, Frame,
     cells::{decoration, flags, underline},
     glyphs::{Glyphs, Vertical, cell_codepoint},
+    graphics::{Graphics, Layer},
     theme::Theme,
 };
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
@@ -21,6 +24,7 @@ use std::{
 pub struct Scene<'a> {
     pub frame: Frame,
     pub cells: &'a [Cell],
+    pub graphics: Option<&'a Graphics>,
     pub bidi: Option<&'a bidi::Grid>,
     pub metrics: (f64, f64),
     pub scale: f64,
@@ -100,6 +104,7 @@ struct RowColors<'a, 'b> {
     base: usize,
     selection: Option<(usize, usize)>,
     cursor: Option<std::ops::Range<usize>>,
+    explicit_backgrounds: bool,
 }
 
 impl RowColors<'_, '_> {
@@ -143,7 +148,9 @@ impl RowColors<'_, '_> {
             [Some((scene.theme.selection_background, 1.0)), None]
         } else if scene.highlight(index) == 1 {
             [Some((cell.bg, 1.0)), Some((scene.theme.palette[11], 0.3))]
-        } else if cell.bg != scene.frame.background {
+        } else if cell.bg != scene.frame.background
+            || (self.explicit_backgrounds && cell.decoration & decoration::EXPLICIT_BACKGROUND != 0)
+        {
             [Some((cell.bg, 1.0)), None]
         } else {
             [None, None]
@@ -317,13 +324,33 @@ struct CachedRow {
     hovered_link: Option<(u16, u16)>,
     pixel_phase: f64,
     background: Option<gsk::RenderNode>,
+    below_glyphs: Option<gsk::RenderNode>,
+    hidden_below_glyphs: Option<gsk::RenderNode>,
     foreground: Option<gsk::RenderNode>,
-    hidden_background: Option<gsk::RenderNode>,
     hidden_foreground: Option<gsk::RenderNode>,
     blink: bool,
     blink_start: Option<u16>,
     glyphs_changed: bool,
     bidi: bool,
+}
+
+impl CachedRow {
+    fn below_glyphs(&self, blink_visible: bool) -> Option<&gsk::RenderNode> {
+        if self.blink && !blink_visible {
+            self.hidden_below_glyphs.as_ref()
+        } else {
+            self.below_glyphs.as_ref()
+        }
+    }
+}
+
+fn append_cached_row(snapshot: &gtk::Snapshot, node: Option<&gsk::RenderNode>, y: f64) {
+    if let Some(node) = node {
+        snapshot.save();
+        snapshot.translate(&graphene::Point::new(0.0, y as f32));
+        snapshot.append_node(node);
+        snapshot.restore();
+    }
 }
 
 /// Retain both phases with shared nodes. Segment boundaries preserve paint
@@ -392,6 +419,8 @@ pub struct Renderer {
     appearance: Option<Appearance>,
     rows: Vec<CachedRow>,
     glyphs: Glyphs,
+    textures: graphics::Textures,
+    image_layers: [bool; 2],
     glyph_paths: HashMap<char, glyphs::GlyphPath>,
     glyph_rasters: Option<glyphs::GlyphRasters>,
     baseline: Option<f64>,
@@ -414,7 +443,12 @@ impl Renderer {
             *rasters = Default::default();
         }
         self.rows.clear();
+        self.clear_graphics();
         self.appearance = None;
+    }
+
+    pub fn clear_graphics(&mut self) {
+        self.textures = Default::default();
     }
 
     pub fn set_glyphs(&mut self, glyphs: &Glyphs) {
@@ -535,6 +569,28 @@ impl Renderer {
             1.0,
             (0.0, 0.0, scene.width as f64, scene.height as f64),
         );
+        if let Some(graphics) = scene.graphics {
+            self.textures.retain(graphics);
+        }
+        let graphics = scene
+            .graphics
+            .filter(|graphics| !graphics.placements.is_empty());
+        let [below_background, below_text] = graphics.map_or([false, false], |graphics| {
+            [
+                graphics.placements[0].layer == Layer::BelowBackground,
+                graphics
+                    .placements
+                    .binary_search_by_key(&Layer::BelowText, |placement| placement.layer)
+                    .is_ok(),
+            ]
+        });
+        let layers = [below_background, below_text];
+        let image_layers_changed = self.image_layers != layers;
+        self.image_layers = layers;
+        if let Some(graphics) = graphics {
+            self.textures
+                .append(snapshot, scene, graphics, Layer::BelowBackground);
+        }
         let cols = scene.frame.cols as usize;
         let cursor_visible = scene.cursor_visible();
         let block_cursor = (cursor_visible
@@ -568,6 +624,7 @@ impl Renderer {
                 base,
                 selection: selection.map(|(start, end)| (base + start, base + end)),
                 cursor: cursor.map(|(start, width, _)| base + start..base + start + width),
+                explicit_backgrounds: below_background,
             };
             let row = &mut self.rows[y];
             // Rectangle snapping depends on the row's position in device pixels.
@@ -589,18 +646,19 @@ impl Renderer {
                     )
                 })
             });
-            let cells =
-                if let Some(bidi) = bidi.filter(|_| rebuild || row.hovered_link != hovered_link) {
-                    self.visual_cells.clear();
-                    self.visual_cells.extend(
-                        (0..logical_cells.len()).map(|x| logical_cells[bidi.logical(x)].clone()),
-                    );
-                    &self.visual_cells[..]
-                } else {
-                    logical_cells
-                };
+            let rebuild_background =
+                rebuild || image_layers_changed || row.hovered_link != hovered_link;
+            let cells = if let Some(bidi) = bidi.filter(|_| rebuild_background) {
+                self.visual_cells.clear();
+                self.visual_cells.extend(
+                    (0..logical_cells.len()).map(|x| logical_cells[bidi.logical(x)].clone()),
+                );
+                &self.visual_cells[..]
+            } else {
+                logical_cells
+            };
             let mut flags = 0;
-            if rebuild || row.hovered_link != hovered_link {
+            if rebuild_background {
                 let background = gtk::Snapshot::new();
                 // Adjacent backgrounds share a node, which keeps full-screen
                 // applications from creating one color node for every cell.
@@ -635,9 +693,16 @@ impl Renderer {
                     }
                     x = end;
                 }
+                let below_glyphs = if below_text {
+                    row.background = background.to_node();
+                    gtk::Snapshot::new()
+                } else {
+                    row.background = None;
+                    background
+                };
                 if let Some((x, width, rgb)) = cursor {
                     append_row_rect(
-                        &background,
+                        &below_glyphs,
                         scene,
                         y as f64 * scene.metrics.1,
                         rgb,
@@ -672,12 +737,12 @@ impl Renderer {
                     .flatten()
                     // Row-local columns are bounded by Frame::cols.
                     .map(|x| x as u16);
-                let mut background = RowPhases::with_snapshot(background, row.blink);
+                let mut below_glyphs = RowPhases::with_snapshot(below_glyphs, row.blink);
                 // Ghostty paints underlines and overlines below glyphs so
                 // contrasting colors cannot cover descenders or tall ink.
                 if decorations & decoration::UNDERLINE_MASK != 0 || hovered_link.is_some() {
                     append_decorations(
-                        &mut background,
+                        &mut below_glyphs,
                         &colors,
                         cells,
                         base,
@@ -687,7 +752,7 @@ impl Renderer {
                 }
                 if decorations & decoration::OVERLINE != 0 {
                     append_decorations(
-                        &mut background,
+                        &mut below_glyphs,
                         &colors,
                         cells,
                         base,
@@ -695,7 +760,7 @@ impl Renderer {
                         DecorationKind::Overline,
                     );
                 }
-                (row.background, row.hidden_background) = background.finish();
+                (row.below_glyphs, row.hidden_below_glyphs) = below_glyphs.finish();
                 row.hovered_link = hovered_link;
                 stats.background_rows += 1;
             }
@@ -706,6 +771,10 @@ impl Renderer {
                 while x < cells.len() {
                     let cell = &cells[x];
                     let text = cell.text();
+                    if text.starts_with('\u{10eeee}') {
+                        x += 1;
+                        continue;
+                    }
                     if let Some(bidi) = bidi.filter(|row| row.rtl(x))
                         && can_shape_rtl(cells, x, &self.glyphs)
                     {
@@ -931,35 +1000,36 @@ impl Renderer {
             {
                 stats.blinking_rows += 1;
             }
-            if let Some(node) = if row.blink && !scene.text_blink_visible {
-                &row.hidden_background
+            let background = if below_text {
+                row.background.as_ref()
             } else {
-                &row.background
-            } {
-                snapshot.save();
-                snapshot.translate(&graphene::Point::new(
-                    0.0,
-                    (y as f64 * scene.metrics.1) as f32,
-                ));
-                snapshot.append_node(node);
-                snapshot.restore();
+                row.below_glyphs(scene.text_blink_visible)
+            };
+            append_cached_row(snapshot, background, y as f64 * scene.metrics.1);
+        }
+        if let Some(graphics) = graphics.filter(|_| below_text) {
+            self.textures
+                .append(snapshot, scene, graphics, Layer::BelowText);
+            for (y, row) in self.rows.iter().enumerate() {
+                append_cached_row(
+                    snapshot,
+                    row.below_glyphs(scene.text_blink_visible),
+                    y as f64 * scene.metrics.1,
+                );
             }
         }
         // Paint every background before any text, including wide and tall glyphs.
         for (y, row) in self.rows.iter().enumerate() {
-            if let Some(node) = if row.blink && !scene.text_blink_visible {
-                &row.hidden_foreground
+            let foreground = if row.blink && !scene.text_blink_visible {
+                row.hidden_foreground.as_ref()
             } else {
-                &row.foreground
-            } {
-                snapshot.save();
-                snapshot.translate(&graphene::Point::new(
-                    0.0,
-                    (y as f64 * scene.metrics.1) as f32,
-                ));
-                snapshot.append_node(node);
-                snapshot.restore();
-            }
+                row.foreground.as_ref()
+            };
+            append_cached_row(snapshot, foreground, y as f64 * scene.metrics.1);
+        }
+        if let Some(graphics) = graphics {
+            self.textures
+                .append(snapshot, scene, graphics, Layer::AboveText);
         }
         if cursor_visible && block_cursor.is_none() {
             let alpha = if scene.focused { 1.0 } else { 0.35 };
@@ -987,6 +1057,7 @@ fn can_shape_rtl(cells: &[Cell], x: usize, glyphs: &Glyphs) -> bool {
     cell.flags & 64 == 0
         && !cells.get(x + 1).is_some_and(|cell| cell.flags & 64 != 0)
         && render::Graphic::from_text(cell.text()).is_none()
+        && !cell.text().starts_with('\u{10eeee}')
         && cell_codepoint(cell.text()).is_none_or(|cp| glyphs.get(cp).is_none())
 }
 

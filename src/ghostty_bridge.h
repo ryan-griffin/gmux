@@ -68,6 +68,7 @@
 #define GMUX_DECORATION_UNDERLINE_MASK 7
 #define GMUX_DECORATION_OVERLINE 8
 #define GMUX_DECORATION_UNDERLINE_COLOR 16
+#define GMUX_DECORATION_EXPLICIT_BACKGROUND 32
 
 #define GMUX_CELL_BLINK 8
 
@@ -184,12 +185,39 @@ typedef void (*GmuxGlyphFn)(void *userdata, const GmuxGlyph *glyph);
 typedef void (*GmuxGlyphHoldFn)(void *userdata, const GmuxEngine *engine, bool held);
 uint64_t gmux_engine_glyphs(const GmuxEngine *engine, uint64_t known, void *userdata, GmuxGlyphFn callback);
 void gmux_engine_glyph_hold_callback(GmuxEngine *engine, GmuxGlyphHoldFn callback);
+
+typedef struct { const uint8_t *ptr; size_t len; } GmuxText;
+
+#define GMUX_GRAPHICS_MAX_PIXEL_BYTES 10000000
+#define GMUX_GRAPHICS_MAX_PLACEMENTS 4096
+typedef struct {
+    uint64_t generation;
+    uint32_t id;
+    int32_t z, cell[2];
+    uint32_t offset[2], size[2], source[4];
+    uint8_t layer;
+} GmuxImagePlacement;
+typedef struct {
+    uint32_t width, height;
+    uint8_t channels;
+    GmuxText pixels;
+} GmuxImage;
+typedef void (*GmuxImagePlacementFn)(void *userdata, const GmuxImagePlacement *placement);
+typedef size_t (*GmuxGraphicsIdsFn)(const void *viewdata, const uint32_t **ids);
+typedef void (*GmuxGraphicsHoldFn)(void *userdata, const GmuxEngine *engine,
+    const GmuxView *view, void *viewdata, bool held);
+uint64_t gmux_engine_graphics(const GmuxEngine *engine, const GmuxView *view, uint64_t known,
+    uint32_t cell_pixels[2], void *userdata, GmuxImagePlacementFn callback);
+bool gmux_engine_image(const GmuxEngine *engine, uint32_t id, uint64_t generation, GmuxImage *image);
+bool gmux_engine_graphics_tick(GmuxEngine *engine, uint64_t *delay_ms, GmuxGraphicsIdsFn ids);
+void gmux_engine_graphics_hold_callback(GmuxEngine *engine, GmuxGraphicsHoldFn callback);
+void gmux_engine_view_graphics_data(GmuxView *view, void *viewdata);
+bool gmux_engine_view_held_render(const GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
 // Event kind 9. Zero keeps the current dimension.
 typedef struct { uint16_t cols, rows; } GmuxResizeEvent;
 // Event kind 7. Stable codes, independent of upstream enum representation.
-typedef struct { const uint8_t *ptr; size_t len; } GmuxText;
 typedef struct {
     uint8_t state; // 0 idle, 1 working, 2 done, 3 blocked, 4 error, 5 clear
     uint8_t kind; // 0 absent, 1 permission, 2 question, 3 auth

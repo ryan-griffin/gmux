@@ -105,6 +105,78 @@ fn heartbeat_acknowledgements_bypass_saturated_decode_admission() {
 }
 
 #[test]
+fn image_payload_can_arrive_after_the_base_record_deadline() {
+    use gmux_protocol::{
+        Frame,
+        graphics::{GraphicsUpdate, Image, Layer, PixelFormat, Placement},
+        transport::{PaneHeader, PaneUpdate},
+    };
+    let size = 256;
+    let pixels = vec![42; size as usize * size as usize * 4];
+    let mut bytes = Vec::new();
+    Packet::Pane(PaneUpdate {
+        header: PaneHeader {
+            frame: Some(Frame {
+                cols: 1,
+                rows: 1,
+                ..Default::default()
+            }),
+            graphics: Some(GraphicsUpdate {
+                replace: true,
+                cell_pixels: [8, 16],
+                placements: vec![Placement {
+                    image: 1,
+                    layer: Layer::AboveText,
+                    cell: [0, 0],
+                    offset: [0, 0],
+                    size: [8, 16],
+                    source: [0, 0, size, size],
+                }],
+                images: vec![Arc::new(Image {
+                    key: 1,
+                    width: size,
+                    height: size,
+                    format: PixelFormat::Rgba,
+                    pixels: pixels.clone(),
+                })],
+            }),
+            ..Default::default()
+        },
+        cells: Vec::new(),
+    })
+    .encode_into(&mut bytes)
+    .unwrap();
+    let budget = 1024 * 1024;
+    let shared = Arc::new(tokio::sync::Semaphore::new(budget));
+    let (sender, receiver) = incoming::channel_with_budget(budget, 8, shared);
+    let (socket, mut peer) = tokio::io::duplex(4096);
+    let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
+    let timeout = Duration::from_millis(400);
+    let task = runtime::spawn(async move { read_packets(socket, &sender, &wake, timeout).await });
+    runtime::block_on(async {
+        let split = bytes.len() - pixels.len() / 2;
+        peer.write_all(&bytes[..split]).await.unwrap();
+        tokio::time::sleep(timeout + Duration::from_millis(100)).await;
+        peer.write_all(&bytes[split..]).await.unwrap();
+    });
+    drop(peer);
+    assert!(runtime::block_on(task).unwrap().is_err());
+    let packet = receiver.try_recv().unwrap().unwrap();
+    assert_eq!(
+        packet
+            .as_pane()
+            .unwrap()
+            .header
+            .graphics
+            .as_ref()
+            .unwrap()
+            .images[0]
+            .pixels,
+        pixels
+    );
+}
+
+#[test]
 fn heartbeat_replies_keep_idle_streams_alive_without_waking_the_ui() {
     use std::{
         io::{BufRead, Write},

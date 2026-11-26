@@ -45,6 +45,10 @@ impl Packet {
                 .glyphs
                 .as_ref()
                 .map_or(0, crate::glyphs::GlyphUpdate::memory_size)
+            + header
+                .graphics
+                .as_ref()
+                .map_or(0, crate::graphics::GraphicsUpdate::memory_size)
             + header.row_flags.capacity()
             + header
                 .cache

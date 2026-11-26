@@ -48,6 +48,9 @@ const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_protocol::cells::
 #[path = "engine/glyphs.rs"]
 mod glyphs;
 use glyphs::{GlyphState, glyph_hold};
+#[path = "engine/graphics.rs"]
+mod graphics;
+use graphics::{GraphicsState, graphics_hold};
 
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
@@ -91,6 +94,7 @@ struct Events {
     command: gmux_protocol::shell::CommandState,
     resize_request: Option<(u16, u16)>,
     glyphs: GlyphState,
+    graphics: GraphicsState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
 const _: () =
@@ -426,6 +430,7 @@ pub(crate) struct EngineView {
     _resources: Rc<ViewResources>,
     raw: NonNull<GmuxView>,
     held_frame: Frame,
+    graphics: Rc<std::cell::RefCell<graphics::Snapshot>>,
     find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
@@ -448,6 +453,9 @@ impl EngineView {
 
     pub(crate) fn set_active(&mut self, active: bool) {
         unsafe { gmux_engine_view_set_active(self.raw.as_ptr(), active) }
+        if !active {
+            *self.graphics.borrow_mut() = graphics::Snapshot::default();
+        }
     }
     pub(crate) fn set_theme(&mut self, theme: &Theme) {
         unsafe {
@@ -732,12 +740,19 @@ impl Engine {
         self.new_view_in(&Rc::default())
     }
     pub(crate) fn new_view_in(&self, resources: &Rc<ViewResources>) -> anyhow::Result<EngineView> {
+        let raw = NonNull::new(unsafe {
+            gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?;
+        let graphics = Rc::<std::cell::RefCell<graphics::Snapshot>>::default();
+        // The native view borrows the capture until it is freed.
+        unsafe {
+            gmux_engine_view_graphics_data(raw.as_ptr(), Rc::as_ptr(&graphics).cast_mut().cast())
+        };
         Ok(EngineView {
+            raw,
+            graphics,
             _resources: resources.clone(),
-            raw: NonNull::new(unsafe {
-                gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
-            })
-            .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?,
             find: crate::search::HistorySearch::with_budget(resources.search.clone()),
             find_row: Vec::new(),
             retention_revision: 0,
@@ -913,6 +928,7 @@ impl Engine {
         unsafe {
             gmux_engine_read_callback(raw.as_ptr(), Some(clipboard_read));
             gmux_engine_glyph_hold_callback(raw.as_ptr(), Some(glyph_hold));
+            gmux_engine_graphics_hold_callback(raw.as_ptr(), Some(graphics_hold));
         }
         Ok(Self {
             revision: 1,
@@ -1296,6 +1312,17 @@ impl Engine {
         );
         Ok((String::from_utf8(out.bytes)?, colors))
     }
+    pub(crate) fn tick_graphics(&mut self) -> (bool, Option<std::time::Duration>) {
+        let mut delay = 0;
+        let changed = unsafe {
+            gmux_engine_graphics_tick(self.raw.as_ptr(), &mut delay, Some(graphics::visible_ids))
+        };
+        (
+            changed,
+            (delay != u64::MAX).then(|| std::time::Duration::from_millis(delay)),
+        )
+    }
+
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }
     }
@@ -1439,6 +1466,29 @@ impl ActiveView<'_> {
             return (state.live.revision, &state.live.glyphs);
         }
         (state.held.revision, &state.held.glyphs)
+    }
+    pub(crate) fn graphics(
+        &mut self,
+    ) -> (
+        Option<std::sync::Arc<gmux_protocol::graphics::Graphics>>,
+        bool,
+    ) {
+        let state = &mut self.engine.events.graphics;
+        if self.held {
+            let graphics = if unsafe { gmux_engine_view_held_render(self.view.raw.as_ptr()) } {
+                self.view.graphics.borrow().graphics.clone()
+            } else {
+                state.held.graphics.clone()
+            };
+            return (graphics, false);
+        }
+        let mut capture = self.view.graphics.borrow_mut();
+        let newly_visible = capture.refresh(
+            self.engine.raw.as_ptr(),
+            std::ptr::null(),
+            &mut state.pixels,
+        );
+        (capture.graphics.clone(), newly_visible)
     }
     pub(crate) fn hyperlinks(&self) -> &gmux_protocol::hyperlinks::Hyperlinks {
         &self.engine.hyperlinks
@@ -2511,6 +2561,7 @@ mod tests {
     #[test]
     fn checkpoints_keep_complete_kitty_images_and_omit_unfinished_transfers() {
         let mut old = Engine::new().unwrap();
+        old.resize(80, 24, 8, 16).unwrap();
         old.write(b"\x1b_Ga=t,f=32,s=1,v=1,i=6122;BwcH/w==\x1b\\");
         old.write(b"\x1b_Ga=T,f=32,s=2,v=2,i=6123,c=1,r=1,m=1;CVF8A9Na\x1b\\");
         assert_eq!(old.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
@@ -2521,7 +2572,7 @@ mod tests {
                 .any(|bytes| bytes == [9, 81, 124, 3, 211, 90])
         );
         let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
-        fresh.prepare_shell((0, 0)).unwrap();
+        fresh.prepare_shell((8, 16)).unwrap();
         let last_chunk = b"\x1b_Gm=0;B/8HBwf/BwcH/w==\x1b\\";
         old.events.replies.clear();
         old.write(last_chunk);
@@ -2531,6 +2582,20 @@ mod tests {
         fresh.events.replies.clear();
         fresh.write(b"\x1b_Ga=p,i=6122,c=1,r=1\x1b\\");
         assert_eq!(fresh.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
+        let mut view = fresh.new_view().unwrap();
+        fresh
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let graphics = active.graphics().0.unwrap();
+                let [placement] = graphics.placements.as_slice() else {
+                    panic!("Expected a restored image placement");
+                };
+                assert_eq!(
+                    graphics.image(placement.image).unwrap().pixels,
+                    [7, 7, 7, 255]
+                );
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2620,6 +2685,7 @@ mod tests {
                                         hyperlinks: &Default::default(),
                                         hyperlink_revision: 0,
                                         glyphs: &Glyphs::default(),
+                                        graphics: None,
                                         frame: engine.frame,
                                         cells: &engine.cells,
                                         row_flags: &engine.row_flags,
@@ -3068,6 +3134,7 @@ mod tests {
                 .with_view(view, |engine| assert_eq!(engine.text().unwrap(), "before"))
                 .unwrap();
         }
+        assert!(engine.tick_graphics().1.is_some());
         assert!(!engine.expire_render_hold());
         std::thread::sleep(std::time::Duration::from_millis(1050));
         assert!(engine.expire_render_hold());

@@ -202,8 +202,9 @@ impl Record {
 }
 
 /// Allocation bound for the stream payload schemas, computed without allocating
-/// or decoding strings. Numeric values never control allocation, except clipboard
-/// lengths checked separately above. Strings use at most their encoded length.
+/// or decoding strings. Clipboard lengths and image dimensions are checked
+/// against the framed payload before allocating their binary buffers. Strings
+/// use at most their encoded length.
 /// Four times the input covers the input itself, serde's geometrically grown
 /// escape scratch and owned strings. Each object gets 2048 bytes for typed
 /// structs, Vec minimum capacity and tree boxes. Arrays

@@ -464,7 +464,8 @@ async fn read_packets(
         .await?;
         let record = transport::Record::decode(framing)?;
         let reservation = sender.reserve_decode(record.decode_bytes()).await?;
-        let (packet, reservation, retained) = runtime::deadline(Instant::now() + timeout, async {
+        let deadline = Instant::now() + timeout;
+        let (header, reservation) = runtime::deadline(deadline, async {
             // read_buf initializes only bytes received. Avoid clearing large
             // header allocations immediately before the socket overwrites them.
             let mut bytes = Vec::with_capacity(record.header_size());
@@ -486,8 +487,18 @@ async fn read_packets(
             } else {
                 (record.parse_header(&bytes), reservation)
             };
+            Ok((decoded?, reservation))
+        })
+        .await?;
+        let image_bytes = header
+            .as_pane()
+            .and_then(|pane| pane.header.graphics.as_ref())
+            .map_or(Ok(0), |graphics| graphics.payload_len())?;
+        // Allow packed image data to arrive at 128 KiB/s within a finite deadline.
+        let deadline = deadline + Duration::from_millis(image_bytes as u64 * 1000 / (128 * 1024));
+        let (packet, reservation, retained) = runtime::deadline(deadline, async {
             let packet =
-                Packet::read_body_async(&mut (&mut reader).compat(), record, decoded?).await?;
+                Packet::read_body_async(&mut (&mut reader).compat(), record, header).await?;
             let (result, packet, reservation) = if record.decode_bytes() > 64 * 1024 {
                 runtime::blocking(move || (record.validate_packet(&packet), packet, reservation))
                     .await
@@ -796,6 +807,11 @@ impl SessionManager {
                     panes: self.visible.clone(),
                 }))?;
             self.subscription_pending = false;
+            for (id, session) in &self.sessions {
+                if !self.visible.contains(id) {
+                    session.borrow_mut().viewport.suspend_graphics();
+                }
+            }
         }
         if self.git_subscription_pending {
             self.connection
@@ -1004,7 +1020,9 @@ impl SessionManager {
     }
     pub fn close(&mut self, id: u64) {
         if let Some(session) = self.sessions.remove(&id) {
-            session.borrow_mut().viewport.clear_cache();
+            let mut session = session.borrow_mut();
+            session.viewport.clear_cache();
+            session.viewport.suspend_graphics();
         }
         self.metadata.remove(&id);
         self.git.remove(&id);
@@ -1016,6 +1034,7 @@ impl SessionManager {
             let mut session = session.borrow_mut();
             session.git = None;
             session.viewport.clear_cache();
+            session.viewport.suspend_graphics();
         }
         self.git.clear();
         self.git_panes.clear();

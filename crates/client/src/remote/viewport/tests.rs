@@ -2425,3 +2425,55 @@ fn a_forced_scroll_can_succeed_before_selection_admission_fails() {
     assert!(session.borrow().clear_selection().is_err());
     assert_eq!(session.borrow().viewport.selection_serial.get(), 2);
 }
+
+#[test]
+fn resubscribing_ignores_queued_image_deltas_until_the_full_viewport_arrives() {
+    use gmux_protocol::graphics::{GraphicsUpdate, Image, Layer, PixelFormat, Placement};
+    use std::sync::Arc;
+
+    let mut view = viewport();
+    let pixels = Arc::new(Image {
+        key: 1,
+        width: 1,
+        height: 1,
+        format: PixelFormat::Rgb,
+        pixels: vec![0, 255, 0],
+    });
+    let apply = |view: &mut Viewport, replace, col| {
+        let packet = PaneUpdate {
+            header: PaneHeader {
+                meta: view.meta.clone(),
+                frame: Some(view.frame),
+                graphics: Some(GraphicsUpdate {
+                    replace,
+                    cell_pixels: [8, 16],
+                    placements: vec![Placement {
+                        image: pixels.key,
+                        layer: Layer::BelowText,
+                        cell: [col, 0],
+                        offset: [0, 0],
+                        size: [8, 16],
+                        source: [0, 0, 1, 1],
+                    }],
+                    images: if replace {
+                        vec![pixels.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                }),
+                ..PaneHeader::default()
+            },
+            cells: Vec::new(),
+        };
+        view.apply(packet, true, Instant::now()).unwrap();
+    };
+    apply(&mut view, true, 0);
+    assert_eq!(view.snapshot().graphics.unwrap().placements[0].cell, [0, 0]);
+
+    view.suspend_graphics();
+    apply(&mut view, false, 1);
+    assert!(view.snapshot().graphics.unwrap().images.is_empty());
+
+    apply(&mut view, true, 1);
+    assert_eq!(view.snapshot().graphics.unwrap().placements[0].cell, [1, 0]);
+}

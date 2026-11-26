@@ -64,6 +64,10 @@ Media and volume keys delivered by the desktop work in terminal programs that
 enable the Kitty keyboard protocol. See [keyboard input](docs/keyboard.md) for
 supported keys and browser-key limitations.
 
+The GTK terminal displays Kitty graphics locally and over remote connections.
+For example, run `kitten icat --transfer-mode=stream image.png` in a pane.
+See [terminal rendering](docs/renderer.md#kitty-graphics) for supported transfers.
+
 Programs can also [register custom glyphs](docs/renderer.md#registered-glyphs)
 for terminal icons without installing a font.
 

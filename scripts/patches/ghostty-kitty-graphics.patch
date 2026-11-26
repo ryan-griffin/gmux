@@ -1,0 +1,144 @@
+Bound RGBA conversion and schedule animations for visible images.
+
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -1165,9 +1165,13 @@
+         io: std.Io,
+         alloc: Allocator,
+         img: *Image,
+-    ) Allocator.Error!void {
++    ) (Allocator.Error || error{ImageStorageFull})!void {
+         if (img.format == .rgba) return;
+         const old = img.data.bytes() orelse return;
++
++        const rgba_len = @as(usize, img.width) * img.height * 4;
++        if (rgba_len -| old.len > self.total_limit -| self.total_bytes)
++            return error.ImageStorageFull;
+
+         const rgba = try pixel.rgbaFromFormat(alloc, img.format, old);
+         self.total_bytes -= old.len;
+@@ -1238,16 +1242,34 @@
+     /// the last tick, this returns null right away instead of looking
+     /// at every image.
+     pub fn animationTick(self: *ImageStorage, io: std.Io, now_ms: u64) ?u64 {
++        return self.animationTickVisible(io, now_ms, null);
++    }
++
++    pub const AnimationImages = struct {
++        next: *const fn (?*anyopaque) callconv(.c) u32,
++        userdata: ?*anyopaque,
++    };
++
++    pub fn animationTickVisible(
++        self: *ImageStorage,
++        io: std.Io,
++        now_ms: u64,
++        visible: ?AnimationImages,
++    ) ?u64 {
+         // Nothing changed since the last tick found nothing to play,
+         // so there is still nothing to play. See
+         // animation_idle_generation.
+-        if (self.animation_idle_generation == self.generation) return null;
++        if (visible == null and self.animation_idle_generation == self.generation) return null;
+
+         var min_delay: ?u64 = null;
+
+         var it = self.images.iterator();
+-        while (it.next()) |entry| {
+-            const img: *Image = entry.value_ptr;
++        while (true) {
++            const img: *Image = if (visible) |images| img: {
++                const id = images.next(images.userdata);
++                if (id == 0) break;
++                break :img self.images.getPtr(id) orelse continue;
++            } else (it.next() orelse break).value_ptr;
+
+             // The gates below mirror Kitty's image_is_animatable.
+
+@@ -1352,14 +1374,10 @@
+             }
+         }
+
+-        // Remember the generation only when nothing is playing. We
+-        // read it after the loop because showing a new frame above
+-        // changes it. That case always schedules another tick, so it
+-        // never records a stale value here.
+-        self.animation_idle_generation = if (min_delay == null)
+-            self.generation
+-        else
+-            null;
++        // The unfiltered idle result applies only to the full storage.
++        if (visible == null) {
++            self.animation_idle_generation = if (min_delay == null) self.generation else null;
++        }
+
+         return min_delay;
+     }
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -1094,12 +1094,13 @@
+     return .{ .image = img, .display = display_ };
+ }
+
+-const EncodeableError = Image.Error || Allocator.Error;
++const EncodeableError = Image.Error || Allocator.Error || error{ImageStorageFull};
+
+ /// Encode an error code into a message for a response.
+ fn encodeError(r: *Response, err: EncodeableError) void {
+     switch (err) {
+         error.OutOfMemory => r.message = "ENOMEM: out of memory",
++        error.ImageStorageFull => r.message = "ENOSPC: image storage full",
+         error.InsufficientData => r.message = "ENODATA: insufficient data",
+         error.InvalidData => r.message = "EINVAL: invalid data",
+         error.DecompressionFailed => r.message = "EINVAL: decompression failed",
+--- a/src/terminal/c/kitty_graphics.zig
++++ b/src/terminal/c/kitty_graphics.zig
+@@ -222,6 +222,16 @@
+     now_ms: u64,
+     next_ms: ?*u64,
+ ) callconv(lib.calling_conv) Result {
++    return gmux_animation_tick(graphics_, now_ms, next_ms, null, null);
++}
++
++pub fn gmux_animation_tick(
++    graphics_: ?KittyGraphics,
++    now_ms: u64,
++    next_ms: ?*u64,
++    next_image: ?*const fn (?*anyopaque) callconv(.c) u32,
++    userdata: ?*anyopaque,
++) callconv(lib.calling_conv) Result {
+     if (comptime !lib.feature(.kitty_graphics)) return .unsupported;
+
+     const out = next_ms orelse return .invalid_value;
+@@ -230,9 +240,10 @@
+     // The tick needs an Io only to hand out new generation numbers.
+     // The storage handle doesn't carry one, but TinyIo has no state,
+     // so a fresh one works just as well as the terminal's.
+-    const delay = storage.animationTick(
++    const delay = storage.animationTickVisible(
+         terminal_c.Io.init.io(),
+         now_ms,
++        if (next_image) |next| .{ .next = next, .userdata = userdata } else null,
+     ) orelse return .no_value;
+     // The Zig tick returns a delay. The C API returns the absolute
+     // time instead, so callers don't have to remember when they
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -16,6 +16,7 @@
+ pub const kitty_graphics = @import("kitty_graphics.zig");
+ pub const kitty_graphics_get = kitty_graphics.get;
+ pub const kitty_graphics_animation_tick = kitty_graphics.animation_tick;
++pub const kitty_graphics_gmux_animation_tick = kitty_graphics.gmux_animation_tick;
+ pub const kitty_graphics_image = kitty_graphics.image_get_handle;
+ pub const kitty_graphics_image_get = kitty_graphics.image_get;
+ pub const kitty_graphics_image_get_multi = kitty_graphics.image_get_multi;
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -380,6 +380,7 @@
+         @export(&c.snapshot_decoder_decode, .{ .name = "ghostty_snapshot_decoder_decode" });
+         @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+         @export(&c.kitty_graphics_animation_tick, .{ .name = "ghostty_kitty_graphics_animation_tick" });
++        @export(&c.kitty_graphics_gmux_animation_tick, .{ .name = "ghostty_kitty_graphics_gmux_animation_tick" });
+         @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
+         @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
+         @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });

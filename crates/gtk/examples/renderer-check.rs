@@ -101,6 +101,7 @@ fn scene(cells: &[Cell], theme: Theme) -> Scene<'_> {
             ..Frame::default()
         },
         cells,
+        graphics: None,
         bidi: None,
         metrics: (10.0, 24.0),
         scale: 1.0,
@@ -2208,6 +2209,122 @@ fn validate_extended_boxes(
     }
 }
 
+fn validate_kitty_graphics(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    use gmux_protocol::graphics::{Graphics, Image, Layer, PixelFormat, Placement};
+    use std::sync::Arc;
+
+    let theme = Theme {
+        background: [0; 3],
+        foreground: [0, 0, 255],
+        ..Theme::adwaita(true)
+    };
+    let mut cells = vec![cell(" ", theme, 0); 40 * 8];
+    cells[1].bg = [0, 255, 0];
+    cells[2] = cell("█", theme, 0);
+    cells[3] = cell("█", theme, 0);
+    cells[5] = cell("\u{10eeee}\u{0305}\u{0305}", theme, 0);
+    cells[7].decoration |= decoration::EXPLICIT_BACKGROUND;
+    cells[8].decoration = decoration::OVERLINE | gmux_protocol::cells::underline::SINGLE;
+    let image = |key, width, format, pixels: &[u8]| {
+        Arc::new(Image {
+            key,
+            width,
+            height: 1,
+            format,
+            pixels: pixels.to_vec(),
+        })
+    };
+    let placement = |image, layer, col, width, source| Placement {
+        image,
+        layer,
+        cell: [col, 0],
+        offset: [0, 0],
+        size: [width, 24],
+        source,
+    };
+    let graphics = Graphics {
+        cell_pixels: [10, 24],
+        images: vec![
+            image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
+            image(2, 1, PixelFormat::Rgba, &[255, 0, 0, 128]),
+            image(3, 3, PixelFormat::Rgb, &[0, 0, 255, 0, 255, 0, 0, 0, 255]),
+        ],
+        placements: vec![
+            placement(1, Layer::BelowBackground, -1, 30, [0, 0, 1, 1]),
+            placement(1, Layer::BelowBackground, 6, 20, [0, 0, 1, 1]),
+            placement(1, Layer::BelowText, 2, 10, [0, 0, 1, 1]),
+            placement(1, Layer::BelowText, 5, 10, [0, 0, 1, 1]),
+            placement(1, Layer::BelowText, 8, 20, [0, 0, 1, 1]),
+            placement(2, Layer::AboveText, 3, 10, [0, 0, 1, 1]),
+            placement(3, Layer::AboveText, 4, 10, [1, 0, 1, 1]),
+        ],
+    };
+    let mut renderer = Renderer::new();
+    let mut scene = scene(&cells, theme);
+    scene.graphics = Some(&graphics);
+    scene.focused = true;
+    scene.frame.cursor_visible = 1;
+    scene.frame.cursor_style = 1;
+    scene.frame.cursor_x = 9;
+    scene.frame.cursor = [0, 255, 0];
+    let painted = node(&mut renderer, &scene, font, context).0;
+    let data = pixels(&render(gpu, &painted, &scene));
+    for (x, expected) in [
+        (5, [0, 0, 255, 255]),
+        (15, [0, 255, 0, 255]),
+        (25, [255, 0, 0, 255]),
+        (35, [127, 0, 128, 255]),
+        (45, [0, 255, 0, 255]),
+        (55, [0, 0, 255, 255]),
+        (65, [0, 0, 255, 255]),
+        (75, [0, 0, 0, 255]),
+        (95, [0, 255, 0, 255]),
+    ] {
+        let start = (12 * scene.width as usize + x) * 4;
+        assert!(
+            data[start..start + 4]
+                .iter()
+                .zip(expected)
+                .all(|(&a, b)| a.abs_diff(b) <= 1),
+            "Unexpected image color at x={x}: {:?}",
+            &data[start..start + 4]
+        );
+    }
+    for half in [0..12, 12..24] {
+        assert!(
+            half.into_iter().any(|y| {
+                let start = (y * scene.width as usize + 85) * 4;
+                data[start..start + 4] == [255, 0, 0, 255]
+            }),
+            "An image below text covered an underline or overline"
+        );
+    }
+    let mut expected = cells.clone();
+    expected[5] = cell(" ", theme, 0);
+    let empty_placeholder = node(
+        &mut renderer,
+        &Scene {
+            cells: &expected,
+            ..scene
+        },
+        font,
+        context,
+    )
+    .0;
+    assert_eq!(data, pixels(&render(gpu, &empty_placeholder, &scene)));
+    let without_images = Scene {
+        graphics: None,
+        ..scene
+    };
+    let _ = node(&mut renderer, &without_images, font, context);
+    let restored = node(&mut renderer, &scene, font, context).0;
+    assert_eq!(data, pixels(&render(gpu, &restored, &scene)));
+}
+
 fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
     let theme = Theme::adwaita(true);
     for scale in [1.0, 1.25, 1.5, 2.0] {
@@ -2571,10 +2688,12 @@ fn main() -> anyhow::Result<()> {
     validate_cache(cache_gpu, &font, &context, &options.output);
     validate_scroll_cache(cache_gpu, &font, &context, &options.output);
     validate_geometry(&gpu, &font, &context);
+    validate_kitty_graphics(&cairo.0, &font, &context);
     validate_rtl(&cairo.0, &font, &context);
     validate_box_drawing(&cairo.0, &font, &context);
     validate_extended_boxes(&cairo.0, &font, &context);
     if gpu.type_() != cairo.0.type_() {
+        validate_kitty_graphics(&gpu, &font, &context);
         validate_rtl(&gpu, &font, &context);
         validate_box_drawing(&gpu, &font, &context);
         validate_extended_boxes(&gpu, &font, &context);
@@ -2595,7 +2714,7 @@ fn main() -> anyhow::Result<()> {
                        "font and context changes", "fractional blocks", "all 128 box glyphs, stroke widths and joins", "linear and rectangular selection and search", "link hover SGR pixels and glyph cache retention",
                        "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
                        "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts", "Arabic joining and visual selection geometry",
-                       "text blink phases, decorations, cursor and selection pixels", "text blink retains row and glyph nodes"]
+                       "text blink phases, decorations, cursor and selection pixels", "text blink retains row and glyph nodes", "Kitty image clipping, layering, cropping and alpha"]
         }))?,
     )?;
     println!(

@@ -1,4 +1,4 @@
-//! Typed stream events: kind-selected JSON followed by cell rows or clipboard bytes.
+//! Typed stream events: kind-selected JSON followed by cell rows, image pixels, or clipboard bytes.
 use crate::{Cell, Frame};
 #[cfg(feature = "async")]
 use futures_lite::io::{AsyncBufReadExt, AsyncReadExt};
@@ -16,7 +16,7 @@ pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
 };
 
-pub const VERSION: u32 = 47;
+pub const VERSION: u32 = 48;
 /// A zero-length record acknowledges a connection heartbeat without a viewport.
 pub const HEARTBEAT_REPLY: &[u8; 4] = &[0; 4];
 pub const MAX_PASTE: usize = 4 * 1024 * 1024;
@@ -97,6 +97,8 @@ pub struct PaneHeader {
     /// Glyph state delivered with this viewport.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glyphs: Option<crate::glyphs::GlyphUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphics: Option<crate::graphics::GraphicsUpdate>,
     pub rows: Vec<u16>,
     /// Flags corresponding to `rows`; empty means every changed row is unwrapped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -284,25 +286,28 @@ macro_rules! packet_reader {
             } else {
                 anyhow::ensure!(
                     header.rows.is_empty() && header.cache.is_none() && header.row_shift == 0
-                        && header.glyphs.is_none(),
-                    "Rows and glyph glossaries require a frame"
+                        && header.glyphs.is_none() && header.graphics.is_none(),
+                    "Rows, glyphs, and graphics require a frame"
                 );
                 0
             };
             anyhow::ensure!(expected == record.cell_count(), "Incorrect cell count");
+            let image_bytes = header.graphics.as_ref().map_or(Ok(0), |graphics| graphics.payload_len())?;
+            let cell_bytes = payload.checked_sub(image_bytes)
+                .ok_or_else(|| anyhow::anyhow!("Invalid terminal image payload length"))?;
             anyhow::ensure!(
                 (expected * CELL_PREFIX_BYTES
                     ..=expected * (CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES))
-                    .contains(&payload),
+                    .contains(&cell_bytes),
                 "Invalid viewport cell data"
             );
             // Bound reads to this record even when a length claims the next packet.
-            let mut reader = $take(reader, payload as u64);
-            let mut remaining = payload;
+            let mut cell_reader = $take(&mut *reader, cell_bytes as u64);
+            let mut remaining = cell_bytes;
             let mut cells = Vec::with_capacity(expected);
             while cells.len() < expected {
                 $($yield)*
-                let bytes = match reader.fill_buf()$($wait)* {
+                let bytes = match cell_reader.fill_buf()$($wait)* {
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     result => result?,
                 };
@@ -320,18 +325,29 @@ macro_rules! packet_reader {
                 }
                 if consumed != 0 {
                     remaining -= consumed;
-                    reader.consume(consumed);
+                    cell_reader.consume(consumed);
                     continue;
                 }
                 let mut bytes = [0; CELL_PREFIX_BYTES + crate::cells::MAX_GRAPHEME_BYTES];
-                reader.read_exact(&mut bytes[..CELL_PREFIX_BYTES])$($wait)*?;
+                cell_reader.read_exact(&mut bytes[..CELL_PREFIX_BYTES])$($wait)*?;
                 let len = cell_length(&bytes)?;
-                reader.read_exact(&mut bytes[CELL_PREFIX_BYTES..len])$($wait)*?;
+                cell_reader.read_exact(&mut bytes[CELL_PREFIX_BYTES..len])$($wait)*?;
                 remaining -= len;
                 cells.push(decode_cell(&bytes[..len])?);
             }
             anyhow::ensure!(remaining == 0, "Trailing viewport cell data");
             update.cells = cells;
+            if let Some(graphics) = &mut update.header.graphics {
+                for image in &mut graphics.images {
+                    let image = std::sync::Arc::get_mut(image)
+                        .ok_or_else(|| anyhow::anyhow!("Shared terminal image before decoding"))?;
+                    image.pixels = vec![0; image.pixel_len()?];
+                    for chunk in image.pixels.chunks_mut(64 * 1024) {
+                        $($yield)*
+                        reader.read_exact(chunk)$($wait)*?;
+                    }
+                }
+            }
             Ok(packet)
         }
     };
@@ -346,7 +362,7 @@ impl Packet {
     pub fn encode_into_limit(&self, bytes: &mut Vec<u8>, limit: usize) -> anyhow::Result<()> {
         let start = bytes.len();
         let limit = limit.min(MAX_PACKET + 4);
-        let (cells, clipboard_payload) = match self {
+        let (cells, payload) = match self {
             Self::ClipboardRead(read) => {
                 read.event.validate()?;
                 (&[][..], 0)
@@ -361,18 +377,31 @@ impl Packet {
                 write.validate()?;
                 (&[][..], payload)
             }
-            Self::Pane(update) => (update.cells.as_slice(), 0),
+            Self::Pane(update) => {
+                let payload = if let Some(graphics) = &update.header.graphics {
+                    let len = graphics.payload_len()?;
+                    for image in &graphics.images {
+                        anyhow::ensure!(
+                            image.pixels.len() == image.pixel_len()?,
+                            "Invalid terminal image pixels"
+                        );
+                    }
+                    len
+                } else {
+                    0
+                };
+                (update.cells.as_slice(), payload)
+            }
             _ => (&[][..], 0),
         };
         anyhow::ensure!(
-            limit >= RECORD_PREFIX_BYTES + clipboard_payload,
+            limit >= RECORD_PREFIX_BYTES + payload,
             "Frontend is too slow"
         );
         // Serialize into the reusable output buffer, then fill the lengths.
         // A failed packet must leave previously queued packets untouched.
         bytes.extend_from_slice(&[0; RECORD_PREFIX_BYTES]);
         let result = (|| {
-            let payload = clipboard_payload;
             let kind = self.kind();
             self.write_header(HeaderWriter {
                 bytes,
@@ -391,17 +420,26 @@ impl Packet {
             anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
             let record = Record::new(size, header_size, kind, json_budget, cells.len())?;
             bytes[start..start + RECORD_PREFIX_BYTES].copy_from_slice(&record.encode());
+            if payload != 0 {
+                bytes.reserve(payload + cell_bytes);
+            }
             if let Self::Clipboard(crate::clipboard::Write {
                 content: Some(content),
                 ..
             }) = self
             {
-                bytes.reserve(content.byte_len());
                 for representation in &content.0 {
                     bytes.extend_from_slice(&representation.data);
                 }
             }
             encode_cells(cells, bytes, cell_bytes);
+            if let Self::Pane(update) = self
+                && let Some(graphics) = &update.header.graphics
+            {
+                for image in &graphics.images {
+                    bytes.extend_from_slice(&image.pixels);
+                }
+            }
             Ok(())
         })();
         if result.is_err() {
