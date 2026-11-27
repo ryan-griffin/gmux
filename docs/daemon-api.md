@@ -531,6 +531,8 @@ The image is a generation key. The `[x, y, w, h]` array is the source rectangle.
 Unicode placements supply a fractional source rectangle in 16.16 pixels in
 `source_subpixels`. Other placements set this field to `null`.
 Unicode crops use logical columns. Relative placements use visual columns.
+An optional `unicode_cell_pixels` pair gives the geometry basis for Unicode
+crops when it differs from `cell_pixels`.
 For explicitly sized placements, `fit_rows` gives the `[top trim, visible rows]`
 of the sizing box. Fit the source aspect ratio inside the full box, then
 clip to the visible rows. Other placements set this field to `null`.

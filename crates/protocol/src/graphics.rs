@@ -183,6 +183,7 @@ impl<'de> Deserialize<'de> for Placement {
 #[derive(Default)]
 pub struct Graphics {
     pub cell_pixels: [u32; 2],
+    pub unicode_cell_pixels: Option<[u32; 2]>,
     pub placements: Vec<Placement>,
     /// Sorted by generation.
     pub images: Vec<Arc<Image>>,
@@ -205,6 +206,8 @@ fn find_image(images: &[Arc<Image>], key: u64) -> Option<&Arc<Image>> {
 pub struct GraphicsUpdate {
     pub replace: bool,
     pub cell_pixels: [u32; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unicode_cell_pixels: Option<[u32; 2]>,
     pub placements: Vec<Placement>,
     pub images: Vec<Arc<Image>>,
 }
@@ -215,6 +218,9 @@ impl GraphicsUpdate {
             self.placements.len() <= MAX_PLACEMENTS
                 && self.images.len() <= self.placements.len()
                 && (self.placements.is_empty() || !self.cell_pixels.contains(&0))
+                && self
+                    .unicode_cell_pixels
+                    .is_none_or(|cell| !cell.contains(&0))
                 && self
                     .placements
                     .windows(2)
@@ -306,6 +312,7 @@ impl GraphicsUpdate {
         );
         *previous = Graphics {
             cell_pixels: self.cell_pixels,
+            unicode_cell_pixels: self.unicode_cell_pixels,
             placements: self.placements,
             images: images.into_values().collect(),
         };
@@ -363,6 +370,7 @@ mod tests {
                 graphics: Some(GraphicsUpdate {
                     replace: true,
                     cell_pixels: [8, 16],
+                    unicode_cell_pixels: None,
                     placements: vec![placement; MAX_PLACEMENTS],
                     images: vec![image],
                 }),
@@ -407,6 +415,7 @@ mod tests {
                 graphics: Some(GraphicsUpdate {
                     replace: true,
                     cell_pixels: [8, 16],
+                    unicode_cell_pixels: None,
                     placements: vec![placement],
                     images: vec![Arc::new(Image {
                         key: 1,
@@ -447,6 +456,7 @@ mod tests {
         GraphicsUpdate {
             replace: false,
             cell_pixels: [8, 16],
+            unicode_cell_pixels: None,
             placements: vec![placement],
             images: vec![],
         }
@@ -460,6 +470,7 @@ mod tests {
             GraphicsUpdate {
                 replace: false,
                 cell_pixels: [8, 16],
+                unicode_cell_pixels: None,
                 placements: vec![placement],
                 images: vec![],
             }

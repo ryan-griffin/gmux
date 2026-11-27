@@ -393,6 +393,7 @@ mod tests {
                     graphics: Some(GraphicsUpdate {
                         replace: true,
                         cell_pixels: [8, 16],
+                        unicode_cell_pixels: None,
                         placements: images
                             .iter()
                             .map(|image| Placement {

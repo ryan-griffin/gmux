@@ -2251,6 +2251,7 @@ fn validate_kitty_graphics(
     };
     let graphics = Graphics {
         cell_pixels: [10, 24],
+        unicode_cell_pixels: None,
         images: vec![
             image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
             image(2, 1, PixelFormat::Rgba, &[255, 0, 0, 128]),
@@ -2344,6 +2345,7 @@ fn validate_kitty_graphics(
     let unit = gmux_protocol::graphics::SOURCE_SUBPIXELS;
     let graphics = Graphics {
         cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
         images: vec![pixels_across_rows],
         placements: vec![
             Placement {
@@ -2375,20 +2377,21 @@ fn validate_kitty_graphics(
     }
 
     let mut bidi_cells = blank.clone();
-    for (x, text) in ["\u{202b}", "س", "\u{10eeee}", "م", "ا", "\u{202c}"]
+    for (x, text) in ["\u{202e}", "س", "م", "ا", "\u{10eeee}", "\u{202c}"]
         .into_iter()
         .enumerate()
     {
         bidi_cells[x] = cell(text, theme, 0);
     }
     let bidi = bidi::Grid::update(40, &bidi_cells, None).unwrap();
-    let logical = 2;
+    let logical = 4;
     let visual = bidi.visual(logical);
-    assert_ne!(logical, visual);
+    assert!(visual < logical);
     tiled.cells = &bidi_cells;
     tiled.bidi = Some(&bidi);
     let graphics = Graphics {
         cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
         images: vec![
             image(1, 1, PixelFormat::Rgb, &[0, 255, 0]),
             image(2, 1, PixelFormat::Rgb, &[255, 0, 0]),
@@ -2417,6 +2420,13 @@ fn validate_kitty_graphics(
     assert_ne!(sample(logical, 0), [0, 255, 0, 255]);
     assert_eq!(sample(visual, 1), [0, 0, 255, 255]);
     assert_eq!(sample(logical, 1), [0, 0, 0, 255]);
+    let wide = tiled.width;
+    tiled.width = ((visual + 1) * 8) as i32;
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    let sample = (8 * tiled.width as usize + visual * 8 + 4) * 4;
+    assert_eq!(data[sample..sample + 4], [0, 255, 0, 255]);
+    tiled.width = wide;
 
     // The size owner's cell aspect ratio can differ from this viewer's.
     tiled.metrics = (10.0, 24.0);
@@ -2424,6 +2434,7 @@ fn validate_kitty_graphics(
     tiled.bidi = None;
     let graphics = Graphics {
         cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
         images: vec![
             image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
             Arc::new(Image {

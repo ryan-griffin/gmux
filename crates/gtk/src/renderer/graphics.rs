@@ -218,10 +218,23 @@ impl Textures {
             let Some(image) = graphics.image(p.image) else {
                 continue;
             };
-            let bounds = p.bounds([cw, ch], graphics.cell_pixels);
+            let pixels = if p.source_subpixels.is_some() {
+                graphics.unicode_cell_pixels.unwrap_or(graphics.cell_pixels)
+            } else {
+                graphics.cell_pixels
+            };
+            let bounds = p.bounds([cw, ch], pixels);
             let [x, y, width, height] = bounds.rect.map(|value| value as f32);
             let dest = graphene::Rect::new(x, y, width, height);
-            if viewport.intersection(&dest).is_none() {
+            let reordered_tile = p.source_subpixels.is_some()
+                && usize::try_from(p.cell[1])
+                    .ok()
+                    .and_then(|row| scene.bidi?.row(row))
+                    .is_some();
+            if y >= viewport.height()
+                || y + height <= 0.0
+                || (!reordered_tile && viewport.intersection(&dest).is_none())
+            {
                 continue;
             }
             let clip = bounds.clip_y.map(|[top, bottom]| {

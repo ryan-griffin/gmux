@@ -8,7 +8,7 @@ Bound graphics storage and schedule animations for visible images.
  const log = std.log.scoped(.kitty_gfx);
 +
 +const max_images = 4096;
-+const max_placements = 4096;
++pub const max_placements = 4096;
 +pub const max_animation_frames = 32768;
 +const ImageAdmissionError = Allocator.Error || error{ImageStorageFull};
 
@@ -441,7 +441,31 @@ Bound graphics storage and schedule animations for visible images.
 
          /// The z-index for this placement.
          z: i32 = 0,
-@@ -2183,7 +2246,7 @@
+@@ -2147,7 +2210,10 @@
+                     cell_width,
+                     self.columns,
+                 ) -| cell_offset.x;
+-                const calc_height = scaleDimension(calc_width, height, width);
++                const calc_height = if (calc_width == 0 or width == 0 or height == 0)
++                    0
++                else
++                    @max(1, scaleDimension(calc_width, height, width));
+
+                 return .{
+                     .width = calc_width,
+@@ -2162,7 +2228,10 @@
+                     cell_height,
+                     self.rows,
+                 ) -| cell_offset.y;
+-                const calc_width = scaleDimension(calc_height, width, height);
++                const calc_width = if (calc_height == 0 or width == 0 or height == 0)
++                    0
++                else
++                    @max(1, scaleDimension(calc_height, width, height));
+
+                 return .{
+                     .width = calc_width,
+@@ -2183,7 +2252,7 @@
              // If we have a specified columns and rows then this is trivial.
              if (self.columns > 0 and self.rows > 0) return .{
                  .cols = self.columns,
@@ -450,7 +474,7 @@ Bound graphics storage and schedule animations for visible images.
              };
 
              // Otherwise we calculate the pixel size, divide by
-@@ -2222,6 +2285,11 @@
+@@ -2222,6 +2291,11 @@
              span: u32,
          ) bool {
              assert(count > 0 and count < span);
@@ -462,7 +486,7 @@ Bound graphics storage and schedule animations for visible images.
              const src = self.sourceRect(image);
              const crop: u32 = if (self.rows > 0)
                  // Scaled placement: each grid row shows an equal
-@@ -2249,6 +2317,11 @@
+@@ -2249,6 +2323,11 @@
              span: u32,
          ) bool {
              assert(count > 0 and count < span);
@@ -474,7 +498,7 @@ Bound graphics storage and schedule animations for visible images.
              const src = self.sourceRect(image);
              // An empty source can never be clipped smaller. This also
              // guarantees we never store an explicit zero source height,
-@@ -4080,7 +4153,7 @@
+@@ -4080,7 +4159,7 @@
          .gap_ms = 10,
          .pending_len = 4,
      });
@@ -483,7 +507,7 @@ Bound graphics storage and schedule animations for visible images.
      s.images.getPtr(1).?.animation = anim;
      try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
          .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
-@@ -4373,7 +4446,7 @@
+@@ -4373,7 +4452,7 @@
      try testing.expectEqual(@as(usize, 0), storage.placements.count());
  }
 
@@ -492,7 +516,7 @@ Bound graphics storage and schedule animations for visible images.
      const testing = std.testing;
      const alloc = testing.allocator;
      const io = testing.io;
-@@ -4404,10 +4477,10 @@
+@@ -4404,10 +4483,10 @@
      }).?;
      const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
      try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
@@ -629,27 +653,29 @@ Bound graphics storage and schedule animations for visible images.
  pub const kitty_graphics_image = kitty_graphics.image_get_handle;
  pub const kitty_graphics_image_get = kitty_graphics.image_get;
  pub const kitty_graphics_image_get_multi = kitty_graphics.image_get_multi;
-@@ -115,6 +116,8 @@
+@@ -115,6 +116,9 @@
  pub const render_state_row_cells_free = render.row_cells_free;
  pub const render_state_image_iterator_new = render.image_iterator_new;
  pub const render_state_image_iterator_next = render.image_iterator_next;
 +pub const render_state_gmux_image_geometry = render.gmux_image_geometry;
 +pub const render_state_gmux_virtual_runs = render.gmux_virtual_runs;
++pub const render_state_gmux_cell_pixels = render.gmux_cell_pixels;
  pub const render_state_image_iterator_free = render.image_iterator_free;
  pub const render_state_image_get = render.image_get;
  pub const render_state_image_get_multi = render.image_get_multi;
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -307,6 +307,8 @@
+@@ -307,6 +307,9 @@
          @export(&c.render_state_row_cells_free, .{ .name = "ghostty_render_state_row_cells_free" });
          @export(&c.render_state_image_iterator_new, .{ .name = "ghostty_render_state_image_iterator_new" });
          @export(&c.render_state_image_iterator_next, .{ .name = "ghostty_render_state_image_iterator_next" });
 +        @export(&c.render_state_gmux_image_geometry, .{ .name = "ghostty_render_state_gmux_image_geometry" });
 +        @export(&c.render_state_gmux_virtual_runs, .{ .name = "ghostty_render_state_gmux_virtual_runs" });
++        @export(&c.render_state_gmux_cell_pixels, .{ .name = "ghostty_render_state_gmux_cell_pixels" });
          @export(&c.render_state_image_iterator_free, .{ .name = "ghostty_render_state_image_iterator_free" });
          @export(&c.render_state_image_get, .{ .name = "ghostty_render_state_image_get" });
          @export(&c.render_state_image_get_multi, .{ .name = "ghostty_render_state_image_get_multi" });
-@@ -380,6 +382,7 @@
+@@ -380,6 +383,7 @@
          @export(&c.snapshot_decoder_decode, .{ .name = "ghostty_snapshot_decoder_decode" });
          @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
          @export(&c.kitty_graphics_animation_tick, .{ .name = "ghostty_kitty_graphics_animation_tick" });
@@ -762,8 +788,13 @@ Bound graphics storage and schedule animations for visible images.
              },
          };
      }
-@@ -1594,6 +1610,10 @@
-         if (storage.placements.contains(key)) return;
+@@ -1591,9 +1607,14 @@
+         const key = self.key orelse return;
+         const img = storage.images.getPtr(key.image_id) orelse return;
+         if (ready_generation) |ready| if (img.transmission > ready) return;
+-        if (storage.placements.contains(key)) return;
++        if (storage.placements.contains(key) or storage.placements.count() >=
++            @import("../kitty/graphics_storage.zig").max_placements) return;
 
          var placement = self.placement;
 +        if (placement.trim_top != 0 or placement.trim_bottom != 0) {
@@ -773,9 +804,43 @@ Bound graphics storage and schedule animations for visible images.
          switch (self.location) {
              .invalid => return,
              .virtual => placement.location = .virtual,
+@@ -2290,6 +2311,25 @@
+     return t;
+ }
+
++test "kitty snapshot restores at most the placement quota" {
++    const alloc = testing.allocator;
++    const io_ = testing.io;
++    var t = try testTerminal(4, 4);
++    defer t.deinit(alloc);
++    try testCommand(&t, "a=t,i=1,f=24,s=1,v=1,q=2", &.{ 0xff, 0, 0 });
++    const screen = t.screens.active;
++    const limit = @import("../kitty/graphics_storage.zig").max_placements;
++    for (0..limit + 1) |index| {
++        const decoded: DecodedPlacement = .{
++            .key = .{ .image_id = 1, .placement_id = .{ .tag = .external, .id = @intCast(index + 1) } },
++            .location = .virtual,
++            .placement = .{ .location = .virtual, .columns = 1, .rows = 1 },
++        };
++        try decoded.restore(io_, alloc, screen, .{ .storage = &.{} }, null);
++    }
++    try testing.expectEqual(limit, screen.kitty_images.placements.count());
++}
++
+ test "golden snapshot with a virtual placement" {
+     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+     var t = try testVirtualTerminal();
 --- a/src/terminal/render.zig
 +++ b/src/terminal/render.zig
-@@ -689,11 +689,7 @@
+@@ -372,6 +372,7 @@
+     /// Internal state for Kitty graphics placeholders. Read the results
+     /// with `imagePlacementIterator` instead.
+     kitty: Kitty.Data = .{},
++    gmux_cell_pixels: [2]u32 = @splat(0),
+
+     /// Initial state.
+     pub const empty: RenderState = .{
+@@ -689,11 +690,7 @@
          cols: u32,
          rows: u32,
 
@@ -788,7 +853,7 @@ Bound graphics storage and schedule animations for visible images.
          offset_x: u32,
          offset_y: u32,
 
-@@ -706,6 +702,15 @@
+@@ -706,6 +703,15 @@
          source_y: u32,
          source_width: u32,
          source_height: u32,
@@ -804,7 +869,7 @@ Bound graphics storage and schedule animations for visible images.
 
          pub const Protocol = union(ImageProtocol) {
              kitty: KittyPlacement,
-@@ -723,9 +728,8 @@
+@@ -723,9 +729,8 @@
      /// z-index before drawing. Only placements with something to draw
      /// are returned.
      ///
@@ -816,7 +881,7 @@ Bound graphics storage and schedule animations for visible images.
      pub const ImagePlacementIterator = struct {
          /// The placeholder runs of each captured row, top to bottom.
          rows: []const std.ArrayList(Placeholder),
-@@ -734,19 +738,21 @@
+@@ -734,19 +739,21 @@
          /// negative when there are overscan rows above the viewport.
          viewport_y_base: isize,
 
@@ -843,7 +908,7 @@ Bound graphics storage and schedule animations for visible images.
              while (self.y < self.rows.len) {
                  const runs = self.rows[self.y].items;
                  while (self.i < runs.len) {
-@@ -775,16 +781,14 @@
+@@ -775,16 +782,14 @@
                          .source_y = g.source_y,
                          .source_width = g.source_width,
                          .source_height = g.source_height,
@@ -862,7 +927,7 @@ Bound graphics storage and schedule animations for visible images.
          }
      };
 
-@@ -1950,6 +1954,7 @@
+@@ -1950,6 +1955,7 @@
              source_y: u32,
              source_width: u32,
              source_height: u32,
@@ -870,7 +935,43 @@ Bound graphics storage and schedule animations for visible images.
          };
      };
 
-@@ -2174,6 +2179,9 @@
+@@ -1972,6 +1978,8 @@
+         /// the screen. If it changed but the generation didn't, `placed`
+         /// is built again from the same `roots`.
+         dirty: u64 = 0,
++
++        viewer_cell_pixels: [2]u32 = @splat(0),
+
+         /// True if the placeholder runs changed since the last update.
+         /// The row builder sets it in two cases:
+@@ -2131,8 +2139,9 @@
+             // moves, when the storage says that they moved, or (for
+             // placements positioned from placeholder cells) when rows
+             // are rebuilt.
+-            if (state.kitty.roots.items.len == 0) return;
+-            if (!redraw and state.kitty.dirty == storage.dirty and
++            const same_viewer = std.meta.eql(state.kitty.viewer_cell_pixels, state.gmux_cell_pixels);
++            if (state.kitty.roots.items.len == 0 and same_viewer) return;
++            if (!redraw and state.kitty.dirty == storage.dirty and same_viewer and
+                 !(any_dirty and state.kitty.virtual_anchors > 0)) return;
+         }
+
+@@ -2166,33 +2175,46 @@
+         // the row builder added or dropped runs, or if the loop below
+         // looks up any run again, since its result may differ.
+         var runs_changed = state.kitty.stale;
+-        if (roots_stale or state.kitty.stale) {
++        const owner_cell = [2]u32{ t.width_px / state.cols, t.height_px / state.rows };
++        const unicode_cell = unicodeCellPixels(owner_cell, state.gmux_cell_pixels);
++        const unicode_geometry_changed = !std.meta.eql(
++            unicode_cell,
++            unicodeCellPixels(owner_cell, state.kitty.viewer_cell_pixels),
++        );
++        if (roots_stale or state.kitty.stale or unicode_geometry_changed) {
+             state.kitty.stale = false;
+-            const cell_width: u32 = t.width_px / state.cols;
+-            const cell_height: u32 = t.height_px / state.rows;
+             const row_data = state.row_data.slice();
              const row_pins = row_data.items(.pin);
              const row_placeholders = row_data.items(.placeholders);
              const range = state.rowDataRange();
@@ -880,9 +981,10 @@ Bound graphics storage and schedule animations for visible images.
              for (
                  row_pins[range.start..range.end],
                  row_placeholders[range.start..range.end],
-@@ -2181,8 +2189,13 @@
+             ) |pin, runs| {
                  for (runs.items) |*run| {
-                     if (!roots_stale and run.state != .stale) continue;
+-                    if (!roots_stale and run.state != .stale) continue;
++                    if (!roots_stale and !unicode_geometry_changed and run.state != .stale) continue;
                      runs_changed = true;
 +                    if (run.placement_id == 0 and !indexed) {
 +                        try indexDefaultPlacements(alloc, storage, &defaults);
@@ -893,8 +995,21 @@ Bound graphics storage and schedule animations for visible images.
 +                        &defaults,
                          pin,
                          run,
-                         cell_width,
-@@ -2253,33 +2266,37 @@
+-                        cell_width,
+-                        cell_height,
++                        unicode_cell[0],
++                        unicode_cell[1],
+                     );
+                 }
+             }
+         }
+
+         try placeRoots(state, alloc);
++        state.kitty.viewer_cell_pixels = state.gmux_cell_pixels;
+         state.kitty.dirty = storage.dirty;
+
+         // Tell consumers to read the iterator again if anything it
+@@ -2253,33 +2275,42 @@
              }
          }
 
@@ -922,8 +1037,13 @@ Bound graphics storage and schedule animations for visible images.
 +            }
 +        }
 +
++        const cell_pixels = [2]u32{
++            state.kitty.width_px / state.cols,
++            state.kitty.height_px / state.rows,
++        };
          for (state.kitty.roots.items) |root| {
              const p = root.placement;
++            const extent = viewerExtent(p, cell_pixels, state.gmux_cell_pixels);
 
              // Where the anchor is. `y` counts captured rows, where 0 is
              // the first captured row.
@@ -954,16 +1074,27 @@ Bound graphics storage and schedule animations for visible images.
 
                  // The pin's cell. A pin is marked garbage when its row
                  // is removed from the scrollback. It has no position
-@@ -2303,11 +2320,20 @@
+@@ -2290,7 +2321,7 @@
+                         state.kitty.chunks.items,
+                         pin.*,
+                         captured_len,
+-                        p.rows,
++                        extent[1],
+                         root.vertical_offset,
+                     ) orelse continue;
+                     break :origin .{ .x = pin.x, .y = y };
+@@ -2302,14 +2333,60 @@
+             // keep any with at least one cell in the captured rows.
              const x: i64 = origin.x + root.horizontal_offset;
              const y: i64 = origin.y + root.vertical_offset;
-             if (y + p.rows - 1 < 0 or y >= captured_len) continue;
+-            if (y + p.rows - 1 < 0 or y >= captured_len) continue;
 -            if (x + p.cols - 1 < 0 or x >= state.cols) continue;
++            if (y + extent[1] - 1 < 0 or y >= captured_len) continue;
 +            // A Unicode anchor can move horizontally when its row is
 +            // reordered. Keep the child if any visual column would show it.
 +            const anchor_x = if (root.anchor == .virtual) origin.x else 0;
 +            const anchor_shift = if (root.anchor == .virtual) @as(i64, state.cols) - 1 - origin.x else 0;
-+            if (x + anchor_shift + p.cols - 1 < 0 or x - anchor_x >= state.cols) continue;
++            if (x + anchor_shift + extent[0] - 1 < 0 or x - anchor_x >= state.cols) continue;
 
              var positioned = p;
              positioned.x = std.math.cast(i32, x) orelse continue;
@@ -975,8 +1106,47 @@ Bound graphics storage and schedule animations for visible images.
 +            };
              try state.kitty.placed.append(alloc, positioned);
          }
++    }
++
++    fn unicodeCellPixels(owner: [2]u32, viewer: [2]u32) [2]u32 {
++        if (viewer[0] == 0 or viewer[1] == 0 or
++            @as(u64, owner[0]) * viewer[1] == @as(u64, owner[1]) * viewer[0]) return owner;
++        return viewer;
++    }
++
++    fn viewerExtent(p: RenderState.ImagePlacement, owner: [2]u32, viewer: [2]u32) [2]u32 {
++        if (p.sizing == .cells or owner[0] == 0 or owner[1] == 0 or
++            viewer[0] == 0 or viewer[1] == 0) return .{ p.cols, p.rows };
++
++        const owner_w: f64 = @floatFromInt(owner[0]);
++        const owner_h: f64 = @floatFromInt(owner[1]);
++        const viewer_w: f64 = @floatFromInt(viewer[0]);
++        const viewer_h: f64 = @floatFromInt(viewer[1]);
++        const source_w: f64 = @floatFromInt(p.source_width);
++        const source_h: f64 = @floatFromInt(p.source_height);
++        const width: f64 = @floatFromInt(p.width);
++        const height: f64 = @floatFromInt(p.height);
++        const dest_cols = switch (p.sizing) {
++            .columns => width / owner_w,
++            .rows => (height / owner_h) * viewer_h * source_w / (viewer_w * source_h),
++            .native => width / viewer_w,
++            .cells => unreachable,
++        };
++        const dest_rows = switch (p.sizing) {
++            .columns => (width / owner_w) * viewer_w * source_h / (viewer_h * source_w),
++            .rows => height / owner_h,
++            .native => height / viewer_h,
++            .cells => unreachable,
++        };
++        const max: f64 = std.math.maxInt(u32);
++        return .{
++            @intFromFloat(@min(max, @ceil(dest_cols + @as(f64, @floatFromInt(p.offset_x)) / owner_w))),
++            @intFromFloat(@min(max, @ceil(dest_rows + @as(f64, @floatFromInt(p.offset_y)) / owner_h))),
++        };
      }
-@@ -2471,6 +2497,7 @@
+
+     /// Returns the row of a pin, counted in captured rows where 0 is the
+@@ -2471,6 +2548,7 @@
          if (dest.width == 0 or dest.height == 0) return null;
          const offset = p.cellOffset(t);
          const source = p.sourceRect(image);
@@ -984,7 +1154,7 @@ Bound graphics storage and schedule animations for visible images.
 
          return .{
              .protocol = .{ .kitty = .{
-@@ -2492,6 +2519,16 @@
+@@ -2492,6 +2570,16 @@
              .offset_y = offset.y,
              .width = dest.width,
              .height = dest.height,
@@ -1001,7 +1171,7 @@ Bound graphics storage and schedule animations for visible images.
              .source_x = source.x,
              .source_y = source.y,
              .source_width = source.width,
-@@ -2499,10 +2536,29 @@
+@@ -2499,10 +2587,29 @@
          };
      }
 
@@ -1031,7 +1201,7 @@ Bound graphics storage and schedule animations for visible images.
          row_pin: PageList.Pin,
          run: *Placeholder,
          cell_width: u32,
-@@ -2514,11 +2570,16 @@
+@@ -2514,11 +2621,16 @@
          // Remember the virtual placement even if the image can't be
          // drawn. Relative placements attached to it still need the
          // position of these cells.
@@ -1053,7 +1223,7 @@ Bound graphics storage and schedule animations for visible images.
 
          // Nothing to draw until the displayed pixels arrive, as in
          // `template`.
-@@ -2540,7 +2601,7 @@
+@@ -2540,7 +2652,7 @@
              .height = 1,
          };
          const rp = vp.renderPlacement(
@@ -1062,7 +1232,7 @@ Bound graphics storage and schedule animations for visible images.
              &image,
              cell_width,
              cell_height,
-@@ -2560,6 +2621,7 @@
+@@ -2560,6 +2672,7 @@
              .source_y = rp.source_y,
              .source_width = rp.source_width,
              .source_height = rp.source_height,
@@ -1070,7 +1240,7 @@ Bound graphics storage and schedule animations for visible images.
          };
          run.state = .visible;
      }
-@@ -4943,8 +5005,6 @@
+@@ -4943,8 +5056,6 @@
          .placement_id = .{ .tag = .external, .id = 7 },
      }).?;
      const grid = sp.gridSize(image, &t);
@@ -1079,7 +1249,7 @@ Bound graphics storage and schedule animations for visible images.
      const source = sp.sourceRect(image);
      try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, p.protocol.kitty.kind);
      try testing.expectEqual(7, p.protocol.kitty.placement_id);
-@@ -4958,10 +5018,9 @@
+@@ -4958,10 +5069,9 @@
      try testing.expectEqual(grid.rows, p.rows);
      try testing.expectEqual(4, p.offset_x);
      try testing.expectEqual(3, p.offset_y);
@@ -1095,7 +1265,29 @@ Bound graphics storage and schedule animations for visible images.
      try testing.expectEqual(source.width, p.source_width);
 --- a/src/terminal/kitty/graphics_unicode.zig
 +++ b/src/terminal/kitty/graphics_unicode.zig
-@@ -254,17 +254,31 @@
+@@ -81,8 +81,8 @@
+             x_scale: f64 = 0,
+             y_scale: f64 = 0,
+         } = scale: {
+-            const p_rows_px: f64 = @floatFromInt(p_grid.rows * cell_height);
+-            const p_cols_px: f64 = @floatFromInt(p_grid.columns * cell_width);
++            const p_rows_px: f64 = @floatFromInt(@as(u64, p_grid.rows) * cell_height);
++            const p_cols_px: f64 = @floatFromInt(@as(u64, p_grid.columns) * cell_width);
+             if (img_width_f64 * p_rows_px > img_height_f64 * p_cols_px) {
+                 // Image is wider than the grid, fit width and center height
+                 const x_scale = p_cols_px / @max(img_width_f64, 1);
+@@ -167,8 +167,8 @@
+         } = dest: {
+             var x_offset: f64 = 0;
+             var y_offset: f64 = 0;
+-            var width: f64 = @floatFromInt(self.width * cell_width);
+-            var height: f64 = @floatFromInt(self.height * cell_height);
++            var width: f64 = @floatFromInt(@as(u64, self.width) * cell_width);
++            var height: f64 = @floatFromInt(@as(u64, self.height) * cell_height);
+
+             if (img_scale_source.y < img_scaled.y_offset) {
+                 // If our source rect y is within the offset area, we need to
+@@ -254,17 +254,35 @@
          //     p_dest,
          // });
 
@@ -1106,20 +1298,29 @@ Bound graphics storage and schedule animations for visible images.
 +        const subpixel_y = pixelRange(img_scale_source.y * scale, img_scale_source.height * scale, img.height * scale);
          return .{
              .top_left = self.pin,
-             .offset_x = @intFromFloat(@round(p_dest.x_offset)),
-             .offset_y = @intFromFloat(@round(p_dest.y_offset)),
+-            .offset_x = @intFromFloat(@round(p_dest.x_offset)),
+-            .offset_y = @intFromFloat(@round(p_dest.y_offset)),
 -            .source_x = @intFromFloat(@round(img_scale_source.x)),
 -            .source_y = @intFromFloat(@round(img_scale_source.y)),
 -            .source_width = @intFromFloat(@round(img_scale_source.width)),
 -            .source_height = @intFromFloat(@round(img_scale_source.height)),
+-            .dest_width = @intFromFloat(@round(p_dest.width)),
+-            .dest_height = @intFromFloat(@round(p_dest.height)),
+-        };
++            .offset_x = pixelExtent(p_dest.x_offset),
++            .offset_y = pixelExtent(p_dest.y_offset),
 +            .source_x = source_x.start,
 +            .source_y = source_y.start,
 +            .source_width = source_x.len,
 +            .source_height = source_y.len,
 +            .source_subpixels = .{ subpixel_x.start, subpixel_y.start, subpixel_x.len, subpixel_y.len },
-             .dest_width = @intFromFloat(@round(p_dest.width)),
-             .dest_height = @intFromFloat(@round(p_dest.height)),
-         };
++            .dest_width = pixelExtent(p_dest.width),
++            .dest_height = pixelExtent(p_dest.height),
++        };
++    }
++
++    fn pixelExtent(value: f64) u32 {
++        return @intFromFloat(@min(@as(f64, std.math.maxInt(u32)), @max(0, @round(value))));
 +    }
 +
 +    fn pixelRange(origin: f64, extent: f64, dimension: u32) struct { start: u32, len: u32 } {
@@ -1131,6 +1332,19 @@ Bound graphics storage and schedule animations for visible images.
      }
 
      // Calculate the grid size for the placement. For virtual placements,
+@@ -287,8 +305,10 @@
+         // For unspecified rows/columns, calculate based on the image size.
+         var rows = placement.rows;
+         var columns = placement.columns;
+-        if (rows == 0) rows = (image.height + cell_height - 1) / cell_height;
+-        if (columns == 0) columns = (image.width + cell_width - 1) / cell_width;
++        if (rows == 0) rows = std.math.divCeil(u32, image.height, cell_height) catch
++            return Error.PlacementGridOutOfBounds;
++        if (columns == 0) columns = std.math.divCeil(u32, image.width, cell_width) catch
++            return Error.PlacementGridOutOfBounds;
+         return .{
+             .rows = std.math.cast(terminal.size.CellCountInt, rows) orelse
+                 return Error.PlacementGridOutOfBounds,
 --- a/src/terminal/kitty/graphics_render.zig
 +++ b/src/terminal/kitty/graphics_render.zig
 @@ -20,6 +20,8 @@
@@ -1144,7 +1358,7 @@ Bound graphics storage and schedule animations for visible images.
      dest_width: u32 = 0,
 --- a/src/terminal/c/render.zig
 +++ b/src/terminal/c/render.zig
-@@ -1218,6 +1218,47 @@
+@@ -1218,6 +1218,57 @@
      const it = iterator_ orelse return false;
      it.current = it.inner.next();
      return it.current != null;
@@ -1172,6 +1386,16 @@ Bound graphics storage and schedule animations for visible images.
 +        };
 +    }
 +    return @intFromEnum(placement.sizing);
++}
++
++pub fn gmux_cell_pixels(
++    state_: RenderState,
++    width: u32,
++    height: u32,
++) callconv(lib.calling_conv) void {
++    if (comptime !lib.feature(.render_state)) return;
++    const wrapped = state_ orelse return;
++    wrapped.state.gmux_cell_pixels = .{ width, height };
 +}
 +
 +pub fn gmux_virtual_runs(

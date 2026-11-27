@@ -113,6 +113,7 @@ impl SentGraphics {
         Ok(Some(GraphicsUpdate {
             replace,
             cell_pixels: current.cell_pixels,
+            unicode_cell_pixels: current.unicode_cell_pixels,
             placements: current.placements.clone(),
             images,
         }))
@@ -188,10 +189,21 @@ impl PaneViewState {
         if self.presentation.is_none() {
             let mut view = session.new_view_in(resources)?;
             view.set_active(self.visible);
+            view.set_graphics_viewport(self.graphics_viewport());
             self.presentation = Some(Box::new(PanePresentation::new(view)));
         }
         self.presentation.as_ref().unwrap().view.check_resources()?;
         Ok(self.presentation.as_mut().unwrap())
+    }
+
+    fn graphics_viewport(&self) -> crate::engine::GraphicsViewport {
+        self.size
+            .map_or_else(Default::default, |(_, _, cw, ch, width, height)| {
+                crate::engine::GraphicsViewport {
+                    cell_pixels: [cw, ch],
+                    canvas_pixels: [width, height],
+                }
+            })
     }
 
     fn screen(&self) -> Option<&SentScreen> {
@@ -921,6 +933,10 @@ impl Daemon {
             let size = Some((cols, rows, cw, ch, width, height));
             pane.changed |= pane.visible && pane.size != size;
             pane.size = size;
+            let geometry = pane.graphics_viewport();
+            if let Some(presentation) = &mut pane.presentation {
+                presentation.view.set_graphics_viewport(geometry);
+            }
             self.resize_session(id, Some((frontend_id, frontend)));
             return Ok(());
         }
@@ -1545,14 +1561,6 @@ impl Daemon {
             let mut glyphs = None;
             let mut graphics = None;
             let mut newly_visible_images = false;
-            let graphics_viewport =
-                pane.size
-                    .map_or_else(Default::default, |(_, _, cw, ch, width, height)| {
-                        crate::engine::GraphicsViewport {
-                            cell_pixels: [cw, ch],
-                            canvas_pixels: [width, height],
-                        }
-                    });
             let (frame, find, selection, selection_origin) = if screen
                 || pane.presentation.is_some()
             {
@@ -1581,7 +1589,7 @@ impl Daemon {
                         let old = presentation.screen.get_or_insert_with(Default::default);
                         let (revision, glossary) = active.glyphs();
                         glyphs = old.glyphs.update(revision, glossary);
-                        let (visible, newly_visible) = active.graphics(graphics_viewport);
+                        let (visible, newly_visible) = active.graphics();
                         graphics = presentation
                             .graphics
                             .update(visible.as_ref(), |source| active.graphics_image(source))?;
@@ -2505,6 +2513,7 @@ mod tests {
                     graphics: Some(GraphicsUpdate {
                         replace: true,
                         cell_pixels: [8, 16],
+                        unicode_cell_pixels: None,
                         placements: vec![Placement {
                             image: 1,
                             layer: Layer::AboveText,

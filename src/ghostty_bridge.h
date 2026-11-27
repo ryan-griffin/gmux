@@ -221,6 +221,7 @@ void gmux_engine_graphics_tick(GmuxEngine *engine, uint64_t *delay_ms, GmuxGraph
     GmuxImageChangedFn changed, void *userdata);
 void gmux_engine_graphics_hold_callback(GmuxEngine *engine, GmuxGraphicsHoldFn callback);
 void gmux_engine_view_graphics_data(GmuxView *view, void *viewdata);
+void gmux_engine_view_graphics_size(GmuxView *view, uint32_t width, uint32_t height);
 bool gmux_engine_view_captured(const GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);

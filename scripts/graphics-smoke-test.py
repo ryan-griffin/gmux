@@ -237,6 +237,32 @@ while True:
         for peer in peers:
             graphics(peer, lambda g: any(im["pixels"] == png_pixel for im in g["images"]))
 
+    with scenario("Unicode tiles and thin column placements follow each subscriber's cell aspect"):
+        exchange(b"\x1b[?1049h\x1b[H"
+                 + command("a=T,U=1,f=24,i=89,s=1,v=2,c=1,r=1,q=2", red * 2)
+                 + "\x1b[38;5;89m\U0010EEEE\u0305\u0305\x1b[39m".encode())
+        for peer in peers:
+            frame = graphics(peer, lambda g: any(im["pixels"] == red * 2 for im in g["images"]))
+            assert frame["placements"][0]["size"] == [8, 16], frame
+        for width in (24, 16, 24):
+            remote.send("resize", cols=12, rows=4, cw=width, ch=16)
+            frame = graphics(remote, lambda g: g.get("unicode_cell_pixels") == [width, 16])
+            placement, = frame["placements"]
+            assert placement["size"] == [8, 16] and placement["offset"] == [(width - 8) // 2, 0], placement
+            assert not frame["images"], frame
+        thin = blue * 24
+        exchange(b"\x1b[2;1H" + command("a=T,f=24,i=90,s=24,v=1,c=1,C=1,q=2", thin))
+        for peer in peers:
+            frame = graphics(peer, lambda g: any(im["pixels"] == thin for im in g["images"]))
+            key = next(im["key"] for im in frame["images"] if im["pixels"] == thin)
+            placement = next(p for p in frame["placements"] if p["image"] == key)
+            assert placement["size"] == [8, 1] and placement["sizing"] == "columns", placement
+        remote.send("resize", cols=12, rows=4, cw=8, ch=16)
+        remote.barrier("restore-unicode-metrics")
+        exchange(b"\x1b[?1049l")
+        for peer in peers:
+            graphics(peer, lambda g: any(im["pixels"] == png_pixel for im in g["images"]))
+
     with scenario("A relative image is anchored to the visual left edge of all parent runs"):
         parent = command("a=T,U=1,f=32,i=81,p=2,s=1,v=1,c=1,r=1,q=2", green)
         mark = "\x1b[38;5;81m\U0010EEEE\u0305\u0305\x1b[39m".encode()
@@ -386,6 +412,62 @@ while True:
         snapshots = fixture.rpc("status")["snapshots"]
         assert_stays(lambda: fixture.rpc("status")["snapshots"] == snapshots, 0.35,
                      message="An animation is ticking behind its empty letterbox")
+
+    with scenario("Resizing a frozen view preserves pixels deleted by held output"):
+        exchange(b"\x1bc\x1b[1;3H" + command("a=T,i=85,f=24,s=1,v=1,c=1,r=1,C=1,q=2", red))
+        for peer in peers:
+            graphics(peer, lambda g: any(im["pixels"] == red for im in g["images"]))
+        exchange(b"\x1b[?2026h" + command("a=d,d=I,i=85,q=2"))
+        for width in (8, 96):
+            snapshots = fixture.rpc("status")["snapshots"]
+            remote.send("resize", cols=12, rows=4, cw=8, ch=16, width=width, height=64)
+            wait_for(lambda: fixture.rpc("status")["snapshots"] > snapshots)
+            remote.barrier("held-resize")
+        exchange(b"\x1b[?2026l")
+        for peer in peers:
+            graphics(peer, lambda g: not g["placements"])
+
+    with scenario("A wider subscriber keeps the visible end of a column-sized image in scrollback"):
+        remote.send("resize", cols=12, rows=4, cw=16, ch=16)
+        remote.barrier("wider-font")
+        exchange(b"\x1bc" + command("a=T,i=86,f=24,s=1,v=3,c=1,C=1,q=2", red * 3))
+        for peer in peers:
+            graphics(peer, lambda g: any(im["pixels"] == red * 3 for im in g["images"]))
+        row = remote.frame["scrollback"]["offset"]
+        exchange(b"\x1b[4;1H" + b"\r\n" * 6)
+        for peer in peers:
+            graphics(peer, lambda g: not g["placements"])
+        remote.send("scroll-to", row=row + 2, serial=70)
+        visible = graphics(remote, lambda g: any(im["pixels"] == red * 3 for im in g["images"]))
+        assert visible["placements"][0]["cell"] == [0, -2], visible
+        remote.send("resize", cols=12, rows=4, cw=8, ch=16)
+        graphics(remote, lambda g: not g["placements"])
+        remote.send("scroll", delta=0, bottom=True)
+        remote.barrier("restore-viewport")
+
+    with scenario("Unicode animation stops when every subscriber clips its tile"):
+        remote.send("resize", cols=1, rows=4, cw=8, ch=16, width=8, height=64)
+        remote.barrier("narrow-font")
+        exchange(b"\x1bc" + command("a=T,U=1,i=87,f=32,s=1,v=1,c=1,r=1,q=2", green)
+                 + "\x1b[1;3H\x1b[38;5;87m\U0010EEEE\u0305\u0305\x1b[39m".encode()
+                 + command("a=a,i=87,r=1,z=80,q=2")
+                 + command("a=f,i=87,f=32,s=1,v=1,z=80,q=2", red + b"\xff")
+                 + command("a=a,i=87,s=3,q=2"))
+        graphics(local, lambda g: any(im["pixels"] == red + b"\xff" for im in g["images"]))
+        row = local.frame["scrollback"]["offset"]
+        exchange(b"\x1b[4;1H" + b"\r\n" * 8)
+        graphics(local, lambda g: not g["placements"])
+        remote.send("scroll-to", row=row, serial=71)
+        packet = remote.until(lambda h: h.get("scroll_serial") == 71)
+        assert not packet.get("graphics", {}).get("placements"), packet
+        time.sleep(0.25)
+        snapshots = fixture.rpc("status")["snapshots"]
+        assert_stays(lambda: fixture.rpc("status")["snapshots"] == snapshots, 0.35,
+                     message="A clipped Unicode tile is still animating")
+        remote.send("resize", cols=12, rows=4, cw=8, ch=16)
+        graphics(remote, lambda g: any(im["pixels"] == green for im in g["images"]))
+        remote.send("scroll", delta=0, bottom=True)
+        graphics(remote, lambda g: not g["placements"])
 
     with scenario("The image count limit evicts the oldest unplaced image before a visible one"):
         exchange(b"\x1bc" + command("a=T,i=1,p=1,f=24,s=1,v=1,C=1,q=2", red)

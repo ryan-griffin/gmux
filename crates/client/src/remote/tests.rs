@@ -124,6 +124,7 @@ fn image_payload_can_arrive_after_the_base_record_deadline() {
             graphics: Some(GraphicsUpdate {
                 replace: true,
                 cell_pixels: [8, 16],
+                unicode_cell_pixels: None,
                 placements: vec![Placement {
                     image: 1,
                     layer: Layer::AboveText,

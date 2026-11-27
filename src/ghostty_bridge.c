@@ -240,6 +240,7 @@ struct GmuxView {
     GhosttyTerminalScreen selection_screen;
     Links links;
     void *graphics_data;
+    uint32_t graphics_cell[2];
     bool held_used;
     bool captured;
     bool active;
@@ -348,6 +349,13 @@ void gmux_engine_view_free(GmuxView *v) {
     v->budget->count--;
     free(v);
 }
+extern void ghostty_render_state_gmux_cell_pixels(GhosttyRenderState, uint32_t, uint32_t);
+
+void gmux_engine_view_graphics_size(GmuxView *v, uint32_t width, uint32_t height) {
+    v->graphics_cell[0] = width;
+    v->graphics_cell[1] = height;
+}
+
 bool gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
     if (v->owner != e || e->view_history) return false;
     gmux_engine_expire_render_hold(e);
@@ -360,6 +368,8 @@ bool gmux_engine_view_enter(GmuxEngine *e, GmuxView *v) {
         GhosttyRenderState render=e->render; e->render=v->render; v->render=render;
         GhosttyTerminalScrollbar scrollbar=e->scrollbar; e->scrollbar=v->scrollbar; v->scrollbar=scrollbar;
     }
+    if (!e->held)
+        ghostty_render_state_gmux_cell_pixels(e->render, v->graphics_cell[0], v->graphics_cell[1]);
     GhosttyPointCoordinate point;
     if (v->viewport) {
         // A discarded viewport follows the oldest retained row, while a live
@@ -588,6 +598,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
     if (held) {
         // Capture at the exact start of the hold, even if the same PTY chunk
         // contains the next frame. Keep it visible until that frame is complete.
+        ghostty_render_state_gmux_cell_pixels(e->render, 0, 0);
         if (ghostty_render_state_update(e->render, terminal)) return;
         uint64_t image_generation = 0;
         GhosttyRenderStateImageIterator images = e->images;
@@ -623,6 +634,7 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
             v->budget->used += additional;
             v->captured=false;
             if (!v->render) ghostty_render_state_new(&v->budget->allocator, &v->render);
+            ghostty_render_state_gmux_cell_pixels(v->render, v->graphics_cell[0], v->graphics_cell[1]);
             // Reapplying the current default dirties Ghostty's terminal
             // palette without changing OSC overrides. DIRTY_FULL on a render
             // cache only controls extraction; other caches consumed the rows.

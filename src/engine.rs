@@ -444,6 +444,11 @@ pub(crate) struct EngineView {
     retention_revision: u64,
 }
 impl EngineView {
+    pub(crate) fn set_graphics_viewport(&mut self, geometry: GraphicsViewport) {
+        self.graphics.borrow_mut().geometry = geometry;
+        let [width, height] = geometry.cell_pixels;
+        unsafe { gmux_engine_view_graphics_size(self.raw.as_ptr(), width, height) };
+    }
     pub(crate) fn check_resources(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !unsafe { gmux_engine_view_failed(self.raw.as_ptr()) },
@@ -1504,17 +1509,16 @@ impl ActiveView<'_> {
         }
         (state.held.revision, &state.held.glyphs)
     }
-    pub(crate) fn graphics(
-        &mut self,
-        geometry: GraphicsViewport,
-    ) -> (Option<std::sync::Arc<GraphicsLayout>>, bool) {
+    pub(crate) fn graphics(&mut self) -> (Option<std::sync::Arc<GraphicsLayout>>, bool) {
         let mut snapshot = self.view.graphics.borrow_mut();
         let engine = self.engine.raw.as_ptr();
         if !self.held {
+            let geometry = snapshot.geometry;
             snapshot.live.refresh(
                 engine,
                 std::ptr::null(),
                 &mut self.engine.events.graphics.pixels,
+                geometry,
             );
         }
         let (layout, newly_visible) = snapshot.publish(
@@ -1523,7 +1527,6 @@ impl ActiveView<'_> {
             self.engine.frame,
             self.engine.snapshot_revision,
             &self.engine.cells,
-            geometry,
         );
         (layout, !self.held && newly_visible)
     }
@@ -2632,7 +2635,7 @@ mod tests {
         fresh
             .with_view(&mut view, |active| {
                 active.snapshot().unwrap();
-                let graphics = active.graphics(Default::default()).0.unwrap();
+                let graphics = active.graphics().0.unwrap();
                 let [placement] = graphics.placements.as_slice() else {
                     panic!("Expected a restored image placement");
                 };

@@ -28,6 +28,8 @@ pub(super) struct Snapshot {
     pub live: LayoutSnapshot,
     pub held: LayoutSnapshot,
     pub published: Option<Arc<GraphicsLayout>>,
+    pub geometry: GraphicsViewport,
+    held_geometry: GraphicsViewport,
     budget: Rc<Cell<usize>>,
 }
 
@@ -39,10 +41,18 @@ pub(super) struct LayoutSnapshot {
     pub layout: Option<Arc<GraphicsLayout>>,
     anchors: Vec<VirtualAnchor>,
     has_sizing: bool,
+    has_unicode: bool,
     viewport: Option<Viewport>,
     visible: Option<Arc<GraphicsLayout>>,
     origin_viewport: Option<Viewport>,
     origins: HashMap<[u32; 3], VisualOrigin>,
+    unicode_columns: HashMap<i32, Option<VisibleColumns>>,
+    unicode_viewport: Option<(Viewport, [u32; 2])>,
+}
+
+struct VisibleColumns {
+    full: Vec<u64>,
+    partial: usize,
 }
 
 struct VirtualAnchor {
@@ -66,6 +76,30 @@ struct Viewport {
     geometry: GraphicsViewport,
 }
 
+impl Viewport {
+    fn pixels(self, owner_pixels: [u32; 2]) -> ([f64; 2], [f64; 2]) {
+        let cell = if self.geometry.cell_pixels.contains(&0) {
+            owner_pixels
+        } else {
+            self.geometry.cell_pixels
+        }
+        .map(f64::from);
+        let [canvas_w, canvas_h] = self.geometry.canvas_pixels;
+        let size = [
+            f64::from(self.cols) * cell[0],
+            f64::from(self.rows) * cell[1],
+        ];
+        let clip = |size: f64, canvas| {
+            if canvas == 0 {
+                size
+            } else {
+                size.min(f64::from(canvas))
+            }
+        };
+        (cell, [clip(size[0], canvas_w), clip(size[1], canvas_h)])
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GraphicsViewport {
     pub cell_pixels: [u32; 2],
@@ -80,6 +114,7 @@ pub(crate) struct ImageSource {
 
 pub(crate) struct GraphicsLayout {
     pub cell_pixels: [u32; 2],
+    pub unicode_cell_pixels: Option<[u32; 2]>,
     pub placements: Vec<Placement>,
     pub images: Vec<ImageSource>,
 }
@@ -109,6 +144,8 @@ impl Snapshot {
             live: Default::default(),
             held: Default::default(),
             published: None,
+            geometry: GraphicsViewport::default(),
+            held_geometry: GraphicsViewport::default(),
             budget,
         }
     }
@@ -130,14 +167,19 @@ impl Snapshot {
         frame: Frame,
         revision: u64,
         cells: &[TerminalCell],
-        geometry: GraphicsViewport,
     ) -> (Option<Arc<GraphicsLayout>>, bool) {
+        let geometry = if held {
+            self.held_geometry
+        } else {
+            self.geometry
+        };
         let latest = if held { &mut self.held } else { &mut self.live };
         let newly_visible = latest.fit_viewport(engine, frame, revision, cells, geometry);
         let latest = &latest.visible;
         if let (Some(published), Some(latest)) = (&self.published, latest)
             && (Arc::ptr_eq(published, latest)
                 || (published.cell_pixels == latest.cell_pixels
+                    && published.unicode_cell_pixels == latest.unicode_cell_pixels
                     && published.placements == latest.placements))
         {
             return (Some(published.clone()), newly_visible);
@@ -153,6 +195,7 @@ impl LayoutSnapshot {
         engine: *const GmuxEngine,
         view: *const GmuxView,
         pixels: &mut HashMap<u64, Weak<Image>>,
+        geometry: GraphicsViewport,
     ) {
         unsafe extern "C" fn collect(data: *mut c_void, raw: *const GmuxImagePlacement) {
             unsafe { &mut *data.cast::<Vec<GmuxImagePlacement>>() }.push(unsafe { *raw });
@@ -177,6 +220,7 @@ impl LayoutSnapshot {
         self.cell_pixels = cell_pixels;
         self.anchors.clear();
         self.has_sizing = false;
+        self.has_unicode = false;
         self.viewport = None;
         if raw.is_empty() {
             self.layout = None;
@@ -222,6 +266,8 @@ impl LayoutSnapshot {
                 _ => None,
             };
             self.has_sizing |= fit_rows.is_some() || sizing.is_some();
+            let source_subpixels = (p.source_subpixels[2] != 0).then_some(p.source_subpixels);
+            self.has_unicode |= source_subpixels.is_some();
             placements.push(Placement {
                 image: p.generation,
                 layer: [Layer::BelowBackground, Layer::BelowText, Layer::AboveText]
@@ -230,18 +276,27 @@ impl LayoutSnapshot {
                 offset: p.offset,
                 size: p.size,
                 source: p.source,
-                source_subpixels: (p.source_subpixels[2] != 0).then_some(p.source_subpixels),
+                source_subpixels,
                 fit_rows,
                 sizing,
             });
         }
-        if !self
-            .layout
-            .as_ref()
-            .is_some_and(|old| old.cell_pixels == cell_pixels && old.placements == placements)
-        {
+        let [width, height] = geometry.cell_pixels;
+        let [owner_width, owner_height] = cell_pixels;
+        let unicode_cell_pixels = (self.has_unicode
+            && width != 0
+            && height != 0
+            && u64::from(owner_width) * u64::from(height)
+                != u64::from(owner_height) * u64::from(width))
+        .then_some(geometry.cell_pixels);
+        if !self.layout.as_ref().is_some_and(|old| {
+            old.cell_pixels == cell_pixels
+                && old.unicode_cell_pixels == unicode_cell_pixels
+                && old.placements == placements
+        }) {
             self.layout = Some(Arc::new(GraphicsLayout {
                 cell_pixels,
+                unicode_cell_pixels,
                 placements,
                 images: images.into_values().collect(),
             }));
@@ -257,15 +312,27 @@ impl LayoutSnapshot {
         cells: &[TerminalCell],
         geometry: GraphicsViewport,
     ) -> bool {
-        let viewport = Viewport {
-            revision: if self.anchors.is_empty() { 0 } else { revision },
+        let mut viewport = Viewport {
+            revision,
             offset: frame.scrollback.offset,
             cols: frame.cols,
             rows: frame.rows,
             geometry,
         };
+        let (cell, canvas) = viewport.pixels(self.cell_pixels);
+        let unicode_clipped = self.has_unicode
+            && (canvas[0] < f64::from(viewport.cols) * cell[0]
+                || canvas[1] < f64::from(viewport.rows) * cell[1]);
+        if self.anchors.is_empty() && !unicode_clipped {
+            viewport.revision = 0;
+        }
         if self.viewport == Some(viewport) {
             return false;
+        }
+        let unicode_viewport = unicode_clipped.then_some((viewport, self.cell_pixels));
+        if self.unicode_viewport != unicode_viewport {
+            self.unicode_columns.clear();
+            self.unicode_viewport = unicode_viewport;
         }
         self.viewport = Some(viewport);
         let text_viewport = Viewport {
@@ -273,7 +340,7 @@ impl LayoutSnapshot {
             ..viewport
         };
         let visible = match &self.layout {
-            Some(layout) if self.has_sizing || !self.anchors.is_empty() => {
+            Some(layout) if self.has_sizing || !self.anchors.is_empty() || unicode_clipped => {
                 if self.anchors.is_empty() {
                     self.origins.clear();
                     self.origin_viewport = None;
@@ -297,7 +364,15 @@ impl LayoutSnapshot {
                     read_visual_origins(engine, &mut self.origins, cells, frame.cols.into());
                     self.origin_viewport = Some(text_viewport);
                 }
-                project_viewport(layout, &self.anchors, &self.origins, viewport)
+                project_viewport(
+                    layout,
+                    &self.anchors,
+                    &self.origins,
+                    viewport,
+                    unicode_clipped,
+                    cells,
+                    &mut self.unicode_columns,
+                )
             }
             layout => {
                 self.origins.clear();
@@ -339,6 +414,13 @@ impl LayoutSnapshot {
                 }
             })
             + self.origins.capacity() * (size_of::<([u32; 3], VisualOrigin)>() + 1)
+            + self.unicode_columns.capacity() * (size_of::<(i32, Option<VisibleColumns>)>() + 1)
+            + self
+                .unicode_columns
+                .values()
+                .flatten()
+                .map(|columns| columns.full.capacity() * size_of::<u64>())
+                .sum::<usize>()
     }
 
     pub fn shows_images(&self, changed: &[u32]) -> bool {
@@ -376,10 +458,7 @@ fn read_visual_origins(
         };
         if capture.viewport_row != Some(row) {
             capture.viewport_row = Some(row);
-            capture.bidi = usize::try_from(row).ok().and_then(|row| {
-                let start = row * capture.cols;
-                Row::new(capture.cells.get(start..start + capture.cols)?)
-            });
+            capture.bidi = bidi_row(capture.cells, capture.cols, row);
         }
         let column = column as usize;
         let visual = capture.bidi.as_ref().map_or(column, |row| {
@@ -403,36 +482,30 @@ fn read_visual_origins(
     };
 }
 
+fn bidi_row(cells: &[TerminalCell], cols: usize, row: i32) -> Option<Row> {
+    let start = usize::try_from(row).ok()? * cols;
+    Row::new(cells.get(start..start + cols)?)
+}
+
 fn project_viewport(
     layout: &Arc<GraphicsLayout>,
     anchors: &[VirtualAnchor],
     origins: &HashMap<[u32; 3], VisualOrigin>,
     viewport: Viewport,
+    unicode_clipped: bool,
+    cells: &[TerminalCell],
+    unicode_columns: &mut HashMap<i32, Option<VisibleColumns>>,
 ) -> Option<Arc<GraphicsLayout>> {
-    let cell = if viewport.geometry.cell_pixels.contains(&0) {
-        layout.cell_pixels
-    } else {
-        viewport.geometry.cell_pixels
-    }
-    .map(f64::from);
-    let [canvas_w, canvas_h] = viewport.geometry.canvas_pixels;
-    let view_w = f64::from(viewport.cols) * cell[0];
-    let view_h = f64::from(viewport.rows) * cell[1];
-    let view_w = if canvas_w == 0 {
-        view_w
-    } else {
-        view_w.min(f64::from(canvas_w))
-    };
-    let view_h = if canvas_h == 0 {
-        view_h
-    } else {
-        view_h.min(f64::from(canvas_h))
-    };
+    let (cell, [view_w, view_h]) = viewport.pixels(layout.cell_pixels);
+    let cols = usize::from(viewport.cols);
+    let whole_cols = (view_w / cell[0]).floor() as usize;
+    let partial_width = view_w - whole_cols as f64 * cell[0];
     let mut placements = Vec::new();
     let mut copied = 0;
     let mut anchors = anchors.iter().peekable();
     for (index, &original) in layout.placements.iter().enumerate() {
         let mut placement = original;
+        let unicode = placement.source_subpixels.is_some();
         if anchors.peek().is_some_and(|anchor| anchor.index == index) {
             let anchor = anchors.next().unwrap();
             if let Some(origin) = origins.get(&anchor.key)
@@ -440,14 +513,49 @@ fn project_viewport(
             {
                 placement.cell[0] = placement.cell[0].saturating_add(visual - anchor.column as i32);
             }
-        } else if placement.fit_rows.is_none() && placement.sizing.is_none() {
+        } else if placement.fit_rows.is_none()
+            && placement.sizing.is_none()
+            && !(unicode && unicode_clipped)
+        {
             continue;
         }
-        let bounds = placement.bounds(cell, layout.cell_pixels);
+        let pixels = if unicode {
+            layout.unicode_cell_pixels.unwrap_or(layout.cell_pixels)
+        } else {
+            layout.cell_pixels
+        };
+        let bounds = placement.bounds(cell, pixels);
         let [x, y, w, h] = bounds.rect;
         let [top, bottom] = bounds.clip_y.unwrap_or([0.0, view_h]);
-        let visible =
-            x < view_w && x + w > 0.0 && y.max(top).max(0.0) < (y + h).min(bottom).min(view_h);
+        let visible_y = y.max(top).max(0.0) < (y + h).min(bottom).min(view_h);
+        let visible = visible_y
+            && if unicode && whole_cols < cols {
+                let columns = unicode_columns.entry(placement.cell[1]).or_insert_with(|| {
+                    let row = bidi_row(cells, cols, placement.cell[1])?;
+                    let mut full = vec![0; cols.div_ceil(64)];
+                    for visual in 0..whole_cols {
+                        let logical = row.logical(visual);
+                        full[logical / 64] |= 1 << (logical % 64);
+                    }
+                    Some(VisibleColumns {
+                        full,
+                        partial: row.logical(whole_cols),
+                    })
+                });
+                if let Some(columns) = columns {
+                    let start = (x / cell[0]).floor().max(0.0) as usize;
+                    let end = (((x + w) / cell[0]).ceil().max(0.0) as usize).min(cols);
+                    (start..end).any(|col| {
+                        columns.full[col / 64] & (1 << (col % 64)) != 0
+                            || (col == columns.partial
+                                && (x - col as f64 * cell[0]).max(0.0) < partial_width)
+                    })
+                } else {
+                    x < view_w && x + w > 0.0
+                }
+            } else {
+                x < view_w && x + w > 0.0
+            };
         if visible && placement == original {
             continue;
         }
@@ -467,6 +575,7 @@ fn project_viewport(
     let used: HashSet<_> = placements.iter().map(|p| p.image).collect();
     Some(Arc::new(GraphicsLayout {
         cell_pixels: layout.cell_pixels,
+        unicode_cell_pixels: layout.unicode_cell_pixels,
         placements,
         images: layout
             .images
@@ -557,7 +666,11 @@ pub(super) unsafe extern "C" fn capture_hold(
     }
     let snapshot = unsafe { &*viewdata.cast::<RefCell<Snapshot>>() };
     let mut snapshot = snapshot.borrow_mut();
-    snapshot.held.refresh(engine, view, &mut state.pixels);
+    let geometry = snapshot.geometry;
+    snapshot.held_geometry = geometry;
+    snapshot
+        .held
+        .refresh(engine, view, &mut state.pixels, geometry);
     let Some(layout) = &snapshot.held.layout else {
         return true;
     };
