@@ -6,7 +6,7 @@ use gmux_protocol::{
     clipboard::{
         Destination, ReadDescriptor, ReadEvent, ReadRequest, ReadResult, ReadStatus, Representation,
     },
-    transport::StreamCommand,
+    transport::{MAX_IMAGE_TRANSFER_TIME, StreamCommand},
 };
 use gtk::gio;
 use gtk::{gdk, glib, prelude::*};
@@ -14,7 +14,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// One operation per desktop window. Clipboard bytes are never prefetched.
@@ -32,23 +32,49 @@ struct LocalPaste {
     destination: Destination,
     epoch: u64,
     expires: Instant,
+    image_read_time: Duration,
     session: Weak<RefCell<RemoteSession>>,
 }
+impl LocalPaste {
+    fn is_fresh(&self, time: PasteTime) -> bool {
+        let delay = time
+            .image_read_time
+            .saturating_sub(self.image_read_time)
+            .min(MAX_IMAGE_TRANSFER_TIME);
+        self.expires + delay > time.now
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PasteTime {
+    now: Instant,
+    image_read_time: Duration,
+}
+impl PasteTime {
+    fn now(session: &SessionHandle) -> Self {
+        let (now, image_read_time) = session.borrow().clipboard_time();
+        Self {
+            now,
+            image_read_time,
+        }
+    }
+}
+
 fn consume_paste(
     pastes: &mut HashMap<PaneRef, LocalPaste>,
     pane: PaneRef,
     destination: Destination,
     epoch: u64,
-    serial: Option<u64>,
+    serial: u64,
     session: &Weak<RefCell<RemoteSession>>,
-    now: Instant,
+    time: PasteTime,
 ) -> bool {
     let valid = pastes.get(&pane).is_some_and(|p| {
         p.destination == destination
             && p.session.ptr_eq(session)
             && p.epoch == epoch
-            && p.expires > now
-            && serial.is_none_or(|serial| serial == p.serial)
+            && p.serial == serial
+            && p.is_fresh(time)
     });
     if valid {
         pastes.remove(&pane);
@@ -183,11 +209,15 @@ impl Desktop {
                 delta: 0,
                 bottom: true,
             })?;
-        let now = Instant::now();
+        let time = PasteTime::now(&terminal.session);
         let epoch = self.epochs[destination as usize].get();
         {
             let mut pastes = self.pastes.borrow_mut();
-            pastes.retain(|_, p| p.expires > now);
+            pastes.retain(|_, p| {
+                p.session
+                    .upgrade()
+                    .is_some_and(|session| p.is_fresh(PasteTime::now(&session)))
+            });
             if pastes.len() >= 16
                 && let Some(oldest) = pastes
                     .iter()
@@ -202,7 +232,8 @@ impl Desktop {
                     serial,
                     destination,
                     epoch,
-                    expires: now + protocol::TRANSFER_TIMEOUT,
+                    expires: time.now + protocol::TRANSFER_TIMEOUT,
+                    image_read_time: time.image_read_time,
                     session: Rc::downgrade(&terminal.session),
                 },
             );
@@ -300,9 +331,9 @@ impl Desktop {
                         terminal.id,
                         destination,
                         epoch,
-                        Some(serial),
+                        serial,
                         &Rc::downgrade(&terminal.session),
-                        Instant::now(),
+                        PasteTime::now(&terminal.session),
                     )
                 {
                     return;
@@ -327,6 +358,7 @@ impl Desktop {
                         name: String::new(),
                         granted: true,
                         epoch: Some(epoch),
+                        paste_serial: Some(serial),
                     },
                     true,
                 );
@@ -364,15 +396,17 @@ impl Desktop {
                 }
                 if request.granted
                     && (request.epoch != Some(self.epochs[request.destination as usize].get())
-                        || !consume_paste(
-                            &mut self.pastes.borrow_mut(),
-                            terminal.id,
-                            request.destination,
-                            self.epochs[request.destination as usize].get(),
-                            None,
-                            &Rc::downgrade(&terminal.session),
-                            Instant::now(),
-                        ))
+                        || !request.paste_serial.is_some_and(|serial| {
+                            consume_paste(
+                                &mut self.pastes.borrow_mut(),
+                                terminal.id,
+                                request.destination,
+                                self.epochs[request.destination as usize].get(),
+                                serial,
+                                &Rc::downgrade(&terminal.session),
+                                PasteTime::now(&terminal.session),
+                            )
+                        }))
                 {
                     Self::fail(&terminal.session, request.id, ReadStatus::Denied);
                     return;
@@ -603,6 +637,10 @@ mod tests {
     #[test]
     fn remote_claims_require_a_local_one_use_paste_with_matching_scope() {
         let now = Instant::now();
+        let time = PasteTime {
+            now,
+            image_read_time: Duration::ZERO,
+        };
         let mut pastes = HashMap::new();
         let session = Weak::new();
         assert!(!consume_paste(
@@ -610,9 +648,9 @@ mod tests {
             p(7),
             Destination::Clipboard,
             3,
-            None,
+            42,
             &session,
-            now
+            time
         ));
         pastes.insert(
             p(7),
@@ -621,6 +659,7 @@ mod tests {
                 destination: Destination::Clipboard,
                 epoch: 3,
                 expires: now + protocol::TRANSFER_TIMEOUT,
+                image_read_time: Duration::ZERO,
                 session: session.clone(),
             },
         );
@@ -632,63 +671,63 @@ mod tests {
             },
             Destination::Clipboard,
             3,
-            Some(42),
+            42,
             &session,
-            now
+            time
         ));
         assert!(!consume_paste(
             &mut pastes,
             p(8),
             Destination::Clipboard,
             3,
-            None,
+            42,
             &session,
-            now
+            time
         ));
         assert!(!consume_paste(
             &mut pastes,
             p(7),
             Destination::Primary,
             3,
-            None,
+            42,
             &session,
-            now
+            time
         ));
         assert!(!consume_paste(
             &mut pastes,
             p(7),
             Destination::Clipboard,
             4,
-            None,
+            42,
             &session,
-            now
+            time
         ));
         assert!(!consume_paste(
             &mut pastes,
             p(7),
             Destination::Clipboard,
             3,
-            Some(41),
+            41,
             &session,
-            now
+            time
         ));
         assert!(consume_paste(
             &mut pastes,
             p(7),
             Destination::Clipboard,
             3,
-            Some(42),
+            42,
             &session,
-            now
+            time
         ));
         assert!(!consume_paste(
             &mut pastes,
             p(7),
             Destination::Clipboard,
             3,
-            None,
+            42,
             &session,
-            now
+            time
         ));
         pastes.insert(
             p(7),
@@ -697,6 +736,7 @@ mod tests {
                 destination: Destination::Primary,
                 epoch: 4,
                 expires: now,
+                image_read_time: Duration::ZERO,
                 session: session.clone(),
             },
         );
@@ -705,9 +745,36 @@ mod tests {
             p(7),
             Destination::Primary,
             4,
-            Some(43),
+            43,
             &session,
-            now
+            time
         ));
+    }
+
+    #[test]
+    fn a_paste_lease_excludes_only_a_bounded_period_spent_reading_images() {
+        let now = Instant::now();
+        let started = Duration::from_secs(2);
+        let paste = LocalPaste {
+            serial: 42,
+            destination: Destination::Clipboard,
+            epoch: 3,
+            expires: now + protocol::TRANSFER_TIMEOUT,
+            image_read_time: started,
+            session: Weak::new(),
+        };
+        let delayed = now + Duration::from_secs(6);
+        assert!(!paste.is_fresh(PasteTime {
+            now: delayed,
+            image_read_time: started
+        }));
+        assert!(paste.is_fresh(PasteTime {
+            now: delayed,
+            image_read_time: started + Duration::from_secs(2)
+        }));
+        assert!(!paste.is_fresh(PasteTime {
+            now: paste.expires + MAX_IMAGE_TRANSFER_TIME,
+            image_read_time: started + MAX_IMAGE_TRANSFER_TIME + Duration::from_secs(1),
+        }));
     }
 }

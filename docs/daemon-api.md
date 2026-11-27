@@ -351,10 +351,9 @@ An event accepts only the fields for its selected kind. Extra fields are invalid
 even when their value is null.
 
 Request IDs identify a transient native request, independently of the program's
-Kitty `id`. A true `granted` is a hint, not desktop authority. The frontend must
-independently match it to a recent local user-paste gesture for the same pane,
-connection, destination, and clipboard epoch, and consume that authorization
-once. It must also validate `paste_text` against its own gesture serial. A server
+Kitty `id`. A granted request carries `paste_serial` and `epoch`. The frontend
+must match either paste event to a recent local gesture with the same serial,
+pane, connection, destination, and clipboard epoch, and consume that gesture once. A server
 flag or program-supplied name cannot authorize reading the desktop. Targets-only requests do not read
 content and do not consume the one-use paste authorization. All other data reads
 require explicit consent. `SessionManager::poll_with_clipboard_events` delivers
@@ -379,6 +378,8 @@ binary extension to the frontend command stream; attach, authentication,
 heartbeats, and other commands retain their existing framing. Partial binary
 chunks and result assembly have five-second deadlines. Invalid transfers can
 detach the frontend. Late or foreign request IDs never complete another read.
+The daemon allows 15 seconds for the initial result, with extra time for any
+preceding image record to reach the frontend.
 
 A genuine desktop paste uses `user-paste` with a new connection-wide `serial`,
 `destination`, `epoch`, and bounded `mimes`. It supersedes unanswered reads routed
@@ -391,6 +392,11 @@ then ordinary `paste-data` chunks and `paste-end`. Scripted `paste` always inser
 text and cannot create clipboard grants. A client claiming desktop capability
 is a trusted clipboard broker within the existing socket/authentication boundary;
 a JSON field cannot prove a physical gesture.
+
+The daemon allows extra delivery time for `paste_text` queued behind image
+data. GTK excludes a bounded amount of time spent receiving image records
+from a paste gesture's lifetime. The native authorization for a Kitty program
+to initiate its clipboard read expires after five seconds.
 
 `generation` identifies cached history for this pane and view. Clears, reflow,
 screen switches, and resolved palette or appearance changes advance it. Discard

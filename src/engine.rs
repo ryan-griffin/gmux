@@ -224,6 +224,7 @@ unsafe extern "C" fn clipboard_read(ud: *mut c_void, request: *const GmuxClipboa
             name: String::from_utf8_lossy(name).into_owned(),
             granted: request.granted,
             epoch: None,
+            paste_serial: None,
         });
     }
     GMUX_CLIPBOARD_SUCCESS as i32

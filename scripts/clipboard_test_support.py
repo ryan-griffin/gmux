@@ -2,6 +2,7 @@
 from html.parser import HTMLParser
 import base64
 from pathlib import Path
+import zlib
 
 
 PNG = (Path(__file__).resolve().parent / "fixtures/clipboard.png").read_bytes()
@@ -111,6 +112,18 @@ with received.open('ab', buffering=0) as output:
         temporary = self.control.with_suffix(".tmp")
         temporary.write_text(json.dumps([self.serial, text]))
         temporary.replace(self.control)
+
+    def write_large_image(self):
+        width = height = 1500
+        payload = zlib.compress(b"\xff\0\0\xff" * (width * height))
+        commands = []
+        for start in range(0, len(payload), 3072):
+            options = f"a=T,f=32,o=z,s={width},v={height},c=1,r=1,C=1,q=2," if start == 0 else ""
+            more = int(start + 3072 < len(payload))
+            data = base64.b64encode(payload[start:start + 3072]).decode()
+            commands.append(f"\x1b_G{options}m={more};{data}\x1b\\")
+        self.write("".join(commands))
+        return width * height * 4
 
     def bytes(self):
         return self.received.read_bytes() if self.received.exists() else b""

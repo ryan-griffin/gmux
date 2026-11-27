@@ -7,7 +7,8 @@ use gmux_protocol::{
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
     transport::{
-        self, KeyAction, KeyLayout, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest,
+        self, KeyAction, KeyLayout, Metadata, Packet, PasteOptions, RESPONSE_TIMEOUT,
+        StreamCommand, StreamRequest,
     },
 };
 #[cfg(test)]
@@ -31,7 +32,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default for tests that do not report a display interval.
 #[cfg(test)]
 const SCROLL_CADENCE: Duration = transport::DEFAULT_FRAME_INTERVAL;
@@ -494,8 +494,8 @@ async fn read_packets(
             .as_pane()
             .and_then(|pane| pane.header.graphics.as_ref())
             .map_or(Ok(0), |graphics| graphics.payload_len())?;
-        // Allow packed image data to arrive at 128 KiB/s within a finite deadline.
-        let deadline = deadline + Duration::from_millis(image_bytes as u64 * 1000 / (128 * 1024));
+        let deadline = deadline + transport::image_transfer_allowance(image_bytes);
+        let image_read = (image_bytes != 0).then(|| sender.begin_image_read());
         let (packet, reservation, retained) = runtime::deadline(deadline, async {
             let packet =
                 Packet::read_body_async(&mut (&mut reader).compat(), record, header).await?;
@@ -509,6 +509,7 @@ async fn read_packets(
         })
         .await?;
         sender.send_decoded(packet, reservation, retained).await?;
+        drop(image_read);
         wake.notify();
     }
 }
@@ -852,6 +853,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Missing daemon metadata for pane {id}"))?;
         let handle = Rc::new(RefCell::new(RemoteSession {
             connection: self.connection.clone(),
+            image_reads: self.receiver.image_read_clock(),
             git: self.git.remove(&id),
             viewport: Viewport::new(meta, theme, self.frame_interval, self.focused.get()),
             wake: self.wake.clone(),
@@ -1050,6 +1052,7 @@ impl Drop for SessionManager {
 
 pub struct RemoteSession {
     connection: Rc<Connection>,
+    image_reads: incoming::ImageReadClock,
     viewport: Viewport,
     git: Option<transport::GitMetadata>,
     wake: gmux_platform::unix::ipc::Wake,
@@ -1112,6 +1115,10 @@ impl RemoteSession {
         epoch: u64,
     ) -> anyhow::Result<()> {
         self.connection.clipboard_changed(destination, epoch)
+    }
+    /// Monotonic time and time spent receiving image records on this connection.
+    pub fn clipboard_time(&self) -> (Instant, Duration) {
+        self.image_reads.now()
     }
     pub fn clipboard_command(&self, command: StreamCommand) -> anyhow::Result<()> {
         self.connection

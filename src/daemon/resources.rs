@@ -158,6 +158,7 @@ pub(super) struct OutputStorage {
     pub(super) bytes: Vec<u8>,
     pub(super) offset: usize,
     graphics: Option<ImageOutput>,
+    image_delivery_deadline: Option<Instant>,
     closed: bool,
     blocked: bool,
 }
@@ -176,6 +177,7 @@ impl OutputStorage {
         self.bytes = Vec::new();
         self.offset = 0;
         self.graphics = None;
+        self.image_delivery_deadline = None;
         self.blocked = false;
     }
     fn compact(&mut self, additional: usize) {
@@ -259,6 +261,9 @@ impl Output {
     pub(super) fn graphics_pending(&self) -> bool {
         self.storage.borrow().graphics.is_some()
     }
+    pub(super) fn image_delivery_deadline(&self) -> Option<Instant> {
+        self.storage.borrow().image_delivery_deadline
+    }
     pub(super) fn backlogged(&self) -> bool {
         let storage = self.storage.borrow();
         storage.blocked && storage.pending() != 0
@@ -299,9 +304,16 @@ impl Output {
             let images = packet.encode_into_parts(&mut storage.bytes, limit)?;
             if !images.is_empty() {
                 anyhow::ensure!(storage.graphics.is_none(), "Image payload already queued");
+                let pending = images.iter().map(|image| image.pixels.len()).sum();
+                let deadline = Instant::now()
+                    + transport::RESPONSE_TIMEOUT
+                    + transport::image_transfer_allowance(pending);
+                // The client can still be reading pixels after the socket accepts them.
+                storage.image_delivery_deadline =
+                    storage.image_delivery_deadline.max(Some(deadline));
                 storage.graphics = Some(ImageOutput {
                     at: storage.bytes.len(),
-                    pending: images.iter().map(|image| image.pixels.len()).sum(),
+                    pending,
                     images: self.budget.retain_images(images),
                     offset: 0,
                 });

@@ -4,13 +4,14 @@ import base64
 import subprocess
 from functools import partial
 from pathlib import Path
+import time
 import gi
 
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi, GLib
 from cargo_test_support import cargo_binary
 from clipboard_test_support import ReadProbe, kitty_write
-from test_support import AccessibilityFixture, AppFixture, descendants, scenario, wait_accessible, wait_for as shared_wait_for
+from test_support import AccessibilityFixture, AppFixture, DelayedViewport, descendants, scenario, wait_accessible, wait_for as shared_wait_for
 from wayland_test_support import REMOTE, WaylandInput, ensure_wayland_session
 
 ensure_wayland_session()
@@ -18,7 +19,8 @@ wait_for = partial(shared_wait_for, context=GLib.MainContext.default())
 artifacts = Path(__file__).resolve().parent.parent / "artifacts"
 artifacts.mkdir(exist_ok=True)
 with (artifacts / "clipboard-read-ui-smoke.log").open("w") as log, AccessibilityFixture(), \
-        AppFixture(env=dict(GTK_A11Y="atspi")) as desktop, AppFixture() as server, WaylandInput() as native:
+        AppFixture(env=dict(GTK_A11Y="atspi")) as desktop, AppFixture() as server, WaylandInput() as native, \
+        DelayedViewport(desktop.env["GMUX_SOCKET"], desktop.path / "clipboard-frontend") as proxy:
     result = subprocess.run([str(cargo_binary("clipboard-banner-check", example=True))],
                             env=dict(desktop.env, GTK_A11Y="test"), capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -28,7 +30,13 @@ with (artifacts / "clipboard-read-ui-smoke.log").open("w") as log, Accessibility
     server.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
     address = wait_for(lambda: server.rpc("status")["bound_address"])
     desktop.rpc("connection-add", name="server", address=address, authentication=dict(mode="none"))
-    app = desktop.start_app(cargo_binary("gmux-gtk"), stdout=log, stderr=log)
+    desktop.start(cargo_binary("gmux"), "serve", stdout=log, stderr=log)
+    wait_for(lambda: desktop.rpc("status"))
+    app = subprocess.Popen([str(cargo_binary("gmux-gtk"))],
+                           env=dict(desktop.env, GMUX_SOCKET=proxy.proxy_path), stdout=log, stderr=log)
+    desktop.processes.append(app)
+    wait_for(lambda: desktop.rpc("status")["local_clients"])
+    wait_for(lambda: desktop.rpc("renderer-info")["gtk"])
 
     def objects():
         return [obj for obj in descendants(Atspi.get_desktop(0)) if obj.get_process_id() == app.pid
@@ -141,4 +149,42 @@ with (artifacts / "clipboard-read-ui-smoke.log").open("w") as log, Accessibility
             finally:
                 native.bus.signal_unsubscribe(subscription)
                 desktop.rpc("close-tab", connection=connection, tab=created["tab"])
+
+    with scenario("ordinary and Kitty paste survive a slow image on the frontend stream"):
+        created = desktop.rpc("new", connection="local", name="Paste during image")
+        pane = created["pane"]
+        probe = ReadProbe(desktop, pane)
+        try:
+            for rich in (False, True):
+                title = f"IMAGE_PASTE_{rich}"
+                mode = "\x1b[?5522h" if rich else "\x1b[?5522l"
+                probe.write(mode + f"\x1b]2;{title}\x07")
+                wait_for(lambda: desktop.rpc("_metadata", pane=pane)["meta"]["title"] == title)
+                text = "IMAGE_PASTE " + title
+                native.set_clipboard_text(text)
+                before, stream_bytes = len(probe.bytes()), proxy.reply_bytes
+                proxy.delay = .065
+                try:
+                    probe.write_large_image()
+                    wait_for(lambda: proxy.reply_bytes - stream_bytes >= 192 * 1024)
+                    started = time.monotonic()
+                    desktop.rpc("action", name="paste")
+                    if rich:
+                        event = wait_for(lambda: probe.bytes()[before:] if b":pw=" in probe.bytes()[before:] else None)
+                        password = event.split(b":pw=", 1)[1].split(b"\x1b", 1)[0].decode()
+                        before = len(probe.bytes())
+                        probe.write("\x1b]5522;type=read:name=UGFzdGUgZXZlbnQ=:pw=" + password + ";dGV4dC9wbGFpbg==\x1b\\")
+                        expected = base64.b64encode(text.encode())
+                    else:
+                        expected = text.encode()
+                    try:
+                        wait_for(lambda: expected in probe.bytes()[before:], timeout=30)
+                    except AssertionError as error:
+                        raise AssertionError((title, probe.bytes()[before:], proxy.reply_bytes - stream_bytes)) from error
+                    assert time.monotonic() - started > 5
+                    assert not find("Allow Once")
+                finally:
+                    proxy.delay = 0
+        finally:
+            desktop.rpc("close-tab", connection="local", tab=created["tab"])
 print("PASS: native GTK consent, no prefetch, local/remote MIME reads, genuine paste grants and denial")

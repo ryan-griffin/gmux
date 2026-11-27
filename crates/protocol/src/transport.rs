@@ -31,6 +31,14 @@ pub const MAX_CACHE_ROWS: usize = 512;
 /// when the actual text is shorter. This also bounds allocations before decoding.
 pub const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+pub const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const MAX_IMAGE_TRANSFER_TIME: std::time::Duration =
+    RESPONSE_TIMEOUT.saturating_add(image_transfer_allowance(crate::graphics::MAX_PIXEL_BYTES));
+
+/// Extra time for image payloads to arrive at 128 KiB/s.
+pub const fn image_transfer_allowance(bytes: usize) -> std::time::Duration {
+    std::time::Duration::from_millis(bytes as u64 * 1000 / (128 * 1024))
+}
 
 /// Wire row limit for a supported width. Independent of Rust cell layout and
 /// any client's choice of history-cache storage or retention budget.

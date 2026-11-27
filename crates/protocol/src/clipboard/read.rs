@@ -49,6 +49,8 @@ pub struct ReadRequest {
     /// Only true after the daemon validates the native grant against a live paste lease.
     pub granted: bool,
     pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_serial: Option<u64>,
 }
 impl ReadRequest {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -56,7 +58,11 @@ impl ReadRequest {
             self.id != 0
                 && self.mimes.len() <= MAX_MIMES
                 && self.mimes.iter().all(|m| valid_mime(m))
-                && self.name.len() <= 256,
+                && self.name.len() <= 256
+                && matches!(
+                    (self.granted, self.epoch, self.paste_serial),
+                    (false, None, None) | (true, Some(_), Some(1..))
+                ),
             "Invalid clipboard read request"
         );
         Ok(())

@@ -148,6 +148,7 @@ fn manager() -> (SessionManager, incoming::Sender, SessionHandle) {
     let wake = gmux_platform::unix::ipc::Wake::new().unwrap();
     let session = Rc::new(RefCell::new(RemoteSession {
         connection: connection.clone(),
+        image_reads: receiver.image_read_clock(),
         git: None,
         wake: wake.clone(),
         viewport: viewport(),

@@ -1,6 +1,9 @@
 //! Ordered stream backpressure bounded by retained bytes as well as packet count.
 use gmux_protocol::transport::Packet;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::{
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    time::{Duration, Instant},
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -19,7 +22,36 @@ fn process_budget() -> Arc<Semaphore> {
 struct Budget {
     limit: usize,
     ready: Arc<tokio::sync::Semaphore>,
+    image_reads: Mutex<ImageReadTime>,
 }
+
+#[derive(Default)]
+struct ImageReadTime {
+    completed: Duration,
+    started: Option<Instant>,
+}
+
+pub(super) struct ImageReadClock(Arc<Budget>);
+
+impl ImageReadClock {
+    pub fn now(&self) -> (Instant, Duration) {
+        let time = self.0.image_reads.lock().unwrap();
+        let now = Instant::now();
+        let active = time.started.map_or(Duration::ZERO, |start| now - start);
+        (now, time.completed + active)
+    }
+}
+
+pub(super) struct ImageRead<'a>(&'a Mutex<ImageReadTime>);
+
+impl Drop for ImageRead<'_> {
+    fn drop(&mut self) {
+        let mut time = self.0.lock().unwrap();
+        let started = time.started.take().unwrap();
+        time.completed += started.elapsed();
+    }
+}
+
 struct Message {
     item: Result<Packet, String>,
     reservation: Reservation,
@@ -92,6 +124,7 @@ pub(super) fn channel_with_pools(
     let budget = Arc::new(Budget {
         limit: bytes,
         ready: Arc::new(tokio::sync::Semaphore::new(bytes)),
+        image_reads: Default::default(),
     });
     (
         Sender {
@@ -108,6 +141,11 @@ pub(super) fn channel_with_pools(
     )
 }
 impl Sender {
+    pub(super) fn begin_image_read(&self) -> ImageRead<'_> {
+        self.budget.image_reads.lock().unwrap().started = Some(Instant::now());
+        ImageRead(&self.budget.image_reads)
+    }
+
     #[cfg(test)]
     pub fn send(&self, item: Result<Packet, String>) -> Result<(), SendError> {
         crate::runtime::block_on(self.send_async(item))
@@ -188,6 +226,10 @@ impl Sender {
     }
 }
 impl Receiver {
+    pub(super) fn image_read_clock(&self) -> ImageReadClock {
+        ImageReadClock(self.budget.clone())
+    }
+
     pub fn pending(&self) -> bool {
         let receiver = self.receiver.borrow();
         !receiver.is_empty() || receiver.is_closed()
