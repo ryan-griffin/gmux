@@ -105,7 +105,7 @@ Bound graphics storage and schedule animations for visible images.
              inside: {
                  const image = self.images.get(entry.key_ptr.image_id) orelse break :inside;
                  const grid = p.gridSize(image, t);
-+                const rows: i64 = if (p.margin_clipped) p.max_rows.? else grid.rows;
++                const rows: i64 = grid.rows;
 
                  // Unknown geometry (e.g. pixel sizes not yet reported)
                  // means we can't know the extent, so we can't consider
@@ -507,21 +507,72 @@ Bound graphics storage and schedule animations for visible images.
      }
 
      /// State returned by scrollMarginsBegin: the final active-area
-@@ -1980,6 +2016,13 @@
-         /// The columns/rows this image occupies.
+@@ -1981,6 +2017,13 @@
          columns: u32 = 0,
          rows: u32 = 0,
-+
+
 +        /// Keep the sizing box when a margin scroll trims its rows.
 +        trim_top: u32 = 0,
 +        max_rows: ?u32 = null,
 +
 +        /// A clipped pin scrolls with its remaining rows across cell size changes.
 +        margin_clipped: bool = false,
-
++
          /// The z-index for this placement.
          z: i32 = 0,
-@@ -2147,7 +2190,10 @@
+
+@@ -2029,14 +2072,21 @@
+             return std.math.mul(u32, lhs, rhs) catch std.math.maxInt(u32);
+         }
+
+-        /// Scale a dimension by an aspect ratio and round to the nearest
+-        /// integer. The u64 intermediate can hold the product of two u32s as
+-        /// well as the rounding adjustment.
+-        fn scaleDimension(value: u32, numerator: u32, denominator: u32) u32 {
++        const PixelRounding = enum { nearest, outward };
++
++        fn scaleDimension(
++            value: u32,
++            numerator: u32,
++            denominator: u32,
++            comptime rounding: PixelRounding,
++        ) u32 {
+             if (denominator == 0) return 0;
+
+-            const rounded = (@as(u64, value) * @as(u64, numerator) +
+-                @as(u64, denominator) / 2) / @as(u64, denominator);
++            const adjustment: u64 = switch (rounding) {
++                .nearest => denominator / 2,
++                .outward => denominator - 1,
++            };
++            const rounded = (@as(u64, value) * numerator + adjustment) / denominator;
+             return std.math.cast(u32, rounded) orelse std.math.maxInt(u32);
+         }
+
+@@ -2099,10 +2149,18 @@
+             self: Placement,
+             image: Image,
+             t: *const terminal.Terminal,
+-        ) struct {
+-            width: u32,
+-            height: u32,
+-        } {
++        ) PixelSize {
++            return self.pixelSizeRounded(image, t, .nearest);
++        }
++
++        const PixelSize = struct { width: u32, height: u32 };
++
++        fn pixelSizeRounded(
++            self: Placement,
++            image: Image,
++            t: *const terminal.Terminal,
++            comptime rounding: PixelRounding,
++        ) PixelSize {
+             const source = self.sourceRect(image);
+             const width = source.width;
+             const height = source.height;
+@@ -2147,7 +2205,10 @@
                      cell_width,
                      self.columns,
                  ) -| cell_offset.x;
@@ -529,11 +580,11 @@ Bound graphics storage and schedule animations for visible images.
 +                const calc_height = if (calc_width == 0 or width == 0 or height == 0)
 +                    0
 +                else
-+                    @max(1, scaleDimension(calc_width, height, width));
++                    @max(1, scaleDimension(calc_width, height, width, rounding));
 
                  return .{
                      .width = calc_width,
-@@ -2162,7 +2208,10 @@
+@@ -2162,7 +2223,10 @@
                      cell_height,
                      self.rows,
                  ) -| cell_offset.y;
@@ -541,25 +592,36 @@ Bound graphics storage and schedule animations for visible images.
 +                const calc_width = if (calc_height == 0 or width == 0 or height == 0)
 +                    0
 +                else
-+                    @max(1, scaleDimension(calc_height, width, height));
++                    @max(1, scaleDimension(calc_height, width, height, rounding));
 
                  return .{
                      .width = calc_width,
-@@ -2180,98 +2229,31 @@
+@@ -2171,7 +2235,8 @@
+             }
+         }
+
+-        /// Returns the size in grid cells that this placement takes up.
++        /// Terminal footprint for cursor moves, margin scrolling, and
++        /// cell-based deletion.
+         pub fn gridSize(
+             self: Placement,
+             image: Image,
+@@ -2180,98 +2245,35 @@
              cols: u32,
              rows: u32,
          } {
 -            // If we have a specified columns and rows then this is trivial.
-+            const row_limit = self.max_rows orelse std.math.maxInt(u32);
              if (self.columns > 0 and self.rows > 0) return .{
                  .cols = self.columns,
 -                .rows = self.rows,
-+                .rows = @min(row_limit, self.rows -| self.trim_top),
++                .rows = self.occupiedRows(self.rows),
              };
 
-             // Otherwise we calculate the pixel size, divide by
-             // cell size, and round up to the nearest integer.
-             const calc_size = self.pixelSize(image, t);
+-            // Otherwise we calculate the pixel size, divide by
+-            // cell size, and round up to the nearest integer.
+-            const calc_size = self.pixelSize(image, t);
++            // Even a fractional pixel can extend into the next cell.
++            const calc_size = self.pixelSizeRounded(image, t, .outward);
              const cell_offset = self.cellOffset(t);
 +            const full_rows = std.math.divCeil(
 +                u32,
@@ -577,12 +639,12 @@ Bound graphics storage and schedule animations for visible images.
 -                    calc_size.height +| cell_offset.y,
 -                    t.height_px / t.rows,
 -                ) catch 0,
-+                .rows = @min(row_limit, full_rows -| self.trim_top),
++                .rows = self.occupiedRows(full_rows),
              };
              // NOTE: Above `divCeil`s can only fail if the cell size is 0,
              //       in such a case it seems safe to return 0 for this.
--        }
--
+         }
+
 -        /// Permanently clip `count` rows off the top of this placement,
 -        /// which currently spans `span` grid rows, by shrinking the
 -        /// source rectangle (the requested source rect is materialized
@@ -649,10 +711,14 @@ Bound graphics storage and schedule animations for visible images.
 -            self.source_y = src.y;
 -            self.source_width = src.width;
 -            return true;
++        fn occupiedRows(self: Placement, full_rows: u32) u32 {
++            const row_limit = self.max_rows orelse std.math.maxInt(u32);
++            if (self.margin_clipped) return row_limit;
++            return @min(row_limit, full_rows -| self.trim_top);
          }
 
          /// Returns a selection of the entire rectangle this placement
-@@ -4080,7 +4062,7 @@
+@@ -4080,7 +4082,7 @@
          .gap_ms = 10,
          .pending_len = 4,
      });
@@ -661,7 +727,7 @@ Bound graphics storage and schedule animations for visible images.
      s.images.getPtr(1).?.animation = anim;
      try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
          .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
-@@ -4245,7 +4227,7 @@
+@@ -4245,7 +4247,7 @@
      }
 
      // Would extend above the top margin: anchored at the top margin
@@ -670,7 +736,7 @@ Bound graphics storage and schedule animations for visible images.
      try t.index();
      {
          const p = storage.placements.get(.{
-@@ -4254,8 +4236,8 @@
+@@ -4254,8 +4256,8 @@
          }).?;
          const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
          try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
@@ -681,7 +747,7 @@ Bound graphics storage and schedule animations for visible images.
      }
 
      // Fully clipped: deleted.
-@@ -4355,7 +4337,7 @@
+@@ -4355,7 +4357,7 @@
      t.setTopAndBottomMargin(2, 5);
      t.setCursorPos(2, 1);
 
@@ -690,7 +756,7 @@ Bound graphics storage and schedule animations for visible images.
      t.reverseIndex();
      {
          const p = storage.placements.get(.{
-@@ -4364,8 +4346,8 @@
+@@ -4364,8 +4366,8 @@
          }).?;
          const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
          try testing.expectEqual(point.Coordinate{ .x = 0, .y = 4 }, pt.coord());
@@ -701,7 +767,7 @@ Bound graphics storage and schedule animations for visible images.
      }
 
      // Fully clipped: deleted.
-@@ -4373,7 +4355,7 @@
+@@ -4373,7 +4375,7 @@
      try testing.expectEqual(@as(usize, 0), storage.placements.count());
  }
 
@@ -710,7 +776,7 @@ Bound graphics storage and schedule animations for visible images.
      const testing = std.testing;
      const alloc = testing.allocator;
      const io = testing.io;
-@@ -4404,10 +4386,10 @@
+@@ -4404,10 +4406,10 @@
      }).?;
      const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
      try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
@@ -1361,13 +1427,13 @@ Bound graphics storage and schedule animations for visible images.
 +    }
 +
 +    fn viewerExtent(p: RenderState.ImagePlacement, owner: [2]u32, viewer: [2]u32) [2]u32 {
-+        if (p.sizing == .cells or owner[0] == 0 or owner[1] == 0 or
-+            viewer[0] == 0 or viewer[1] == 0) return .{ p.cols, p.rows };
++        if (p.sizing == .cells or owner[0] == 0 or owner[1] == 0) return .{ p.cols, p.rows };
 +
++        const pixels = if (viewer[0] == 0 or viewer[1] == 0) owner else viewer;
 +        const owner_w: f64 = @floatFromInt(owner[0]);
 +        const owner_h: f64 = @floatFromInt(owner[1]);
-+        const viewer_w: f64 = @floatFromInt(viewer[0]);
-+        const viewer_h: f64 = @floatFromInt(viewer[1]);
++        const viewer_w: f64 = @floatFromInt(pixels[0]);
++        const viewer_h: f64 = @floatFromInt(pixels[1]);
 +        const source_w: f64 = @floatFromInt(p.source_width);
 +        const source_h: f64 = @floatFromInt(p.source_height);
 +        const width: f64 = @floatFromInt(p.width);

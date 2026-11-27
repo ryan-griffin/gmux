@@ -106,6 +106,21 @@ pub struct PlacementBounds {
     pub clip_y: Option<[f64; 2]>,
 }
 
+impl PlacementBounds {
+    /// The visible pixel interval after clipping to the viewport and placement rows.
+    #[inline]
+    pub fn visible_y(&self, viewport_height: f64) -> Option<[f64; 2]> {
+        let [_, y, _, height] = self.rect;
+        if y >= viewport_height || y + height <= 0.0 {
+            return None;
+        }
+        let [top, bottom] = self.clip_y.unwrap_or([0.0, viewport_height]);
+        let top = y.max(top).max(0.0);
+        let bottom = (y + height).min(bottom).min(viewport_height);
+        (top < bottom).then_some([top, bottom])
+    }
+}
+
 impl Placement {
     pub fn viewport_bounds(
         &self,

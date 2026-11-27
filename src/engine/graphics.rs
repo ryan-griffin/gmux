@@ -526,9 +526,8 @@ impl Selection<'_> {
             self.owner_pixels
         };
         let bounds = placement.viewport_bounds(self.cell, pixels, self.frozen_pixels);
-        let [x, y, w, h] = bounds.rect;
-        let [top, bottom] = bounds.clip_y.unwrap_or([0.0, view_h]);
-        if y.max(top).max(0.0) < (y + h).min(bottom).min(view_h)
+        let [x, _, w, _] = bounds.rect;
+        if bounds.visible_y(view_h).is_some()
             && self.visible_x(unicode && narrow, cell[1], x, w, view_w)
         {
             self.visible.push((raw.id, raw.z, placement));

@@ -2448,7 +2448,7 @@ fn validate_kitty_graphics(
     tiled.metrics = (10.0, 24.0);
     tiled.cells = &blank;
     tiled.bidi = None;
-    let graphics = Graphics {
+    let mut graphics = Graphics {
         cell_pixels: [8, 16],
         unicode_cell_pixels: None,
         frozen_cell_pixels: None,
@@ -2460,6 +2460,16 @@ fn validate_kitty_graphics(
                 height: 8,
                 format: PixelFormat::Rgb,
                 pixels: [255, 0, 0].repeat(64),
+            }),
+            Arc::new(Image {
+                key: 3,
+                width: 8,
+                height: 48,
+                format: PixelFormat::Rgb,
+                pixels: [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+                    .into_iter()
+                    .flat_map(|color| color.repeat(8 * 16))
+                    .collect(),
             }),
         ],
         placements: vec![
@@ -2489,6 +2499,21 @@ fn validate_kitty_graphics(
             },
         ],
     };
+    let modes = [
+        Some(ImageSizing::Columns),
+        Some(ImageSizing::Rows),
+        Some(ImageSizing::Native),
+        None,
+    ];
+    graphics
+        .placements
+        .extend(modes.into_iter().enumerate().map(|(i, sizing)| Placement {
+            cell: [14 + 2 * i as i32, 1],
+            size: [8, 48],
+            fit_rows: Some([1, 1]),
+            sizing,
+            ..placement(3, Layer::AboveText, 0, 8, [0, 0, 8, 48])
+        }));
     tiled.graphics = Some(&graphics);
     let drawn = node(&mut renderer, &tiled, font, context).0;
     let data = pixels(&render(gpu, &drawn, &tiled));
@@ -2500,6 +2525,22 @@ fn validate_kitty_graphics(
                 || (80..104).contains(&x)
                 || ((110..118).contains(&x) && y < 32);
             assert_eq!(data[byte..byte + 4], [0, 0, if red { 255 } else { 0 }, 255]);
+        }
+    }
+    for (i, sizing) in modes.into_iter().enumerate() {
+        let x = 143 + 20 * i;
+        let lower = match sizing {
+            Some(ImageSizing::Columns | ImageSizing::Native) => [255, 0, 0, 255],
+            _ => [0, 255, 0, 255],
+        };
+        for (y, expected) in [
+            (23, [0, 0, 0, 255]),
+            (28, [0, 255, 0, 255]),
+            (44, lower),
+            (48, [0, 0, 0, 255]),
+        ] {
+            let byte = (y * tiled.width as usize + x) * 4;
+            assert_eq!(&data[byte..byte + 4], &expected, "Sizing {i} at row {y}");
         }
     }
 

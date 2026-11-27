@@ -32,9 +32,12 @@ shared-memory transfers are disabled. GTK renders the PNG samples from
 Ghostty's Wuffs decoder as sRGB.
 
 Images follow their placements when scrolling and switching screens. An explicit
-row and column box fits the source aspect ratio. Animations advance while visible
-in a subscribed viewport. During synchronized output, resizing an existing
-viewport can expose more of its frozen frame. Placement sizing uses the
+row and column box fits the source aspect ratio. When margins clip an image,
+the terminal keeps the surviving rows across font changes and restart. Each
+viewer projects the original image using its cell metrics and clips it to those
+rows. Animations advance while visible in a subscribed viewport. During
+synchronized output, resizing an existing viewport can expose more of its
+frozen frame. Placement sizing uses the
 captured cell metrics until the hold ends. A new viewport waits for a complete
 frame when it joins a hold with image placements.
 Cached scroll previews show text until the daemon sends the requested viewport.

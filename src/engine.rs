@@ -2718,49 +2718,113 @@ mod tests {
     }
 
     #[test]
-    fn checkpoints_preserve_both_margin_clips_on_column_sized_images() {
+    fn restored_margin_rows_drive_scrolling_and_deletion_across_viewer_sizes() {
+        for (sizing, [width, height], owner_after) in [
+            ("c=1,", [1, 6], [2, 16]),
+            ("r=3,", [1, 6], [4, 28]),
+            ("", [8, 48], [8, 64]),
+            ("c=1,r=3,", [1, 6], [4, 24]),
+        ] {
+            let mut engine = Engine::new().unwrap();
+            engine.resize(12, 4, 8, 16).unwrap();
+            engine.write(
+                format!(
+                    "\x1b[2;4r\x1b[2;1H\x1b_Ga=T,f=24,i=5,s={width},v={height},{sizing}C=1,q=2;{}\x1b\\",
+                    "/wAA".repeat((width * height) as usize)
+                )
+                .as_bytes(),
+            );
+            engine.write(b"\x1b[4;1H\n\x1b[2;1H\x1bM\x1bM");
+
+            let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+            restored.resize(12, 4, 8, 16).unwrap();
+            let mut view = restored.new_view().unwrap();
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    let layout = active.graphics().0.unwrap();
+                    let [placement] = layout.placements.as_slice() else {
+                        panic!("Expected a clipped image placement for {sizing:?}");
+                    };
+                    assert_eq!(placement.cell, [0, 3]);
+                    assert_eq!(placement.source, [0, 0, width, height]);
+                    assert_eq!(placement.fit_rows, Some([1, 1]));
+                    let bounds = placement.bounds([8.0, 16.0], layout.cell_pixels);
+                    assert_eq!(bounds.rect, [0.0, 32.0, 8.0, 48.0]);
+                    assert_eq!(bounds.visible_y(64.0), Some([48.0, 64.0]));
+                })
+                .unwrap();
+
+            restored
+                .resize(12, 4, owner_after[0], owner_after[1])
+                .unwrap();
+            view.set_graphics_viewport(GraphicsViewport {
+                cell_pixels: [8, 16],
+                canvas_pixels: [96, 64],
+            });
+            restored.write(b"\x1b[2;4r\x1b[4;1H\n");
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    let layout = active.graphics().0.unwrap();
+                    let [placement] = layout.placements.as_slice() else {
+                        panic!(
+                            "Expected the subscriber to see the scrolled placement for {sizing:?}"
+                        );
+                    };
+                    assert_eq!(placement.cell, [0, 2]);
+                    assert_eq!(placement.fit_rows, Some([1, 1]));
+                    let bounds = placement.bounds([8.0, 16.0], layout.cell_pixels);
+                    assert_eq!(bounds.visible_y(64.0), Some([32.0, 48.0]));
+                })
+                .unwrap();
+
+            restored.write(b"\x1b_Ga=d,d=y,y=3,q=2\x1b\\");
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert!(
+                        active.graphics().0.is_none(),
+                        "Placement still visible for {sizing:?}"
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn margin_scroll_preserves_a_fractionally_occupied_row() {
         let mut engine = Engine::new().unwrap();
         engine.resize(12, 4, 8, 16).unwrap();
         engine.write(
-            b"\x1b[2;4r\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=1,v=6,c=1,C=1,q=2;/wAA/wAA/wAA/wAA/wAA/wAA\x1b\\",
+            format!(
+                "\x1b[2;4r\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=17,v=35,c=1,C=1,q=2;{}\x1b\\",
+                "/wAA".repeat(17 * 35)
+            )
+            .as_bytes(),
         );
-        engine.write(b"\x1b[4;1H\n\x1b[2;1H\x1bM\x1bM");
-
-        let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
-        let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
-        restored.resize(12, 4, 8, 16).unwrap();
-        let mut view = restored.new_view().unwrap();
-        restored
-            .with_view(&mut view, |active| {
-                active.snapshot().unwrap();
-                let layout = active.graphics().0.unwrap();
-                let [placement] = layout.placements.as_slice() else {
-                    panic!("Expected a clipped image placement");
-                };
-                assert_eq!(placement.cell, [0, 3]);
-                assert_eq!(placement.source, [0, 0, 1, 6]);
-                assert_eq!(placement.fit_rows, Some([1, 1]));
-                let bounds = placement.bounds([8.0, 16.0], layout.cell_pixels);
-                assert_eq!(bounds.rect, [0.0, 32.0, 8.0, 48.0]);
-                assert_eq!(bounds.clip_y, Some([48.0, 64.0]));
-            })
-            .unwrap();
-
-        restored.resize(12, 4, 2, 16).unwrap();
+        // The original height of 280/17 pixels occupies part of a second row.
+        engine.write(b"\x1b[4;1H\n");
+        let mut view = engine.new_view().unwrap();
         view.set_graphics_viewport(GraphicsViewport {
-            cell_pixels: [8, 16],
-            canvas_pixels: [96, 64],
+            cell_pixels: [12, 16],
+            canvas_pixels: [144, 64],
         });
-        restored.write(b"\x1b[2;4r\x1b[4;1H\n");
-        restored
+        engine
             .with_view(&mut view, |active| {
                 active.snapshot().unwrap();
                 let layout = active.graphics().0.unwrap();
                 let [placement] = layout.placements.as_slice() else {
-                    panic!("Expected the wider view to show the scrolled placement");
+                    panic!("Expected the wider viewport to show the surviving row");
                 };
-                assert_eq!(placement.cell, [0, 2]);
+                assert_eq!(placement.cell, [0, 1]);
+                assert_eq!(placement.source, [0, 0, 17, 35]);
                 assert_eq!(placement.fit_rows, Some([1, 1]));
+                assert_eq!(
+                    placement.bounds([12.0, 16.0], layout.cell_pixels).clip_y,
+                    Some([16.0, 32.0])
+                );
             })
             .unwrap();
     }

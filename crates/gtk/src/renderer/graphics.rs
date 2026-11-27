@@ -461,12 +461,12 @@ impl Textures {
             return;
         }
         let (cw, ch) = scene.metrics;
-        let viewport = graphene::Rect::new(
-            0.0,
-            0.0,
-            (cw * f64::from(scene.frame.cols)).min(f64::from(scene.width)) as f32,
-            (ch * f64::from(scene.frame.rows)).min(f64::from(scene.height)) as f32,
-        );
+        let view_width = (cw * f64::from(scene.frame.cols)).min(f64::from(scene.width));
+        let view_height = (ch * f64::from(scene.frame.rows)).min(f64::from(scene.height));
+        if view_width <= 0.0 || view_height <= 0.0 {
+            return;
+        }
+        let viewport = graphene::Rect::new(0.0, 0.0, view_width as f32, view_height as f32);
         snapshot.push_clip(&viewport);
         let mut pruned = false;
         for p in &graphics.placements[start..end] {
@@ -479,26 +479,24 @@ impl Textures {
                 graphics.cell_pixels
             };
             let bounds = p.viewport_bounds([cw, ch], pixels, graphics.frozen_cell_pixels);
-            let [x, y, width, height] = bounds.rect.map(|value| value as f32);
-            let dest = graphene::Rect::new(x, y, width, height);
+            if bounds.visible_y(view_height).is_none() {
+                continue;
+            }
             let reordered_tile = p.source_subpixels.is_some()
                 && usize::try_from(p.cell[1])
                     .ok()
                     .and_then(|row| scene.bidi?.row(row))
                     .is_some();
-            if y >= viewport.height()
-                || y + height <= 0.0
-                || (!reordered_tile && viewport.intersection(&dest).is_none())
-            {
+            let [x, _, width, _] = bounds.rect;
+            if !reordered_tile && (x >= view_width || x + width <= 0.0) {
                 continue;
             }
+            let [x, y, width, height] = bounds.rect.map(|value| value as f32);
+            let dest = graphene::Rect::new(x, y, width, height);
             let clip = bounds.clip_y.map(|[top, bottom]| {
                 graphene::Rect::new(0.0, top as f32, viewport.width(), (bottom - top) as f32)
             });
             if let Some(clip) = &clip {
-                if clip.intersection(&dest).is_none() {
-                    continue;
-                }
                 snapshot.push_clip(clip);
             }
             let full = [0, 0, image.width, image.height];
