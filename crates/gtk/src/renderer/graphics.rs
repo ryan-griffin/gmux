@@ -223,7 +223,7 @@ impl Textures {
             } else {
                 graphics.cell_pixels
             };
-            let bounds = p.bounds([cw, ch], pixels);
+            let bounds = p.viewport_bounds([cw, ch], pixels, graphics.frozen_cell_pixels);
             let [x, y, width, height] = bounds.rect.map(|value| value as f32);
             let dest = graphene::Rect::new(x, y, width, height);
             let reordered_tile = p.source_subpixels.is_some()

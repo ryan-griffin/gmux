@@ -96,7 +96,7 @@ pub struct Placement {
     pub source: [u32; 4],
     /// Optional Unicode crop in 16.16 source pixels.
     pub source_subpixels: Option<[u32; 4]>,
-    /// For an aspect-preserving sizing box, the trimmed top and visible row counts.
+    /// The trimmed top and visible row counts for a sizing box or clipped image.
     pub fit_rows: Option<[u32; 2]>,
     pub sizing: Option<ImageSizing>,
 }
@@ -107,6 +107,26 @@ pub struct PlacementBounds {
 }
 
 impl Placement {
+    pub fn viewport_bounds(
+        &self,
+        viewer: [f64; 2],
+        owner_pixels: [u32; 2],
+        frozen_pixels: Option<[u32; 2]>,
+    ) -> PlacementBounds {
+        let Some(frozen) = frozen_pixels else {
+            return self.bounds(viewer, owner_pixels);
+        };
+        let cell = frozen.map(f64::from);
+        let sx = viewer[0] / cell[0];
+        let sy = viewer[1] / cell[1];
+        let bounds = self.bounds(cell, owner_pixels);
+        let [x, y, w, h] = bounds.rect;
+        PlacementBounds {
+            rect: [x * sx, y * sy, w * sx, h * sy],
+            clip_y: bounds.clip_y.map(|clip| clip.map(|y| y * sy)),
+        }
+    }
+
     pub fn bounds(&self, [cw, ch]: [f64; 2], [pixel_w, pixel_h]: [u32; 2]) -> PlacementBounds {
         let sx = cw / f64::from(pixel_w);
         let sy = ch / f64::from(pixel_h);
@@ -118,24 +138,26 @@ impl Placement {
         let mut clip_y = None;
         let source_w = f64::from(self.source[2]);
         let source_h = f64::from(self.source[3]);
+        match self.sizing {
+            Some(ImageSizing::Columns) => height = width * source_h / source_w,
+            Some(ImageSizing::Rows) => width = height * source_w / source_h,
+            Some(ImageSizing::Native) => [width, height] = self.size.map(f64::from),
+            None if self.fit_rows.is_some() => {
+                let scale = (width / source_w).min(height / source_h);
+                let fitted_width = source_w * scale;
+                let fitted_height = source_h * scale;
+                x += (width - fitted_width) / 2.0;
+                y += (height - fitted_height) / 2.0;
+                width = fitted_width;
+                height = fitted_height;
+            }
+            None => {}
+        }
         if let Some([trim_top, rows]) = self.fit_rows {
-            let scale = (width / source_w).min(height / source_h);
-            let fitted_width = source_w * scale;
-            let fitted_height = source_h * scale;
-            x += (width - fitted_width) / 2.0;
-            y += (height - fitted_height) / 2.0 - f64::from(trim_top) * ch;
-            width = fitted_width;
-            height = fitted_height;
+            y -= f64::from(trim_top) * ch;
             let bottom = row_y + f64::from(rows) * ch;
             if y < row_y || y + height > bottom {
                 clip_y = Some([row_y, bottom]);
-            }
-        } else {
-            match self.sizing {
-                Some(ImageSizing::Columns) => height = width * source_h / source_w,
-                Some(ImageSizing::Rows) => width = height * source_w / source_h,
-                Some(ImageSizing::Native) => [width, height] = self.size.map(f64::from),
-                None => {}
             }
         }
         PlacementBounds {
@@ -184,6 +206,7 @@ impl<'de> Deserialize<'de> for Placement {
 pub struct Graphics {
     pub cell_pixels: [u32; 2],
     pub unicode_cell_pixels: Option<[u32; 2]>,
+    pub frozen_cell_pixels: Option<[u32; 2]>,
     pub placements: Vec<Placement>,
     /// Sorted by generation.
     pub images: Vec<Arc<Image>>,
@@ -208,6 +231,8 @@ pub struct GraphicsUpdate {
     pub cell_pixels: [u32; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unicode_cell_pixels: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_cell_pixels: Option<[u32; 2]>,
     pub placements: Vec<Placement>,
     pub images: Vec<Arc<Image>>,
 }
@@ -220,6 +245,9 @@ impl GraphicsUpdate {
                 && (self.placements.is_empty() || !self.cell_pixels.contains(&0))
                 && self
                     .unicode_cell_pixels
+                    .is_none_or(|cell| !cell.contains(&0))
+                && self
+                    .frozen_cell_pixels
                     .is_none_or(|cell| !cell.contains(&0))
                 && self
                     .placements
@@ -301,8 +329,7 @@ impl GraphicsUpdate {
                 );
             }
             anyhow::ensure!(
-                placement.sizing.is_none()
-                    || (placement.fit_rows.is_none() && placement.source_subpixels.is_none()),
+                placement.sizing.is_none() || placement.source_subpixels.is_none(),
                 "Conflicting terminal image sizing"
             );
         }
@@ -313,6 +340,7 @@ impl GraphicsUpdate {
         *previous = Graphics {
             cell_pixels: self.cell_pixels,
             unicode_cell_pixels: self.unicode_cell_pixels,
+            frozen_cell_pixels: self.frozen_cell_pixels,
             placements: self.placements,
             images: images.into_values().collect(),
         };
@@ -371,6 +399,7 @@ mod tests {
                     replace: true,
                     cell_pixels: [8, 16],
                     unicode_cell_pixels: None,
+                    frozen_cell_pixels: None,
                     placements: vec![placement; MAX_PLACEMENTS],
                     images: vec![image],
                 }),
@@ -416,6 +445,7 @@ mod tests {
                     replace: true,
                     cell_pixels: [8, 16],
                     unicode_cell_pixels: None,
+                    frozen_cell_pixels: None,
                     placements: vec![placement],
                     images: vec![Arc::new(Image {
                         key: 1,
@@ -457,6 +487,7 @@ mod tests {
             replace: false,
             cell_pixels: [8, 16],
             unicode_cell_pixels: None,
+            frozen_cell_pixels: None,
             placements: vec![placement],
             images: vec![],
         }
@@ -471,6 +502,7 @@ mod tests {
                 replace: false,
                 cell_pixels: [8, 16],
                 unicode_cell_pixels: None,
+                frozen_cell_pixels: None,
                 placements: vec![placement],
                 images: vec![],
             }

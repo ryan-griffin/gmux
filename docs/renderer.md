@@ -33,9 +33,10 @@ Ghostty's Wuffs decoder as sRGB.
 
 Images follow their placements when scrolling and switching screens. An explicit
 row and column box fits the source aspect ratio. Animations advance while visible
-in a subscribed viewport. During synchronized output,
-existing viewports keep their images. A new viewport waits for a complete
-image-bearing frame when it joins a hold with images.
+in a subscribed viewport. During synchronized output, resizing an existing
+viewport can expose more of its frozen frame. Placement sizing uses the
+captured cell metrics until the hold ends. A new viewport waits for a complete
+frame when it joins a hold with image placements.
 Cached scroll previews show text until the daemon sends the requested viewport.
 Each screen can retain 10 MB of pixels, 4,096 images, 4,096 placements, and
 32,768 additional animation frames. When images exceed the pixel or image count

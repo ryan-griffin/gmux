@@ -202,9 +202,11 @@ typedef struct {
     uint8_t channels;
     GmuxText pixels;
 } GmuxImage;
-typedef void (*GmuxImagePlacementFn)(void *userdata, const GmuxImagePlacement *placement);
+typedef bool (*GmuxImagePlacementFn)(void *userdata, const GmuxImagePlacement *placement,
+    const uint32_t cell_pixels[2]);
 typedef void (*GmuxVirtualRunFn)(void *userdata, uint32_t image, uint32_t placement,
     uint32_t tag, int32_t row, uint32_t column, uint32_t width);
+typedef bool (*GmuxGraphicsSourceFn)(void *userdata, uint32_t id, uint64_t generation);
 typedef size_t (*GmuxGraphicsIdsFn)(const void *viewdata, const uint32_t **ids);
 typedef void (*GmuxImageChangedFn)(void *userdata, uint32_t image_id);
 typedef struct {
@@ -213,9 +215,11 @@ typedef struct {
 } GmuxGraphicsHold;
 typedef bool (*GmuxGraphicsHoldFn)(void *userdata, const GmuxEngine *engine,
     const GmuxView *view, void *viewdata, GmuxGraphicsHold *hold);
-uint64_t gmux_engine_graphics(const GmuxEngine *engine, const GmuxView *view, uint64_t known,
+uint64_t gmux_engine_graphics(const GmuxEngine *engine, uint64_t known,
     uint32_t cell_pixels[2], void *userdata, GmuxImagePlacementFn callback);
 void gmux_engine_graphics_virtual_runs(const GmuxEngine *engine, void *userdata, GmuxVirtualRunFn visit);
+bool gmux_engine_graphics_sources(const GmuxEngine *engine, const GmuxView *view, void *userdata,
+    GmuxGraphicsSourceFn visit);
 bool gmux_engine_image(const GmuxEngine *engine, uint32_t id, uint64_t generation, GmuxImage *image);
 void gmux_engine_graphics_tick(GmuxEngine *engine, uint64_t *delay_ms, GmuxGraphicsIdsFn ids,
     GmuxImageChangedFn changed, void *userdata);

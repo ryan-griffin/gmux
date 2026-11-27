@@ -1,7 +1,7 @@
 use super::{
     Events, GMUX_GRAPHICS_MAX_PIXEL_BYTES, GMUX_GRAPHICS_MAX_PLACEMENTS, GmuxEngine,
     GmuxGraphicsHold, GmuxImage, GmuxImagePlacement, GmuxView, gmux_engine_graphics,
-    gmux_engine_graphics_virtual_runs, gmux_engine_image,
+    gmux_engine_graphics_sources, gmux_engine_graphics_virtual_runs, gmux_engine_image,
 };
 use gmux_protocol::{
     Cell as TerminalCell, Frame,
@@ -10,7 +10,7 @@ use gmux_protocol::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ffi::c_void,
     mem::MaybeUninit,
     ptr,
@@ -29,7 +29,8 @@ pub(super) struct Snapshot {
     pub held: LayoutSnapshot,
     pub published: Option<Arc<GraphicsLayout>>,
     pub geometry: GraphicsViewport,
-    held_geometry: GraphicsViewport,
+    held_revision: u64,
+    held_cell_pixels: [u32; 2],
     budget: Rc<Cell<usize>>,
 }
 
@@ -39,11 +40,8 @@ pub(super) struct LayoutSnapshot {
     cell_pixels: [u32; 2],
     image_ids: Vec<u32>,
     pub layout: Option<Arc<GraphicsLayout>>,
-    anchors: Vec<VirtualAnchor>,
-    has_sizing: bool,
-    has_unicode: bool,
+    needs_text: bool,
     viewport: Option<Viewport>,
-    visible: Option<Arc<GraphicsLayout>>,
     origin_viewport: Option<Viewport>,
     origins: HashMap<[u32; 3], VisualOrigin>,
     unicode_columns: HashMap<i32, Option<VisibleColumns>>,
@@ -56,7 +54,6 @@ struct VisibleColumns {
 }
 
 struct VirtualAnchor {
-    index: usize,
     key: [u32; 3],
     column: u32,
     runs_stamp: u64,
@@ -74,6 +71,7 @@ struct Viewport {
     cols: u16,
     rows: u16,
     geometry: GraphicsViewport,
+    frozen_cell_pixels: Option<[u32; 2]>,
 }
 
 impl Viewport {
@@ -115,6 +113,7 @@ pub(crate) struct ImageSource {
 pub(crate) struct GraphicsLayout {
     pub cell_pixels: [u32; 2],
     pub unicode_cell_pixels: Option<[u32; 2]>,
+    pub frozen_cell_pixels: Option<[u32; 2]>,
     pub placements: Vec<Placement>,
     pub images: Vec<ImageSource>,
 }
@@ -145,7 +144,8 @@ impl Snapshot {
             held: Default::default(),
             published: None,
             geometry: GraphicsViewport::default(),
-            held_geometry: GraphicsViewport::default(),
+            held_revision: 0,
+            held_cell_pixels: [0; 2],
             budget,
         }
     }
@@ -160,226 +160,136 @@ impl Snapshot {
         size_of::<Self>() + self.live.memory_size() + self.held.memory_size()
     }
 
-    pub fn publish(
-        &mut self,
-        engine: *const GmuxEngine,
-        held: bool,
-        frame: Frame,
-        revision: u64,
-        cells: &[TerminalCell],
-    ) -> (Option<Arc<GraphicsLayout>>, bool) {
-        let geometry = if held {
-            self.held_geometry
+    pub fn publish(&mut self, held: bool) -> Option<Arc<GraphicsLayout>> {
+        let latest = if held {
+            &self.held.layout
         } else {
-            self.geometry
+            &self.live.layout
         };
-        let latest = if held { &mut self.held } else { &mut self.live };
-        let newly_visible = latest.fit_viewport(engine, frame, revision, cells, geometry);
-        let latest = &latest.visible;
         if let (Some(published), Some(latest)) = (&self.published, latest)
             && (Arc::ptr_eq(published, latest)
                 || (published.cell_pixels == latest.cell_pixels
                     && published.unicode_cell_pixels == latest.unicode_cell_pixels
+                    && published.frozen_cell_pixels == latest.frozen_cell_pixels
                     && published.placements == latest.placements))
         {
-            return (Some(published.clone()), newly_visible);
+            return Some(published.clone());
         }
         self.published.clone_from(latest);
-        (self.published.clone(), newly_visible)
+        self.published.clone()
+    }
+
+    pub fn refresh(
+        &mut self,
+        engine: *const GmuxEngine,
+        pixels: &mut HashMap<u64, Weak<Image>>,
+        held: bool,
+        frame: Frame,
+        revision: u64,
+        cells: &[TerminalCell],
+    ) -> bool {
+        let (snapshot, revision) = if held {
+            (&mut self.held, self.held_revision)
+        } else {
+            (&mut self.live, revision)
+        };
+        snapshot.refresh(
+            engine,
+            Viewport {
+                revision,
+                offset: frame.scrollback.offset,
+                cols: frame.cols,
+                rows: frame.rows,
+                geometry: self.geometry,
+                frozen_cell_pixels: held.then_some(self.held_cell_pixels),
+            },
+            cells,
+            pixels,
+        )
     }
 }
 
 impl LayoutSnapshot {
-    pub fn refresh(
+    fn refresh(
         &mut self,
         engine: *const GmuxEngine,
-        view: *const GmuxView,
+        viewport: Viewport,
+        cells: &[TerminalCell],
         pixels: &mut HashMap<u64, Weak<Image>>,
-        geometry: GraphicsViewport,
-    ) {
-        unsafe extern "C" fn collect(data: *mut c_void, raw: *const GmuxImagePlacement) {
-            unsafe { &mut *data.cast::<Vec<GmuxImagePlacement>>() }.push(unsafe { *raw });
+    ) -> bool {
+        unsafe extern "C" fn collect(
+            data: *mut c_void,
+            raw: *const GmuxImagePlacement,
+            cell_pixels: *const u32,
+        ) -> bool {
+            let selection = unsafe { &mut *data.cast::<Selection<'_>>() };
+            let raw = unsafe { *raw };
+            // The iterator visits positioned images before Unicode runs.
+            if raw.source_subpixels[2] == 0 {
+                selection.positioned.push(raw);
+                return true;
+            }
+            selection.prepare(unsafe { *cell_pixels.cast::<[u32; 2]>() });
+            selection.keep(raw)
         }
 
-        let mut raw = Vec::<GmuxImagePlacement>::new();
+        let known_viewport = Viewport {
+            revision: if self.needs_text {
+                viewport.revision
+            } else {
+                0
+            },
+            ..viewport
+        };
+        let same_viewport = self.viewport == Some(known_viewport);
+        let known = if same_viewport { self.generation } else { 0 };
         let mut cell_pixels = self.cell_pixels;
+        let mut selection = Selection {
+            viewport,
+            engine,
+            cells,
+            positioned: Vec::new(),
+            visible: Vec::new(),
+            needs_text: false,
+            owner_pixels: [0; 2],
+            unicode_pixels: None,
+            frozen_pixels: None,
+            cell: [0.0; 2],
+            canvas: [0.0; 2],
+            prepared: false,
+            origin_viewport: &mut self.origin_viewport,
+            origins: &mut self.origins,
+            unicode_viewport: &mut self.unicode_viewport,
+            unicode_columns: &mut self.unicode_columns,
+        };
         let generation = unsafe {
             gmux_engine_graphics(
                 engine,
-                view,
-                self.generation,
+                known,
                 cell_pixels.as_mut_ptr(),
-                ptr::from_mut(&mut raw).cast(),
+                ptr::from_mut(&mut selection).cast(),
                 Some(collect),
             )
         };
-        if generation == self.generation && (generation == 0 || self.cell_pixels == cell_pixels) {
-            return;
-        }
-        self.generation = generation;
-        self.cell_pixels = cell_pixels;
-        self.anchors.clear();
-        self.has_sizing = false;
-        self.has_unicode = false;
-        self.viewport = None;
-        if raw.is_empty() {
-            self.layout = None;
-            pixels.retain(|_, image| image.strong_count() != 0);
-            return;
-        }
-        raw.sort_unstable_by_key(|p| {
-            (
-                p.layer,
-                p.z,
-                p.id,
-                p.cell,
-                p.offset,
-                p.source,
-                p.source_subpixels,
-                p.virtual_anchor,
-                p.fit_rows,
-                p.sizing,
-                p.size,
-            )
-        });
-        let mut images = BTreeMap::new();
-        let mut placements = Vec::with_capacity(raw.len());
-        for p in raw {
-            images.entry(p.generation).or_insert(ImageSource {
-                key: p.generation,
-                id: p.id,
-            });
-            let [image, placement, tag, column] = p.virtual_anchor;
-            if image != 0 {
-                self.anchors.push(VirtualAnchor {
-                    index: placements.len(),
-                    key: [image, placement, tag],
-                    column,
-                    runs_stamp: p.anchor_runs_stamp,
-                });
-            }
-            let fit_rows = (p.fit_rows[1] != 0).then_some(p.fit_rows);
-            let sizing = match p.sizing {
-                1 => Some(ImageSizing::Columns),
-                2 => Some(ImageSizing::Rows),
-                3 => Some(ImageSizing::Native),
-                _ => None,
-            };
-            self.has_sizing |= fit_rows.is_some() || sizing.is_some();
-            let source_subpixels = (p.source_subpixels[2] != 0).then_some(p.source_subpixels);
-            self.has_unicode |= source_subpixels.is_some();
-            placements.push(Placement {
-                image: p.generation,
-                layer: [Layer::BelowBackground, Layer::BelowText, Layer::AboveText]
-                    [p.layer as usize],
-                cell: p.cell,
-                offset: p.offset,
-                size: p.size,
-                source: p.source,
-                source_subpixels,
-                fit_rows,
-                sizing,
-            });
-        }
-        let [width, height] = geometry.cell_pixels;
-        let [owner_width, owner_height] = cell_pixels;
-        let unicode_cell_pixels = (self.has_unicode
-            && width != 0
-            && height != 0
-            && u64::from(owner_width) * u64::from(height)
-                != u64::from(owner_height) * u64::from(width))
-        .then_some(geometry.cell_pixels);
-        if !self.layout.as_ref().is_some_and(|old| {
-            old.cell_pixels == cell_pixels
-                && old.unicode_cell_pixels == unicode_cell_pixels
-                && old.placements == placements
-        }) {
-            self.layout = Some(Arc::new(GraphicsLayout {
-                cell_pixels,
-                unicode_cell_pixels,
-                placements,
-                images: images.into_values().collect(),
-            }));
-        }
-        pixels.retain(|_, image| image.strong_count() != 0);
-    }
-
-    fn fit_viewport(
-        &mut self,
-        engine: *const GmuxEngine,
-        frame: Frame,
-        revision: u64,
-        cells: &[TerminalCell],
-        geometry: GraphicsViewport,
-    ) -> bool {
-        let mut viewport = Viewport {
-            revision,
-            offset: frame.scrollback.offset,
-            cols: frame.cols,
-            rows: frame.rows,
-            geometry,
-        };
-        let (cell, canvas) = viewport.pixels(self.cell_pixels);
-        let unicode_clipped = self.has_unicode
-            && (canvas[0] < f64::from(viewport.cols) * cell[0]
-                || canvas[1] < f64::from(viewport.rows) * cell[1]);
-        if self.anchors.is_empty() && !unicode_clipped {
-            viewport.revision = 0;
-        }
-        if self.viewport == Some(viewport) {
+        if same_viewport
+            && generation == self.generation
+            && (generation == 0 || self.cell_pixels == cell_pixels)
+        {
             return false;
         }
-        let unicode_viewport = unicode_clipped.then_some((viewport, self.cell_pixels));
-        if self.unicode_viewport != unicode_viewport {
-            self.unicode_columns.clear();
-            self.unicode_viewport = unicode_viewport;
-        }
-        self.viewport = Some(viewport);
-        let text_viewport = Viewport {
-            geometry: GraphicsViewport::default(),
+        selection.prepare(cell_pixels);
+        self.generation = generation;
+        self.cell_pixels = cell_pixels;
+        self.needs_text = selection.needs_text;
+        self.viewport = Some(Viewport {
+            revision: if self.needs_text {
+                viewport.revision
+            } else {
+                0
+            },
             ..viewport
-        };
-        let visible = match &self.layout {
-            Some(layout) if self.has_sizing || !self.anchors.is_empty() || unicode_clipped => {
-                if self.anchors.is_empty() {
-                    self.origins.clear();
-                    self.origin_viewport = None;
-                } else if self.origin_viewport != Some(text_viewport)
-                    || self.anchors.iter().any(|a| {
-                        self.origins
-                            .get(&a.key)
-                            .is_none_or(|o| o.runs_stamp != a.runs_stamp)
-                    })
-                {
-                    self.origins.clear();
-                    self.origins.extend(self.anchors.iter().map(|a| {
-                        (
-                            a.key,
-                            VisualOrigin {
-                                left: usize::MAX,
-                                runs_stamp: a.runs_stamp,
-                            },
-                        )
-                    }));
-                    read_visual_origins(engine, &mut self.origins, cells, frame.cols.into());
-                    self.origin_viewport = Some(text_viewport);
-                }
-                project_viewport(
-                    layout,
-                    &self.anchors,
-                    &self.origins,
-                    viewport,
-                    unicode_clipped,
-                    cells,
-                    &mut self.unicode_columns,
-                )
-            }
-            layout => {
-                self.origins.clear();
-                self.origin_viewport = None;
-                layout.clone()
-            }
-        };
+        });
+        let visible = selection.into_layout();
         let visible_images = visible.as_ref().map_or(&[][..], |layout| &layout.images);
         let newly_visible = visible_images
             .iter()
@@ -389,29 +299,24 @@ impl LayoutSnapshot {
             .extend(visible_images.iter().map(|source| source.id));
         self.image_ids.sort_unstable();
         self.image_ids.dedup();
-        self.visible = visible;
+        if !matches!((&self.layout, &visible), (Some(old), Some(new))
+            if old.cell_pixels == new.cell_pixels
+                && old.unicode_cell_pixels == new.unicode_cell_pixels
+                && old.frozen_cell_pixels == new.frozen_cell_pixels
+                && old.placements == new.placements)
+        {
+            self.layout = visible;
+        }
+        pixels.retain(|_, image| image.strong_count() != 0);
         newly_visible
     }
 
     pub fn memory_size(&self) -> usize {
-        let layout_size = |layout: &Arc<GraphicsLayout>| {
-            size_of::<GraphicsLayout>()
-                + layout.placements.capacity() * size_of::<Placement>()
-                + layout.images.capacity() * size_of::<ImageSource>()
-        };
         self.image_ids.capacity() * size_of::<u32>()
-            + self.anchors.capacity() * size_of::<VirtualAnchor>()
-            + self.layout.as_ref().map_or(0, layout_size)
-            + self.visible.as_ref().map_or(0, |visible| {
-                if self
-                    .layout
-                    .as_ref()
-                    .is_some_and(|layout| Arc::ptr_eq(visible, layout))
-                {
-                    0
-                } else {
-                    layout_size(visible)
-                }
+            + self.layout.as_ref().map_or(0, |layout| {
+                size_of::<GraphicsLayout>()
+                    + layout.placements.capacity() * size_of::<Placement>()
+                    + layout.images.capacity() * size_of::<ImageSource>()
             })
             + self.origins.capacity() * (size_of::<([u32; 3], VisualOrigin)>() + 1)
             + self.unicode_columns.capacity() * (size_of::<(i32, Option<VisibleColumns>)>() + 1)
@@ -428,6 +333,11 @@ impl LayoutSnapshot {
             .iter()
             .any(|id| self.image_ids.binary_search(id).is_ok())
     }
+}
+
+fn bidi_row(cells: &[TerminalCell], cols: usize, row: i32) -> Option<Row> {
+    let start = usize::try_from(row).ok()? * cols;
+    Row::new(cells.get(start..start + cols)?)
 }
 
 fn read_visual_origins(
@@ -482,108 +392,230 @@ fn read_visual_origins(
     };
 }
 
-fn bidi_row(cells: &[TerminalCell], cols: usize, row: i32) -> Option<Row> {
-    let start = usize::try_from(row).ok()? * cols;
-    Row::new(cells.get(start..start + cols)?)
+struct Selection<'a> {
+    viewport: Viewport,
+    engine: *const GmuxEngine,
+    cells: &'a [TerminalCell],
+    positioned: Vec<GmuxImagePlacement>,
+    visible: Vec<(u32, i32, Placement)>,
+    owner_pixels: [u32; 2],
+    unicode_pixels: Option<[u32; 2]>,
+    frozen_pixels: Option<[u32; 2]>,
+    cell: [f64; 2],
+    canvas: [f64; 2],
+    needs_text: bool,
+    prepared: bool,
+    origin_viewport: &'a mut Option<Viewport>,
+    origins: &'a mut HashMap<[u32; 3], VisualOrigin>,
+    unicode_viewport: &'a mut Option<(Viewport, [u32; 2])>,
+    unicode_columns: &'a mut HashMap<i32, Option<VisibleColumns>>,
 }
 
-fn project_viewport(
-    layout: &Arc<GraphicsLayout>,
-    anchors: &[VirtualAnchor],
-    origins: &HashMap<[u32; 3], VisualOrigin>,
-    viewport: Viewport,
-    unicode_clipped: bool,
-    cells: &[TerminalCell],
-    unicode_columns: &mut HashMap<i32, Option<VisibleColumns>>,
-) -> Option<Arc<GraphicsLayout>> {
-    let (cell, [view_w, view_h]) = viewport.pixels(layout.cell_pixels);
-    let cols = usize::from(viewport.cols);
-    let whole_cols = (view_w / cell[0]).floor() as usize;
-    let partial_width = view_w - whole_cols as f64 * cell[0];
-    let mut placements = Vec::new();
-    let mut copied = 0;
-    let mut anchors = anchors.iter().peekable();
-    for (index, &original) in layout.placements.iter().enumerate() {
-        let mut placement = original;
-        let unicode = placement.source_subpixels.is_some();
-        if anchors.peek().is_some_and(|anchor| anchor.index == index) {
-            let anchor = anchors.next().unwrap();
-            if let Some(origin) = origins.get(&anchor.key)
-                && let Ok(visual) = i32::try_from(origin.left)
-            {
-                placement.cell[0] = placement.cell[0].saturating_add(visual - anchor.column as i32);
-            }
-        } else if placement.fit_rows.is_none()
-            && placement.sizing.is_none()
-            && !(unicode && unicode_clipped)
-        {
-            continue;
+impl Selection<'_> {
+    fn prepare(&mut self, owner_pixels: [u32; 2]) {
+        if self.prepared {
+            return;
         }
-        let pixels = if unicode {
-            layout.unicode_cell_pixels.unwrap_or(layout.cell_pixels)
-        } else {
-            layout.cell_pixels
+        self.prepared = true;
+        self.owner_pixels = owner_pixels;
+        (self.cell, self.canvas) = self.viewport.pixels(owner_pixels);
+        let source = self
+            .viewport
+            .frozen_cell_pixels
+            .unwrap_or(self.viewport.geometry.cell_pixels);
+        let [width, height] = source;
+        if self.viewport.frozen_cell_pixels.is_some() {
+            let frozen = if source.contains(&0) {
+                owner_pixels
+            } else {
+                source
+            };
+            self.frozen_pixels = (frozen.map(f64::from) != self.cell).then_some(frozen);
+        }
+        let [owner_width, owner_height] = owner_pixels;
+        self.unicode_pixels = (width != 0
+            && height != 0
+            && u64::from(owner_width) * u64::from(height)
+                != u64::from(owner_height) * u64::from(width))
+        .then_some([width, height]);
+        let viewport = Viewport {
+            geometry: GraphicsViewport::default(),
+            frozen_cell_pixels: None,
+            ..self.viewport
         };
-        let bounds = placement.bounds(cell, pixels);
+        let positioned = std::mem::take(&mut self.positioned);
+        let anchors = || positioned.iter().filter_map(VirtualAnchor::from_raw);
+        let any_anchors = anchors().next().is_some();
+        self.needs_text |= any_anchors;
+        if !any_anchors {
+            self.origins.clear();
+            *self.origin_viewport = None;
+        } else if *self.origin_viewport != Some(viewport)
+            || anchors().any(|a| {
+                self.origins
+                    .get(&a.key)
+                    .is_none_or(|o| o.runs_stamp != a.runs_stamp)
+            })
+        {
+            self.origins.clear();
+            self.origins.extend(anchors().map(|a| {
+                (
+                    a.key,
+                    VisualOrigin {
+                        left: usize::MAX,
+                        runs_stamp: a.runs_stamp,
+                    },
+                )
+            }));
+            read_visual_origins(
+                self.engine,
+                self.origins,
+                self.cells,
+                usize::from(viewport.cols),
+            );
+            *self.origin_viewport = Some(viewport);
+        }
+        let narrow = self.canvas[0] < f64::from(self.viewport.cols) * self.cell[0];
+        let unicode_viewport = narrow.then_some((self.viewport, owner_pixels));
+        if *self.unicode_viewport != unicode_viewport {
+            self.unicode_columns.clear();
+            *self.unicode_viewport = unicode_viewport;
+        }
+        for raw in positioned {
+            if !self.keep(raw) {
+                break;
+            }
+        }
+    }
+
+    fn keep(&mut self, raw: GmuxImagePlacement) -> bool {
+        if self.visible.len() == GMUX_GRAPHICS_MAX_PLACEMENTS as usize {
+            return false;
+        }
+        let source_subpixels = (raw.source_subpixels[2] != 0).then_some(raw.source_subpixels);
+        let unicode = source_subpixels.is_some();
+        let [view_w, view_h] = self.canvas;
+        let narrow = view_w < f64::from(self.viewport.cols) * self.cell[0];
+        self.needs_text |= unicode && narrow;
+        let mut cell = raw.cell;
+        if let Some(anchor) = VirtualAnchor::from_raw(&raw)
+            && let Some(origin) = self.origins.get(&anchor.key)
+            && let Ok(visual) = i32::try_from(origin.left)
+        {
+            cell[0] = cell[0].saturating_add(visual - anchor.column as i32);
+        }
+        let placement = Placement {
+            image: raw.generation,
+            layer: [Layer::BelowBackground, Layer::BelowText, Layer::AboveText][raw.layer as usize],
+            cell,
+            offset: raw.offset,
+            size: raw.size,
+            source: raw.source,
+            source_subpixels,
+            fit_rows: (raw.fit_rows[1] != 0).then_some(raw.fit_rows),
+            sizing: match raw.sizing {
+                1 => Some(ImageSizing::Columns),
+                2 => Some(ImageSizing::Rows),
+                3 => Some(ImageSizing::Native),
+                _ => None,
+            },
+        };
+        let pixels = if unicode {
+            self.unicode_pixels.unwrap_or(self.owner_pixels)
+        } else {
+            self.owner_pixels
+        };
+        let bounds = placement.viewport_bounds(self.cell, pixels, self.frozen_pixels);
         let [x, y, w, h] = bounds.rect;
         let [top, bottom] = bounds.clip_y.unwrap_or([0.0, view_h]);
-        let visible_y = y.max(top).max(0.0) < (y + h).min(bottom).min(view_h);
-        let visible = visible_y
-            && if unicode && whole_cols < cols {
-                let columns = unicode_columns.entry(placement.cell[1]).or_insert_with(|| {
-                    let row = bidi_row(cells, cols, placement.cell[1])?;
-                    let mut full = vec![0; cols.div_ceil(64)];
-                    for visual in 0..whole_cols {
-                        let logical = row.logical(visual);
-                        full[logical / 64] |= 1 << (logical % 64);
-                    }
-                    Some(VisibleColumns {
-                        full,
-                        partial: row.logical(whole_cols),
-                    })
-                });
-                if let Some(columns) = columns {
-                    let start = (x / cell[0]).floor().max(0.0) as usize;
-                    let end = (((x + w) / cell[0]).ceil().max(0.0) as usize).min(cols);
-                    (start..end).any(|col| {
-                        columns.full[col / 64] & (1 << (col % 64)) != 0
-                            || (col == columns.partial
-                                && (x - col as f64 * cell[0]).max(0.0) < partial_width)
-                    })
-                } else {
-                    x < view_w && x + w > 0.0
+        if y.max(top).max(0.0) < (y + h).min(bottom).min(view_h)
+            && self.visible_x(unicode && narrow, cell[1], x, w, view_w)
+        {
+            self.visible.push((raw.id, raw.z, placement));
+        }
+        self.visible.len() < GMUX_GRAPHICS_MAX_PLACEMENTS as usize
+    }
+
+    fn visible_x(&mut self, reorder: bool, row: i32, x: f64, w: f64, view_w: f64) -> bool {
+        if reorder {
+            let cols = usize::from(self.viewport.cols);
+            let cw = self.cell[0];
+            let whole_cols = (view_w / cw).floor() as usize;
+            let columns = self.unicode_columns.entry(row).or_insert_with(|| {
+                let row = bidi_row(self.cells, cols, row)?;
+                let mut full = vec![0; cols.div_ceil(64)];
+                for visual in 0..whole_cols {
+                    let logical = row.logical(visual);
+                    full[logical / 64] |= 1 << (logical % 64);
                 }
-            } else {
-                x < view_w && x + w > 0.0
-            };
-        if visible && placement == original {
-            continue;
+                Some(VisibleColumns {
+                    full,
+                    partial: row.logical(whole_cols),
+                })
+            });
+            if let Some(columns) = columns {
+                let start = (x / cw).floor().max(0.0) as usize;
+                let end = (((x + w) / cw).ceil().max(0.0) as usize).min(cols);
+                let partial_width = view_w - whole_cols as f64 * cw;
+                return (start..end).any(|col| {
+                    columns.full[col / 64] & (1 << (col % 64)) != 0
+                        || (col == columns.partial
+                            && (x - col as f64 * cw).max(0.0) < partial_width)
+                });
+            }
         }
-        placements.extend_from_slice(&layout.placements[copied..index]);
-        if visible {
-            placements.push(placement);
+        x < view_w && x + w > 0.0
+    }
+
+    fn into_layout(mut self) -> Option<Arc<GraphicsLayout>> {
+        if self.visible.is_empty() {
+            return None;
         }
-        copied = index + 1;
+        self.visible.sort_unstable_by_key(|&(id, z, p)| {
+            (
+                p.layer,
+                z,
+                id,
+                p.cell,
+                p.offset,
+                p.source,
+                p.source_subpixels,
+                p.fit_rows,
+                p.size,
+            )
+        });
+        let mut images = BTreeMap::new();
+        let mut uses_unicode = false;
+        let placements = self
+            .visible
+            .into_iter()
+            .map(|(id, _, p)| {
+                images
+                    .entry(p.image)
+                    .or_insert(ImageSource { key: p.image, id });
+                uses_unicode |= p.source_subpixels.is_some();
+                p
+            })
+            .collect();
+        Some(Arc::new(GraphicsLayout {
+            cell_pixels: self.owner_pixels,
+            unicode_cell_pixels: self.unicode_pixels.filter(|_| uses_unicode),
+            frozen_cell_pixels: self.frozen_pixels,
+            placements,
+            images: images.into_values().collect(),
+        }))
     }
-    if copied == 0 {
-        return Some(layout.clone());
+}
+
+impl VirtualAnchor {
+    fn from_raw(raw: &GmuxImagePlacement) -> Option<Self> {
+        let [image, placement, tag, column] = raw.virtual_anchor;
+        (image != 0).then_some(Self {
+            key: [image, placement, tag],
+            column,
+            runs_stamp: raw.anchor_runs_stamp,
+        })
     }
-    placements.extend_from_slice(&layout.placements[copied..]);
-    if placements.is_empty() {
-        return None;
-    }
-    let used: HashSet<_> = placements.iter().map(|p| p.image).collect();
-    Some(Arc::new(GraphicsLayout {
-        cell_pixels: layout.cell_pixels,
-        unicode_cell_pixels: layout.unicode_cell_pixels,
-        placements,
-        images: layout
-            .images
-            .iter()
-            .filter(|im| used.contains(&im.key))
-            .copied()
-            .collect(),
-    }))
 }
 
 impl GraphicsState {
@@ -596,10 +628,18 @@ impl GraphicsState {
     }
 
     pub fn image(&mut self, engine: *const GmuxEngine, source: ImageSource) -> Option<Arc<Image>> {
+        self.image_with(source, || native_image(engine, source))
+    }
+
+    fn image_with(
+        &mut self,
+        source: ImageSource,
+        load: impl FnOnce() -> Option<GmuxImage>,
+    ) -> Option<Arc<Image>> {
         if let Some(image) = self.pixels.get(&source.key).and_then(Weak::upgrade) {
             return Some(image);
         }
-        let image = read_image(engine, source)?;
+        let image = read_image(source, load()?)?;
         self.pixels.insert(source.key, Arc::downgrade(&image));
         Some(image)
     }
@@ -613,8 +653,7 @@ fn native_image(engine: *const GmuxEngine, source: ImageSource) -> Option<GmuxIm
     Some(unsafe { raw.assume_init() })
 }
 
-fn read_image(engine: *const GmuxEngine, source: ImageSource) -> Option<Arc<Image>> {
-    let raw = native_image(engine, source)?;
+fn read_image(source: ImageSource, raw: GmuxImage) -> Option<Arc<Image>> {
     let mut image = Image {
         key: source.key,
         width: raw.width,
@@ -666,42 +705,57 @@ pub(super) unsafe extern "C" fn capture_hold(
     }
     let snapshot = unsafe { &*viewdata.cast::<RefCell<Snapshot>>() };
     let mut snapshot = snapshot.borrow_mut();
-    let geometry = snapshot.geometry;
-    snapshot.held_geometry = geometry;
-    snapshot
-        .held
-        .refresh(engine, view, &mut state.pixels, geometry);
-    let Some(layout) = &snapshot.held.layout else {
-        return true;
-    };
-    for &source in &layout.images {
-        if snapshot.published.as_ref().is_some_and(|layout| {
-            layout
-                .images
-                .binary_search_by_key(&source.key, |im| im.key)
-                .is_ok()
-        }) || state.held.contains_key(&source.key)
-        {
-            continue;
+    snapshot.held_revision = snapshot.held_revision.wrapping_add(1);
+    snapshot.held_cell_pixels = snapshot.geometry.cell_pixels;
+    struct Capture<'a> {
+        state: &'a mut GraphicsState,
+        budget: &'a Rc<Cell<usize>>,
+        hold: &'a mut GmuxGraphicsHold,
+        engine: *const GmuxEngine,
+    }
+    unsafe extern "C" fn stage(data: *mut c_void, id: u32, key: u64) -> bool {
+        let capture = unsafe { &mut *data.cast::<Capture<'_>>() };
+        if capture.state.held.contains_key(&key) {
+            return true;
         }
-        let Some(image) = state.image(engine, source) else {
+        let source = ImageSource { id, key };
+        let Some(raw) = native_image(capture.engine, source) else {
             return false;
         };
-        let bytes = snapshot.budget.get() + image.pixels.len();
-        hold.staged_bytes += image.pixels.len();
+        let bytes = capture.budget.get() + raw.pixels.len;
         if bytes > super::MAX_GRAPHICS_HOLD_BYTES {
             return false;
         }
-        snapshot.budget.set(bytes);
-        state.held.insert(
-            source.key,
+        let Some(image) = capture.state.image_with(source, || Some(raw)) else {
+            return false;
+        };
+        capture.hold.staged_bytes += image.pixels.len();
+        capture.budget.set(bytes);
+        capture.state.held.insert(
+            key,
             HeldImage {
                 image,
                 source,
-                budget: snapshot.budget.clone(),
-                alternate_screen: hold.alternate_screen,
+                budget: capture.budget.clone(),
+                alternate_screen: capture.hold.alternate_screen,
             },
         );
+        true
     }
-    true
+
+    // A later resize can reveal any of the candidates in the frozen render.
+    let mut capture = Capture {
+        state,
+        budget: &snapshot.budget,
+        hold,
+        engine,
+    };
+    unsafe {
+        gmux_engine_graphics_sources(
+            engine,
+            view,
+            ptr::from_mut(&mut capture).cast(),
+            Some(stage),
+        )
+    }
 }

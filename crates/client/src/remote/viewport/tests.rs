@@ -2448,6 +2448,7 @@ fn resubscribing_ignores_queued_image_deltas_until_the_full_viewport_arrives() {
                     replace,
                     cell_pixels: [8, 16],
                     unicode_cell_pixels: None,
+                    frozen_cell_pixels: None,
                     placements: vec![Placement {
                         image: pixels.key,
                         layer: Layer::BelowText,

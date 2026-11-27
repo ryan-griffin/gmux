@@ -1511,24 +1511,16 @@ impl ActiveView<'_> {
     }
     pub(crate) fn graphics(&mut self) -> (Option<std::sync::Arc<GraphicsLayout>>, bool) {
         let mut snapshot = self.view.graphics.borrow_mut();
-        let engine = self.engine.raw.as_ptr();
-        if !self.held {
-            let geometry = snapshot.geometry;
-            snapshot.live.refresh(
-                engine,
-                std::ptr::null(),
+        let newly_visible = (!self.held || self.view.render_captured())
+            && snapshot.refresh(
+                self.engine.raw.as_ptr(),
                 &mut self.engine.events.graphics.pixels,
-                geometry,
+                self.held,
+                self.engine.frame,
+                self.engine.snapshot_revision,
+                &self.engine.cells,
             );
-        }
-        let (layout, newly_visible) = snapshot.publish(
-            engine,
-            self.held,
-            self.engine.frame,
-            self.engine.snapshot_revision,
-            &self.engine.cells,
-        );
-        (layout, !self.held && newly_visible)
+        (snapshot.publish(self.held), !self.held && newly_visible)
     }
     pub(crate) fn graphics_image(
         &mut self,
@@ -2647,6 +2639,82 @@ mod tests {
                 assert!(pixels.upgrade().is_none());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn exhausted_hold_budget_does_not_copy_uncached_graphics_pixels() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 4, 8, 16).unwrap();
+        let resources = Rc::new(ViewResources::default());
+        let view = engine.new_view_in(&resources).unwrap();
+        resources.graphics_hold.set(MAX_GRAPHICS_HOLD_BYTES);
+        engine.write(b"\x1b_Ga=T,f=24,s=1,v=1,c=1,r=1,C=1,q=2;/wAA\x1b\\\x1b[?2026h");
+        assert!(view.check_resources().is_err());
+        assert!(engine.events.graphics.pixels.is_empty());
+        assert!(!engine.events.graphics.has_held_pixels());
+        assert_eq!(resources.graphics_hold_bytes(), MAX_GRAPHICS_HOLD_BYTES);
+        resources.graphics_hold.set(0);
+    }
+
+    #[test]
+    fn fresh_shell_prompt_starts_below_restored_above_text_images() {
+        let mut old = Engine::new().unwrap();
+        old.resize(24, 5, 8, 16).unwrap();
+        old.write(b"\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=4,v=1,c=16,r=2,C=1,q=2;/wAA/wAA/wAA/wAA\x1b\\");
+        let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+        fresh.prepare_shell((8, 16)).unwrap();
+        fresh.write(b"$ ");
+        let mut view = fresh.new_view().unwrap();
+        fresh
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                assert_eq!(active.frame().cursor_y, 3);
+                assert_eq!(active.cells()[3 * 24].text(), "$");
+                let graphics = active.graphics().0.unwrap();
+                assert_eq!(graphics.placements[0].cell, [0, 1]);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn restored_images_that_extend_past_the_grid_are_clipped_before_the_new_prompt() {
+        for sizing in ["c=8,r=10", "c=8"] {
+            let mut old = Engine::new().unwrap();
+            old.resize(24, 5, 8, 16).unwrap();
+            old.write(
+                format!(
+                    "\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=2,v=5,{sizing},C=1,q=2;{}\x1b\\",
+                    "/wAA".repeat(10)
+                )
+                .as_bytes(),
+            );
+            let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+            fresh.prepare_shell((8, 16)).unwrap();
+            fresh.write(b"$ ");
+            let checkpoint = fresh.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+            restored.resize(24, 5, 8, 16).unwrap();
+            let mut view = restored.new_view().unwrap();
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert_eq!(active.cells()[4 * 24].text(), "$");
+                    let graphics = active.graphics().0.unwrap();
+                    let placement = graphics.placements[0];
+                    assert_eq!(placement.cell, [0, 0]);
+                    assert_eq!(placement.source, [0, 0, 2, 5]);
+                    assert_eq!(placement.fit_rows, Some([0, 4]));
+                    for metrics in [[8.0, 16.0], [16.0, 16.0]] {
+                        assert_eq!(
+                            placement.bounds(metrics, graphics.cell_pixels).clip_y,
+                            Some([0.0, 64.0])
+                        );
+                    }
+                })
+                .unwrap();
+        }
     }
 
     #[test]

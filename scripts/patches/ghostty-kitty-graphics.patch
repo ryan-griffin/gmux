@@ -430,7 +430,7 @@ Bound graphics storage and schedule animations for visible images.
      }
 
      /// State returned by scrollMarginsBegin: the final active-area
-@@ -1980,6 +2039,10 @@
+@@ -1980,6 +2039,11 @@
          /// The columns/rows this image occupies.
          columns: u32 = 0,
          rows: u32 = 0,
@@ -438,10 +438,11 @@ Bound graphics storage and schedule animations for visible images.
 +        /// Keep the sizing box when a margin scroll trims its rows.
 +        trim_top: u32 = 0,
 +        trim_bottom: u32 = 0,
++        max_rows: ?u32 = null,
 
          /// The z-index for this placement.
          z: i32 = 0,
-@@ -2147,7 +2210,10 @@
+@@ -2147,7 +2211,10 @@
                      cell_width,
                      self.columns,
                  ) -| cell_offset.x;
@@ -453,7 +454,7 @@ Bound graphics storage and schedule animations for visible images.
 
                  return .{
                      .width = calc_width,
-@@ -2162,7 +2228,10 @@
+@@ -2162,7 +2229,10 @@
                      cell_height,
                      self.rows,
                  ) -| cell_offset.y;
@@ -465,19 +466,38 @@ Bound graphics storage and schedule animations for visible images.
 
                  return .{
                      .width = calc_width,
-@@ -2183,7 +2252,7 @@
-             // If we have a specified columns and rows then this is trivial.
+@@ -2180,10 +2250,10 @@
+             cols: u32,
+             rows: u32,
+         } {
+-            // If we have a specified columns and rows then this is trivial.
++            const row_limit = self.max_rows orelse std.math.maxInt(u32);
              if (self.columns > 0 and self.rows > 0) return .{
                  .cols = self.columns,
 -                .rows = self.rows,
-+                .rows = self.rows -| self.trim_top -| self.trim_bottom,
++                .rows = @min(row_limit, self.rows -| self.trim_top -| self.trim_bottom),
              };
 
              // Otherwise we calculate the pixel size, divide by
-@@ -2222,6 +2291,11 @@
+@@ -2196,11 +2266,11 @@
+                     calc_size.width +| cell_offset.x,
+                     t.width_px / t.cols,
+                 ) catch 0,
+-                .rows = std.math.divCeil(
++                .rows = @min(row_limit, std.math.divCeil(
+                     u32,
+                     calc_size.height +| cell_offset.y,
+                     t.height_px / t.rows,
+-                ) catch 0,
++                ) catch 0),
+             };
+             // NOTE: Above `divCeil`s can only fail if the cell size is 0,
+             //       in such a case it seems safe to return 0 for this.
+@@ -2222,6 +2292,12 @@
              span: u32,
          ) bool {
              assert(count > 0 and count < span);
++            if (self.max_rows) |limit| self.max_rows = limit -| count;
 +            if (self.columns != 0 and self.rows != 0) {
 +                self.trim_top += count;
 +                return true;
@@ -486,10 +506,14 @@ Bound graphics storage and schedule animations for visible images.
              const src = self.sourceRect(image);
              const crop: u32 = if (self.rows > 0)
                  // Scaled placement: each grid row shows an equal
-@@ -2249,6 +2323,11 @@
+@@ -2249,6 +2325,15 @@
              span: u32,
          ) bool {
              assert(count > 0 and count < span);
++            if (self.max_rows != null) {
++                self.max_rows = span - count;
++                return true;
++            }
 +            if (self.columns != 0 and self.rows != 0) {
 +                self.trim_bottom += count;
 +                return true;
@@ -498,7 +522,7 @@ Bound graphics storage and schedule animations for visible images.
              const src = self.sourceRect(image);
              // An empty source can never be clipped smaller. This also
              // guarantees we never store an explicit zero source height,
-@@ -4080,7 +4159,7 @@
+@@ -4080,7 +4165,7 @@
          .gap_ms = 10,
          .pending_len = 4,
      });
@@ -507,7 +531,7 @@ Bound graphics storage and schedule animations for visible images.
      s.images.getPtr(1).?.animation = anim;
      try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
          .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
-@@ -4373,7 +4452,7 @@
+@@ -4373,7 +4458,7 @@
      try testing.expectEqual(@as(usize, 0), storage.placements.count());
  }
 
@@ -516,7 +540,7 @@ Bound graphics storage and schedule animations for visible images.
      const testing = std.testing;
      const alloc = testing.allocator;
      const io = testing.io;
-@@ -4404,10 +4483,10 @@
+@@ -4404,10 +4489,10 @@
      }).?;
      const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
      try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
@@ -705,30 +729,45 @@ Bound graphics storage and schedule animations for visible images.
  /// using init on the first chunk and then addData for each subsequent
 --- a/src/terminal/snapshot/kitty.zig
 +++ b/src/terminal/snapshot/kitty.zig
-@@ -270,6 +270,9 @@
+@@ -270,6 +270,11 @@
  //!     | Z (i32)                            |
  //! end +------------------------------------+
  //! ```
 +//!
 +//! A clipped pin uses location kind 3 and appends two u32 row trim counts
 +//! (top, bottom) after Z. Its location fields are the same as kind 0.
++//! The high bit of the location kind adds a maximum visible row count
++//! (u32) after the other placement fields.
  //!
  //! Placement ID tags are 0 internal and 1 external. Location kinds and their
  //! locations are:
-@@ -1083,10 +1086,11 @@
+@@ -1083,10 +1088,12 @@
      context: PinContext,
  ) !void {
      const p = planned.placement;
 +    const trimmed = p.trim_top != 0 or p.trim_bottom != 0;
++    const capped: u8 = if (p.max_rows != null) 0x80 else 0;
      try encodePlacementKey(writer, planned.key);
      switch (p.location) {
          .pin => |pin| {
 -            try writer.writeByte(0);
-+            try writer.writeByte(if (trimmed) 3 else 0);
++            try writer.writeByte((if (trimmed) @as(u8, 3) else 0) | capped);
              switch (context) {
                  .storage => |first| try io.writeInt(
                      writer,
-@@ -1115,6 +1119,10 @@
+@@ -1098,9 +1105,9 @@
+             try io.writeInt(writer, u16, pin.y);
+             try io.writeInt(writer, u16, pin.x);
+         },
+-        .virtual => try writer.writeByte(1),
++        .virtual => try writer.writeByte(1 | capped),
+         .relative => |rel| {
+-            try writer.writeByte(2);
++            try writer.writeByte(2 | capped);
+             try encodePlacementKey(writer, rel.parent);
+             try io.writeInt(writer, i32, rel.horizontal_offset);
+             try io.writeInt(writer, i32, rel.vertical_offset);
+@@ -1115,6 +1122,11 @@
      try io.writeInt(writer, u32, p.columns);
      try io.writeInt(writer, u32, p.rows);
      try io.writeInt(writer, i32, p.z);
@@ -736,10 +775,11 @@ Bound graphics storage and schedule animations for visible images.
 +        try io.writeInt(writer, u32, p.trim_top);
 +        try io.writeInt(writer, u32, p.trim_bottom);
 +    }
++    if (p.max_rows) |rows| try io.writeInt(writer, u32, rows);
  }
 
  fn encodeLoading(writer: *std.Io.Writer, loading: *const LoadingImage) !void {
-@@ -1402,6 +1410,7 @@
+@@ -1402,6 +1414,7 @@
          const current_index = try io.readInt(reader, u32);
          const root_gap_ms = try io.readInt(reader, u32);
          const frame_count = try io.readInt(reader, u32);
@@ -747,7 +787,7 @@ Bound graphics storage and schedule animations for visible images.
 
          const anim = try alloc.create(Animation);
          anim.* = .{
-@@ -1466,7 +1475,10 @@
+@@ -1466,7 +1479,10 @@
          const frame_bytes = if (self.animation) |a| a.frameBytes() else 0;
          if (base_len + frame_bytes > storage.total_limit) return;
 
@@ -759,7 +799,7 @@ Bound graphics storage and schedule animations for visible images.
          const anim = self.animation orelse return;
          if (frame_bytes > 0) {
              // Older images could not make room. Keep the image itself and
-@@ -1477,6 +1489,7 @@
+@@ -1477,6 +1493,7 @@
                  screen,
                  self.image.id,
                  frame_bytes,
@@ -767,28 +807,30 @@ Bound graphics storage and schedule animations for visible images.
              ) catch return;
          }
          storage.images.getPtr(self.image.id).?.animation = anim;
-@@ -1530,8 +1543,9 @@
+@@ -1530,8 +1547,10 @@
          context: std.meta.Tag(PinContext),
      ) DecodeError!DecodedPlacement {
          const key = try decodePlacementKey(reader);
 -        const location: Location = switch (try reader.takeByte()) {
 -            0 => .{ .pin = .{
-+        const tag = try reader.takeByte();
++        const encoded_tag = try reader.takeByte();
++        const tag = encoded_tag & 0x7f;
 +        const location: Location = switch (tag) {
 +            0, 3 => .{ .pin = .{
                  .page = switch (context) {
                      .storage => try io.readInt(reader, u16),
                      .page => 0,
-@@ -1570,6 +1584,8 @@
+@@ -1570,6 +1589,9 @@
                  .columns = try io.readInt(reader, u32),
                  .rows = try io.readInt(reader, u32),
                  .z = try io.readInt(reader, i32),
 +                .trim_top = if (tag == 3) try io.readInt(reader, u32) else 0,
 +                .trim_bottom = if (tag == 3) try io.readInt(reader, u32) else 0,
++                .max_rows = if (encoded_tag & 0x80 != 0) try io.readInt(reader, u32) else null,
              },
          };
      }
-@@ -1591,9 +1607,14 @@
+@@ -1591,9 +1613,14 @@
          const key = self.key orelse return;
          const img = storage.images.getPtr(key.image_id) orelse return;
          if (ready_generation) |ready| if (img.transmission > ready) return;
@@ -804,7 +846,7 @@ Bound graphics storage and schedule animations for visible images.
          switch (self.location) {
              .invalid => return,
              .virtual => placement.location = .virtual,
-@@ -2290,6 +2311,25 @@
+@@ -2290,6 +2317,25 @@
      return t;
  }
 
@@ -853,7 +895,7 @@ Bound graphics storage and schedule animations for visible images.
          offset_x: u32,
          offset_y: u32,
 
-@@ -706,6 +703,15 @@
+@@ -706,6 +703,16 @@
          source_y: u32,
          source_width: u32,
          source_height: u32,
@@ -863,13 +905,14 @@ Bound graphics storage and schedule animations for visible images.
 +            column: u32,
 +            runs_stamp: u64,
 +        } = null,
-+        /// For an explicit sizing box, the trimmed top and visible row counts.
++        /// The trimmed top and visible row counts.
 +        fit_rows: ?[2]u32 = null,
++        storage_key: ?kitty_gfx.ImageStorage.PlacementKey = null,
 +        sizing: enum(u8) { cells, columns, rows, native } = .cells,
 
          pub const Protocol = union(ImageProtocol) {
              kitty: KittyPlacement,
-@@ -723,9 +729,8 @@
+@@ -723,9 +730,8 @@
      /// z-index before drawing. Only placements with something to draw
      /// are returned.
      ///
@@ -881,7 +924,7 @@ Bound graphics storage and schedule animations for visible images.
      pub const ImagePlacementIterator = struct {
          /// The placeholder runs of each captured row, top to bottom.
          rows: []const std.ArrayList(Placeholder),
-@@ -734,19 +739,21 @@
+@@ -734,19 +740,21 @@
          /// negative when there are overscan rows above the viewport.
          viewport_y_base: isize,
 
@@ -908,7 +951,7 @@ Bound graphics storage and schedule animations for visible images.
              while (self.y < self.rows.len) {
                  const runs = self.rows[self.y].items;
                  while (self.i < runs.len) {
-@@ -775,16 +782,14 @@
+@@ -775,16 +783,14 @@
                          .source_y = g.source_y,
                          .source_width = g.source_width,
                          .source_height = g.source_height,
@@ -927,7 +970,7 @@ Bound graphics storage and schedule animations for visible images.
          }
      };
 
-@@ -1950,6 +1955,7 @@
+@@ -1950,6 +1956,7 @@
              source_y: u32,
              source_width: u32,
              source_height: u32,
@@ -935,7 +978,7 @@ Bound graphics storage and schedule animations for visible images.
          };
      };
 
-@@ -1972,6 +1978,8 @@
+@@ -1972,6 +1979,8 @@
          /// the screen. If it changed but the generation didn't, `placed`
          /// is built again from the same `roots`.
          dirty: u64 = 0,
@@ -944,7 +987,7 @@ Bound graphics storage and schedule animations for visible images.
 
          /// True if the placeholder runs changed since the last update.
          /// The row builder sets it in two cases:
-@@ -2131,8 +2139,9 @@
+@@ -2131,8 +2140,9 @@
              // moves, when the storage says that they moved, or (for
              // placements positioned from placeholder cells) when rows
              // are rebuilt.
@@ -956,7 +999,7 @@ Bound graphics storage and schedule animations for visible images.
                  !(any_dirty and state.kitty.virtual_anchors > 0)) return;
          }
 
-@@ -2166,33 +2175,46 @@
+@@ -2166,33 +2176,46 @@
          // the row builder added or dropped runs, or if the loop below
          // looks up any run again, since its result may differ.
          var runs_changed = state.kitty.stale;
@@ -1009,7 +1052,7 @@ Bound graphics storage and schedule animations for visible images.
          state.kitty.dirty = storage.dirty;
 
          // Tell consumers to read the iterator again if anything it
-@@ -2253,33 +2275,42 @@
+@@ -2253,33 +2276,42 @@
              }
          }
 
@@ -1074,7 +1117,7 @@ Bound graphics storage and schedule animations for visible images.
 
                  // The pin's cell. A pin is marked garbage when its row
                  // is removed from the scrollback. It has no position
-@@ -2290,7 +2321,7 @@
+@@ -2290,7 +2322,7 @@
                          state.kitty.chunks.items,
                          pin.*,
                          captured_len,
@@ -1083,7 +1126,7 @@ Bound graphics storage and schedule animations for visible images.
                          root.vertical_offset,
                      ) orelse continue;
                      break :origin .{ .x = pin.x, .y = y };
-@@ -2302,14 +2333,60 @@
+@@ -2302,14 +2334,63 @@
              // keep any with at least one cell in the captured rows.
              const x: i64 = origin.x + root.horizontal_offset;
              const y: i64 = origin.y + root.vertical_offset;
@@ -1141,12 +1184,15 @@ Bound graphics storage and schedule animations for visible images.
 +        const max: f64 = std.math.maxInt(u32);
 +        return .{
 +            @intFromFloat(@min(max, @ceil(dest_cols + @as(f64, @floatFromInt(p.offset_x)) / owner_w))),
-+            @intFromFloat(@min(max, @ceil(dest_rows + @as(f64, @floatFromInt(p.offset_y)) / owner_h))),
++            @min(
++                if (p.fit_rows) |fit| fit[1] else std.math.maxInt(u32),
++                @as(u32, @intFromFloat(@min(max, @ceil(dest_rows + @as(f64, @floatFromInt(p.offset_y)) / owner_h)))),
++            ),
 +        };
      }
 
      /// Returns the row of a pin, counted in captured rows where 0 is the
-@@ -2471,6 +2548,7 @@
+@@ -2471,6 +2552,7 @@
          if (dest.width == 0 or dest.height == 0) return null;
          const offset = p.cellOffset(t);
          const source = p.sourceRect(image);
@@ -1154,14 +1200,17 @@ Bound graphics storage and schedule animations for visible images.
 
          return .{
              .protocol = .{ .kitty = .{
-@@ -2492,6 +2570,16 @@
+@@ -2492,6 +2574,19 @@
              .offset_y = offset.y,
              .width = dest.width,
              .height = dest.height,
 +            .fit_rows = if (p.columns != 0 and p.rows != 0)
 +                .{ p.trim_top, grid.rows }
++            else if (p.max_rows) |rows|
++                .{ 0, rows }
 +            else
 +                null,
++            .storage_key = key,
 +            .sizing = if (p.columns != 0)
 +                if (p.rows != 0) .cells else .columns
 +            else if (p.rows != 0)
@@ -1171,7 +1220,7 @@ Bound graphics storage and schedule animations for visible images.
              .source_x = source.x,
              .source_y = source.y,
              .source_width = source.width,
-@@ -2499,10 +2587,29 @@
+@@ -2499,10 +2594,29 @@
          };
      }
 
@@ -1201,7 +1250,7 @@ Bound graphics storage and schedule animations for visible images.
          row_pin: PageList.Pin,
          run: *Placeholder,
          cell_width: u32,
-@@ -2514,11 +2621,16 @@
+@@ -2514,11 +2628,16 @@
          // Remember the virtual placement even if the image can't be
          // drawn. Relative placements attached to it still need the
          // position of these cells.
@@ -1223,7 +1272,7 @@ Bound graphics storage and schedule animations for visible images.
 
          // Nothing to draw until the displayed pixels arrive, as in
          // `template`.
-@@ -2540,7 +2652,7 @@
+@@ -2540,7 +2659,7 @@
              .height = 1,
          };
          const rp = vp.renderPlacement(
@@ -1232,7 +1281,7 @@ Bound graphics storage and schedule animations for visible images.
              &image,
              cell_width,
              cell_height,
-@@ -2560,6 +2672,7 @@
+@@ -2560,6 +2679,7 @@
              .source_y = rp.source_y,
              .source_width = rp.source_width,
              .source_height = rp.source_height,
@@ -1240,7 +1289,7 @@ Bound graphics storage and schedule animations for visible images.
          };
          run.state = .visible;
      }
-@@ -4943,8 +5056,6 @@
+@@ -4943,8 +5063,6 @@
          .placement_id = .{ .tag = .external, .id = 7 },
      }).?;
      const grid = sp.gridSize(image, &t);
@@ -1249,7 +1298,7 @@ Bound graphics storage and schedule animations for visible images.
      const source = sp.sourceRect(image);
      try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, p.protocol.kitty.kind);
      try testing.expectEqual(7, p.protocol.kitty.placement_id);
-@@ -4958,10 +5069,9 @@
+@@ -4958,10 +5076,9 @@
      try testing.expectEqual(grid.rows, p.rows);
      try testing.expectEqual(4, p.offset_x);
      try testing.expectEqual(3, p.offset_y);

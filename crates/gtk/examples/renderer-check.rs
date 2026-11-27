@@ -2252,6 +2252,7 @@ fn validate_kitty_graphics(
     let graphics = Graphics {
         cell_pixels: [10, 24],
         unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
         images: vec![
             image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
             image(2, 1, PixelFormat::Rgba, &[255, 0, 0, 128]),
@@ -2346,6 +2347,7 @@ fn validate_kitty_graphics(
     let graphics = Graphics {
         cell_pixels: [8, 16],
         unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
         images: vec![pixels_across_rows],
         placements: vec![
             Placement {
@@ -2392,6 +2394,7 @@ fn validate_kitty_graphics(
     let graphics = Graphics {
         cell_pixels: [8, 16],
         unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
         images: vec![
             image(1, 1, PixelFormat::Rgb, &[0, 255, 0]),
             image(2, 1, PixelFormat::Rgb, &[255, 0, 0]),
@@ -2435,6 +2438,7 @@ fn validate_kitty_graphics(
     let graphics = Graphics {
         cell_pixels: [8, 16],
         unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
         images: vec![
             image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
             Arc::new(Image {

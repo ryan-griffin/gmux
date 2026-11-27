@@ -417,12 +417,18 @@ while True:
         exchange(b"\x1bc\x1b[1;3H" + command("a=T,i=85,f=24,s=1,v=1,c=1,r=1,C=1,q=2", red))
         for peer in peers:
             graphics(peer, lambda g: any(im["pixels"] == red for im in g["images"]))
+        remote.send("resize", cols=12, rows=4, cw=8, ch=16, width=8, height=64)
+        graphics(remote, lambda g: not g["placements"])
         exchange(b"\x1b[?2026h" + command("a=d,d=I,i=85,q=2"))
-        for width in (8, 96):
-            snapshots = fixture.rpc("status")["snapshots"]
+        for width in (96, 8, 96):
             remote.send("resize", cols=12, rows=4, cw=8, ch=16, width=width, height=64)
-            wait_for(lambda: fixture.rpc("status")["snapshots"] > snapshots)
-            remote.barrier("held-resize")
+            if width == 8:
+                graphics(remote, lambda g: not g["placements"])
+            else:
+                graphics(remote, lambda g: any(im["pixels"] == red for im in g["images"]))
+        remote.send("resize", cols=12, rows=4, cw=16, ch=16, width=192, height=64)
+        resized = graphics(remote, lambda g: g.get("frozen_cell_pixels") == [8, 16])
+        assert len(resized["placements"]) == 1 and not resized["images"], resized
         exchange(b"\x1b[?2026l")
         for peer in peers:
             graphics(peer, lambda g: not g["placements"])
@@ -468,6 +474,31 @@ while True:
         graphics(remote, lambda g: any(im["pixels"] == green for im in g["images"]))
         remote.send("scroll", delta=0, bottom=True)
         graphics(remote, lambda g: not g["placements"])
+
+    with scenario("A new wide subscriber waits for a complete synchronized frame"):
+        remote.send("resize", cols=12, rows=4, cw=24, ch=16)
+        remote.barrier("wide-view")
+        exchange(b"\x1bc" + command("a=T,i=91,f=24,s=1,v=3,c=1,C=1,q=2", blue * 3))
+        for peer in peers:
+            graphics(peer, lambda g: any(im["pixels"] == blue * 3 for im in g["images"]))
+        exchange(b"\x1b[4;1H" + b"\r\n" * 3)
+        graphics(local, lambda g: not g["placements"])
+        wide = graphics(remote, lambda g: any(p["cell"] == [0, -3] for p in g["placements"]))
+        assert not wide["images"], wide
+        title = exchange(b"\x1b[?2026hHELD")
+        attached = Client(fixture, pane, address=address)
+        stack.callback(attached.close)
+        attached.send("resize", cols=12, rows=4, cw=24, ch=16)
+        initial = attached.until(lambda h: h.get("meta", {}).get("title") == title)
+        assert not initial.get("frame"), initial
+        attached.barrier("await-frozen-image")
+        assert attached.frame is None
+        exchange(b"\x1b[?2026l")
+        assert graphics(attached)["placements"][0]["cell"] == [0, -3]
+        assert "HELD" in attached.text()
+        attached.close()
+        remote.send("resize", cols=12, rows=4, cw=8, ch=16)
+        remote.barrier("restore-font")
 
     with scenario("The image count limit evicts the oldest unplaced image before a visible one"):
         exchange(b"\x1bc" + command("a=T,i=1,p=1,f=24,s=1,v=1,C=1,q=2", red)
@@ -518,6 +549,29 @@ while True:
             frame = graphics(peer, lambda g: any(im["pixels"] == blue for im in g["images"]))
             assert len(frame["placements"]) == 4096
             assert any(im["pixels"] == green for im in frame["images"])
+
+    with scenario("Only visible placements count toward each subscriber's viewport limit"):
+        remote.send("resize", cols=1, rows=100, cw=8, ch=16, width=8, height=1600)
+        remote.barrier("narrow-viewport")
+        tile = "\U0010EEEE\u0305\u0305"
+        offscreen = b"".join(
+            f"\x1b[{row};3H".encode() + ((tile + " ") * 49).encode()
+            for row in range(1, 100)
+        )
+        place = "a=T,U=1,f=24,i=66,p=1,s=1,v=1,c=1,r=1,q=2"
+        exchange(b"\x1bc" + command(place, red) + b"\x1b[38;5;66m" + offscreen
+                 + b"\x1b[100;1H" + tile.encode() + b"\x1b[39m")
+        assert len(graphics(local, lambda g: bool(g["images"]))["placements"]) == 4096
+        visible = graphics(remote, lambda g: any(im["pixels"] == red for im in g["images"]))
+        assert [p["cell"] for p in visible["placements"]] == [[0, 99]], visible
+        exchange(command(place, blue) + b"\x1b[?2026h" + command("a=d,d=I,i=66,q=2"))
+        frozen = graphics(remote, lambda g: any(im["pixels"] == blue for im in g["images"]))
+        assert [p["cell"] for p in frozen["placements"]] == [[0, 99]], frozen
+        exchange(b"\x1b[?2026l")
+        for peer in peers:
+            graphics(peer, lambda g: not g["placements"])
+        remote.send("resize", cols=100, rows=100, cw=8, ch=16)
+        remote.barrier("restore-width")
 
     with scenario("Repeated synchronized holds release superseded image generations"):
         payload = zlib.compress(green * (1500 * 1500))

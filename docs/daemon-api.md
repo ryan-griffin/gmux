@@ -533,9 +533,12 @@ Unicode placements supply a fractional source rectangle in 16.16 pixels in
 Unicode crops use logical columns. Relative placements use visual columns.
 An optional `unicode_cell_pixels` pair gives the geometry basis for Unicode
 crops when it differs from `cell_pixels`.
-For explicitly sized placements, `fit_rows` gives the `[top trim, visible rows]`
-of the sizing box. Fit the source aspect ratio inside the full box, then
-clip to the visible rows. Other placements set this field to `null`.
+When `frozen_cell_pixels` is present, lay out the placement using those cell
+metrics, then scale the result to the current viewport's cells.
+For a sizing box or a vertically clipped image, `fit_rows` gives the
+`[top trim, visible rows]`. Size the image, subtract the top trim in cell
+heights from its drawing origin, and clip to the visible rows starting
+at the placement's cell. Other placements set this field to `null`.
 `sizing` is `columns` or `rows` when only one axis is specified, and `native`
 for unscaled pixels. Two-axis boxes and Unicode crops set it to `null`.
 Placements are listed in paint order and may begin outside the viewport.

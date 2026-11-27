@@ -114,6 +114,7 @@ impl SentGraphics {
             replace,
             cell_pixels: current.cell_pixels,
             unicode_cell_pixels: current.unicode_cell_pixels,
+            frozen_cell_pixels: current.frozen_cell_pixels,
             placements: current.placements.clone(),
             images,
         }))
@@ -2514,6 +2515,7 @@ mod tests {
                         replace: true,
                         cell_pixels: [8, 16],
                         unicode_cell_pixels: None,
+                        frozen_cell_pixels: None,
                         placements: vec![Placement {
                             image: 1,
                             layer: Layer::AboveText,
