@@ -1,6 +1,7 @@
 use super::Scene;
 use gmux_protocol::graphics::{
-    Graphics, Image, Layer, MAX_PIXEL_BYTES, MAX_PLACEMENTS, PixelFormat, SOURCE_SUBPIXELS,
+    Graphics, Image, Layer, MAX_PIXEL_BYTES, MAX_PLACEMENTS, PixelFormat, Placement,
+    SOURCE_SUBPIXELS,
 };
 use gtk::{gdk, glib, graphene, gsk, prelude::*};
 use std::{
@@ -14,6 +15,7 @@ pub(super) struct Textures {
     full: HashMap<u64, CachedTexture>,
     crops: HashMap<(u64, [u32; 4]), CachedTexture>,
     crop_bytes: usize,
+    pruned_placements: Weak<Vec<Placement>>,
     crop_edges: HashMap<(u64, [u32; 4]), CropEdge>,
     crop_nodes: HashMap<CropKey, CachedCrop>,
 }
@@ -317,6 +319,10 @@ impl Textures {
     }
 
     pub fn retain(&mut self, graphics: &Graphics) {
+        if !self.crops_pruned_for(graphics) {
+            // A different layout can populate the cache before reaching its limit.
+            self.pruned_placements = Weak::new();
+        }
         if !self.full.is_empty() {
             self.full
                 .retain(|&key, cached| cached.belongs_to(graphics.image(key)));
@@ -350,6 +356,13 @@ impl Textures {
         self.crops.len() < MAX_PLACEMENTS && bytes <= MAX_PIXEL_BYTES - self.crop_bytes
     }
 
+    fn crops_pruned_for(&self, graphics: &Graphics) -> bool {
+        std::ptr::eq(
+            self.pruned_placements.as_ptr(),
+            Arc::as_ptr(&graphics.placements),
+        )
+    }
+
     fn release_unused_crops(&mut self, graphics: &Graphics) {
         let placements = graphics
             .placements
@@ -363,6 +376,7 @@ impl Textures {
             }
             used
         });
+        self.pruned_placements = Arc::downgrade(&graphics.placements);
     }
 
     fn append_uncached_crop(
@@ -468,7 +482,7 @@ impl Textures {
         }
         let viewport = graphene::Rect::new(0.0, 0.0, view_width as f32, view_height as f32);
         snapshot.push_clip(&viewport);
-        let mut pruned = false;
+        let mut pruned = self.crops_pruned_for(graphics);
         for p in &graphics.placements[start..end] {
             let Some(image) = graphics.image(p.image) else {
                 continue;

@@ -2266,7 +2266,8 @@ fn validate_kitty_graphics(
             placement(1, Layer::BelowText, 8, 20, [0, 0, 1, 1]),
             placement(2, Layer::AboveText, 3, 10, [0, 0, 1, 1]),
             placement(3, Layer::AboveText, 4, 10, [1, 0, 1, 1]),
-        ],
+        ]
+        .into(),
     };
     let mut renderer = Renderer::new();
     let mut scene = scene(&cells, theme);
@@ -2368,7 +2369,8 @@ fn validate_kitty_graphics(
                 source_subpixels: Some([0, 0, 3 * unit, 3 * unit]),
                 ..placement(1, Layer::BelowText, 2, 16, [0, 0, 3, 3])
             },
-        ],
+        ]
+        .into(),
     };
     tiled.graphics = Some(&graphics);
     for (scale, cell_height) in [(1.0, 16.0), (1.25, 10.0)] {
@@ -2423,7 +2425,8 @@ fn validate_kitty_graphics(
                 size: [8, 16],
                 ..placement(2, Layer::AboveText, logical as i32, 8, [0, 0, 1, 1])
             },
-        ],
+        ]
+        .into(),
     };
     tiled.graphics = Some(&graphics);
     let drawn = node(&mut renderer, &tiled, font, context).0;
@@ -2497,7 +2500,8 @@ fn validate_kitty_graphics(
                 sizing: Some(ImageSizing::Native),
                 ..placement(2, Layer::AboveText, 11, 8, [0, 0, 8, 8])
             },
-        ],
+        ]
+        .into(),
     };
     let modes = [
         Some(ImageSizing::Columns),
@@ -2505,15 +2509,15 @@ fn validate_kitty_graphics(
         Some(ImageSizing::Native),
         None,
     ];
-    graphics
-        .placements
-        .extend(modes.into_iter().enumerate().map(|(i, sizing)| Placement {
+    Arc::make_mut(&mut graphics.placements).extend(modes.into_iter().enumerate().map(
+        |(i, sizing)| Placement {
             cell: [14 + 2 * i as i32, 1],
             size: [8, 48],
             fit_rows: Some([1, 1]),
             sizing,
             ..placement(3, Layer::AboveText, 0, 8, [0, 0, 8, 48])
-        }));
+        },
+    ));
     tiled.graphics = Some(&graphics);
     let drawn = node(&mut renderer, &tiled, font, context).0;
     let data = pixels(&render(gpu, &drawn, &tiled));
@@ -2574,7 +2578,8 @@ fn validate_kitty_graphics(
         .zip([23, 23, 23, 23, 2])
         .enumerate()
         .map(|(i, (crop, width))| placement(4, Layer::AboveText, 4 + i as i32 * 4, width, crop))
-        .collect(),
+        .collect::<Vec<_>>()
+        .into(),
     };
     tiled.metrics = (8.25, 16.25);
     let full_cache = Graphics {
@@ -2585,7 +2590,8 @@ fn validate_kitty_graphics(
         ]
         .into_iter()
         .chain(graphics.placements.iter().copied())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into(),
         cell_pixels: graphics.cell_pixels,
         ..Graphics::default()
     };

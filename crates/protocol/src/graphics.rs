@@ -222,7 +222,7 @@ pub struct Graphics {
     pub cell_pixels: [u32; 2],
     pub unicode_cell_pixels: Option<[u32; 2]>,
     pub frozen_cell_pixels: Option<[u32; 2]>,
-    pub placements: Vec<Placement>,
+    pub placements: Arc<Vec<Placement>>,
     /// Sorted by generation.
     pub images: Vec<Arc<Image>>,
 }
@@ -356,7 +356,7 @@ impl GraphicsUpdate {
             cell_pixels: self.cell_pixels,
             unicode_cell_pixels: self.unicode_cell_pixels,
             frozen_cell_pixels: self.frozen_cell_pixels,
-            placements: self.placements,
+            placements: Arc::new(self.placements),
             images: images.into_values().collect(),
         };
         Ok(())
