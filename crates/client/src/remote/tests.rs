@@ -131,6 +131,9 @@ fn image_payload_can_arrive_after_the_base_record_deadline() {
                     offset: [0, 0],
                     size: [8, 16],
                     source: [0, 0, size, size],
+                    source_subpixels: None,
+                    fit_rows: None,
+                    sizing: None,
                 }],
                 images: vec![Arc::new(Image {
                     key: 1,

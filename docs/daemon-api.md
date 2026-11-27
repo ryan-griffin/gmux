@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 47:
+handshake. The current protocol version is 48.
 
 ```json
-{"version":47,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":48,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":47,"daemon":"returned-identity"}
+{"method":"attach","version":48,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -526,8 +526,16 @@ Cached rows use the same glossary as the viewport.
 
 A `graphics` update replaces the viewport's image placements. Its `cell_pixels`
 contains the daemon's cell width and height. Each placement is an array
-`[image, layer, [column, row], [dx, dy], [width, height], [x, y, w, h]]`.
-The image is a generation key. The final array is the source rectangle.
+`[image, layer, [column, row], [dx, dy], [width, height], [x, y, w, h], source_subpixels, fit_rows, sizing]`.
+The image is a generation key. The `[x, y, w, h]` array is the source rectangle.
+Unicode placements supply a fractional source rectangle in 16.16 pixels in
+`source_subpixels`. Other placements set this field to `null`.
+Unicode crops use logical columns. Relative placements use visual columns.
+For explicitly sized placements, `fit_rows` gives the `[top trim, visible rows]`
+of the sizing box. Fit the source aspect ratio inside the full box, then
+clip to the visible rows. Other placements set this field to `null`.
+`sizing` is `columns` or `rows` when only one axis is specified, and `native`
+for unscaled pixels. Two-axis boxes and Unicode crops set it to `null`.
 Placements are listed in paint order and may begin outside the viewport.
 The `images` list describes new payloads as `[image, width, height, format]`.
 Packed pixel rows follow the cells in descriptor order with no padding.

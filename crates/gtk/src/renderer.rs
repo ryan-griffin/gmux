@@ -100,7 +100,7 @@ impl Scene<'_> {
 /// Color lookups use the selection and cursor spans resolved for the row.
 struct RowColors<'a, 'b> {
     scene: &'a Scene<'b>,
-    bidi: Option<&'a bidi::Row>,
+    bidi: Option<&'a gmux_protocol::bidi::Row>,
     base: usize,
     selection: Option<(usize, usize)>,
     cursor: Option<std::ops::Range<usize>>,

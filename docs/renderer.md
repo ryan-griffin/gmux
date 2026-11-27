@@ -31,14 +31,20 @@ accepts inline data from local or remote shells. File, temporary-file, and
 shared-memory transfers are disabled. GTK renders the PNG samples from
 Ghostty's Wuffs decoder as sRGB.
 
-Images follow their placements when scrolling and switching screens. Animations
-advance while visible in a subscribed viewport. Cached scroll previews show
-text until the daemon sends the requested viewport.
-The daemon retains up to 10 MB of image pixels per screen and sends up to 4,096
-placements per viewport. A frontend receives pixel data only when a visible
-image generation is absent from its previous viewport. The GTK renderer reuses
-textures for retained generations and draws placements at their protocol layer
-and z-index.
+Images follow their placements when scrolling and switching screens. An explicit
+row and column box fits the source aspect ratio. Animations advance while visible
+in a subscribed viewport. During synchronized output,
+existing viewports keep their images. A new viewport waits for a complete
+image-bearing frame when it joins a hold with images.
+Cached scroll previews show text until the daemon sends the requested viewport.
+Each screen can retain 10 MB of pixels, 4,096 images, 4,096 placements, and
+32,768 additional animation frames. When images exceed the pixel or image count
+limit, unused images are evicted first. Transfers are limited to 16 MiB before
+image decoding. Each viewport draws up to 4,096 regions, giving fixed and
+relative placements priority over Unicode placeholder runs. A frontend receives
+pixel data only when a visible image generation is absent from its previous
+viewport. The GTK renderer reuses textures for retained generations and draws
+placements at their protocol layer and z-index.
 
 ## Implementation
 

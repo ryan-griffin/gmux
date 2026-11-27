@@ -191,11 +191,11 @@ typedef struct { const uint8_t *ptr; size_t len; } GmuxText;
 #define GMUX_GRAPHICS_MAX_PIXEL_BYTES 10000000
 #define GMUX_GRAPHICS_MAX_PLACEMENTS 4096
 typedef struct {
-    uint64_t generation;
+    uint64_t generation, anchor_runs_stamp;
     uint32_t id;
     int32_t z, cell[2];
-    uint32_t offset[2], size[2], source[4];
-    uint8_t layer;
+    uint32_t offset[2], size[2], source[4], source_subpixels[4], virtual_anchor[4], fit_rows[2];
+    uint8_t layer, sizing;
 } GmuxImagePlacement;
 typedef struct {
     uint32_t width, height;
@@ -203,16 +203,25 @@ typedef struct {
     GmuxText pixels;
 } GmuxImage;
 typedef void (*GmuxImagePlacementFn)(void *userdata, const GmuxImagePlacement *placement);
+typedef void (*GmuxVirtualRunFn)(void *userdata, uint32_t image, uint32_t placement,
+    uint32_t tag, int32_t row, uint32_t column, uint32_t width);
 typedef size_t (*GmuxGraphicsIdsFn)(const void *viewdata, const uint32_t **ids);
-typedef void (*GmuxGraphicsHoldFn)(void *userdata, const GmuxEngine *engine,
-    const GmuxView *view, void *viewdata, bool held);
+typedef void (*GmuxImageChangedFn)(void *userdata, uint32_t image_id);
+typedef struct {
+    size_t staged_bytes;
+    bool held, alternate_screen;
+} GmuxGraphicsHold;
+typedef bool (*GmuxGraphicsHoldFn)(void *userdata, const GmuxEngine *engine,
+    const GmuxView *view, void *viewdata, GmuxGraphicsHold *hold);
 uint64_t gmux_engine_graphics(const GmuxEngine *engine, const GmuxView *view, uint64_t known,
     uint32_t cell_pixels[2], void *userdata, GmuxImagePlacementFn callback);
+void gmux_engine_graphics_virtual_runs(const GmuxEngine *engine, void *userdata, GmuxVirtualRunFn visit);
 bool gmux_engine_image(const GmuxEngine *engine, uint32_t id, uint64_t generation, GmuxImage *image);
-bool gmux_engine_graphics_tick(GmuxEngine *engine, uint64_t *delay_ms, GmuxGraphicsIdsFn ids);
+void gmux_engine_graphics_tick(GmuxEngine *engine, uint64_t *delay_ms, GmuxGraphicsIdsFn ids,
+    GmuxImageChangedFn changed, void *userdata);
 void gmux_engine_graphics_hold_callback(GmuxEngine *engine, GmuxGraphicsHoldFn callback);
 void gmux_engine_view_graphics_data(GmuxView *view, void *viewdata);
-bool gmux_engine_view_held_render(const GmuxView *view);
+bool gmux_engine_view_captured(const GmuxView *view);
 // Called synchronously by the owning engine. Data is borrowed for the call.
 typedef void (*GmuxEventFn)(void *userdata, int kind, const uint8_t *data, size_t len);
 // Event kind 9. Zero keeps the current dimension.
@@ -336,6 +345,7 @@ int gmux_engine_select_output(GmuxEngine *engine, uint8_t target, uint16_t x, ui
 int gmux_engine_output_anchor(GmuxEngine *engine, uint16_t x, uint32_t y);
 bool gmux_engine_cursor_at_prompt(GmuxEngine *engine);
 bool gmux_engine_expire_render_hold(GmuxEngine *engine);
+bool gmux_engine_held_graphics(const GmuxEngine *engine);
 size_t gmux_engine_string(GmuxEngine *engine, int pwd, uint8_t *out, size_t cap);
 int gmux_engine_mode(GmuxEngine *engine, int mode);
 int gmux_engine_paste(GmuxEngine *engine, const uint8_t *data, size_t len);

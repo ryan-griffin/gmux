@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 
 pub const MAX_PIXEL_BYTES: usize = 10_000_000;
 pub const MAX_PLACEMENTS: usize = 4096;
+pub const SOURCE_SUBPIXELS: u32 = 1 << 16;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +78,14 @@ pub enum Layer {
     AboveText,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSizing {
+    Columns,
+    Rows,
+    Native,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     pub image: u64,
@@ -85,6 +94,55 @@ pub struct Placement {
     pub offset: [u32; 2],
     pub size: [u32; 2],
     pub source: [u32; 4],
+    /// Optional Unicode crop in 16.16 source pixels.
+    pub source_subpixels: Option<[u32; 4]>,
+    /// For an aspect-preserving sizing box, the trimmed top and visible row counts.
+    pub fit_rows: Option<[u32; 2]>,
+    pub sizing: Option<ImageSizing>,
+}
+
+pub struct PlacementBounds {
+    pub rect: [f64; 4],
+    pub clip_y: Option<[f64; 2]>,
+}
+
+impl Placement {
+    pub fn bounds(&self, [cw, ch]: [f64; 2], [pixel_w, pixel_h]: [u32; 2]) -> PlacementBounds {
+        let sx = cw / f64::from(pixel_w);
+        let sy = ch / f64::from(pixel_h);
+        let row_y = f64::from(self.cell[1]) * ch;
+        let mut x = f64::from(self.cell[0]) * cw + f64::from(self.offset[0]) * sx;
+        let mut y = row_y + f64::from(self.offset[1]) * sy;
+        let mut width = f64::from(self.size[0]) * sx;
+        let mut height = f64::from(self.size[1]) * sy;
+        let mut clip_y = None;
+        let source_w = f64::from(self.source[2]);
+        let source_h = f64::from(self.source[3]);
+        if let Some([trim_top, rows]) = self.fit_rows {
+            let scale = (width / source_w).min(height / source_h);
+            let fitted_width = source_w * scale;
+            let fitted_height = source_h * scale;
+            x += (width - fitted_width) / 2.0;
+            y += (height - fitted_height) / 2.0 - f64::from(trim_top) * ch;
+            width = fitted_width;
+            height = fitted_height;
+            let bottom = row_y + f64::from(rows) * ch;
+            if y < row_y || y + height > bottom {
+                clip_y = Some([row_y, bottom]);
+            }
+        } else {
+            match self.sizing {
+                Some(ImageSizing::Columns) => height = width * source_h / source_w,
+                Some(ImageSizing::Rows) => width = height * source_w / source_h,
+                Some(ImageSizing::Native) => [width, height] = self.size.map(f64::from),
+                None => {}
+            }
+        }
+        PlacementBounds {
+            rect: [x, y, width, height],
+            clip_y,
+        }
+    }
 }
 
 impl Serialize for Placement {
@@ -96,6 +154,9 @@ impl Serialize for Placement {
             self.offset,
             self.size,
             self.source,
+            self.source_subpixels,
+            self.fit_rows,
+            self.sizing,
         )
             .serialize(serializer)
     }
@@ -103,7 +164,8 @@ impl Serialize for Placement {
 
 impl<'de> Deserialize<'de> for Placement {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (image, layer, cell, offset, size, source) = Deserialize::deserialize(deserializer)?;
+        let (image, layer, cell, offset, size, source, source_subpixels, fit_rows, sizing) =
+            Deserialize::deserialize(deserializer)?;
         Ok(Self {
             image,
             layer,
@@ -111,6 +173,9 @@ impl<'de> Deserialize<'de> for Placement {
             offset,
             size,
             source,
+            source_subpixels,
+            fit_rows,
+            sizing,
         })
     }
 }
@@ -122,12 +187,6 @@ pub struct Graphics {
     /// Sorted by generation.
     pub images: Vec<Arc<Image>>,
 }
-
-pub static EMPTY_GRAPHICS: Graphics = Graphics {
-    cell_pixels: [0, 0],
-    placements: Vec::new(),
-    images: Vec::new(),
-};
 
 impl Graphics {
     pub fn image(&self, key: u64) -> Option<&Arc<Image>> {
@@ -218,6 +277,28 @@ impl GraphicsUpdate {
                     && y.checked_add(height).is_some_and(|end| end <= image.height),
                 "Invalid terminal image placement"
             );
+            if let Some([x, y, width, height]) = placement.source_subpixels {
+                anyhow::ensure!(
+                    width != 0
+                        && height != 0
+                        && x.checked_add(width)
+                            .is_some_and(|end| end <= image.width * SOURCE_SUBPIXELS)
+                        && y.checked_add(height)
+                            .is_some_and(|end| end <= image.height * SOURCE_SUBPIXELS),
+                    "Invalid fractional terminal image placement"
+                );
+            }
+            if let Some([_, rows]) = placement.fit_rows {
+                anyhow::ensure!(
+                    rows != 0 && placement.source_subpixels.is_none(),
+                    "Invalid terminal image sizing box"
+                );
+            }
+            anyhow::ensure!(
+                placement.sizing.is_none()
+                    || (placement.fit_rows.is_none() && placement.source_subpixels.is_none()),
+                "Conflicting terminal image sizing"
+            );
         }
         anyhow::ensure!(
             added == self.images.len(),
@@ -241,7 +322,7 @@ mod tests {
     };
 
     #[test]
-    fn full_text_and_graphics_viewport_fits_the_record_budget() {
+    fn full_text_with_search_and_graphics_fits_one_record() {
         let (cols, rows) = crate::viewport::constrain(1000, 1000);
         let mut cell = Cell::default();
         cell.set_text(&format!("🎵{}", "\u{1d185}".repeat(64)))
@@ -260,6 +341,9 @@ mod tests {
             offset: [0, 0],
             size: [1, 1],
             source: [0, 0, 1, 1],
+            source_subpixels: None,
+            fit_rows: None,
+            sizing: None,
         };
         let packet = Packet::Pane(PaneUpdate {
             header: PaneHeader {
@@ -269,6 +353,13 @@ mod tests {
                     ..Frame::default()
                 }),
                 rows: (0..rows).collect(),
+                find: Some(crate::search::FindState {
+                    total: 65_500,
+                    highlights: (0..65_500)
+                        .map(|index| (index * 2, index * 2 + 1, 1))
+                        .collect(),
+                    ..Default::default()
+                }),
                 graphics: Some(GraphicsUpdate {
                     replace: true,
                     cell_pixels: [8, 16],
@@ -279,7 +370,17 @@ mod tests {
             },
             cells: vec![cell; usize::from(cols) * usize::from(rows)],
         });
-        packet.encode_into(&mut Vec::new()).unwrap();
+        let mut wire = Vec::new();
+        packet.encode_into(&mut wire).unwrap();
+        let framing = crate::transport::Record::decode(
+            wire[..crate::transport::RECORD_PREFIX_BYTES]
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(framing.decode_bytes() > 64 * 1024 * 1024);
+        let decoded = Packet::read(&mut wire.as_slice()).unwrap();
+        assert!(framing.validate_packet(&decoded).unwrap() < 64 * 1024 * 1024);
     }
 
     #[test]
@@ -291,6 +392,9 @@ mod tests {
             offset: [1, 2],
             size: [8, 32],
             source: [0, 0, 1, 2],
+            source_subpixels: None,
+            fit_rows: None,
+            sizing: None,
         };
         let packet = Packet::Pane(PaneUpdate {
             header: PaneHeader {

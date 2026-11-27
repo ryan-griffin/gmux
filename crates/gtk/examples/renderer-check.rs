@@ -2214,7 +2214,7 @@ fn validate_kitty_graphics(
     font: &pango::FontDescription,
     context: &pango::Context,
 ) {
-    use gmux_protocol::graphics::{Graphics, Image, Layer, PixelFormat, Placement};
+    use gmux_protocol::graphics::{Graphics, Image, ImageSizing, Layer, PixelFormat, Placement};
     use std::sync::Arc;
 
     let theme = Theme {
@@ -2245,6 +2245,9 @@ fn validate_kitty_graphics(
         offset: [0, 0],
         size: [width, 24],
         source,
+        source_subpixels: None,
+        fit_rows: None,
+        sizing: None,
     };
     let graphics = Graphics {
         cell_pixels: [10, 24],
@@ -2323,6 +2326,154 @@ fn validate_kitty_graphics(
     let _ = node(&mut renderer, &without_images, font, context);
     let restored = node(&mut renderer, &scene, font, context).0;
     assert_eq!(data, pixels(&render(gpu, &restored, &scene)));
+
+    let pixels_across_rows = std::sync::Arc::new(Image {
+        key: 1,
+        width: 3,
+        height: 3,
+        format: PixelFormat::Rgb,
+        pixels: [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+            .into_iter()
+            .flat_map(|row| row.repeat(3))
+            .collect(),
+    });
+    let blank = vec![cell(" ", theme, 0); 40 * 8];
+    let mut tiled = crate::scene(&blank, theme);
+    tiled.frame.cursor_visible = 0;
+    tiled.metrics = (8.0, 16.0);
+    let unit = gmux_protocol::graphics::SOURCE_SUBPIXELS;
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        images: vec![pixels_across_rows],
+        placements: vec![
+            Placement {
+                offset: [0, 8],
+                size: [16, 8],
+                source_subpixels: Some([0, 0, 3 * unit, 3 * unit / 2]),
+                ..placement(1, Layer::BelowText, 0, 16, [0, 0, 3, 2])
+            },
+            Placement {
+                cell: [0, 1],
+                size: [16, 8],
+                source_subpixels: Some([0, 3 * unit / 2, 3 * unit, 3 * unit / 2]),
+                ..placement(1, Layer::BelowText, 0, 16, [0, 2, 3, 1])
+            },
+            Placement {
+                offset: [0, 8],
+                size: [16, 16],
+                ..placement(1, Layer::BelowText, 2, 16, [0, 0, 3, 3])
+            },
+        ],
+    };
+    tiled.graphics = Some(&graphics);
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    for y in 8..24 {
+        let start = y * tiled.width as usize * 4;
+        let (tiles, reference) = data[start..start + 128].split_at(64);
+        assert_eq!(tiles, reference, "Unicode image seam on pixel row {y}");
+    }
+
+    let mut bidi_cells = blank.clone();
+    for (x, text) in ["\u{202b}", "س", "\u{10eeee}", "م", "ا", "\u{202c}"]
+        .into_iter()
+        .enumerate()
+    {
+        bidi_cells[x] = cell(text, theme, 0);
+    }
+    let bidi = bidi::Grid::update(40, &bidi_cells, None).unwrap();
+    let logical = 2;
+    let visual = bidi.visual(logical);
+    assert_ne!(logical, visual);
+    tiled.cells = &bidi_cells;
+    tiled.bidi = Some(&bidi);
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        images: vec![
+            image(1, 1, PixelFormat::Rgb, &[0, 255, 0]),
+            image(2, 1, PixelFormat::Rgb, &[255, 0, 0]),
+        ],
+        placements: vec![
+            Placement {
+                size: [8, 16],
+                source_subpixels: Some([0, 0, unit, unit]),
+                ..placement(1, Layer::BelowText, logical as i32, 8, [0, 0, 1, 1])
+            },
+            Placement {
+                cell: [visual as i32, 1],
+                size: [8, 16],
+                ..placement(2, Layer::AboveText, logical as i32, 8, [0, 0, 1, 1])
+            },
+        ],
+    };
+    tiled.graphics = Some(&graphics);
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    let sample = |column: usize, row: usize| {
+        let byte = ((row * 16 + 8) * tiled.width as usize + column * 8 + 4) * 4;
+        &data[byte..byte + 4]
+    };
+    assert_eq!(sample(visual, 0), [0, 255, 0, 255]);
+    assert_ne!(sample(logical, 0), [0, 255, 0, 255]);
+    assert_eq!(sample(visual, 1), [0, 0, 255, 255]);
+    assert_eq!(sample(logical, 1), [0, 0, 0, 255]);
+
+    // The size owner's cell aspect ratio can differ from this viewer's.
+    tiled.metrics = (10.0, 24.0);
+    tiled.cells = &blank;
+    tiled.bidi = None;
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        images: vec![
+            image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
+            Arc::new(Image {
+                key: 2,
+                width: 8,
+                height: 8,
+                format: PixelFormat::Rgb,
+                pixels: [255, 0, 0].repeat(64),
+            }),
+        ],
+        placements: vec![
+            Placement {
+                cell: [4, 1],
+                size: [8, 48],
+                fit_rows: Some([1, 2]),
+                ..placement(1, Layer::AboveText, 4, 8, [0, 0, 1, 1])
+            },
+            Placement {
+                cell: [6, 1],
+                size: [8, 8],
+                sizing: Some(ImageSizing::Columns),
+                ..placement(2, Layer::AboveText, 6, 8, [0, 0, 8, 8])
+            },
+            Placement {
+                cell: [8, 1],
+                size: [16, 16],
+                sizing: Some(ImageSizing::Rows),
+                ..placement(2, Layer::AboveText, 8, 16, [0, 0, 8, 8])
+            },
+            Placement {
+                cell: [11, 1],
+                size: [8, 8],
+                sizing: Some(ImageSizing::Native),
+                ..placement(2, Layer::AboveText, 11, 8, [0, 0, 8, 8])
+            },
+        ],
+    };
+    tiled.graphics = Some(&graphics);
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    for y in 24..48 {
+        for x in 37..122 {
+            let byte = (y * tiled.width as usize + x) * 4;
+            let red = ((40..50).contains(&x) && (31..41).contains(&y))
+                || ((60..70).contains(&x) && y < 34)
+                || (80..104).contains(&x)
+                || ((110..118).contains(&x) && y < 32);
+            assert_eq!(data[byte..byte + 4], [0, 0, if red { 255 } else { 0 }, 255]);
+        }
+    }
 }
 
 fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {

@@ -74,7 +74,8 @@ def decode_packet(body):
                 key=key, width=width, height=height, format=format,
                 pixels=bytes(body[end - length:end]))
             end -= length
-        fields = ("image", "layer", "cell", "offset", "size", "source")
+        fields = ("image", "layer", "cell", "offset", "size", "source", "source_subpixels",
+                  "fit_rows", "sizing")
         graphics["placements"] = [dict(zip(fields, record, strict=True))
                                   for record in graphics["placements"]]
     return header, body[16 + header_size:end]

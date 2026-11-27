@@ -143,12 +143,14 @@ struct GmuxEngine {
     GmuxClipboardReadFn clipboard_read;
     GmuxGlyphHoldFn glyph_hold;
     GmuxGraphicsHoldFn graphics_hold;
+    size_t graphics_staged;
     uint64_t read_id;
-    bool feed_osc, feed_escape, feed_st;
+    bool feeding, feed_osc, feed_escape, feed_st;
     void *userdata;
     uint32_t cell_width, cell_height;
     bool dark;
     bool held;
+    bool held_graphics;
     bool status_reported;
     GhosttyTrackedGridRef selection_start, selection_end, selection_anchor;
     OutputAnchor output_anchor;
@@ -412,6 +414,14 @@ static GhosttyKittyGraphics kitty_graphics(const GmuxEngine *e) {
     return graphics;
 }
 
+extern uint8_t ghostty_render_state_gmux_image_geometry(GhosttyRenderStateImageIterator,
+    uint32_t *, uint32_t *, uint64_t *, uint32_t *);
+extern void ghostty_render_state_gmux_virtual_runs(GhosttyRenderState, void *, GmuxVirtualRunFn);
+
+void gmux_engine_graphics_virtual_runs(const GmuxEngine *e, void *userdata, GmuxVirtualRunFn visit) {
+    ghostty_render_state_gmux_virtual_runs(e->render, userdata, visit);
+}
+
 uint64_t gmux_engine_graphics(const GmuxEngine *e, const GmuxView *v, uint64_t known,
     uint32_t cell_pixels[2], void *userdata, GmuxImagePlacementFn callback) {
     GhosttyRenderState render = v ? v->render : e->render;
@@ -437,7 +447,7 @@ uint64_t gmux_engine_graphics(const GmuxEngine *e, const GmuxView *v, uint64_t k
     };
     for (size_t n = 0; n < GMUX_GRAPHICS_MAX_PLACEMENTS &&
         ghostty_render_state_image_iterator_next(iterator); n++) {
-        GmuxImagePlacement p;
+        GmuxImagePlacement p = {0};
         GhosttyImageLayer layer;
         void *values[] = {
             &p.id, &p.generation, &p.z, &layer, &p.cell[0], &p.cell[1],
@@ -452,7 +462,11 @@ uint64_t gmux_engine_graphics(const GmuxEngine *e, const GmuxView *v, uint64_t k
             case GHOSTTY_IMAGE_LAYER_ABOVE_TEXT: p.layer = 2; break;
             default: continue;
         }
-        if (p.size[0] && p.size[1] && p.source[2] && p.source[3]) callback(userdata, &p);
+        if (p.size[0] && p.size[1] && p.source[2] && p.source[3]) {
+            p.sizing = ghostty_render_state_gmux_image_geometry(
+                iterator, p.source_subpixels, p.virtual_anchor, &p.anchor_runs_stamp, p.fit_rows);
+            callback(userdata, &p);
+        }
     }
     return generation;
 }
@@ -483,13 +497,15 @@ bool gmux_engine_image(const GmuxEngine *e, uint32_t id, uint64_t generation, Gm
 }
 
 extern GhosttyResult ghostty_kitty_graphics_gmux_animation_tick(GhosttyKittyGraphics,
-    uint64_t, uint64_t *, uint32_t (*)(void *), void *);
+    uint64_t, uint64_t *, uint32_t (*)(void *), GmuxImageChangedFn, void *);
 
 typedef struct {
     const GmuxView *view;
     GmuxGraphicsIdsFn get_ids;
     const uint32_t *ids;
     size_t remaining;
+    GmuxImageChangedFn changed;
+    void *userdata;
 } AnimationVisibility;
 
 static uint32_t next_visible_image(void *data) {
@@ -505,40 +521,46 @@ static uint32_t next_visible_image(void *data) {
     return *visibility->ids++;
 }
 
-bool gmux_engine_graphics_tick(GmuxEngine *e, uint64_t *delay_ms, GmuxGraphicsIdsFn ids) {
+static void animation_changed(void *data, uint32_t id) {
+    const AnimationVisibility *visibility = data;
+    visibility->changed(visibility->userdata, id);
+}
+
+void gmux_engine_graphics_tick(GmuxEngine *e, uint64_t *delay_ms, GmuxGraphicsIdsFn ids,
+    GmuxImageChangedFn changed, void *userdata) {
     *delay_ms = UINT64_MAX;
     if (e->held) {
         uint64_t end = e->hold_started_ms + RENDER_HOLD_TIMEOUT_MS;
         uint64_t now = now_ms();
         *delay_ms = end > now ? end - now : 1;
-        return false;
+        return;
     }
     GhosttyKittyGraphics graphics = kitty_graphics(e);
-    uint64_t before = 0, after = 0, next;
+    uint64_t before = 0, next;
     if (ghostty_kitty_graphics_get(graphics, GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION, &before) || !before)
-        return false;
+        return;
     GmuxView *view = e->views;
     while (view && (!view->active || view->failed)) view = view->next;
-    if (!view) return false;
-    AnimationVisibility visibility = {.view = view, .get_ids = ids};
+    if (!view) return;
+    AnimationVisibility visibility = {
+        .view = view, .get_ids = ids, .changed = changed, .userdata = userdata,
+    };
     uint64_t now = now_ms();
     if (ghostty_kitty_graphics_gmux_animation_tick(graphics, now, &next, next_visible_image,
-        &visibility) == GHOSTTY_SUCCESS)
+        animation_changed, &visibility) == GHOSTTY_SUCCESS)
         *delay_ms = next > now ? next - now : 1;
-    return !ghostty_kitty_graphics_get(graphics, GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION, &after) &&
-        after != before;
-}
-
-void gmux_engine_graphics_hold_callback(GmuxEngine *e, GmuxGraphicsHoldFn callback) {
-    e->graphics_hold = callback;
 }
 
 void gmux_engine_view_graphics_data(GmuxView *v, void *viewdata) {
     v->graphics_data = viewdata;
 }
 
-bool gmux_engine_view_held_render(const GmuxView *v) {
-    return v->held_used;
+bool gmux_engine_view_captured(const GmuxView *v) {
+    return v->captured;
+}
+
+void gmux_engine_graphics_hold_callback(GmuxEngine *e, GmuxGraphicsHoldFn callback) {
+    e->graphics_hold = callback;
 }
 
 void gmux_engine_glyph_hold_callback(GmuxEngine *e, GmuxGlyphHoldFn callback) {
@@ -547,8 +569,12 @@ void gmux_engine_glyph_hold_callback(GmuxEngine *e, GmuxGlyphHoldFn callback) {
 
 static void end_render_hold(GmuxEngine *e) {
     if (e->held && e->glyph_hold) e->glyph_hold(e->userdata, e, false);
-    if (e->held && e->graphics_hold) e->graphics_hold(e->userdata, e, NULL, NULL, false);
+    if (e->held && !e->feeding && e->graphics_hold) {
+        GmuxGraphicsHold graphics = {0};
+        e->graphics_hold(e->userdata, e, NULL, NULL, &graphics);
+    }
     e->held=false;
+    e->held_graphics=false;
     e->links.valid=false;
     links_free(&e->link_scratch.spare);
     links_free(&e->held_links);
@@ -563,8 +589,21 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
         // Capture at the exact start of the hold, even if the same PTY chunk
         // contains the next frame. Keep it visible until that frame is complete.
         if (ghostty_render_state_update(e->render, terminal)) return;
+        uint64_t image_generation = 0;
+        GhosttyRenderStateImageIterator images = e->images;
+        bool held_graphics = !ghostty_render_state_get(e->render,
+            GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION, &image_generation) &&
+            image_generation && !ghostty_render_state_get(e->render,
+                GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR, &images) &&
+            ghostty_render_state_image_iterator_next(images);
+        GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+        GmuxGraphicsHold graphics = {
+            .held = true,
+            .alternate_screen = screen != GHOSTTY_TERMINAL_SCREEN_PRIMARY,
+        };
+        if (e->graphics_hold) e->graphics_hold(e->userdata, e, NULL, NULL, &graphics);
         if (e->glyph_hold) e->glyph_hold(e->userdata, e, true);
-        if (e->graphics_hold) e->graphics_hold(e->userdata, e, NULL, NULL, true);
         e->links.valid=false;
         ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &e->scrollbar);
         links_capture(terminal, e->render, e->iterator, &e->held_links, &e->link_scratch, ++e->link_revision, false);
@@ -595,8 +634,8 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
                 !ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &v->scrollbar)) {
                 links_capture(terminal, v->render, e->iterator, &v->links, &e->link_scratch, ++e->link_revision, false);
                 v->captured=true;
-                if (e->graphics_hold && v->graphics_data)
-                    e->graphics_hold(e->userdata, e, v, v->graphics_data, true);
+                if (e->graphics_hold && v->graphics_data &&
+                    !e->graphics_hold(e->userdata, e, v, v->graphics_data, &graphics)) v->failed=true;
             } else {
                 v->failed=true;
                 // An unsuccessful update may leave an incomplete cache.
@@ -612,6 +651,8 @@ static void render_hold(GhosttyTerminal terminal, void *ud, bool held) {
             v->budget->links_reserved -= released;
         }
         e->hold_started_ms = now_ms();
+        e->held_graphics = held_graphics;
+        e->graphics_staged += graphics.staged_bytes;
     }
     if (held) e->held=true;
     else end_render_hold(e);
@@ -623,6 +664,10 @@ bool gmux_engine_expire_render_hold(GmuxEngine *e) {
     ghostty_terminal_set(e->terminal, GHOSTTY_TERMINAL_OPT_MODE, &mode);
     end_render_hold(e);
     return true;
+}
+
+bool gmux_engine_held_graphics(const GmuxEngine *e) {
+    return e->held_graphics;
 }
 
 static void write_pty(GhosttyTerminal t, void *ud, const uint8_t *data, size_t len) {
@@ -1195,6 +1240,8 @@ int gmux_engine_use_view_appearance(GmuxEngine *e, GmuxView *v) {
 bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *consumed) {
     *consumed = 0;
     if (e->read_id) return false;
+    e->feeding = true;
+    e->graphics_staged = 0;
     bool changed = false;
     unsigned stops = 0;
     while (*consumed < len && !e->read_id && stops++ < 64) {
@@ -1216,7 +1263,8 @@ bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *co
         ghostty_terminal_get(e->terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &was_ground);
         if (e->clear_pending && was_ground) changed |= gmux_engine_clear_screen(e) == 0;
         GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
-        uint32_t boundaries = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
+        uint32_t boundaries = GHOSTTY_TERMINAL_BOUNDARY_OSC_START |
+            GHOSTTY_TERMINAL_BOUNDARY_OSC_END | GHOSTTY_TERMINAL_BOUNDARY_APC_END;
         if (e->clear_pending && !was_ground) boundaries |= GHOSTTY_TERMINAL_BOUNDARY_GROUND;
         int rc = ghostty_terminal_vt_write_until(e->terminal, part, left, boundaries, &stop);
         if (rc != GHOSTTY_SUCCESS && rc != GHOSTTY_NO_VALUE) break;
@@ -1235,7 +1283,8 @@ bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *co
             changed |= !bare_escape;
         }
         *consumed += stop.consumed;
-        if (!stop.consumed) break;
+        // Kitty APCs can replace pixels needed by the next synchronized frame.
+        if (!stop.consumed || e->graphics_staged >= 1024 * 1024) break;
     }
     if (e->clear_pending && !e->read_id) {
         bool ground = false;
@@ -1246,6 +1295,7 @@ bool gmux_engine_feed(GmuxEngine *e, const uint8_t *data, size_t len, size_t *co
         e->text_generation++;
         if (e->prompt_count || e->output.point || e->completed_output.point) shell_prune(e);
     }
+    e->feeding = false;
     return changed;
 }
 

@@ -93,7 +93,7 @@ impl TerminalSession {
     pub(crate) fn resume_graphics(&mut self) {
         self.graphics_deadline = Some(Instant::now());
     }
-    fn tick_graphics(&mut self, now: Instant) -> bool {
+    fn tick_graphics(&mut self, now: Instant) -> Vec<u32> {
         let (changed, next) = self.engine.tick_graphics();
         self.graphics_deadline = next.and_then(|delay| now.checked_add(delay));
         changed
@@ -874,6 +874,9 @@ impl TerminalSession {
 
     pub(crate) fn render_held(&self) -> bool {
         self.engine.mode(2026)
+    }
+    pub(crate) fn held_graphics(&self) -> bool {
+        self.engine.held_graphics()
     }
 }
 

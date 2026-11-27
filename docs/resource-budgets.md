@@ -29,7 +29,9 @@ A four-byte zero remains a heartbeat acknowledgement and needs no reservation.
 Readers validate the fixed framing before allocating the header. JSON headers
 are limited to 16 MiB, clipboard headers to 16 KiB, and window resize headers
 to 256 bytes. Complete records are limited to
-64 MiB on the wire and 64 MiB of decode credit.
+64 MiB on the wire. Pane records have up to 96 MiB of decode credit so large
+viewports can carry text, search highlights, and images together. Other records
+have up to 64 MiB of decode credit.
 
 Admission charges each record for its validated JSON allowance, cell vector,
 overflow text and Arc counters, binary clipboard and image payloads, and queue transfer
@@ -76,7 +78,8 @@ client retains up to 10 MB of source pixels for each subscribed pane and release
 them when it unsubscribes. GTK caches up to 10 MB of cropped texture data per
 renderer and drops its image textures when the pane unmaps. Each daemon
 connection coalesces viewport updates until the previous image payload drains
-from its output queue.
+from its output queue. The daemon shares up to 128 MiB of staging storage
+for pixels captured at synchronized-output boundaries.
 
 The prediction pool evicts whole row caches from unfocused windows first, then
 least recently used caches at the same priority. Hidden tabs release their rows
@@ -124,12 +127,13 @@ authenticated TCP streams serviced directly by its frontend loop:
 
 | Resource | Daemon allowance | Per-stream ceiling |
 | --- | --- | --- |
-| Retained encoded output buffer capacity | 128 MiB | 64 MiB |
+| Queued output buffers and image pixels | 128 MiB | 64 MiB of unsent data |
 | Optional sent-screen snapshots for delta generation | 32 MiB | Shared allowance |
 | Admitted frontend streams, including unattached peers | 64 | One slot |
 
 Output accounting charges allocated capacity, including consumed prefixes and
-spare space. A drained buffer retains at most 256 KiB for reuse. Larger drained
+spare space. Streams referencing the same image generation share its pixel
+allocation. A drained buffer retains at most 256 KiB for reuse. Larger drained
 buffers release their allocation. On aggregate exhaustion, the daemon first
 releases idle output allocations, then disconnects the stream with the largest
 unsent backlog. Capacity breaks ties. Local and remote streams use the same

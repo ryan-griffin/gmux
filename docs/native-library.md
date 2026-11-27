@@ -37,8 +37,8 @@ a fresh-shell handoff, and filtering of control characters in decoded text cells
 and updates Glyph Protocol placement and responses. The
 [PNG patch](../scripts/patches/ghostty-png.patch) enables the bundled Wuffs
 decoder with a 10 MB output limit in libghostty-vt. The
-[graphics patch](../scripts/patches/ghostty-kitty-graphics.patch) bounds RGBA
-conversion and limits animation ticks to visible images. An external
+[graphics patch](../scripts/patches/ghostty-kitty-graphics.patch) bounds
+transfer and storage resources and limits animation ticks to visible images. An external
 `GHOSTTY_PREFIX` must provide this exact revision with the integration patches.
 Ghostty implementation types stay inside the C bridge; Rust and frontend clients
 use Gmux's declarations.

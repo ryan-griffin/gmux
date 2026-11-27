@@ -1,8 +1,107 @@
-Bound RGBA conversion and schedule animations for visible images.
+Bound graphics storage and schedule animations for visible images.
 
 --- a/src/terminal/kitty/graphics_storage.zig
 +++ b/src/terminal/kitty/graphics_storage.zig
-@@ -1165,9 +1165,13 @@
+@@ -17,6 +17,11 @@
+ const Command = command.Command;
+
+ const log = std.log.scoped(.kitty_gfx);
++
++const max_images = 4096;
++const max_placements = 4096;
++pub const max_animation_frames = 32768;
++const ImageAdmissionError = Allocator.Error || error{ImageStorageFull};
+
+ /// Process-global counter backing all generation stamps (see
+ /// ImageStorage.generation and Image.generation). This is global rather
+@@ -135,6 +140,7 @@
+     /// reasons an image doesn't animate go away just because time
+     /// passes.
+     animation_idle_generation: ?u64 = null,
++    animation_tick: u64 = 0,
+
+     /// This is the next automatically assigned image ID for images
+     /// transmitted without an ID or number. We start mid-way through
+@@ -169,6 +175,7 @@
+     /// If the limit is reached, the oldest images will be evicted to make
+     /// space. Unused images take priority.
+     total_bytes: usize = 0,
++    animation_frames: usize = 0,
+     total_limit: usize = 320 * 1000 * 1000, // 320MB
+
+     /// A ticket for attaching pixels to an image that was added before its
+@@ -269,6 +276,7 @@
+             if (data.len != frame.pending_len) return false;
+
+             frame.* = .{ .data = data, .gap_ms = frame.gap_ms };
++            anim.playable = null;
+             if (anim.current_index == number - 1) {
+                 storage.markImageContentChanged(io, img);
+             } else {
+@@ -406,7 +414,7 @@
+         alloc: Allocator,
+         s: *terminal.Screen,
+         img: Image,
+-    ) Allocator.Error!void {
++    ) ImageAdmissionError!void {
+         const new_len = img.data.len();
+
+         // If the image itself is over the limit, then error immediately
+@@ -424,18 +432,14 @@
+
+         // Reserve map capacity before evicting anything so allocation failure
+         // cannot leave storage partially evicted. Existing keys need no room.
+-        if (!self.images.contains(img.id)) {
+-            try self.images.ensureUnusedCapacity(alloc, 1);
+-        }
+-
+-        // If this would put us over the limit, then evict.
+-        const total_bytes = self.total_bytes - old_len + new_len;
+-        if (total_bytes > self.total_limit) {
+-            const req_bytes = total_bytes - self.total_limit;
+-            log.info("evicting images to make space for {} bytes", .{req_bytes});
+-            if (!self.evictImageExcept(io, alloc, s, req_bytes, img.id)) {
+-                log.warn("failed to evict enough images for required bytes", .{});
+-                return error.OutOfMemory;
++        const new_id = !self.images.contains(img.id);
++        const needs_slot = new_id and self.images.count() >= max_images;
++        if (new_id and !needs_slot) try self.images.ensureUnusedCapacity(alloc, 1);
++
++        const req_bytes = (self.total_bytes - old_len + new_len) -| self.total_limit;
++        if (needs_slot or req_bytes != 0) {
++            if (!self.evictImageExcept(io, alloc, s, req_bytes, img.id, needs_slot)) {
++                return if (needs_slot) error.ImageStorageFull else error.OutOfMemory;
+             }
+         }
+
+@@ -454,7 +458,7 @@
+             // Replacing an image drops its animation frames with it,
+             // implementing the protocol rule that retransmitting the
+             // base image resets the animation.
+-            self.total_bytes -= gop.value_ptr.storageSize();
++            self.releaseImage(gop.value_ptr);
+             gop.value_ptr.deinit(alloc);
+         }
+
+@@ -482,7 +486,7 @@
+         alloc: Allocator,
+         s: *terminal.Screen,
+         img: Image,
+-    ) Allocator.Error!PendingImage {
++    ) ImageAdmissionError!PendingImage {
+         assert(img.data == .pending);
+         try self.addImage(io, alloc, s, img);
+         const stored = self.images.get(img.id).?;
+@@ -534,6 +538,8 @@
+             },
+         };
+
++        if (self.placements.count() >= max_placements and !self.placements.contains(key))
++            return error.PlacementStorageFull;
+         const gop = try self.placements.getOrPut(alloc, key);
+         if (gop.found_existing) {
+             gop.value_ptr.deinit(s);
+@@ -1165,9 +1171,13 @@
          io: std.Io,
          alloc: Allocator,
          img: *Image,
@@ -17,7 +116,50 @@ Bound RGBA conversion and schedule animations for visible images.
 
          const rgba = try pixel.rgbaFromFormat(alloc, img.format, old);
          self.total_bytes -= old.len;
-@@ -1238,16 +1242,34 @@
+@@ -1192,7 +1202,9 @@
+         s: *terminal.Screen,
+         image_id: u32,
+         bytes: usize,
++        frames: usize,
+     ) Allocator.Error!void {
++        if (frames > max_animation_frames - self.animation_frames) return error.OutOfMemory;
+         if (bytes > self.total_limit) return error.OutOfMemory;
+
+         const total_bytes = self.total_bytes + bytes;
+@@ -1208,6 +1220,7 @@
+                 s,
+                 req_bytes,
+                 image_id,
++                false,
+             )) {
+                 log.warn("failed to evict enough images for animation frame", .{});
+                 return error.OutOfMemory;
+@@ -1215,13 +1228,19 @@
+         }
+
+         self.total_bytes += bytes;
+-    }
+-
+-    /// Release a reservation made by reserveAnimationBytes, or credit
+-    /// bytes freed by deleting animation frame data.
+-    pub fn releaseAnimationBytes(self: *ImageStorage, bytes: usize) void {
++        self.animation_frames += frames;
++    }
++
++    /// Release reserved animation frame storage.
++    pub fn releaseAnimationBytes(self: *ImageStorage, bytes: usize, frames: usize) void {
+         assert(bytes <= self.total_bytes);
+         self.total_bytes -= bytes;
++        self.animation_frames -= frames;
++    }
++
++    fn releaseImage(self: *ImageStorage, img: *const Image) void {
++        const frames = if (img.animation) |anim| anim.frames.items.len else 0;
++        self.releaseAnimationBytes(img.storageSize(), frames);
+     }
+
+     /// Advance every running animation to the frame that should be
+@@ -1238,21 +1257,47 @@
      /// the last tick, this returns null right away instead of looking
      /// at every image.
      pub fn animationTick(self: *ImageStorage, io: std.Io, now_ms: u64) ?u64 {
@@ -26,6 +168,7 @@ Bound RGBA conversion and schedule animations for visible images.
 +
 +    pub const AnimationImages = struct {
 +        next: *const fn (?*anyopaque) callconv(.c) u32,
++        changed: ?*const fn (?*anyopaque, u32) callconv(.c) void,
 +        userdata: ?*anyopaque,
 +    };
 +
@@ -39,8 +182,10 @@ Bound RGBA conversion and schedule animations for visible images.
          // so there is still nothing to play. See
          // animation_idle_generation.
 -        if (self.animation_idle_generation == self.generation) return null;
+-
 +        if (visible == null and self.animation_idle_generation == self.generation) return null;
-
++
++        if (visible != null) self.animation_tick +%= 1;
          var min_delay: ?u64 = null;
 
          var it = self.images.iterator();
@@ -55,7 +200,47 @@ Bound RGBA conversion and schedule animations for visible images.
 
              // The gates below mirror Kitty's image_is_animatable.
 
-@@ -1352,14 +1374,10 @@
+             // No animation state was ever attached (plain image).
+             const anim = img.animation orelse continue;
++
++            // Multiple views can show the same animation.
++            if (visible != null) {
++                if (anim.last_tick == self.animation_tick) continue;
++                anim.last_tick = self.animation_tick;
++            }
+
+             // Stopped is the initial state of every animation: frames
+             // then only change client-driven (a=a c=N), never by time.
+@@ -1272,15 +1317,9 @@
+             // restored from a snapshot); nothing can be displayed.
+             if (img.data.isPending()) continue;
+
+-            // For the same reason, playback waits until every frame's
+-            // pixels have arrived.
+-            if (anim.hasPendingFrames()) continue;
+-
+-            // A zero total duration means every frame is gapless and
+-            // no frame can ever be displayed, so the animation can
+-            // never advance. This also guards the gapless-skip loop
+-            // below from never terminating.
+-            if (anim.durationMs() == 0) continue;
++            if (visible != null) {
++                if (!anim.canPlay()) continue;
++            } else if (anim.hasPendingFrames() or anim.durationMs() == 0) continue;
+
+             // A finite loop budget (a=a v=N) that ran out on an
+             // earlier tick froze playback on the last frame for good.
+@@ -1339,6 +1378,9 @@
+                 anim.current_index = idx;
+                 anim.frame_shown_at_ms = now_ms;
+                 self.markImageContentChanged(io, img);
++                if (visible) |images| {
++                    if (images.changed) |changed| changed(images.userdata, img.id);
++                }
+                 next_at = now_ms +| anim.gapAt(idx);
+             }
+
+@@ -1352,14 +1394,10 @@
              }
          }
 
@@ -74,30 +259,341 @@ Bound RGBA conversion and schedule animations for visible images.
 
          return min_delay;
      }
+@@ -1718,7 +1756,7 @@
+             if (!v.delete) return;
+             self.removePlacementsByImageId(s, img.id);
+             const entry = self.images.getEntry(img.id).?;
+-            self.total_bytes -= entry.value_ptr.storageSize();
++            self.releaseImage(entry.value_ptr);
+             entry.value_ptr.deinit(alloc);
+             self.images.removeByPtr(entry.key_ptr);
+             return;
+@@ -1735,7 +1773,7 @@
+             // promoted frame's bytes stay reserved and only the old root
+             // data is freed. If the promoted frame is still pending, the
+             // image's own pixels become pending.
+-            self.releaseAnimationBytes(img.data.len());
++            self.releaseAnimationBytes(img.data.len(), 1);
+             img.data.deinit(alloc);
+             const promoted = anim.frames.orderedRemove(0);
+             img.data = if (promoted.isPending())
+@@ -1745,8 +1783,15 @@
+             anim.root_gap_ms = promoted.gap_ms;
+         } else {
+             const removed = anim.frames.orderedRemove(number - 2);
+-            self.releaseAnimationBytes(removed.storageSize());
++            self.releaseAnimationBytes(removed.storageSize(), 1);
+             alloc.free(removed.data);
++        }
++
++        anim.playable = null;
++        if (anim.frames.items.len == 0) {
++            anim.frames.clearAndFree(alloc);
++        } else if (anim.frames.items.len < anim.frames.capacity / 4) {
++            anim.frames.shrinkAndFree(alloc, anim.frames.items.len);
+         }
+
+         // Fix up the current frame.
+@@ -1772,7 +1817,7 @@
+         const entry = self.images.getEntry(image_id) orelse return;
+         if (entry.value_ptr.metadata.placement_count > 0) return;
+
+-        self.total_bytes -= entry.value_ptr.storageSize();
++        self.releaseImage(entry.value_ptr);
+         entry.value_ptr.deinit(alloc);
+         self.images.removeByPtr(entry.key_ptr);
+     }
+@@ -1815,7 +1860,7 @@
+         s: *terminal.Screen,
+         req: usize,
+     ) bool {
+-        return self.evictImageExcept(io, alloc, s, req, null);
++        return self.evictImageExcept(io, alloc, s, req, null, false);
+     }
+
+     /// Evict images while preserving `exclude_id`, used when replacing an
+@@ -1827,6 +1872,7 @@
+         s: *terminal.Screen,
+         req: usize,
+         exclude_id: ?u32,
++        needs_slot: bool,
+     ) bool {
+         assert(req <= self.total_limit);
+
+@@ -1850,7 +1896,7 @@
+                 };
+             }
+
+-            fn lessThan(lhs: @This(), rhs: @This()) bool {
++            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                 if (lhs.priority != rhs.priority)
+                     return lhs.priority < rhs.priority;
+                 if (lhs.transmission != rhs.transmission)
+@@ -1859,50 +1905,63 @@
+             }
+         };
+
+-        // Evicting anything is a content mutation. This matters for the
+-        // setLimit path in particular, which doesn't otherwise mark it.
+-        // Evicted placements can also orphan relative placements of
+-        // other images, which must be reaped along with them.
+         const images_before = self.images.count();
++        const placements_before = self.placements.count();
+         defer if (self.images.count() != images_before) {
+-            _ = self.removeOrphans(s, null);
++            if (self.placements.count() != placements_before) _ = self.removeOrphans(s, null);
+             self.markMutated(io);
+         };
++        if (req == 0 and !needs_slot) return true;
++
++        // Most admissions need only one eviction. Find it without allocating
++        // or sorting the candidates for a multi-image eviction.
++        var best: ?Candidate = null;
++        var scan = self.images.iterator();
++        while (scan.next()) |entry| {
++            if (exclude_id == entry.value_ptr.id) continue;
++            const candidate = Candidate.init(entry.value_ptr);
++            if (best == null or Candidate.lessThan({}, candidate, best.?)) best = candidate;
++        }
++        const first = best orelse return false;
++        if (self.images.getPtr(first.id).?.storageSize() >= req) {
++            _ = self.removeEvictedImage(alloc, s, first.id);
++            return true;
++        }
++
++        const candidates = alloc.alloc(Candidate, images_before) catch return false;
++        defer alloc.free(candidates);
++        var len: usize = 0;
++        var it = self.images.iterator();
++        while (it.next()) |entry| {
++            if (exclude_id == entry.value_ptr.id) continue;
++            candidates[len] = Candidate.init(entry.value_ptr);
++            len += 1;
++        }
++        std.mem.sort(Candidate, candidates[0..len], {}, Candidate.lessThan);
+
+         var evicted: usize = 0;
+-        while (evicted < req) {
+-            const c = candidate: {
+-                var best: ?Candidate = null;
+-                var it = self.images.iterator();
+-                while (it.next()) |kv| {
+-                    const img = kv.value_ptr;
+-                    if (exclude_id != null and img.id == exclude_id.?) continue;
+-
+-                    const current = Candidate.init(img);
+-                    if (best == null or current.lessThan(best.?)) best = current;
+-                }
+-                break :candidate best orelse return false;
+-            };
+-
+-            var p_it = self.placements.iterator();
+-            while (p_it.next()) |entry| {
+-                if (entry.key_ptr.image_id == c.id) {
+-                    self.removePlacement(s, entry);
+-                }
+-            }
+-
+-            const entry = self.images.getEntry(c.id).?;
+-            const image_len = entry.value_ptr.storageSize();
+-            log.info("evicting image id={} bytes={}", .{ c.id, image_len });
+-
+-            evicted += image_len;
+-            self.total_bytes -= image_len;
+-
+-            entry.value_ptr.deinit(alloc);
+-            self.images.removeByPtr(entry.key_ptr);
++        for (candidates[0..len]) |candidate| {
++            if (evicted >= req) break;
++            evicted += self.removeEvictedImage(alloc, s, candidate.id);
+         }
+-
+-        return true;
++        return evicted >= req;
++    }
++
++    fn removeEvictedImage(
++        self: *ImageStorage,
++        alloc: Allocator,
++        s: *terminal.Screen,
++        id: u32,
++    ) usize {
++        const entry = self.images.getEntry(id).?;
++        if (entry.value_ptr.metadata.placement_count > 0)
++            self.removePlacementsByImageId(s, id);
++        const bytes = entry.value_ptr.storageSize();
++        log.info("evicting image id={} bytes={}", .{ id, bytes });
++        self.releaseImage(entry.value_ptr);
++        entry.value_ptr.deinit(alloc);
++        self.images.removeByPtr(entry.key_ptr);
++        return bytes;
+     }
+
+     /// State returned by scrollMarginsBegin: the final active-area
+@@ -1980,6 +2039,10 @@
+         /// The columns/rows this image occupies.
+         columns: u32 = 0,
+         rows: u32 = 0,
++
++        /// Keep the sizing box when a margin scroll trims its rows.
++        trim_top: u32 = 0,
++        trim_bottom: u32 = 0,
+
+         /// The z-index for this placement.
+         z: i32 = 0,
+@@ -2183,7 +2246,7 @@
+             // If we have a specified columns and rows then this is trivial.
+             if (self.columns > 0 and self.rows > 0) return .{
+                 .cols = self.columns,
+-                .rows = self.rows,
++                .rows = self.rows -| self.trim_top -| self.trim_bottom,
+             };
+
+             // Otherwise we calculate the pixel size, divide by
+@@ -2222,6 +2285,11 @@
+             span: u32,
+         ) bool {
+             assert(count > 0 and count < span);
++            if (self.columns != 0 and self.rows != 0) {
++                self.trim_top += count;
++                return true;
++            }
++
+             const src = self.sourceRect(image);
+             const crop: u32 = if (self.rows > 0)
+                 // Scaled placement: each grid row shows an equal
+@@ -2249,6 +2317,11 @@
+             span: u32,
+         ) bool {
+             assert(count > 0 and count < span);
++            if (self.columns != 0 and self.rows != 0) {
++                self.trim_bottom += count;
++                return true;
++            }
++
+             const src = self.sourceRect(image);
+             // An empty source can never be clipped smaller. This also
+             // guarantees we never store an explicit zero source height,
+@@ -4080,7 +4153,7 @@
+         .gap_ms = 10,
+         .pending_len = 4,
+     });
+-    try s.reserveAnimationBytes(io, alloc, t.screens.active, 1, anim.frameBytes());
++    try s.reserveAnimationBytes(io, alloc, t.screens.active, 1, anim.frameBytes(), anim.frames.items.len);
+     s.images.getPtr(1).?.animation = anim;
+     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+         .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+@@ -4373,7 +4446,7 @@
+     try testing.expectEqual(@as(usize, 0), storage.placements.count());
+ }
+
+-test "storage: scroll margins scaled placement clips proportionally" {
++test "storage: scroll margins trim the sizing box without changing the source" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+     const io = testing.io;
+@@ -4404,10 +4477,10 @@
+     }).?;
+     const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+     try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+-    try testing.expectEqual(@as(u32, 20), p.source_y);
+-    try testing.expectEqual(@as(u32, 20), p.source_height);
+-    try testing.expectEqual(@as(u32, 1), p.rows);
+-    try testing.expectEqual(@as(u32, 1), p.columns);
++    try testing.expectEqual(@as(u32, 0), p.source_y);
++    try testing.expectEqual(@as(u32, 2), p.rows);
++    try testing.expectEqual(@as(u32, 1), p.trim_top);
++    try testing.expectEqual(@as(u32, 1), p.gridSize(storage.imageById(1).?, &t).rows);
+ }
+
+ test "storage: scroll margins left/right margins respect columns" {
+--- a/src/terminal/kitty/graphics_animation.zig
++++ b/src/terminal/kitty/graphics_animation.zig
+@@ -60,6 +60,8 @@
+     /// ImageStorage.animationTick) when the current frame was shown.
+     /// Null means "not yet shown"; the next tick stamps it.
+     frame_shown_at_ms: ?u64 = null,
++    last_tick: u64 = 0,
++    playable: ?bool = null,
+
+     pub const State = enum {
+         /// Not advancing; frames change only via a=a c=N (client-driven).
+@@ -135,11 +137,19 @@
+
+     /// Set the gap of the frame at the given zero-based index.
+     pub fn setGapAt(self: *Animation, index: u32, gap_ms: u32) void {
++        self.playable = null;
+         if (index == 0) {
+             self.root_gap_ms = gap_ms;
+         } else {
+             self.frames.items[index - 1].gap_ms = gap_ms;
+         }
++    }
++
++    pub fn canPlay(self: *Animation) bool {
++        if (self.playable) |ready| return ready;
++        const ready = !self.hasPendingFrames() and self.durationMs() != 0;
++        self.playable = ready;
++        return ready;
+     }
+
+     /// The sum of all frame gaps. An animation with a zero duration
 --- a/src/terminal/kitty/graphics_exec.zig
 +++ b/src/terminal/kitty/graphics_exec.zig
-@@ -1094,12 +1094,13 @@
+@@ -674,6 +674,7 @@
+             terminal.screens.active,
+             image_id,
+             frame_len,
++            1,
+         ) catch {
+             result.message = "ENOSPC: animation frame storage full";
+             return result;
+@@ -681,7 +682,7 @@
+         img = storage.imagePtrByIdOrNumber(image_id, 0).?;
+
+         const canvas = alloc.alloc(u8, frame_len) catch {
+-            storage.releaseAnimationBytes(frame_len);
++            storage.releaseAnimationBytes(frame_len, 1);
+             result.message = "ENOMEM: out of memory";
+             return result;
+         };
+@@ -707,10 +708,12 @@
+             .gap_ms = gap,
+         }) catch {
+             alloc.free(canvas);
+-            storage.releaseAnimationBytes(frame_len);
++            storage.releaseAnimationBytes(frame_len, 1);
+             result.message = "ENOMEM: out of memory";
+             return result;
+         };
++
++        anim.playable = null;
+
+         // A new frame never changes the displayed frame (playback
+         // reaches it later), but the storage content changed.
+@@ -1094,12 +1097,14 @@
      return .{ .image = img, .display = display_ };
  }
 
 -const EncodeableError = Image.Error || Allocator.Error;
-+const EncodeableError = Image.Error || Allocator.Error || error{ImageStorageFull};
++const EncodeableError = Image.Error || Allocator.Error || error{ ImageStorageFull, PlacementStorageFull };
 
  /// Encode an error code into a message for a response.
  fn encodeError(r: *Response, err: EncodeableError) void {
      switch (err) {
          error.OutOfMemory => r.message = "ENOMEM: out of memory",
 +        error.ImageStorageFull => r.message = "ENOSPC: image storage full",
++        error.PlacementStorageFull => r.message = "ENOSPC: placement storage full",
          error.InsufficientData => r.message = "ENODATA: insufficient data",
          error.InvalidData => r.message = "EINVAL: invalid data",
          error.DecompressionFailed => r.message = "EINVAL: decompression failed",
 --- a/src/terminal/c/kitty_graphics.zig
 +++ b/src/terminal/c/kitty_graphics.zig
-@@ -222,6 +222,16 @@
+@@ -222,6 +222,17 @@
      now_ms: u64,
      next_ms: ?*u64,
  ) callconv(lib.calling_conv) Result {
-+    return gmux_animation_tick(graphics_, now_ms, next_ms, null, null);
++    return gmux_animation_tick(graphics_, now_ms, next_ms, null, null, null);
 +}
 +
 +pub fn gmux_animation_tick(
@@ -105,12 +601,13 @@ Bound RGBA conversion and schedule animations for visible images.
 +    now_ms: u64,
 +    next_ms: ?*u64,
 +    next_image: ?*const fn (?*anyopaque) callconv(.c) u32,
++    changed: ?*const fn (?*anyopaque, u32) callconv(.c) void,
 +    userdata: ?*anyopaque,
 +) callconv(lib.calling_conv) Result {
      if (comptime !lib.feature(.kitty_graphics)) return .unsupported;
 
      const out = next_ms orelse return .invalid_value;
-@@ -230,9 +240,10 @@
+@@ -230,9 +241,10 @@
      // The tick needs an Io only to hand out new generation numbers.
      // The storage handle doesn't carry one, but TinyIo has no state,
      // so a fresh one works just as well as the terminal's.
@@ -118,7 +615,7 @@ Bound RGBA conversion and schedule animations for visible images.
 +    const delay = storage.animationTickVisible(
          terminal_c.Io.init.io(),
          now_ms,
-+        if (next_image) |next| .{ .next = next, .userdata = userdata } else null,
++        if (next_image) |next| .{ .next = next, .changed = changed, .userdata = userdata } else null,
      ) orelse return .no_value;
      // The Zig tick returns a delay. The C API returns the absolute
      // time instead, so callers don't have to remember when they
@@ -132,9 +629,27 @@ Bound RGBA conversion and schedule animations for visible images.
  pub const kitty_graphics_image = kitty_graphics.image_get_handle;
  pub const kitty_graphics_image_get = kitty_graphics.image_get;
  pub const kitty_graphics_image_get_multi = kitty_graphics.image_get_multi;
+@@ -115,6 +116,8 @@
+ pub const render_state_row_cells_free = render.row_cells_free;
+ pub const render_state_image_iterator_new = render.image_iterator_new;
+ pub const render_state_image_iterator_next = render.image_iterator_next;
++pub const render_state_gmux_image_geometry = render.gmux_image_geometry;
++pub const render_state_gmux_virtual_runs = render.gmux_virtual_runs;
+ pub const render_state_image_iterator_free = render.image_iterator_free;
+ pub const render_state_image_get = render.image_get;
+ pub const render_state_image_get_multi = render.image_get_multi;
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -380,6 +380,7 @@
+@@ -307,6 +307,8 @@
+         @export(&c.render_state_row_cells_free, .{ .name = "ghostty_render_state_row_cells_free" });
+         @export(&c.render_state_image_iterator_new, .{ .name = "ghostty_render_state_image_iterator_new" });
+         @export(&c.render_state_image_iterator_next, .{ .name = "ghostty_render_state_image_iterator_next" });
++        @export(&c.render_state_gmux_image_geometry, .{ .name = "ghostty_render_state_gmux_image_geometry" });
++        @export(&c.render_state_gmux_virtual_runs, .{ .name = "ghostty_render_state_gmux_virtual_runs" });
+         @export(&c.render_state_image_iterator_free, .{ .name = "ghostty_render_state_image_iterator_free" });
+         @export(&c.render_state_image_get, .{ .name = "ghostty_render_state_image_get" });
+         @export(&c.render_state_image_get_multi, .{ .name = "ghostty_render_state_image_get_multi" });
+@@ -380,6 +382,7 @@
          @export(&c.snapshot_decoder_decode, .{ .name = "ghostty_snapshot_decoder_decode" });
          @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
          @export(&c.kitty_graphics_animation_tick, .{ .name = "ghostty_kitty_graphics_animation_tick" });
@@ -142,3 +657,538 @@ Bound RGBA conversion and schedule animations for visible images.
          @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
          @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
          @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
+--- a/src/terminal/kitty/graphics_image.zig
++++ b/src/terminal/kitty/graphics_image.zig
+@@ -1,5 +1,6 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
++const build_options = @import("terminal_options");
+ const wuffs = @import("wuffs");
+ const assert = @import("../../quirks.zig").inlineAssert;
+ const Allocator = std.mem.Allocator;
+@@ -19,8 +20,8 @@
+ /// Maximum width or height of an image. Taken directly from Kitty.
+ const max_dimension = 10000;
+
+-/// Maximum size in bytes, taken from Kitty.
+-const max_size = 400 * 1024 * 1024; // 400MB
++/// Maximum bytes buffered or inflated for one transfer.
++const max_size = if (build_options.artifact == .lib) 16 * 1024 * 1024 else 400 * 1024 * 1024;
+
+ /// An image that is still being loaded. The image should be initialized
+ /// using init on the first chunk and then addData for each subsequent
+--- a/src/terminal/snapshot/kitty.zig
++++ b/src/terminal/snapshot/kitty.zig
+@@ -270,6 +270,9 @@
+ //!     | Z (i32)                            |
+ //! end +------------------------------------+
+ //! ```
++//!
++//! A clipped pin uses location kind 3 and appends two u32 row trim counts
++//! (top, bottom) after Z. Its location fields are the same as kind 0.
+ //!
+ //! Placement ID tags are 0 internal and 1 external. Location kinds and their
+ //! locations are:
+@@ -1083,10 +1086,11 @@
+     context: PinContext,
+ ) !void {
+     const p = planned.placement;
++    const trimmed = p.trim_top != 0 or p.trim_bottom != 0;
+     try encodePlacementKey(writer, planned.key);
+     switch (p.location) {
+         .pin => |pin| {
+-            try writer.writeByte(0);
++            try writer.writeByte(if (trimmed) 3 else 0);
+             switch (context) {
+                 .storage => |first| try io.writeInt(
+                     writer,
+@@ -1115,6 +1119,10 @@
+     try io.writeInt(writer, u32, p.columns);
+     try io.writeInt(writer, u32, p.rows);
+     try io.writeInt(writer, i32, p.z);
++    if (trimmed) {
++        try io.writeInt(writer, u32, p.trim_top);
++        try io.writeInt(writer, u32, p.trim_bottom);
++    }
+ }
+
+ fn encodeLoading(writer: *std.Io.Writer, loading: *const LoadingImage) !void {
+@@ -1402,6 +1410,7 @@
+         const current_index = try io.readInt(reader, u32);
+         const root_gap_ms = try io.readInt(reader, u32);
+         const frame_count = try io.readInt(reader, u32);
++        if (frame_count > @import("../kitty/graphics_storage.zig").max_animation_frames) valid = false;
+
+         const anim = try alloc.create(Animation);
+         anim.* = .{
+@@ -1466,7 +1475,10 @@
+         const frame_bytes = if (self.animation) |a| a.frameBytes() else 0;
+         if (base_len + frame_bytes > storage.total_limit) return;
+
+-        _ = try storage.addPendingImage(io_, alloc, screen, self.image);
++        _ = storage.addPendingImage(io_, alloc, screen, self.image) catch |err| switch (err) {
++            error.ImageStorageFull => return,
++            error.OutOfMemory => return error.OutOfMemory,
++        };
+         const anim = self.animation orelse return;
+         if (frame_bytes > 0) {
+             // Older images could not make room. Keep the image itself and
+@@ -1477,6 +1489,7 @@
+                 screen,
+                 self.image.id,
+                 frame_bytes,
++                anim.frames.items.len,
+             ) catch return;
+         }
+         storage.images.getPtr(self.image.id).?.animation = anim;
+@@ -1530,8 +1543,9 @@
+         context: std.meta.Tag(PinContext),
+     ) DecodeError!DecodedPlacement {
+         const key = try decodePlacementKey(reader);
+-        const location: Location = switch (try reader.takeByte()) {
+-            0 => .{ .pin = .{
++        const tag = try reader.takeByte();
++        const location: Location = switch (tag) {
++            0, 3 => .{ .pin = .{
+                 .page = switch (context) {
+                     .storage => try io.readInt(reader, u16),
+                     .page => 0,
+@@ -1570,6 +1584,8 @@
+                 .columns = try io.readInt(reader, u32),
+                 .rows = try io.readInt(reader, u32),
+                 .z = try io.readInt(reader, i32),
++                .trim_top = if (tag == 3) try io.readInt(reader, u32) else 0,
++                .trim_bottom = if (tag == 3) try io.readInt(reader, u32) else 0,
+             },
+         };
+     }
+@@ -1594,6 +1610,10 @@
+         if (storage.placements.contains(key)) return;
+
+         var placement = self.placement;
++        if (placement.trim_top != 0 or placement.trim_bottom != 0) {
++            if (placement.columns == 0 or placement.rows <=
++                @as(u64, placement.trim_top) + placement.trim_bottom) return;
++        }
+         switch (self.location) {
+             .invalid => return,
+             .virtual => placement.location = .virtual,
+--- a/src/terminal/render.zig
++++ b/src/terminal/render.zig
+@@ -689,11 +689,7 @@
+         cols: u32,
+         rows: u32,
+
+-        /// Where the image starts within the top-left cell, in pixels.
+-        /// For a virtual run, an image that doesn't fill its cells is
+-        /// centered, so these can be larger than one cell. For fixed and
+-        /// relative placements, these are the offsets the program asked
+-        /// for, limited to less than one cell.
++        /// Where the image or its sizing box starts relative to its cell.
+         offset_x: u32,
+         offset_y: u32,
+
+@@ -706,6 +702,15 @@
+         source_y: u32,
+         source_width: u32,
+         source_height: u32,
++        source_subpixels: [4]u32 = @splat(0),
++        virtual_anchor: ?struct {
++            key: kitty_gfx.ImageStorage.PlacementKey,
++            column: u32,
++            runs_stamp: u64,
++        } = null,
++        /// For an explicit sizing box, the trimmed top and visible row counts.
++        fit_rows: ?[2]u32 = null,
++        sizing: enum(u8) { cells, columns, rows, native } = .cells,
+
+         pub const Protocol = union(ImageProtocol) {
+             kitty: KittyPlacement,
+@@ -723,9 +728,8 @@
+     /// z-index before drawing. Only placements with something to draw
+     /// are returned.
+     ///
+-    /// The iterator returns the placeholder runs of each row first, then
+-    /// the placements in `placed`. Build one with
+-    /// `imagePlacementIterator` rather than setting the fields yourself.
++    /// The iterator returns fixed and relative placements first, then
++    /// the placeholder runs. Build one with `imagePlacementIterator`.
+     pub const ImagePlacementIterator = struct {
+         /// The placeholder runs of each captured row, top to bottom.
+         rows: []const std.ArrayList(Placeholder),
+@@ -734,19 +738,21 @@
+         /// negative when there are overscan rows above the viewport.
+         viewport_y_base: isize,
+
+-        /// Placements that already have their final position, returned
+-        /// after all of the placeholder runs. These are the placements
+-        /// that are not placeholder runs: fixed and relative placements.
++        /// Fixed and relative placements with their final position.
+         placed: []const ImagePlacement,
+
+         /// The current index into `rows`.
+         y: usize = 0,
+
+-        /// The current index into the runs of `rows[y]`, or into
+-        /// `placed` once every row is done.
++        /// The current index into the runs of `rows[y]`.
+         i: usize = 0,
++        placed_index: usize = 0,
+
+         pub fn next(self: *ImagePlacementIterator) ?ImagePlacement {
++            if (self.placed_index < self.placed.len) {
++                defer self.placed_index += 1;
++                return self.placed[self.placed_index];
++            }
+             while (self.y < self.rows.len) {
+                 const runs = self.rows[self.y].items;
+                 while (self.i < runs.len) {
+@@ -775,16 +781,14 @@
+                         .source_y = g.source_y,
+                         .source_width = g.source_width,
+                         .source_height = g.source_height,
++                        .source_subpixels = g.source_subpixels,
+                     };
+                 }
+                 self.y += 1;
+                 self.i = 0;
+             }
+
+-            const idx = self.i;
+-            if (idx >= self.placed.len) return null;
+-            self.i += 1;
+-            return self.placed[idx];
++            return null;
+         }
+     };
+
+@@ -1950,6 +1954,7 @@
+             source_y: u32,
+             source_width: u32,
+             source_height: u32,
++            source_subpixels: [4]u32 = @splat(0),
+         };
+     };
+
+@@ -2174,6 +2179,9 @@
+             const row_pins = row_data.items(.pin);
+             const row_placeholders = row_data.items(.placeholders);
+             const range = state.rowDataRange();
++            var defaults: DefaultPlacements = .empty;
++            defer defaults.deinit(alloc);
++            var indexed = false;
+             for (
+                 row_pins[range.start..range.end],
+                 row_placeholders[range.start..range.end],
+@@ -2181,8 +2189,13 @@
+                 for (runs.items) |*run| {
+                     if (!roots_stale and run.state != .stale) continue;
+                     runs_changed = true;
++                    if (run.placement_id == 0 and !indexed) {
++                        try indexDefaultPlacements(alloc, storage, &defaults);
++                        indexed = true;
++                    }
+                     resolvePlaceholder(
+                         storage,
++                        &defaults,
+                         pin,
+                         run,
+                         cell_width,
+@@ -2253,33 +2266,37 @@
+             }
+         }
+
++        const Origin = struct { x: i64, y: i64, runs_stamp: u64 = 0 };
++        var virtual_origins: std.AutoHashMapUnmanaged(PlacementKey, ?Origin) = .empty;
++        defer virtual_origins.deinit(alloc);
++        if (state.kitty.virtual_anchors > 0) {
++            for (state.kitty.roots.items) |root| {
++                if (root.anchor != .virtual) continue;
++                const slot = try virtual_origins.getOrPut(alloc, root.anchor.virtual);
++                if (!slot.found_existing) slot.value_ptr.* = null;
++            }
++
++            // Find each referenced virtual placement's top-left corner.
++            for (captured_placeholders, 0..) |runs, y| {
++                for (runs.items) |run| {
++                    const target = run.target orelse continue;
++                    const origin = virtual_origins.getPtr(target) orelse continue;
++                    if (origin.* == null) origin.* = .{ .x = run.x, .y = @intCast(y) };
++                    const present = &origin.*.?;
++                    present.x = @min(present.x, run.x);
++                    const coordinates = [3]u32{ @intCast(y), run.x, run.width };
++                    present.runs_stamp = std.hash.Wyhash.hash(present.runs_stamp, std.mem.asBytes(&coordinates));
++                }
++            }
++        }
++
+         for (state.kitty.roots.items) |root| {
+             const p = root.placement;
+
+             // Where the anchor is. `y` counts captured rows, where 0 is
+             // the first captured row.
+-            const origin: struct { x: i64, y: i64 } = switch (root.anchor) {
+-                // The top-left corner of the virtual placement's cells:
+-                // the smallest column and the smallest row of those
+-                // cells. Without any of those cells in the captured rows,
+-                // the placement isn't drawn, which matches Kitty. There
+-                // are rarely more than a few of these, so a simple scan of
+-                // the runs for each one is fine.
+-                .virtual => |key| origin: {
+-                    var origin: ?struct { x: i64, y: i64 } = null;
+-                    for (captured_placeholders, 0..) |runs, y| {
+-                        for (runs.items) |run| {
+-                            const target = run.target orelse continue;
+-                            if (!target.eql(key)) continue;
+-                            if (origin) |*o| {
+-                                o.x = @min(o.x, run.x);
+-                                o.y = @min(o.y, @as(i64, @intCast(y)));
+-                            } else origin = .{ .x = run.x, .y = @intCast(y) };
+-                        }
+-                    }
+-                    const o = origin orelse continue;
+-                    break :origin .{ .x = o.x, .y = o.y };
+-                },
++            const origin: Origin = switch (root.anchor) {
++                .virtual => |key| virtual_origins.get(key).? orelse continue,
+
+                 // The pin's cell. A pin is marked garbage when its row
+                 // is removed from the scrollback. It has no position
+@@ -2303,11 +2320,20 @@
+             const x: i64 = origin.x + root.horizontal_offset;
+             const y: i64 = origin.y + root.vertical_offset;
+             if (y + p.rows - 1 < 0 or y >= captured_len) continue;
+-            if (x + p.cols - 1 < 0 or x >= state.cols) continue;
++            // A Unicode anchor can move horizontally when its row is
++            // reordered. Keep the child if any visual column would show it.
++            const anchor_x = if (root.anchor == .virtual) origin.x else 0;
++            const anchor_shift = if (root.anchor == .virtual) @as(i64, state.cols) - 1 - origin.x else 0;
++            if (x + anchor_shift + p.cols - 1 < 0 or x - anchor_x >= state.cols) continue;
+
+             var positioned = p;
+             positioned.x = std.math.cast(i32, x) orelse continue;
+             positioned.y = std.math.cast(i32, viewport_y_base + y) orelse continue;
++            if (root.anchor == .virtual) positioned.virtual_anchor = .{
++                .key = root.anchor.virtual,
++                .column = @intCast(origin.x),
++                .runs_stamp = origin.runs_stamp,
++            };
+             try state.kitty.placed.append(alloc, positioned);
+         }
+     }
+@@ -2471,6 +2497,7 @@
+         if (dest.width == 0 or dest.height == 0) return null;
+         const offset = p.cellOffset(t);
+         const source = p.sourceRect(image);
++        if (source.width == 0 or source.height == 0) return null;
+
+         return .{
+             .protocol = .{ .kitty = .{
+@@ -2492,6 +2519,16 @@
+             .offset_y = offset.y,
+             .width = dest.width,
+             .height = dest.height,
++            .fit_rows = if (p.columns != 0 and p.rows != 0)
++                .{ p.trim_top, grid.rows }
++            else
++                null,
++            .sizing = if (p.columns != 0)
++                if (p.rows != 0) .cells else .columns
++            else if (p.rows != 0)
++                .rows
++            else
++                .native,
+             .source_x = source.x,
+             .source_y = source.y,
+             .source_width = source.width,
+@@ -2499,10 +2536,29 @@
+         };
+     }
+
++    const DefaultPlacements = std.AutoHashMapUnmanaged(u32, PlacementKey);
++
++    fn indexDefaultPlacements(
++        alloc: Allocator,
++        storage: *const kitty_gfx.ImageStorage,
++        defaults: *DefaultPlacements,
++    ) Allocator.Error!void {
++        var placements = storage.placements.iterator();
++        while (placements.next()) |entry| {
++            if (entry.value_ptr.location != .virtual) continue;
++            const key = entry.key_ptr.*;
++            const slot = try defaults.getOrPut(alloc, key.image_id);
++            if (!slot.found_existing or key.placement_id.preferredOver(slot.value_ptr.placement_id)) {
++                slot.value_ptr.* = key;
++            }
++        }
++    }
++
+     /// Look up what one placeholder run draws and store it in the run.
+     /// `row_pin` is the pin of the run's row.
+     fn resolvePlaceholder(
+         storage: *const kitty_gfx.ImageStorage,
++        defaults: *const DefaultPlacements,
+         row_pin: PageList.Pin,
+         run: *Placeholder,
+         cell_width: u32,
+@@ -2514,11 +2570,16 @@
+         // Remember the virtual placement even if the image can't be
+         // drawn. Relative placements attached to it still need the
+         // position of these cells.
+-        const target = storage.placeholderTarget(
+-            run.image_id,
+-            run.placement_id,
+-        ) orelse return;
+-        run.target = target.key;
++        const key: PlacementKey = if (run.placement_id == 0)
++            defaults.get(run.image_id) orelse return
++        else
++            .{
++                .image_id = run.image_id,
++                .placement_id = .{ .tag = .external, .id = run.placement_id },
++            };
++        const target = storage.placements.get(key) orelse return;
++        if (target.location != .virtual) return;
++        run.target = key;
+
+         // Nothing to draw until the displayed pixels arrive, as in
+         // `template`.
+@@ -2540,7 +2601,7 @@
+             .height = 1,
+         };
+         const rp = vp.renderPlacement(
+-            &target.placement,
++            &target,
+             &image,
+             cell_width,
+             cell_height,
+@@ -2560,6 +2621,7 @@
+             .source_y = rp.source_y,
+             .source_width = rp.source_width,
+             .source_height = rp.source_height,
++            .source_subpixels = rp.source_subpixels,
+         };
+         run.state = .visible;
+     }
+@@ -4943,8 +5005,6 @@
+         .placement_id = .{ .tag = .external, .id = 7 },
+     }).?;
+     const grid = sp.gridSize(image, &t);
+-    const dest = sp.pixelSize(image, &t);
+-    const offset = sp.cellOffset(&t);
+     const source = sp.sourceRect(image);
+     try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, p.protocol.kitty.kind);
+     try testing.expectEqual(7, p.protocol.kitty.placement_id);
+@@ -4958,10 +5018,9 @@
+     try testing.expectEqual(grid.rows, p.rows);
+     try testing.expectEqual(4, p.offset_x);
+     try testing.expectEqual(3, p.offset_y);
+-    try testing.expectEqual(offset.x, p.offset_x);
+-    try testing.expectEqual(offset.y, p.offset_y);
+-    try testing.expectEqual(dest.width, p.width);
+-    try testing.expectEqual(dest.height, p.height);
++    try testing.expectEqual(26, p.width);
++    try testing.expectEqual(17, p.height);
++    try testing.expectEqual(@as(?[2]u32, .{ 0, 2 }), p.fit_rows);
+     try testing.expectEqual(source.x, p.source_x);
+     try testing.expectEqual(source.y, p.source_y);
+     try testing.expectEqual(source.width, p.source_width);
+--- a/src/terminal/kitty/graphics_unicode.zig
++++ b/src/terminal/kitty/graphics_unicode.zig
+@@ -254,17 +254,31 @@
+         //     p_dest,
+         // });
+
++        const source_x = pixelRange(img_scale_source.x, img_scale_source.width, img.width);
++        const source_y = pixelRange(img_scale_source.y, img_scale_source.height, img.height);
++        const scale = 65536;
++        const subpixel_x = pixelRange(img_scale_source.x * scale, img_scale_source.width * scale, img.width * scale);
++        const subpixel_y = pixelRange(img_scale_source.y * scale, img_scale_source.height * scale, img.height * scale);
+         return .{
+             .top_left = self.pin,
+             .offset_x = @intFromFloat(@round(p_dest.x_offset)),
+             .offset_y = @intFromFloat(@round(p_dest.y_offset)),
+-            .source_x = @intFromFloat(@round(img_scale_source.x)),
+-            .source_y = @intFromFloat(@round(img_scale_source.y)),
+-            .source_width = @intFromFloat(@round(img_scale_source.width)),
+-            .source_height = @intFromFloat(@round(img_scale_source.height)),
++            .source_x = source_x.start,
++            .source_y = source_y.start,
++            .source_width = source_x.len,
++            .source_height = source_y.len,
++            .source_subpixels = .{ subpixel_x.start, subpixel_y.start, subpixel_x.len, subpixel_y.len },
+             .dest_width = @intFromFloat(@round(p_dest.width)),
+             .dest_height = @intFromFloat(@round(p_dest.height)),
+         };
++    }
++
++    fn pixelRange(origin: f64, extent: f64, dimension: u32) struct { start: u32, len: u32 } {
++        const limit: f64 = @floatFromInt(dimension);
++        const start = std.math.clamp(@round(origin), 0, limit - 1);
++        // A visible sliver of the source still needs a pixel to sample.
++        const end = std.math.clamp(@round(origin + extent), start + 1, limit);
++        return .{ .start = @intFromFloat(start), .len = @intFromFloat(end - start) };
+     }
+
+     // Calculate the grid size for the placement. For virtual placements,
+--- a/src/terminal/kitty/graphics_render.zig
++++ b/src/terminal/kitty/graphics_render.zig
+@@ -20,6 +20,8 @@
+     source_y: u32 = 0,
+     source_width: u32 = 0,
+     source_height: u32 = 0,
++    /// Unicode crop in 16.16 source pixels.
++    source_subpixels: [4]u32 = @splat(0),
+
+     /// The final width/height of the image in pixels.
+     dest_width: u32 = 0,
+--- a/src/terminal/c/render.zig
++++ b/src/terminal/c/render.zig
+@@ -1218,6 +1218,47 @@
+     const it = iterator_ orelse return false;
+     it.current = it.inner.next();
+     return it.current != null;
++}
++
++pub fn gmux_image_geometry(
++    iterator_: ImageIterator,
++    source_subpixels: *[4]u32,
++    virtual_anchor: *[4]u32,
++    runs_stamp: *u64,
++    fit_rows: *[2]u32,
++) callconv(lib.calling_conv) u8 {
++    if (comptime !lib.feature(.render_state)) return 0;
++    const it = iterator_ orelse return 0;
++    const placement = it.current orelse return 0;
++    source_subpixels.* = placement.source_subpixels;
++    fit_rows.* = placement.fit_rows orelse @splat(0);
++    if (placement.virtual_anchor) |anchor| {
++        runs_stamp.* = anchor.runs_stamp;
++        virtual_anchor.* = .{
++            anchor.key.image_id,
++            anchor.key.placement_id.id,
++            @intFromEnum(anchor.key.placement_id.tag),
++            anchor.column,
++        };
++    }
++    return @intFromEnum(placement.sizing);
++}
++
++pub fn gmux_virtual_runs(
++    state_: RenderState,
++    userdata: ?*anyopaque,
++    visit: *const fn (?*anyopaque, u32, u32, u32, i32, u32, u32) callconv(lib.calling_conv) void,
++) callconv(lib.calling_conv) void {
++    if (comptime !lib.feature(.render_state)) return;
++    const wrapped = state_ orelse return;
++    const images = wrapped.state.imagePlacementIterator();
++    for (images.rows, 0..) |runs, y| {
++        const viewport_row = std.math.cast(i32, images.viewport_y_base + @as(isize, @intCast(y))) orelse continue;
++        for (runs.items) |run| {
++            const key = run.target orelse continue;
++            visit(userdata, key.image_id, key.placement_id.id, @intFromEnum(key.placement_id.tag), viewport_row, run.x, run.width);
++        }
++    }
+ }
+
+ pub fn image_get(

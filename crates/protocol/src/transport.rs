@@ -10,7 +10,7 @@ use std::{
 
 mod memory;
 mod record;
-pub use record::{RECORD_PREFIX_BYTES, Record, RecordKind};
+pub use record::{MAX_DECODE_BYTES, RECORD_PREFIX_BYTES, Record, RecordKind};
 mod requests;
 pub use requests::{
     KeyAction, KeyLayout, PasteOptions, SelectionMode, StreamCommand, StreamRequest,
@@ -360,6 +360,28 @@ impl Packet {
 
     /// Limit the complete record before copying clipboard payloads to the queue.
     pub fn encode_into_limit(&self, bytes: &mut Vec<u8>, limit: usize) -> anyhow::Result<()> {
+        self.encode_record(bytes, limit, true)
+    }
+
+    /// Encode a record prefix and return its image payloads in wire order.
+    pub fn encode_into_parts(
+        mut self,
+        bytes: &mut Vec<u8>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<std::sync::Arc<crate::graphics::Image>>> {
+        self.encode_record(bytes, limit, false)?;
+        Ok(self
+            .as_pane_mut()
+            .and_then(|pane| pane.header.graphics.as_mut())
+            .map_or_else(Vec::new, |graphics| std::mem::take(&mut graphics.images)))
+    }
+
+    fn encode_record(
+        &self,
+        bytes: &mut Vec<u8>,
+        limit: usize,
+        copy_images: bool,
+    ) -> anyhow::Result<()> {
         let start = bytes.len();
         let limit = limit.min(MAX_PACKET + 4);
         let (cells, payload) = match self {
@@ -420,7 +442,7 @@ impl Packet {
             anyhow::ensure!(size + 4 <= limit, "Frontend is too slow");
             let record = Record::new(size, header_size, kind, json_budget, cells.len())?;
             bytes[start..start + RECORD_PREFIX_BYTES].copy_from_slice(&record.encode());
-            if payload != 0 {
+            if payload != 0 && (copy_images || !matches!(self, Self::Pane(_))) {
                 bytes.reserve(payload + cell_bytes);
             }
             if let Self::Clipboard(crate::clipboard::Write {
@@ -433,7 +455,8 @@ impl Packet {
                 }
             }
             encode_cells(cells, bytes, cell_bytes);
-            if let Self::Pane(update) = self
+            if copy_images
+                && let Self::Pane(update) = self
                 && let Some(graphics) = &update.header.graphics
             {
                 for image in &graphics.images {

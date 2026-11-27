@@ -454,9 +454,9 @@ pub fn run() -> anyhow::Result<()> {
             daemon.git_dirty |= update.directory_changed && daemon.git.is_some();
             if update.changed {
                 daemon.changed.insert(id);
-            } else if update.graphics_changed {
+            } else if !update.graphics_changed.is_empty() {
                 for frontend in daemon.frontends.values_mut().filter(|f| f.attached) {
-                    frontend.redraw_graphics(id);
+                    frontend.redraw_graphics(id, &update.graphics_changed);
                 }
             }
             if let Some(error) = update.error {

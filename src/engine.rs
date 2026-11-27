@@ -50,7 +50,8 @@ mod glyphs;
 use glyphs::{GlyphState, glyph_hold};
 #[path = "engine/graphics.rs"]
 mod graphics;
-use graphics::{GraphicsState, graphics_hold};
+pub(crate) use graphics::{GraphicsLayout, GraphicsViewport, ImageSource};
+use graphics::{GraphicsState, capture_hold};
 
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
@@ -370,6 +371,7 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
 
 pub struct Engine {
     pub(crate) revision: u64,
+    snapshot_revision: u64,
     pub(crate) history: GmuxHistory,
     raw: NonNull<GmuxEngine>,
     events: Box<Events>,
@@ -391,10 +393,12 @@ pub struct Engine {
 
 pub(crate) const MAX_VIEWS: usize = 256;
 pub(crate) const MAX_VIEW_NATIVE_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_GRAPHICS_HOLD_BYTES: usize = 128 * 1024 * 1024;
 /// The Rc outlives every native allocator and view registered in this pool.
 pub(crate) struct ViewResources {
     raw: NonNull<GmuxViewBudget>,
     pub(crate) search: crate::search::SearchBudget,
+    graphics_hold: Rc<std::cell::Cell<usize>>,
 }
 impl Default for ViewResources {
     fn default() -> Self {
@@ -407,6 +411,7 @@ impl ViewResources {
             raw: NonNull::new(unsafe { gmux_engine_view_budget_new(bytes, views) })
                 .expect("view budget"),
             search: Default::default(),
+            graphics_hold: Default::default(),
         }
     }
     pub(crate) fn render_bytes(&self) -> usize {
@@ -417,6 +422,9 @@ impl ViewResources {
     }
     pub(crate) fn count(&self) -> usize {
         unsafe { gmux_engine_view_budget_count(self.raw.as_ptr()) }
+    }
+    pub(crate) fn graphics_hold_bytes(&self) -> usize {
+        self.graphics_hold.get()
     }
 }
 impl Drop for ViewResources {
@@ -448,14 +456,21 @@ impl EngineView {
             + self.find.memory_size()
             + self.find_row.capacity() * size_of::<Cell>()
             + self.find_row.iter().map(Cell::heap_bytes).sum::<usize>()
+            + self.graphics.borrow().memory_size()
             + unsafe { gmux_engine_view_memory(self.raw.as_ptr()) }
     }
 
     pub(crate) fn set_active(&mut self, active: bool) {
         unsafe { gmux_engine_view_set_active(self.raw.as_ptr(), active) }
         if !active {
-            *self.graphics.borrow_mut() = graphics::Snapshot::default();
+            self.graphics.borrow_mut().clear();
         }
+    }
+    pub(crate) fn render_captured(&self) -> bool {
+        unsafe { gmux_engine_view_captured(self.raw.as_ptr()) }
+    }
+    pub(crate) fn shows_images(&self, changed: &[u32]) -> bool {
+        self.graphics.borrow().live.shows_images(changed)
     }
     pub(crate) fn set_theme(&mut self, theme: &Theme) {
         unsafe {
@@ -716,6 +731,9 @@ impl Engine {
                 &mut consumed,
             )
         };
+        if self.events.graphics.has_held_pixels() && !self.mode(2026) {
+            self.events.graphics.clear_held();
+        }
         if changed {
             self.revision = self.revision.wrapping_add(1);
             self.find.invalidate();
@@ -744,7 +762,9 @@ impl Engine {
             gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
         })
         .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?;
-        let graphics = Rc::<std::cell::RefCell<graphics::Snapshot>>::default();
+        let graphics = Rc::new(std::cell::RefCell::new(graphics::Snapshot::new(
+            resources.graphics_hold.clone(),
+        )));
         // The native view borrows the capture until it is freed.
         unsafe {
             gmux_engine_view_graphics_data(raw.as_ptr(), Rc::as_ptr(&graphics).cast_mut().cast())
@@ -928,10 +948,11 @@ impl Engine {
         unsafe {
             gmux_engine_read_callback(raw.as_ptr(), Some(clipboard_read));
             gmux_engine_glyph_hold_callback(raw.as_ptr(), Some(glyph_hold));
-            gmux_engine_graphics_hold_callback(raw.as_ptr(), Some(graphics_hold));
+            gmux_engine_graphics_hold_callback(raw.as_ptr(), Some(capture_hold));
         }
         Ok(Self {
             revision: 1,
+            snapshot_revision: 0,
             history: GmuxHistory {
                 generation: 0,
                 origin: 0,
@@ -1049,6 +1070,9 @@ impl Engine {
             )
         };
         anyhow::ensure!(result >= 0, "Ghostty render-state update failed");
+        if result != 0 {
+            self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        }
         self.history = unsafe { gmux_engine_history_state(self.raw.as_ptr()) };
         if !self.mode(2026) {
             self.held_hyperlinks = Default::default();
@@ -1312,19 +1336,32 @@ impl Engine {
         );
         Ok((String::from_utf8(out.bytes)?, colors))
     }
-    pub(crate) fn tick_graphics(&mut self) -> (bool, Option<std::time::Duration>) {
+    pub(crate) fn tick_graphics(&mut self) -> (Vec<u32>, Option<std::time::Duration>) {
+        unsafe extern "C" fn changed(data: *mut c_void, id: u32) {
+            unsafe { &mut *data.cast::<Vec<u32>>() }.push(id);
+        }
+        let mut images = Vec::new();
         let mut delay = 0;
-        let changed = unsafe {
-            gmux_engine_graphics_tick(self.raw.as_ptr(), &mut delay, Some(graphics::visible_ids))
+        unsafe {
+            gmux_engine_graphics_tick(
+                self.raw.as_ptr(),
+                &mut delay,
+                Some(graphics::visible_ids),
+                Some(changed),
+                (&mut images as *mut Vec<u32>).cast(),
+            )
         };
         (
-            changed,
+            images,
             (delay != u64::MAX).then(|| std::time::Duration::from_millis(delay)),
         )
     }
 
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }
+    }
+    pub(crate) fn held_graphics(&self) -> bool {
+        unsafe { gmux_engine_held_graphics(self.raw.as_ptr()) }
     }
     fn scroll(&mut self, delta: isize, bottom: bool) {
         unsafe { gmux_engine_scroll(self.raw.as_ptr(), delta, bottom) }
@@ -1469,26 +1506,35 @@ impl ActiveView<'_> {
     }
     pub(crate) fn graphics(
         &mut self,
-    ) -> (
-        Option<std::sync::Arc<gmux_protocol::graphics::Graphics>>,
-        bool,
-    ) {
-        let state = &mut self.engine.events.graphics;
-        if self.held {
-            let graphics = if unsafe { gmux_engine_view_held_render(self.view.raw.as_ptr()) } {
-                self.view.graphics.borrow().graphics.clone()
-            } else {
-                state.held.graphics.clone()
-            };
-            return (graphics, false);
+        geometry: GraphicsViewport,
+    ) -> (Option<std::sync::Arc<GraphicsLayout>>, bool) {
+        let mut snapshot = self.view.graphics.borrow_mut();
+        let engine = self.engine.raw.as_ptr();
+        if !self.held {
+            snapshot.live.refresh(
+                engine,
+                std::ptr::null(),
+                &mut self.engine.events.graphics.pixels,
+            );
         }
-        let mut capture = self.view.graphics.borrow_mut();
-        let newly_visible = capture.refresh(
-            self.engine.raw.as_ptr(),
-            std::ptr::null(),
-            &mut state.pixels,
+        let (layout, newly_visible) = snapshot.publish(
+            engine,
+            self.held,
+            self.engine.frame,
+            self.engine.snapshot_revision,
+            &self.engine.cells,
+            geometry,
         );
-        (capture.graphics.clone(), newly_visible)
+        (layout, !self.held && newly_visible)
+    }
+    pub(crate) fn graphics_image(
+        &mut self,
+        source: ImageSource,
+    ) -> Option<std::sync::Arc<gmux_protocol::graphics::Image>> {
+        self.engine
+            .events
+            .graphics
+            .image(self.engine.raw.as_ptr(), source)
     }
     pub(crate) fn hyperlinks(&self) -> &gmux_protocol::hyperlinks::Hyperlinks {
         &self.engine.hyperlinks
@@ -2586,14 +2632,16 @@ mod tests {
         fresh
             .with_view(&mut view, |active| {
                 active.snapshot().unwrap();
-                let graphics = active.graphics().0.unwrap();
+                let graphics = active.graphics(Default::default()).0.unwrap();
                 let [placement] = graphics.placements.as_slice() else {
                     panic!("Expected a restored image placement");
                 };
-                assert_eq!(
-                    graphics.image(placement.image).unwrap().pixels,
-                    [7, 7, 7, 255]
-                );
+                let image = active.graphics_image(graphics.images[0]).unwrap();
+                assert_eq!(image.pixels, [7, 7, 7, 255]);
+                assert_eq!(placement.image, graphics.images[0].key);
+                let pixels = std::sync::Arc::downgrade(&image);
+                drop(image);
+                assert!(pixels.upgrade().is_none());
             })
             .unwrap();
     }

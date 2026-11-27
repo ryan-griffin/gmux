@@ -10,8 +10,8 @@ bundled integration patches applied:
 - The [snapshot-state patch](../scripts/patches/ghostty-snapshot-state.patch) omits unfinished parser input and image transfers, prepares restored state for a fresh shell, and filters decoded text cells.
 - The [glyph patch](../scripts/patches/ghostty-glyphs.patch) exposes pane-local Glyph Protocol outlines.
 - The [PNG patch](../scripts/patches/ghostty-png.patch) enables bounded PNG decoding.
-- The [graphics patch](../scripts/patches/ghostty-kitty-graphics.patch) bounds RGBA
-  conversion and limits animation ticks to visible images.
+- The [graphics patch](../scripts/patches/ghostty-kitty-graphics.patch) bounds
+  transfer and storage resources and limits animation ticks to visible images.
 
 The bootstrap uses the architecture's baseline CPU target so cached libraries
 remain portable between machines. Ghostty's SIMD dispatch remains enabled.

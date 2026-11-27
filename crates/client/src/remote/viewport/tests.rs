@@ -2454,6 +2454,9 @@ fn resubscribing_ignores_queued_image_deltas_until_the_full_viewport_arrives() {
                         offset: [0, 0],
                         size: [8, 16],
                         source: [0, 0, 1, 1],
+                        source_subpixels: None,
+                        fit_rows: None,
+                        sizing: None,
                     }],
                     images: if replace {
                         vec![pixels.clone()]

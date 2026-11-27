@@ -3,7 +3,8 @@ use super::{CELL_PREFIX_BYTES, MAX_PACKET, Packet, PaneHeader, PaneUpdate};
 
 pub const RECORD_PREFIX_BYTES: usize = 20;
 pub(super) const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
+const STANDARD_DECODE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_DECODE_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -98,7 +99,7 @@ impl Record {
             "Invalid record header size"
         );
         anyhow::ensure!(
-            self.json >= 4096 + 4 * self.header && self.json <= MAX_DECODE_BYTES,
+            self.json >= 4096 + 4 * self.header && self.json <= STANDARD_DECODE_BYTES,
             "Invalid JSON decode allowance"
         );
         anyhow::ensure!(
@@ -119,8 +120,13 @@ impl Record {
             ),
             RecordKind::Pane => {}
         }
+        let decode_limit = if self.kind == RecordKind::Pane {
+            MAX_DECODE_BYTES
+        } else {
+            STANDARD_DECODE_BYTES
+        };
         anyhow::ensure!(
-            self.decode_bytes() <= MAX_DECODE_BYTES,
+            self.decode_bytes() <= decode_limit,
             "Record exceeds decoded-size limit"
         );
         Ok(())
@@ -259,7 +265,7 @@ pub(super) fn json_budget(bytes: &[u8]) -> anyhow::Result<usize> {
         index += 1;
     }
     anyhow::ensure!(
-        budget <= MAX_DECODE_BYTES,
+        budget <= STANDARD_DECODE_BYTES,
         "JSON exceeds decoded-size limit"
     );
     Ok(budget)

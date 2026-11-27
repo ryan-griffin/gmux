@@ -1,7 +1,8 @@
 //! Frontend socket buffering, terminal input, and viewport updates.
 use super::*;
+use crate::engine::{GraphicsLayout, ImageSource};
 use gmux_protocol::glyphs::{GlyphUpdate, Glyphs};
-use gmux_protocol::graphics::{EMPTY_GRAPHICS, Graphics, GraphicsUpdate};
+use gmux_protocol::graphics::{GraphicsUpdate, Image};
 use gmux_protocol::transport::{KeyAction, PasteOptions, StreamCommand, StreamRequest};
 use std::sync::{Arc, Weak};
 
@@ -71,38 +72,50 @@ impl SentGlyphs {
 #[derive(Default)]
 struct SentGraphics {
     known: bool,
-    snapshot: Option<Weak<Graphics>>,
+    snapshot: Option<Weak<GraphicsLayout>>,
     keys: Vec<u64>,
 }
 
 impl SentGraphics {
-    fn update(&mut self, current: Option<&Arc<Graphics>>) -> Option<GraphicsUpdate> {
+    fn update(
+        &mut self,
+        current: Option<&Arc<GraphicsLayout>>,
+        mut read_image: impl FnMut(ImageSource) -> Option<Arc<Image>>,
+    ) -> anyhow::Result<Option<GraphicsUpdate>> {
         let same = match (&self.snapshot, current) {
             (None, None) => self.known,
             (Some(old), Some(current)) => std::ptr::eq(old.as_ptr(), Arc::as_ptr(current)),
             _ => false,
         };
         if same {
-            return None;
+            return Ok(None);
         }
         let replace = !std::mem::replace(&mut self.known, true);
         self.snapshot = current.map(Arc::downgrade);
-        let current = current.map_or(&EMPTY_GRAPHICS, Arc::as_ref);
+        let Some(current) = current else {
+            self.keys.clear();
+            return Ok(Some(GraphicsUpdate {
+                replace,
+                ..Default::default()
+            }));
+        };
         let images = current
             .images
             .iter()
             .filter(|image| self.keys.binary_search(&image.key).is_err())
-            .cloned()
-            .collect();
+            .map(|source| {
+                read_image(*source).ok_or_else(|| anyhow::anyhow!("Missing terminal image pixels"))
+            })
+            .collect::<anyhow::Result<_>>()?;
         self.keys.clear();
         self.keys
             .extend(current.images.iter().map(|image| image.key));
-        Some(GraphicsUpdate {
+        Ok(Some(GraphicsUpdate {
             replace,
             cell_pixels: current.cell_pixels,
             placements: current.placements.clone(),
             images,
-        })
+        }))
     }
 }
 
@@ -282,9 +295,15 @@ impl Frontend {
         self.panes.entry(pane).or_default().error = Some(error);
     }
 
-    pub(super) fn redraw_graphics(&mut self, id: u64) {
-        if let Some(pane) = self.panes.get_mut(&id) {
-            pane.changed |= pane.visible;
+    pub(super) fn redraw_graphics(&mut self, id: u64, images: &[u32]) {
+        if let Some(pane) = self.panes.get_mut(&id)
+            && pane.visible
+            && pane
+                .presentation
+                .as_ref()
+                .is_some_and(|p| p.view.shows_images(images))
+        {
+            pane.changed = true;
         }
     }
 
@@ -302,6 +321,7 @@ impl Frontend {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn retained_output(&self) -> usize {
         self.output.capacity()
     }
@@ -897,7 +917,10 @@ impl Daemon {
                 gmux_protocol::viewport::valid(cols.into(), rows.into()),
                 "Invalid terminal size"
             );
-            frontend.panes.entry(id).or_default().size = Some((cols, rows, cw, ch, width, height));
+            let pane = frontend.panes.entry(id).or_default();
+            let size = Some((cols, rows, cw, ch, width, height));
+            pane.changed |= pane.visible && pane.size != size;
+            pane.size = size;
             self.resize_session(id, Some((frontend_id, frontend)));
             return Ok(());
         }
@@ -1470,8 +1493,14 @@ impl Daemon {
                     screen.prefetch_at.is_some_and(|at| at <= Instant::now())
                 })
                 || pane.find_pending();
-            let first_frame = pane.visible && pane.screen().is_none();
-            let screen = first_frame || (pane.visible && changed);
+            let awaiting_first_frame = pane.visible && pane.screen().is_none();
+            let first_frame = awaiting_first_frame
+                && (!session.held_graphics()
+                    || pane
+                        .presentation(session, &self.view_resources)?
+                        .view
+                        .render_captured());
+            let screen = first_frame || (pane.visible && !awaiting_first_frame && changed);
             if !metadata_changed
                 && !changed
                 && !screen
@@ -1516,6 +1545,14 @@ impl Daemon {
             let mut glyphs = None;
             let mut graphics = None;
             let mut newly_visible_images = false;
+            let graphics_viewport =
+                pane.size
+                    .map_or_else(Default::default, |(_, _, cw, ch, width, height)| {
+                        crate::engine::GraphicsViewport {
+                            cell_pixels: [cw, ch],
+                            canvas_pixels: [width, height],
+                        }
+                    });
             let (frame, find, selection, selection_origin) = if screen
                 || pane.presentation.is_some()
             {
@@ -1544,8 +1581,10 @@ impl Daemon {
                         let old = presentation.screen.get_or_insert_with(Default::default);
                         let (revision, glossary) = active.glyphs();
                         glyphs = old.glyphs.update(revision, glossary);
-                        let (visible, newly_visible) = active.graphics();
-                        graphics = presentation.graphics.update(visible.as_ref());
+                        let (visible, newly_visible) = active.graphics(graphics_viewport);
+                        graphics = presentation
+                            .graphics
+                            .update(visible.as_ref(), |source| active.graphics_image(source))?;
                         newly_visible_images = newly_visible;
                         let cells_snapshot = active.cells();
                         self.snapshots += 1;
@@ -2473,6 +2512,9 @@ mod tests {
                             offset: [0, 0],
                             size,
                             source: [0, 0, size[0], size[1]],
+                            source_subpixels: None,
+                            fit_rows: None,
+                            sizing: None,
                         }],
                         images: vec![Arc::new(Image {
                             key: 1,
