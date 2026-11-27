@@ -247,7 +247,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 +    const limit: u32 = @intCast(std.math.clamp(available, 0, std.math.maxInt(u32)));
 +    if (placement.max_rows) |previous| if (previous <= limit) return false;
 +    if (placement.columns != 0 and placement.rows != 0 and
-+        placement.rows -| placement.trim_top -| placement.trim_bottom <= limit) return false;
++        placement.rows -| placement.trim_top <= limit) return false;
 +    placement.max_rows = limit;
 +    return true;
  }

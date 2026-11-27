@@ -214,6 +214,36 @@ while True:
         for peer in peers:
             assert graphics(peer)["images"][0]["pixels"] == png_pixel
 
+    with scenario("Margin scrolling preserves the scale of a column-sized image"):
+        remote.send("resize", cols=12, rows=4, cw=4, ch=16)
+        remote.barrier("narrow-font-for-margin-scroll")
+        image = red * 6
+        exchange(b"\x1b[?1049h\x1b[2;4r\x1b[2;1H"
+                 + command("a=T,f=24,i=80,s=1,v=6,c=1,C=1,q=2", image))
+        for peer in peers:
+            graphics(peer, lambda g: any(im["pixels"] == image for im in g["images"]))
+        exchange(b"\x1b[4;1H\n")
+        for peer in peers:
+            frame = graphics(peer)
+            placement, = frame["placements"]
+            assert placement["cell"] == [0, 1] and placement["fit_rows"] == [1, 2**32 - 1], placement
+            assert placement["size"] == [8, 48] and placement["source"] == [0, 0, 1, 6], placement
+            assert not frame["images"], frame
+        exchange(b"\n")
+        graphics(local, lambda g: any(p["fit_rows"][0] == 2 for p in g["placements"]))
+        graphics(remote, lambda g: not g["placements"])
+        remote.send("resize", cols=12, rows=4, cw=8, ch=16)
+        graphics(remote, lambda g: bool(g["placements"]))
+        local.send("resize", cols=12, rows=4, cw=4, ch=16)
+        graphics(local, lambda g: not g["placements"])
+        wider = graphics(remote, lambda g: any(p["size"] == [4, 24] for p in g["placements"]))
+        assert wider["placements"][0]["fit_rows"] == [2, 2**32 - 1], wider
+        exchange(b"\x1b[?1049l\x1b[r")
+        for peer in peers:
+            assert graphics(peer)["images"][0]["pixels"] == png_pixel
+        local.send("resize", cols=12, rows=4, cw=8, ch=16)
+        local.barrier("restore-font-after-margin-scroll")
+
     with scenario("Each subscriber sees the part of a trimmed image that fits its own font metrics"):
         for peer, width in zip(peers, (6, 10)):
             peer.send("resize", cols=12, rows=4, cw=width, ch=16)

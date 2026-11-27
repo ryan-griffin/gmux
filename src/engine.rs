@@ -2718,6 +2718,36 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_preserve_both_margin_clips_on_column_sized_images() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 4, 8, 16).unwrap();
+        engine.write(
+            b"\x1b[2;4r\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=1,v=6,c=1,C=1,q=2;/wAA/wAA/wAA/wAA/wAA/wAA\x1b\\",
+        );
+        engine.write(b"\x1b[4;1H\n\x1b[2;1H\x1bM\x1bM");
+
+        let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+        restored.resize(12, 4, 8, 16).unwrap();
+        let mut view = restored.new_view().unwrap();
+        restored
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let layout = active.graphics().0.unwrap();
+                let [placement] = layout.placements.as_slice() else {
+                    panic!("Expected a clipped image placement");
+                };
+                assert_eq!(placement.cell, [0, 3]);
+                assert_eq!(placement.source, [0, 0, 1, 6]);
+                assert_eq!(placement.fit_rows, Some([1, 1]));
+                let bounds = placement.bounds([8.0, 16.0], layout.cell_pixels);
+                assert_eq!(bounds.rect, [0.0, 32.0, 8.0, 48.0]);
+                assert_eq!(bounds.clip_y, Some([48.0, 64.0]));
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn restored_history_images_cannot_cover_the_new_prompt_at_wider_cell_sizes() {
         use gmux_protocol::graphics::Layer;
 
