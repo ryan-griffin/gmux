@@ -2794,6 +2794,43 @@ mod tests {
     }
 
     #[test]
+    fn restored_margin_footprint_survives_owner_font_narrowing() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 4, 8, 16).unwrap();
+        engine.write(
+            format!(
+                "\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;4H\x1b_Ga=T,f=24,i=5,s=8,v=48,C=1,q=2;{}\x1b\\",
+                "/wAA".repeat(8 * 48)
+            )
+            .as_bytes(),
+        );
+        engine.write(b"\x1b[4;2H\n");
+
+        let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+        restored.resize(12, 4, 4, 16).unwrap();
+        let mut view = restored.new_view().unwrap();
+        view.set_graphics_viewport(GraphicsViewport {
+            cell_pixels: [8, 16],
+            canvas_pixels: [96, 64],
+        });
+
+        restored.write(b"\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[4;2H\n");
+        restored
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let layout = active.graphics().0.unwrap();
+                let [placement] = layout.placements.as_slice() else {
+                    panic!("Expected a placement clipped at both scrolls");
+                };
+                assert_eq!(placement.cell, [3, 1]);
+                assert_eq!(placement.fit_rows, Some([2, 1]));
+                assert_eq!(placement.source, [0, 0, 8, 48]);
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn margin_scroll_preserves_a_fractionally_occupied_row() {
         let mut engine = Engine::new().unwrap();
         engine.resize(12, 4, 8, 16).unwrap();
