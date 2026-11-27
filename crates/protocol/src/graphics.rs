@@ -96,8 +96,7 @@ pub struct Placement {
     pub source: [u32; 4],
     /// Optional Unicode crop in 16.16 source pixels.
     pub source_subpixels: Option<[u32; 4]>,
-    /// Rows trimmed at the top and the maximum visible rows. A limit of
-    /// `u32::MAX` leaves the bottom edge of the image unconstrained.
+    /// Rows trimmed at the top and the maximum visible rows.
     pub fit_rows: Option<[u32; 2]>,
     pub sizing: Option<ImageSizing>,
 }

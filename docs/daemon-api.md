@@ -537,9 +537,8 @@ When `frozen_cell_pixels` is present, lay out the placement using those cell
 metrics, then scale the result to the current viewport's cells.
 For a sizing box or a vertically clipped image, `fit_rows` gives the
 `[top trim, row limit]`. Size the image, subtract the top trim in cell
-heights from its drawing origin, and clip starting at the placement's cell.
-A row limit of `4294967295` leaves the bottom edge unconstrained. Other
-placements set this field to `null`.
+heights from its drawing origin, and clip to that many rows starting at the
+placement's cell. Other placements set this field to `null`.
 `sizing` is `columns` or `rows` when only one axis is specified, and `native`
 for unscaled pixels. Two-axis boxes and Unicode crops set it to `null`.
 Placements are listed in paint order and may begin outside the viewport.

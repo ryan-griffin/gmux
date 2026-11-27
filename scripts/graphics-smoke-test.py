@@ -226,7 +226,7 @@ while True:
         for peer in peers:
             frame = graphics(peer)
             placement, = frame["placements"]
-            assert placement["cell"] == [0, 1] and placement["fit_rows"] == [1, 2**32 - 1], placement
+            assert placement["cell"] == [0, 1] and placement["fit_rows"] == [1, 2], placement
             assert placement["size"] == [8, 48] and placement["source"] == [0, 0, 1, 6], placement
             assert not frame["images"], frame
         exchange(b"\n")
@@ -237,7 +237,9 @@ while True:
         local.send("resize", cols=12, rows=4, cw=4, ch=16)
         graphics(local, lambda g: not g["placements"])
         wider = graphics(remote, lambda g: any(p["size"] == [4, 24] for p in g["placements"]))
-        assert wider["placements"][0]["fit_rows"] == [2, 2**32 - 1], wider
+        assert wider["placements"][0]["fit_rows"] == [2, 1], wider
+        exchange(b"\x1b[4;1H\n")
+        graphics(remote, lambda g: not g["placements"])
         exchange(b"\x1b[?1049l\x1b[r")
         for peer in peers:
             assert graphics(peer)["images"][0]["pixels"] == png_pixel

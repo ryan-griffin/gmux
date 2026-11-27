@@ -2745,6 +2745,24 @@ mod tests {
                 assert_eq!(bounds.clip_y, Some([48.0, 64.0]));
             })
             .unwrap();
+
+        restored.resize(12, 4, 2, 16).unwrap();
+        view.set_graphics_viewport(GraphicsViewport {
+            cell_pixels: [8, 16],
+            canvas_pixels: [96, 64],
+        });
+        restored.write(b"\x1b[2;4r\x1b[4;1H\n");
+        restored
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let layout = active.graphics().0.unwrap();
+                let [placement] = layout.placements.as_slice() else {
+                    panic!("Expected the wider view to show the scrolled placement");
+                };
+                assert_eq!(placement.cell, [0, 2]);
+                assert_eq!(placement.fit_rows, Some([1, 1]));
+            })
+            .unwrap();
     }
 
     #[test]
