@@ -48,6 +48,10 @@ const _: () = assert!(GMUX_GRAPHEME_MAX_BYTES as usize == gmux_protocol::cells::
 #[path = "engine/glyphs.rs"]
 mod glyphs;
 use glyphs::{GlyphState, glyph_hold};
+#[path = "engine/graphics.rs"]
+mod graphics;
+pub(crate) use graphics::{GraphicsLayout, GraphicsViewport, ImageSource};
+use graphics::{GraphicsState, capture_hold};
 
 #[cfg(test)]
 #[path = "engine/selection_tests.rs"]
@@ -91,6 +95,7 @@ struct Events {
     command: gmux_protocol::shell::CommandState,
     resize_request: Option<(u16, u16)>,
     glyphs: GlyphState,
+    graphics: GraphicsState,
 }
 const MAX_CLIPBOARD_EVENTS: usize = 64;
 const _: () =
@@ -219,6 +224,7 @@ unsafe extern "C" fn clipboard_read(ud: *mut c_void, request: *const GmuxClipboa
             name: String::from_utf8_lossy(name).into_owned(),
             granted: request.granted,
             epoch: None,
+            paste_serial: None,
         });
     }
     GMUX_CLIPBOARD_SUCCESS as i32
@@ -366,6 +372,7 @@ unsafe extern "C" fn event(ud: *mut c_void, kind: i32, data: *const u8, len: usi
 
 pub struct Engine {
     pub(crate) revision: u64,
+    snapshot_revision: u64,
     pub(crate) history: GmuxHistory,
     raw: NonNull<GmuxEngine>,
     events: Box<Events>,
@@ -387,10 +394,12 @@ pub struct Engine {
 
 pub(crate) const MAX_VIEWS: usize = 256;
 pub(crate) const MAX_VIEW_NATIVE_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_GRAPHICS_HOLD_BYTES: usize = 128 * 1024 * 1024;
 /// The Rc outlives every native allocator and view registered in this pool.
 pub(crate) struct ViewResources {
     raw: NonNull<GmuxViewBudget>,
     pub(crate) search: crate::search::SearchBudget,
+    graphics_hold: Rc<std::cell::Cell<usize>>,
 }
 impl Default for ViewResources {
     fn default() -> Self {
@@ -403,6 +412,7 @@ impl ViewResources {
             raw: NonNull::new(unsafe { gmux_engine_view_budget_new(bytes, views) })
                 .expect("view budget"),
             search: Default::default(),
+            graphics_hold: Default::default(),
         }
     }
     pub(crate) fn render_bytes(&self) -> usize {
@@ -413,6 +423,9 @@ impl ViewResources {
     }
     pub(crate) fn count(&self) -> usize {
         unsafe { gmux_engine_view_budget_count(self.raw.as_ptr()) }
+    }
+    pub(crate) fn graphics_hold_bytes(&self) -> usize {
+        self.graphics_hold.get()
     }
 }
 impl Drop for ViewResources {
@@ -426,11 +439,17 @@ pub(crate) struct EngineView {
     _resources: Rc<ViewResources>,
     raw: NonNull<GmuxView>,
     held_frame: Frame,
+    graphics: Rc<std::cell::RefCell<graphics::Snapshot>>,
     find: crate::search::HistorySearch,
     find_row: Vec<Cell>,
     retention_revision: u64,
 }
 impl EngineView {
+    pub(crate) fn set_graphics_viewport(&mut self, geometry: GraphicsViewport) {
+        self.graphics.borrow_mut().geometry = geometry;
+        let [width, height] = geometry.cell_pixels;
+        unsafe { gmux_engine_view_graphics_size(self.raw.as_ptr(), width, height) };
+    }
     pub(crate) fn check_resources(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !unsafe { gmux_engine_view_failed(self.raw.as_ptr()) },
@@ -443,11 +462,21 @@ impl EngineView {
             + self.find.memory_size()
             + self.find_row.capacity() * size_of::<Cell>()
             + self.find_row.iter().map(Cell::heap_bytes).sum::<usize>()
+            + self.graphics.borrow().memory_size()
             + unsafe { gmux_engine_view_memory(self.raw.as_ptr()) }
     }
 
     pub(crate) fn set_active(&mut self, active: bool) {
         unsafe { gmux_engine_view_set_active(self.raw.as_ptr(), active) }
+        if !active {
+            self.graphics.borrow_mut().clear();
+        }
+    }
+    pub(crate) fn render_captured(&self) -> bool {
+        unsafe { gmux_engine_view_captured(self.raw.as_ptr()) }
+    }
+    pub(crate) fn shows_images(&self, changed: &[u32]) -> bool {
+        self.graphics.borrow().live.shows_images(changed)
     }
     pub(crate) fn set_theme(&mut self, theme: &Theme) {
         unsafe {
@@ -708,6 +737,9 @@ impl Engine {
                 &mut consumed,
             )
         };
+        if self.events.graphics.has_held_pixels() && !self.mode(2026) {
+            self.events.graphics.clear_held();
+        }
         if changed {
             self.revision = self.revision.wrapping_add(1);
             self.find.invalidate();
@@ -732,12 +764,21 @@ impl Engine {
         self.new_view_in(&Rc::default())
     }
     pub(crate) fn new_view_in(&self, resources: &Rc<ViewResources>) -> anyhow::Result<EngineView> {
+        let raw = NonNull::new(unsafe {
+            gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?;
+        let graphics = Rc::new(std::cell::RefCell::new(graphics::Snapshot::new(
+            resources.graphics_hold.clone(),
+        )));
+        // The native view borrows the capture until it is freed.
+        unsafe {
+            gmux_engine_view_graphics_data(raw.as_ptr(), Rc::as_ptr(&graphics).cast_mut().cast())
+        };
         Ok(EngineView {
+            raw,
+            graphics,
             _resources: resources.clone(),
-            raw: NonNull::new(unsafe {
-                gmux_engine_view_new(self.raw.as_ptr(), resources.raw.as_ptr())
-            })
-            .ok_or_else(|| anyhow::anyhow!("Terminal view admission limit reached"))?,
             find: crate::search::HistorySearch::with_budget(resources.search.clone()),
             find_row: Vec::new(),
             retention_revision: 0,
@@ -913,9 +954,11 @@ impl Engine {
         unsafe {
             gmux_engine_read_callback(raw.as_ptr(), Some(clipboard_read));
             gmux_engine_glyph_hold_callback(raw.as_ptr(), Some(glyph_hold));
+            gmux_engine_graphics_hold_callback(raw.as_ptr(), Some(capture_hold));
         }
         Ok(Self {
             revision: 1,
+            snapshot_revision: 0,
             history: GmuxHistory {
                 generation: 0,
                 origin: 0,
@@ -1033,6 +1076,9 @@ impl Engine {
             )
         };
         anyhow::ensure!(result >= 0, "Ghostty render-state update failed");
+        if result != 0 {
+            self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        }
         self.history = unsafe { gmux_engine_history_state(self.raw.as_ptr()) };
         if !self.mode(2026) {
             self.held_hyperlinks = Default::default();
@@ -1296,8 +1342,32 @@ impl Engine {
         );
         Ok((String::from_utf8(out.bytes)?, colors))
     }
+    pub(crate) fn tick_graphics(&mut self) -> (Vec<u32>, Option<std::time::Duration>) {
+        unsafe extern "C" fn changed(data: *mut c_void, id: u32) {
+            unsafe { &mut *data.cast::<Vec<u32>>() }.push(id);
+        }
+        let mut images = Vec::new();
+        let mut delay = 0;
+        unsafe {
+            gmux_engine_graphics_tick(
+                self.raw.as_ptr(),
+                &mut delay,
+                Some(graphics::visible_ids),
+                Some(changed),
+                (&mut images as *mut Vec<u32>).cast(),
+            )
+        };
+        (
+            images,
+            (delay != u64::MAX).then(|| std::time::Duration::from_millis(delay)),
+        )
+    }
+
     pub fn expire_render_hold(&mut self) -> bool {
         unsafe { gmux_engine_expire_render_hold(self.raw.as_ptr()) }
+    }
+    pub(crate) fn held_graphics(&self) -> bool {
+        unsafe { gmux_engine_held_graphics(self.raw.as_ptr()) }
     }
     fn scroll(&mut self, delta: isize, bottom: bool) {
         unsafe { gmux_engine_scroll(self.raw.as_ptr(), delta, bottom) }
@@ -1439,6 +1509,28 @@ impl ActiveView<'_> {
             return (state.live.revision, &state.live.glyphs);
         }
         (state.held.revision, &state.held.glyphs)
+    }
+    pub(crate) fn graphics(&mut self) -> (Option<std::sync::Arc<GraphicsLayout>>, bool) {
+        let mut snapshot = self.view.graphics.borrow_mut();
+        let newly_visible = (!self.held || self.view.render_captured())
+            && snapshot.refresh(
+                self.engine.raw.as_ptr(),
+                &mut self.engine.events.graphics.pixels,
+                self.held,
+                self.engine.frame,
+                self.engine.snapshot_revision,
+                &self.engine.cells,
+            );
+        (snapshot.publish(self.held), !self.held && newly_visible)
+    }
+    pub(crate) fn graphics_image(
+        &mut self,
+        source: ImageSource,
+    ) -> Option<std::sync::Arc<gmux_protocol::graphics::Image>> {
+        self.engine
+            .events
+            .graphics
+            .image(self.engine.raw.as_ptr(), source)
     }
     pub(crate) fn hyperlinks(&self) -> &gmux_protocol::hyperlinks::Hyperlinks {
         &self.engine.hyperlinks
@@ -2511,6 +2603,7 @@ mod tests {
     #[test]
     fn checkpoints_keep_complete_kitty_images_and_omit_unfinished_transfers() {
         let mut old = Engine::new().unwrap();
+        old.resize(80, 24, 8, 16).unwrap();
         old.write(b"\x1b_Ga=t,f=32,s=1,v=1,i=6122;BwcH/w==\x1b\\");
         old.write(b"\x1b_Ga=T,f=32,s=2,v=2,i=6123,c=1,r=1,m=1;CVF8A9Na\x1b\\");
         assert_eq!(old.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
@@ -2521,7 +2614,7 @@ mod tests {
                 .any(|bytes| bytes == [9, 81, 124, 3, 211, 90])
         );
         let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
-        fresh.prepare_shell((0, 0)).unwrap();
+        fresh.prepare_shell((8, 16)).unwrap();
         let last_chunk = b"\x1b_Gm=0;B/8HBwf/BwcH/w==\x1b\\";
         old.events.replies.clear();
         old.write(last_chunk);
@@ -2531,6 +2624,308 @@ mod tests {
         fresh.events.replies.clear();
         fresh.write(b"\x1b_Ga=p,i=6122,c=1,r=1\x1b\\");
         assert_eq!(fresh.events.replies, b"\x1b_Gi=6122;OK\x1b\\");
+        let mut view = fresh.new_view().unwrap();
+        fresh
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let graphics = active.graphics().0.unwrap();
+                let [placement] = graphics.placements.as_slice() else {
+                    panic!("Expected a restored image placement");
+                };
+                let image = active.graphics_image(graphics.images[0]).unwrap();
+                assert_eq!(image.pixels, [7, 7, 7, 255]);
+                assert_eq!(placement.image, graphics.images[0].key);
+                let pixels = std::sync::Arc::downgrade(&image);
+                drop(image);
+                assert!(pixels.upgrade().is_none());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn exhausted_hold_budget_does_not_copy_uncached_graphics_pixels() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 4, 8, 16).unwrap();
+        let resources = Rc::new(ViewResources::default());
+        let view = engine.new_view_in(&resources).unwrap();
+        resources.graphics_hold.set(MAX_GRAPHICS_HOLD_BYTES);
+        engine.write(b"\x1b_Ga=T,f=24,s=1,v=1,c=1,r=1,C=1,q=2;/wAA\x1b\\\x1b[?2026h");
+        assert!(view.check_resources().is_err());
+        assert!(engine.events.graphics.pixels.is_empty());
+        assert!(!engine.events.graphics.has_held_pixels());
+        assert_eq!(resources.graphics_hold_bytes(), MAX_GRAPHICS_HOLD_BYTES);
+        resources.graphics_hold.set(0);
+    }
+
+    #[test]
+    fn fresh_shell_prompt_starts_below_restored_above_text_images() {
+        let mut old = Engine::new().unwrap();
+        old.resize(24, 5, 8, 16).unwrap();
+        old.write(b"\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=4,v=1,c=16,r=2,C=1,q=2;/wAA/wAA/wAA/wAA\x1b\\");
+        let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+        fresh.prepare_shell((8, 16)).unwrap();
+        fresh.write(b"$ ");
+        let mut view = fresh.new_view().unwrap();
+        fresh
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                assert_eq!(active.frame().cursor_y, 3);
+                assert_eq!(active.cells()[3 * 24].text(), "$");
+                let graphics = active.graphics().0.unwrap();
+                assert_eq!(graphics.placements[0].cell, [0, 1]);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn restored_images_that_extend_past_the_grid_are_clipped_before_the_new_prompt() {
+        for sizing in ["c=8,r=10", "c=8"] {
+            let mut old = Engine::new().unwrap();
+            old.resize(24, 5, 8, 16).unwrap();
+            old.write(
+                format!(
+                    "\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=2,v=5,{sizing},C=1,q=2;{}\x1b\\",
+                    "/wAA".repeat(10)
+                )
+                .as_bytes(),
+            );
+            let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+            fresh.prepare_shell((8, 16)).unwrap();
+            fresh.write(b"$ ");
+            let checkpoint = fresh.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+            restored.resize(24, 5, 8, 16).unwrap();
+            let mut view = restored.new_view().unwrap();
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert_eq!(active.cells()[4 * 24].text(), "$");
+                    let graphics = active.graphics().0.unwrap();
+                    let placement = graphics.placements[0];
+                    assert_eq!(placement.cell, [0, 0]);
+                    assert_eq!(placement.source, [0, 0, 2, 5]);
+                    assert_eq!(placement.fit_rows, Some([0, 4]));
+                    for metrics in [[8.0, 16.0], [16.0, 16.0]] {
+                        assert_eq!(
+                            placement.bounds(metrics, graphics.cell_pixels).clip_y,
+                            Some([0.0, 64.0])
+                        );
+                    }
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn restored_margin_rows_drive_scrolling_and_deletion_across_viewer_sizes() {
+        for (sizing, [width, height], owner_after) in [
+            ("c=1,", [1, 6], [2, 16]),
+            ("r=3,", [1, 6], [4, 28]),
+            ("", [8, 48], [8, 64]),
+            ("c=1,r=3,", [1, 6], [4, 24]),
+        ] {
+            let mut engine = Engine::new().unwrap();
+            engine.resize(12, 4, 8, 16).unwrap();
+            engine.write(
+                format!(
+                    "\x1b[2;4r\x1b[2;1H\x1b_Ga=T,f=24,i=5,s={width},v={height},{sizing}C=1,q=2;{}\x1b\\",
+                    "/wAA".repeat((width * height) as usize)
+                )
+                .as_bytes(),
+            );
+            engine.write(b"\x1b[4;1H\n\x1b[2;1H\x1bM\x1bM");
+
+            let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+            restored.resize(12, 4, 8, 16).unwrap();
+            let mut view = restored.new_view().unwrap();
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    let layout = active.graphics().0.unwrap();
+                    let [placement] = layout.placements.as_slice() else {
+                        panic!("Expected a clipped image placement for {sizing:?}");
+                    };
+                    assert_eq!(placement.cell, [0, 3]);
+                    assert_eq!(placement.source, [0, 0, width, height]);
+                    assert_eq!(placement.fit_rows, Some([1, 1]));
+                    let bounds = placement.bounds([8.0, 16.0], layout.cell_pixels);
+                    assert_eq!(bounds.rect, [0.0, 32.0, 8.0, 48.0]);
+                    assert_eq!(bounds.visible_y(64.0), Some([48.0, 64.0]));
+                })
+                .unwrap();
+
+            restored
+                .resize(12, 4, owner_after[0], owner_after[1])
+                .unwrap();
+            view.set_graphics_viewport(GraphicsViewport {
+                cell_pixels: [8, 16],
+                canvas_pixels: [96, 64],
+            });
+            restored.write(b"\x1b[2;4r\x1b[4;1H\n");
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    let layout = active.graphics().0.unwrap();
+                    let [placement] = layout.placements.as_slice() else {
+                        panic!(
+                            "Expected the subscriber to see the scrolled placement for {sizing:?}"
+                        );
+                    };
+                    assert_eq!(placement.cell, [0, 2]);
+                    assert_eq!(placement.fit_rows, Some([1, 1]));
+                    let bounds = placement.bounds([8.0, 16.0], layout.cell_pixels);
+                    assert_eq!(bounds.visible_y(64.0), Some([32.0, 48.0]));
+                })
+                .unwrap();
+
+            restored.write(b"\x1b_Ga=d,d=y,y=3,q=2\x1b\\");
+            restored
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert!(
+                        active.graphics().0.is_none(),
+                        "Placement still visible for {sizing:?}"
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn restored_margin_footprint_survives_owner_font_narrowing() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 4, 8, 16).unwrap();
+        engine.write(
+            format!(
+                "\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;4H\x1b_Ga=T,f=24,i=5,s=8,v=48,C=1,q=2;{}\x1b\\",
+                "/wAA".repeat(8 * 48)
+            )
+            .as_bytes(),
+        );
+        engine.write(b"\x1b[4;2H\n");
+
+        let checkpoint = engine.checkpoint(MAX_PANE_BYTES).unwrap();
+        let mut restored = Engine::restore(&checkpoint, Default::default()).unwrap();
+        restored.resize(12, 4, 4, 16).unwrap();
+        let mut view = restored.new_view().unwrap();
+        view.set_graphics_viewport(GraphicsViewport {
+            cell_pixels: [8, 16],
+            canvas_pixels: [96, 64],
+        });
+
+        restored.write(b"\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[4;2H\n");
+        restored
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let layout = active.graphics().0.unwrap();
+                let [placement] = layout.placements.as_slice() else {
+                    panic!("Expected a placement clipped at both scrolls");
+                };
+                assert_eq!(placement.cell, [3, 1]);
+                assert_eq!(placement.fit_rows, Some([2, 1]));
+                assert_eq!(placement.source, [0, 0, 8, 48]);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn margin_scroll_preserves_a_fractionally_occupied_row() {
+        let mut engine = Engine::new().unwrap();
+        engine.resize(12, 4, 8, 16).unwrap();
+        engine.write(
+            format!(
+                "\x1b[2;4r\x1b[2;1H\x1b_Ga=T,f=24,i=5,s=17,v=35,c=1,C=1,q=2;{}\x1b\\",
+                "/wAA".repeat(17 * 35)
+            )
+            .as_bytes(),
+        );
+        // The original height of 280/17 pixels occupies part of a second row.
+        engine.write(b"\x1b[4;1H\n");
+        let mut view = engine.new_view().unwrap();
+        view.set_graphics_viewport(GraphicsViewport {
+            cell_pixels: [12, 16],
+            canvas_pixels: [144, 64],
+        });
+        engine
+            .with_view(&mut view, |active| {
+                active.snapshot().unwrap();
+                let layout = active.graphics().0.unwrap();
+                let [placement] = layout.placements.as_slice() else {
+                    panic!("Expected the wider viewport to show the surviving row");
+                };
+                assert_eq!(placement.cell, [0, 1]);
+                assert_eq!(placement.source, [0, 0, 17, 35]);
+                assert_eq!(placement.fit_rows, Some([1, 1]));
+                assert_eq!(
+                    placement.bounds([12.0, 16.0], layout.cell_pixels).clip_y,
+                    Some([16.0, 32.0])
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn restored_history_images_cannot_cover_the_new_prompt_at_wider_cell_sizes() {
+        use gmux_protocol::graphics::Layer;
+
+        for relative in [false, true] {
+            let mut old = Engine::new().unwrap();
+            old.resize(24, 5, 8, 16).unwrap();
+            if relative {
+                old.write(b"\x1b_Ga=T,U=1,f=24,i=5,p=1,s=1,v=1,c=1,r=1,q=2;AAD/\x1b\\");
+                old.write("\x1b[38;5;5m\u{10eeee}\u{0305}\u{0305}\x1b[39m".as_bytes());
+                old.write(
+                    b"\x1b_Ga=T,f=24,i=6,p=1,P=5,Q=1,V=-4,s=1,v=4,c=1,q=2;/wAA/wAA/wAA/wAA\x1b\\",
+                );
+            } else {
+                old.write(b"\x1b_Ga=T,f=24,i=5,s=1,v=4,c=1,C=1,q=2;/wAA/wAA/wAA/wAA\x1b\\");
+                old.write(&b"\r\n".repeat(8));
+            }
+            old.write(b"\x1b[1;3Hhistory");
+            let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+            fresh.prepare_shell((8, 16)).unwrap();
+            fresh.write(b"$ ");
+
+            let mut view = fresh.new_view().unwrap();
+            fresh
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert!(active.graphics().0.is_none_or(|graphics| {
+                        graphics
+                            .placements
+                            .iter()
+                            .all(|p| p.layer != Layer::AboveText)
+                    }));
+                    assert_eq!(active.frame().cursor_y, 1);
+                })
+                .unwrap();
+            view.set_graphics_viewport(GraphicsViewport {
+                cell_pixels: [24, 16],
+                canvas_pixels: [576, 80],
+            });
+            fresh
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert_eq!(active.cells()[24].text(), "$");
+                    let graphics = active.graphics().0.unwrap();
+                    let mut above = graphics
+                        .placements
+                        .iter()
+                        .filter(|p| p.layer == Layer::AboveText);
+                    let placement = above.next().expect("Restored image in wider viewport");
+                    assert!(above.next().is_none());
+                    assert_eq!(placement.cell, [0, -4]);
+                    assert_eq!(
+                        placement.bounds([24.0, 16.0], graphics.cell_pixels).clip_y,
+                        Some([-64.0, 16.0])
+                    );
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -2620,6 +3015,7 @@ mod tests {
                                         hyperlinks: &Default::default(),
                                         hyperlink_revision: 0,
                                         glyphs: &Glyphs::default(),
+                                        graphics: None,
                                         frame: engine.frame,
                                         cells: &engine.cells,
                                         row_flags: &engine.row_flags,
@@ -3068,6 +3464,7 @@ mod tests {
                 .with_view(view, |engine| assert_eq!(engine.text().unwrap(), "before"))
                 .unwrap();
         }
+        assert!(engine.tick_graphics().1.is_some());
         assert!(!engine.expire_render_hold());
         std::thread::sleep(std::time::Duration::from_millis(1050));
         assert!(engine.expire_render_hold());

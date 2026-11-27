@@ -62,6 +62,7 @@ pub(crate) struct TerminalSession {
     id: u64,
     engine: Engine,
     compression: crate::compression::IdleCompression,
+    graphics_deadline: Option<Instant>,
     pty: Option<Pty>,
     pid: Option<u32>,
     directory: PathBuf,
@@ -85,6 +86,17 @@ impl TerminalSession {
         limits: gmux_protocol::retention::ScrollbackLimits,
     ) -> anyhow::Result<()> {
         self.engine.set_scrollback_limits(limits)
+    }
+    pub(crate) fn graphics_deadline(&self) -> Option<Instant> {
+        self.graphics_deadline
+    }
+    pub(crate) fn resume_graphics(&mut self) {
+        self.graphics_deadline = Some(Instant::now());
+    }
+    fn tick_graphics(&mut self, now: Instant) -> Vec<u32> {
+        let (changed, next) = self.engine.tick_graphics();
+        self.graphics_deadline = next.and_then(|delay| now.checked_add(delay));
+        changed
     }
     pub(crate) fn compression_deadline(&self) -> Option<Instant> {
         self.compression.deadline
@@ -299,6 +311,7 @@ impl TerminalSession {
             id,
             engine,
             compression,
+            graphics_deadline: None,
             pty: Some(Pty {
                 master: pair.master,
                 child: Some(child),
@@ -606,6 +619,13 @@ impl TerminalSession {
                 }
             }
         }
+        if update.changed
+            || self
+                .graphics_deadline
+                .is_some_and(|at| Instant::now() >= at)
+        {
+            update.graphics_changed = self.tick_graphics(Instant::now());
+        }
         self.read_yielded = read_budget_exhausted;
         let (replies, notifications) = self.engine.take_events();
         update.notifications = notifications;
@@ -854,6 +874,9 @@ impl TerminalSession {
 
     pub(crate) fn render_held(&self) -> bool {
         self.engine.mode(2026)
+    }
+    pub(crate) fn held_graphics(&self) -> bool {
+        self.engine.held_graphics()
     }
 }
 

@@ -158,6 +158,7 @@ fn git_and_clipboard_read_events_charge_spare_capacity_before_queue_admission() 
                     name,
                     granted: false,
                     epoch: None,
+                    paste_serial: None,
                 },
             },
         }),

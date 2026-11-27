@@ -419,7 +419,7 @@ impl Daemon {
                     "sent_rows": self.sent_rows,
                     "frontend_resources": {
                         "streams": self.frontends.len(),
-                        "output_capacity": self.frontends.values().map(Frontend::retained_output).sum::<usize>(),
+                        "output_capacity": self.output_budget.capacity(),
                         "screen_cache_bytes": self.frontends.values().map(Frontend::retained_screens).sum::<usize>(),
                         "views": self.view_resources.count(),
                         "view_limit": crate::engine::MAX_VIEWS,
@@ -427,6 +427,8 @@ impl Daemon {
                         "view_render_bytes": self.view_resources.render_bytes(),
                         "view_native_reserved": self.view_resources.native_reserved(),
                         "view_native_limit": crate::engine::MAX_VIEW_NATIVE_BYTES,
+                        "graphics_hold_bytes": self.view_resources.graphics_hold_bytes(),
+                        "graphics_hold_limit": crate::engine::MAX_GRAPHICS_HOLD_BYTES,
                         "search_bytes": self.view_resources.search.used(),
                         "search_limit": crate::search::MAX_SEARCH_POOL_BYTES,
                         "search_view_limit": crate::search::MAX_SEARCH_BYTES,

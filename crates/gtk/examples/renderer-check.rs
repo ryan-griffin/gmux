@@ -101,6 +101,7 @@ fn scene(cells: &[Cell], theme: Theme) -> Scene<'_> {
             ..Frame::default()
         },
         cells,
+        graphics: None,
         bidi: None,
         metrics: (10.0, 24.0),
         scale: 1.0,
@@ -2208,6 +2209,425 @@ fn validate_extended_boxes(
     }
 }
 
+fn validate_kitty_graphics(
+    gpu: &gsk::Renderer,
+    font: &pango::FontDescription,
+    context: &pango::Context,
+) {
+    use gmux_protocol::graphics::{Graphics, Image, ImageSizing, Layer, PixelFormat, Placement};
+    use std::sync::Arc;
+
+    let theme = Theme {
+        background: [0; 3],
+        foreground: [0, 0, 255],
+        ..Theme::adwaita(true)
+    };
+    let mut cells = vec![cell(" ", theme, 0); 40 * 8];
+    cells[1].bg = [0, 255, 0];
+    cells[2] = cell("█", theme, 0);
+    cells[3] = cell("█", theme, 0);
+    cells[5] = cell("\u{10eeee}\u{0305}\u{0305}", theme, 0);
+    cells[7].decoration |= decoration::EXPLICIT_BACKGROUND;
+    cells[8].decoration = decoration::OVERLINE | gmux_protocol::cells::underline::SINGLE;
+    let image = |key, width, format, pixels: &[u8]| {
+        Arc::new(Image {
+            key,
+            width,
+            height: 1,
+            format,
+            pixels: pixels.to_vec(),
+        })
+    };
+    let placement = |image, layer, col, width, source| Placement {
+        image,
+        layer,
+        cell: [col, 0],
+        offset: [0, 0],
+        size: [width, 24],
+        source,
+        source_subpixels: None,
+        fit_rows: None,
+        sizing: None,
+    };
+    let graphics = Graphics {
+        cell_pixels: [10, 24],
+        unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
+        images: vec![
+            image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
+            image(2, 1, PixelFormat::Rgba, &[255, 0, 0, 128]),
+            image(3, 3, PixelFormat::Rgb, &[0, 0, 255, 0, 255, 0, 0, 0, 255]),
+        ],
+        placements: vec![
+            placement(1, Layer::BelowBackground, -1, 30, [0, 0, 1, 1]),
+            placement(1, Layer::BelowBackground, 6, 20, [0, 0, 1, 1]),
+            placement(1, Layer::BelowText, 2, 10, [0, 0, 1, 1]),
+            placement(1, Layer::BelowText, 5, 10, [0, 0, 1, 1]),
+            placement(1, Layer::BelowText, 8, 20, [0, 0, 1, 1]),
+            placement(2, Layer::AboveText, 3, 10, [0, 0, 1, 1]),
+            placement(3, Layer::AboveText, 4, 10, [1, 0, 1, 1]),
+        ]
+        .into(),
+    };
+    let mut renderer = Renderer::new();
+    let mut scene = scene(&cells, theme);
+    scene.graphics = Some(&graphics);
+    scene.focused = true;
+    scene.frame.cursor_visible = 1;
+    scene.frame.cursor_style = 1;
+    scene.frame.cursor_x = 9;
+    scene.frame.cursor = [0, 255, 0];
+    let painted = node(&mut renderer, &scene, font, context).0;
+    let data = pixels(&render(gpu, &painted, &scene));
+    for (x, expected) in [
+        (5, [0, 0, 255, 255]),
+        (15, [0, 255, 0, 255]),
+        (25, [255, 0, 0, 255]),
+        (35, [127, 0, 128, 255]),
+        (45, [0, 255, 0, 255]),
+        (55, [0, 0, 255, 255]),
+        (65, [0, 0, 255, 255]),
+        (75, [0, 0, 0, 255]),
+        (95, [0, 255, 0, 255]),
+    ] {
+        let start = (12 * scene.width as usize + x) * 4;
+        assert!(
+            data[start..start + 4]
+                .iter()
+                .zip(expected)
+                .all(|(&a, b)| a.abs_diff(b) <= 1),
+            "Unexpected image color at x={x}: {:?}",
+            &data[start..start + 4]
+        );
+    }
+    for half in [0..12, 12..24] {
+        assert!(
+            half.into_iter().any(|y| {
+                let start = (y * scene.width as usize + 85) * 4;
+                data[start..start + 4] == [255, 0, 0, 255]
+            }),
+            "An image below text covered an underline or overline"
+        );
+    }
+    let mut expected = cells.clone();
+    expected[5] = cell(" ", theme, 0);
+    let empty_placeholder = node(
+        &mut renderer,
+        &Scene {
+            cells: &expected,
+            ..scene
+        },
+        font,
+        context,
+    )
+    .0;
+    assert_eq!(data, pixels(&render(gpu, &empty_placeholder, &scene)));
+    let without_images = Scene {
+        graphics: None,
+        ..scene
+    };
+    let _ = node(&mut renderer, &without_images, font, context);
+    let restored = node(&mut renderer, &scene, font, context).0;
+    assert_eq!(data, pixels(&render(gpu, &restored, &scene)));
+
+    let pixels_across_rows = std::sync::Arc::new(Image {
+        key: 1,
+        width: 3,
+        height: 3,
+        format: PixelFormat::Rgb,
+        pixels: [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+            .into_iter()
+            .flat_map(|row| row.repeat(3))
+            .collect(),
+    });
+    let blank = vec![cell(" ", theme, 0); 40 * 8];
+    let mut tiled = crate::scene(&blank, theme);
+    tiled.frame.cursor_visible = 0;
+    tiled.metrics = (8.0, 16.0);
+    let unit = gmux_protocol::graphics::SOURCE_SUBPIXELS;
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
+        images: vec![pixels_across_rows],
+        placements: vec![
+            Placement {
+                offset: [0, 8],
+                size: [16, 8],
+                source_subpixels: Some([0, 0, 3 * unit, 3 * unit / 2]),
+                ..placement(1, Layer::BelowText, 0, 16, [0, 0, 3, 2])
+            },
+            Placement {
+                cell: [0, 1],
+                size: [16, 8],
+                source_subpixels: Some([0, 3 * unit / 2, 3 * unit, 3 * unit / 2]),
+                ..placement(1, Layer::BelowText, 0, 16, [0, 2, 3, 1])
+            },
+            Placement {
+                offset: [0, 8],
+                size: [16, 16],
+                source_subpixels: Some([0, 0, 3 * unit, 3 * unit]),
+                ..placement(1, Layer::BelowText, 2, 16, [0, 0, 3, 3])
+            },
+        ]
+        .into(),
+    };
+    tiled.graphics = Some(&graphics);
+    for (scale, cell_height) in [(1.0, 16.0), (1.25, 10.0)] {
+        let scene = Scene {
+            metrics: (8.0, cell_height),
+            scale,
+            ..tiled
+        };
+        let drawn = node(&mut renderer, &scene, font, context).0;
+        let rendered = render(gpu, &drawn, &scene);
+        let data = pixels(&rendered);
+        let tile_width = (16.0 * scale) as usize * 4;
+        for y in 0..(2.0 * cell_height * scale) as usize {
+            let start = y * rendered.width() as usize * 4;
+            let (tiles, reference) = data[start..start + tile_width * 2].split_at(tile_width);
+            assert_eq!(
+                tiles, reference,
+                "Unicode image seam at scale {scale} on row {y}"
+            );
+        }
+    }
+
+    let mut bidi_cells = blank.clone();
+    for (x, text) in ["\u{202e}", "س", "م", "ا", "\u{10eeee}", "\u{202c}"]
+        .into_iter()
+        .enumerate()
+    {
+        bidi_cells[x] = cell(text, theme, 0);
+    }
+    let bidi = bidi::Grid::update(40, &bidi_cells, None).unwrap();
+    let logical = 4;
+    let visual = bidi.visual(logical);
+    assert!(visual < logical);
+    tiled.cells = &bidi_cells;
+    tiled.bidi = Some(&bidi);
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
+        images: vec![
+            image(1, 1, PixelFormat::Rgb, &[0, 255, 0]),
+            image(2, 1, PixelFormat::Rgb, &[255, 0, 0]),
+        ],
+        placements: vec![
+            Placement {
+                size: [8, 16],
+                source_subpixels: Some([0, 0, unit, unit]),
+                ..placement(1, Layer::BelowText, logical as i32, 8, [0, 0, 1, 1])
+            },
+            Placement {
+                cell: [visual as i32, 1],
+                size: [8, 16],
+                ..placement(2, Layer::AboveText, logical as i32, 8, [0, 0, 1, 1])
+            },
+        ]
+        .into(),
+    };
+    tiled.graphics = Some(&graphics);
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    let sample = |column: usize, row: usize| {
+        let byte = ((row * 16 + 8) * tiled.width as usize + column * 8 + 4) * 4;
+        &data[byte..byte + 4]
+    };
+    assert_eq!(sample(visual, 0), [0, 255, 0, 255]);
+    assert_ne!(sample(logical, 0), [0, 255, 0, 255]);
+    assert_eq!(sample(visual, 1), [0, 0, 255, 255]);
+    assert_eq!(sample(logical, 1), [0, 0, 0, 255]);
+    let wide = tiled.width;
+    tiled.width = ((visual + 1) * 8) as i32;
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    let sample = (8 * tiled.width as usize + visual * 8 + 4) * 4;
+    assert_eq!(data[sample..sample + 4], [0, 255, 0, 255]);
+    tiled.width = wide;
+
+    // The size owner's cell aspect ratio can differ from this viewer's.
+    tiled.metrics = (10.0, 24.0);
+    tiled.cells = &blank;
+    tiled.bidi = None;
+    let mut graphics = Graphics {
+        cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
+        images: vec![
+            image(1, 1, PixelFormat::Rgb, &[255, 0, 0]),
+            Arc::new(Image {
+                key: 2,
+                width: 8,
+                height: 8,
+                format: PixelFormat::Rgb,
+                pixels: [255, 0, 0].repeat(64),
+            }),
+            Arc::new(Image {
+                key: 3,
+                width: 8,
+                height: 48,
+                format: PixelFormat::Rgb,
+                pixels: [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+                    .into_iter()
+                    .flat_map(|color| color.repeat(8 * 16))
+                    .collect(),
+            }),
+        ],
+        placements: vec![
+            Placement {
+                cell: [4, 1],
+                size: [8, 48],
+                fit_rows: Some([1, 2]),
+                ..placement(1, Layer::AboveText, 4, 8, [0, 0, 1, 1])
+            },
+            Placement {
+                cell: [6, 1],
+                size: [8, 8],
+                sizing: Some(ImageSizing::Columns),
+                ..placement(2, Layer::AboveText, 6, 8, [0, 0, 8, 8])
+            },
+            Placement {
+                cell: [8, 1],
+                size: [16, 16],
+                sizing: Some(ImageSizing::Rows),
+                ..placement(2, Layer::AboveText, 8, 16, [0, 0, 8, 8])
+            },
+            Placement {
+                cell: [11, 1],
+                size: [8, 8],
+                sizing: Some(ImageSizing::Native),
+                ..placement(2, Layer::AboveText, 11, 8, [0, 0, 8, 8])
+            },
+        ]
+        .into(),
+    };
+    let modes = [
+        Some(ImageSizing::Columns),
+        Some(ImageSizing::Rows),
+        Some(ImageSizing::Native),
+        None,
+    ];
+    Arc::make_mut(&mut graphics.placements).extend(modes.into_iter().enumerate().map(
+        |(i, sizing)| Placement {
+            cell: [14 + 2 * i as i32, 1],
+            size: [8, 48],
+            fit_rows: Some([1, 1]),
+            sizing,
+            ..placement(3, Layer::AboveText, 0, 8, [0, 0, 8, 48])
+        },
+    ));
+    tiled.graphics = Some(&graphics);
+    let drawn = node(&mut renderer, &tiled, font, context).0;
+    let data = pixels(&render(gpu, &drawn, &tiled));
+    for y in 24..48 {
+        for x in 37..122 {
+            let byte = (y * tiled.width as usize + x) * 4;
+            let red = ((40..50).contains(&x) && (31..41).contains(&y))
+                || ((60..70).contains(&x) && y < 34)
+                || (80..104).contains(&x)
+                || ((110..118).contains(&x) && y < 32);
+            assert_eq!(data[byte..byte + 4], [0, 0, if red { 255 } else { 0 }, 255]);
+        }
+    }
+    for (i, sizing) in modes.into_iter().enumerate() {
+        let x = 143 + 20 * i;
+        let lower = match sizing {
+            Some(ImageSizing::Columns | ImageSizing::Native) => [255, 0, 0, 255],
+            _ => [0, 255, 0, 255],
+        };
+        for (y, expected) in [
+            (23, [0, 0, 0, 255]),
+            (28, [0, 255, 0, 255]),
+            (44, lower),
+            (48, [0, 0, 0, 255]),
+        ] {
+            let byte = (y * tiled.width as usize + x) * 4;
+            assert_eq!(&data[byte..byte + 4], &expected, "Sizing {i} at row {y}");
+        }
+    }
+
+    // Two overlapping crops can consume the cache using pixels from one image.
+    let mut source = vec![255; gmux_protocol::graphics::MAX_PIXEL_BYTES];
+    for y in 0..3 {
+        for x in 0..3 {
+            let start = ((y + 11) * 2000 + x + 11) * 4;
+            source[start..start + 4].copy_from_slice(&[x as u8 * 120, y as u8 * 100, 0, 150]);
+        }
+    }
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
+        images: vec![Arc::new(Image {
+            key: 4,
+            width: 2000,
+            height: 1250,
+            format: PixelFormat::Rgba,
+            pixels: source,
+        })],
+        placements: [
+            [11, 11, 3, 3],
+            [12, 11, 1, 3],
+            [11, 12, 3, 1],
+            [12, 12, 1, 1],
+            [11, 11, 3, 3],
+        ]
+        .into_iter()
+        .zip([23, 23, 23, 23, 2])
+        .enumerate()
+        .map(|(i, (crop, width))| placement(4, Layer::AboveText, 4 + i as i32 * 4, width, crop))
+        .collect::<Vec<_>>()
+        .into(),
+    };
+    tiled.metrics = (8.25, 16.25);
+    let full_cache = Graphics {
+        images: graphics.images.clone(),
+        placements: [
+            placement(4, Layer::AboveText, 0, 8, [0, 0, 1000, 1250]),
+            placement(4, Layer::AboveText, 1, 8, [500, 0, 1000, 1250]),
+        ]
+        .into_iter()
+        .chain(graphics.placements.iter().copied())
+        .collect::<Vec<_>>()
+        .into(),
+        cell_pixels: graphics.cell_pixels,
+        ..Graphics::default()
+    };
+    let mut regular_renderer = Renderer::new();
+    let mut overflow_renderer = Renderer::new();
+    for (scale, origin) in [(1.0, (0.0, 0.0)), (1.25, (0.2, 0.4))] {
+        let paint = |renderer: &mut Renderer, graphics| {
+            let scene = Scene {
+                graphics: Some(graphics),
+                scale,
+                origin,
+                ..tiled
+            };
+            let drawn = node(renderer, &scene, font, context).0;
+            render(gpu, &drawn, &scene)
+        };
+        let reference = paint(&mut regular_renderer, &graphics);
+        let expected = pixels(&reference);
+        let actual = pixels(&paint(&mut overflow_renderer, &full_cache));
+        for y in 0..(26.0 * scale) as usize {
+            for x in (32.0 * scale) as usize..(170.0 * scale) as usize {
+                let offset = (y * reference.width() as usize + x) * 4;
+                let actual = &actual[offset..offset + 4];
+                let expected = &expected[offset..offset + 4];
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(&a, &b)| a.abs_diff(b) <= 1),
+                    "Crop filtering changed at scale {scale} at ({x}, {y}): {expected:?} vs {actual:?}"
+                );
+            }
+        }
+    }
+}
+
 fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {
     let theme = Theme::adwaita(true);
     for scale in [1.0, 1.25, 1.5, 2.0] {
@@ -2571,10 +2991,12 @@ fn main() -> anyhow::Result<()> {
     validate_cache(cache_gpu, &font, &context, &options.output);
     validate_scroll_cache(cache_gpu, &font, &context, &options.output);
     validate_geometry(&gpu, &font, &context);
+    validate_kitty_graphics(&cairo.0, &font, &context);
     validate_rtl(&cairo.0, &font, &context);
     validate_box_drawing(&cairo.0, &font, &context);
     validate_extended_boxes(&cairo.0, &font, &context);
     if gpu.type_() != cairo.0.type_() {
+        validate_kitty_graphics(&gpu, &font, &context);
         validate_rtl(&gpu, &font, &context);
         validate_box_drawing(&gpu, &font, &context);
         validate_extended_boxes(&gpu, &font, &context);
@@ -2595,7 +3017,7 @@ fn main() -> anyhow::Result<()> {
                        "font and context changes", "fractional blocks", "all 128 box glyphs, stroke widths and joins", "linear and rectangular selection and search", "link hover SGR pixels and glyph cache retention",
                        "distinct underline patterns and overline geometry", "batched pattern rectangle equivalence", "cursor blink row reuse", "colored underlines beneath descenders", "decoration color invalidation", "concealed text", "blank and wide decorations", "wide cursor", "background batching", "overlapping fallback order",
                        "ligatures and contextual substitutions", "ligature style and cell boundaries", "GPU ligature layouts", "Arabic joining and visual selection geometry",
-                       "text blink phases, decorations, cursor and selection pixels", "text blink retains row and glyph nodes"]
+                       "text blink phases, decorations, cursor and selection pixels", "text blink retains row and glyph nodes", "Kitty image clipping, layering, cropping and alpha"]
         }))?,
     )?;
     println!(

@@ -78,10 +78,10 @@ port. Omitting the port uses `network::DEFAULT_PORT`, which is `7331`. Use
 `server:8400` or `[::1]:8400` to override it.
 
 TCP listening is opt-in. The connection begins with one newline-terminated JSON
-handshake. The current protocol version is 47:
+handshake. The current protocol version is 48.
 
 ```json
-{"version":47,"channel":"control","token":"shared-token","daemon":"expected-identity"}
+{"version":48,"channel":"control","token":"shared-token","daemon":"expected-identity"}
 ```
 
 Choose `control` or `stream` for `channel`. Omit `token` for a listener configured
@@ -178,7 +178,7 @@ when no daemon is running, so local execution can be disabled after a failed sta
 After a successful TCP stream handshake, send:
 
 ```json
-{"method":"attach","version":47,"daemon":"returned-identity"}
+{"method":"attach","version":48,"daemon":"returned-identity"}
 {"method":"subscribe","panes":[2]}
 {"method":"resize","pane":2,"cols":80,"rows":24}
 ```
@@ -281,11 +281,11 @@ with connection order as the fallback. Detached writes are dropped immediately.
 Replies are binary records. Each starts with five little-endian `u32` values:
 remaining record length, JSON header length, event kind, JSON decode allowance,
 and cell count. The remaining length includes the last four prefix fields. The
-prefix is followed by UTF-8 JSON and binary cell or clipboard bytes.
+prefix is followed by UTF-8 JSON and binary cell, image, or clipboard bytes.
 
 | Kind | Rust payload | JSON header | Binary payload |
 | --- | --- | --- | --- |
-| `1` pane update | `PaneUpdate` | `PaneHeader` with `meta`, optional `frame`, changed `rows`, notifications, Find state, selection, errors, and cache information | Changed viewport cells followed by supplemental cache cells |
+| `1` pane update | `PaneUpdate` | `PaneHeader` with `meta`, optional `frame`, changed `rows`, notifications, Find state, selection, errors, and cache information | Changed viewport cells, supplemental cache cells, then image pixels |
 | `2` execution | `CommandReply` | Execution reply directly, including `revision`, `execution`, and `metadata` | None |
 | `3` clipboard write/clear | `clipboard::Write` | `destination` and `content` descriptors | Representation bytes in descriptor order |
 | `4` Git metadata | `GitMetadata` | `id`, `directory`, and `branch` | None |
@@ -351,10 +351,9 @@ An event accepts only the fields for its selected kind. Extra fields are invalid
 even when their value is null.
 
 Request IDs identify a transient native request, independently of the program's
-Kitty `id`. A true `granted` is a hint, not desktop authority. The frontend must
-independently match it to a recent local user-paste gesture for the same pane,
-connection, destination, and clipboard epoch, and consume that authorization
-once. It must also validate `paste_text` against its own gesture serial. A server
+Kitty `id`. A granted request carries `paste_serial` and `epoch`. The frontend
+must match either paste event to a recent local gesture with the same serial,
+pane, connection, destination, and clipboard epoch, and consume that gesture once. A server
 flag or program-supplied name cannot authorize reading the desktop. Targets-only requests do not read
 content and do not consume the one-use paste authorization. All other data reads
 require explicit consent. `SessionManager::poll_with_clipboard_events` delivers
@@ -379,6 +378,8 @@ binary extension to the frontend command stream; attach, authentication,
 heartbeats, and other commands retain their existing framing. Partial binary
 chunks and result assembly have five-second deadlines. Invalid transfers can
 detach the frontend. Late or foreign request IDs never complete another read.
+The daemon allows 15 seconds for the initial result, with extra time for any
+preceding image record to reach the frontend.
 
 A genuine desktop paste uses `user-paste` with a new connection-wide `serial`,
 `destination`, `epoch`, and bounded `mimes`. It supersedes unanswered reads routed
@@ -391,6 +392,11 @@ then ordinary `paste-data` chunks and `paste-end`. Scripted `paste` always inser
 text and cannot create clipboard grants. A client claiming desktop capability
 is a trusted clipboard broker within the existing socket/authentication boundary;
 a JSON field cannot prove a physical gesture.
+
+The daemon allows extra delivery time for `paste_text` queued behind image
+data. GTK excludes a bounded amount of time spent receiving image records
+from a paste gesture's lifetime. The native authorization for a Kitty program
+to initiate its clipboard read expires after five seconds.
 
 `generation` identifies cached history for this pane and view. Clears, reflow,
 screen switches, and resolved palette or appearance changes advance it. Discard
@@ -505,7 +511,7 @@ three RGB foreground bytes, three RGB background bytes, one flags byte, one
 decoration byte, and three RGB underline-color bytes. The complete UTF-8 text
 immediately follows, without zero padding or a terminator. Length zero represents
 an empty cell. Lengths above 260, malformed UTF-8, embedded NUL, truncated cells, and trailing
-cell data are rejected. This is stream protocol version 47; clients must match
+cell data are rejected. This is stream protocol version 48; clients must match
 the daemon's version.
 
 Flag bits 0-5 mean bold, italic, faint, blink, strike, and invisible.
@@ -513,7 +519,8 @@ Bits 6 and 7 mark wide-character spacer tails and heads. These native layout
 flags determine occupied columns, independently of the text's byte or codepoint
 count. Decoration bits 0-2 encode no underline, single, double, curly,
 dotted, or dashed as 0-5. Bit 3 enables overline. Bit 4 selects the independent
-underline color; otherwise the underline follows the displayed text color.
+underline color. The underline uses the displayed text color by default.
+Bit 5 marks an explicit cell background.
 
 A viewport header may carry a `glyphs` update for the pane. A `replace` array
 sets the complete glossary on attachment. A `patch` object supplies `defined`
@@ -522,6 +529,30 @@ glyph contains its codepoint, placement parameters, and a base64 outline. An out
 point contains signed little-endian 32-bit X and Y coordinates and one flag byte.
 Bit 0 marks on-curve points and bit 1 marks the last point in a contour.
 Cached rows use the same glossary as the viewport.
+
+A `graphics` update replaces the viewport's image placements. Its `cell_pixels`
+contains the daemon's cell width and height. Each placement is an array
+`[image, layer, [column, row], [dx, dy], [width, height], [x, y, w, h], source_subpixels, fit_rows, sizing]`.
+The image is a generation key. The `[x, y, w, h]` array is the source rectangle.
+Unicode placements supply a fractional source rectangle in 16.16 pixels in
+`source_subpixels`. Other placements set this field to `null`.
+Unicode crops use logical columns. Relative placements use visual columns.
+An optional `unicode_cell_pixels` pair gives the geometry basis for Unicode
+crops when it differs from `cell_pixels`.
+When `frozen_cell_pixels` is present, lay out the placement using those cell
+metrics, then scale the result to the current viewport's cells.
+For a sizing box or a vertically clipped image, `fit_rows` gives the
+`[top trim, row limit]`. Size the image, subtract the top trim in cell
+heights from its drawing origin, and clip to that many rows starting at the
+placement's cell. Other placements set this field to `null`.
+`sizing` is `columns` or `rows` when only one axis is specified, and `native`
+for unscaled pixels. Two-axis boxes and Unicode crops set it to `null`.
+Placements are listed in paint order and may begin outside the viewport.
+The `images` list describes new payloads as `[image, width, height, format]`.
+Packed pixel rows follow the cells in descriptor order with no padding.
+Unless `replace` is true, a placement can reuse pixels from the previous
+viewport. An empty placement list clears displayed images. Omitting
+`graphics` keeps the preceding placement list.
 
 Frames include `cursor_blink`, the effective Ghostty blink state, and `mouse_shape`,
 the pinned Ghostty W3C pointer-shape enum. Shape 8 is text and shape 0 is the

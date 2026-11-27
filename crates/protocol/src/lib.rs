@@ -1,9 +1,11 @@
 //! Shared execution protocol and terminal values. No platform I/O or native build.
 pub mod activity;
+pub mod bidi;
 pub mod cells;
 pub mod clipboard;
 pub mod control;
 pub mod glyphs;
+pub mod graphics;
 pub mod hyperlinks;
 pub mod model;
 pub mod network;

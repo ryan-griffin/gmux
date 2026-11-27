@@ -66,6 +66,8 @@ pub(super) struct Viewport {
     hyperlinks: gmux_protocol::hyperlinks::Hyperlinks,
     hyperlink_revision: u64,
     glyphs: gmux_protocol::glyphs::Glyphs,
+    graphics: gmux_protocol::graphics::Graphics,
+    graphics_suspended: bool,
     cache: crate::scroll_cache::RowCache,
     prediction: Option<Prediction>,
     scroll_target: Option<u64>,
@@ -117,6 +119,8 @@ impl Viewport {
             hyperlinks: Default::default(),
             hyperlink_revision: 0,
             glyphs: Default::default(),
+            graphics: Default::default(),
+            graphics_suspended: false,
             cache: {
                 let cache = crate::scroll_cache::RowCache::default();
                 cache.set_focused(focused);
@@ -139,6 +143,15 @@ impl Viewport {
         let glyphs_changed = match packet.header.glyphs {
             Some(update) => update.apply(&mut self.glyphs)?,
             None => false,
+        };
+        let graphics_changed = if let Some(graphics) = packet.header.graphics
+            && (!self.graphics_suspended || (visible && graphics.replace))
+        {
+            graphics.apply(&mut self.graphics)?;
+            self.graphics_suspended = false;
+            true
+        } else {
+            false
         };
         let mut update = SessionUpdate {
             exited: packet.header.meta.exited,
@@ -294,6 +307,7 @@ impl Viewport {
                 || packet.header.row_shift != 0
                 || prediction_changed
                 || glyphs_changed
+                || graphics_changed
             {
                 self.revision = self.revision.wrapping_add(1);
             }
@@ -381,6 +395,10 @@ impl Viewport {
         self.prediction = Some(prediction);
         true
     }
+    pub fn suspend_graphics(&mut self) {
+        self.graphics = Default::default();
+        self.graphics_suspended = true;
+    }
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.prediction = None;
@@ -420,6 +438,7 @@ impl Viewport {
                 hyperlinks: &NO_HYPERLINKS,
                 hyperlink_revision: hyperlink_revision | 1,
                 glyphs: &self.glyphs,
+                graphics: None,
                 revision: self.revision,
                 text_revision: self.text_revision,
             };
@@ -430,6 +449,7 @@ impl Viewport {
             row_flags: &self.row_flags,
             hyperlinks: &self.hyperlinks,
             hyperlink_revision,
+            graphics: Some(&self.graphics),
             glyphs: &self.glyphs,
             revision: self.revision,
             text_revision: self.text_revision,

@@ -29,7 +29,7 @@ def decode_cells(data):
 
 
 def decode_packet(body):
-    """Decode a stream body into its header and cell bytes."""
+    """Decode a stream body into its header, image pixels, and cell bytes."""
     header_size, kind, allowance, count = struct.unpack("<IIII", body[:16])
     assert kind in (1, 2, 3, 4, 5, 6)
     assert header_size <= len(body) - 16
@@ -63,7 +63,22 @@ def decode_packet(body):
         return header, b""
     if kind != 1:
         assert count == 0 and len(body) == 16 + header_size
-    return header, body[16 + header_size:]
+    end = len(body)
+    if graphics := header.get("graphics"):
+        channels = {"gray": 1, "gray_alpha": 2, "rgb": 3, "rgba": 4}
+        for index in reversed(range(len(graphics["images"]))):
+            key, width, height, format = graphics["images"][index]
+            length = width * height * channels[format]
+            assert end - length >= 16 + header_size
+            graphics["images"][index] = dict(
+                key=key, width=width, height=height, format=format,
+                pixels=bytes(body[end - length:end]))
+            end -= length
+        fields = ("image", "layer", "cell", "offset", "size", "source", "source_subpixels",
+                  "fit_rows", "sizing")
+        graphics["placements"] = [dict(zip(fields, record, strict=True))
+                                  for record in graphics["placements"]]
+    return header, body[16 + header_size:end]
 
 
 def clipboard_value(event):

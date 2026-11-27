@@ -176,12 +176,6 @@ impl Terminal {
         root.add_css_class("terminal-pane");
         // PaneRef's daemon:id display form contains a CSS pseudo-class separator.
         root.set_widget_name(&format!("terminal-pane-{}-{}", id.daemon, id.id));
-        let desktop = Rc::downgrade(&clipboard);
-        root.connect_unmap(move |_| {
-            if let Some(desktop) = desktop.upgrade() {
-                desktop.cancel_pane(id);
-            }
-        });
         root.set_hexpand(true);
         root.set_vexpand(true);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -352,6 +346,13 @@ impl Terminal {
             theme: ValueCell::new(Theme::adwaita(adw::StyleManager::default().is_dark())),
             chrome_colors: ValueCell::new(None),
             chrome_css: gtk::CssProvider::new(),
+        });
+        let weak = Rc::downgrade(&terminal);
+        terminal.root.connect_unmap(move |_| {
+            if let Some(terminal) = weak.upgrade() {
+                terminal.clipboard.cancel_pane(id);
+                terminal.renderer.borrow_mut().clear_graphics();
+            }
         });
         gtk::style_context_add_provider_for_display(
             &terminal.root.display(),
@@ -1070,6 +1071,7 @@ impl Terminal {
                 ..e.frame
             },
             cells: e.cells,
+            graphics: e.graphics,
             bidi: bidi.as_deref(),
             metrics: (cw, ch),
             scale,

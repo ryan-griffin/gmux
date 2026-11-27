@@ -21,6 +21,7 @@ pub mod decoration {
     pub const UNDERLINE_MASK: u8 = 7;
     pub const OVERLINE: u8 = 8;
     pub const UNDERLINE_COLOR: u8 = 16;
+    pub const EXPLICIT_BACKGROUND: u8 = 32;
 }
 
 /// W3C pointer names, with an explicit protocol code for each shape.
@@ -157,7 +158,8 @@ pub struct Cell {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub flags: u8,
-    /// Underline style in bits 0-2, overline in bit 3, explicit underline color in bit 4.
+    /// Underline style in bits 0-2, overline in bit 3, explicit underline color in bit 4,
+    /// and explicit background color in bit 5.
     pub decoration: u8,
     pub underline_color: [u8; 3],
 }

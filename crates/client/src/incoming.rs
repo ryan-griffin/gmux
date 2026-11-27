@@ -1,6 +1,9 @@
 //! Ordered stream backpressure bounded by retained bytes as well as packet count.
 use gmux_protocol::transport::Packet;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::{
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    time::{Duration, Instant},
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -19,7 +22,36 @@ fn process_budget() -> Arc<Semaphore> {
 struct Budget {
     limit: usize,
     ready: Arc<tokio::sync::Semaphore>,
+    image_reads: Mutex<ImageReadTime>,
 }
+
+#[derive(Default)]
+struct ImageReadTime {
+    completed: Duration,
+    started: Option<Instant>,
+}
+
+pub(super) struct ImageReadClock(Arc<Budget>);
+
+impl ImageReadClock {
+    pub fn now(&self) -> (Instant, Duration) {
+        let time = self.0.image_reads.lock().unwrap();
+        let now = Instant::now();
+        let active = time.started.map_or(Duration::ZERO, |start| now - start);
+        (now, time.completed + active)
+    }
+}
+
+pub(super) struct ImageRead<'a>(&'a Mutex<ImageReadTime>);
+
+impl Drop for ImageRead<'_> {
+    fn drop(&mut self) {
+        let mut time = self.0.lock().unwrap();
+        let started = time.started.take().unwrap();
+        time.completed += started.elapsed();
+    }
+}
+
 struct Message {
     item: Result<Packet, String>,
     reservation: Reservation,
@@ -35,6 +67,7 @@ fn packet_size(packet: &Packet) -> usize {
 pub struct Sender {
     sender: tokio::sync::mpsc::Sender<Message>,
     budget: Arc<Budget>,
+    decode_limit: usize,
     shared: Arc<Semaphore>,
     small: Arc<Semaphore>,
 }
@@ -60,14 +93,16 @@ impl std::error::Error for SendError {}
 
 pub fn channel(bytes: usize, packets: usize) -> (Sender, Receiver) {
     static SMALL: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    channel_with_pools(
+    let (mut sender, receiver) = channel_with_pools(
         bytes,
         packets,
         process_budget(),
         SMALL
             .get_or_init(|| Arc::new(Semaphore::new(SMALL_PROCESS_BYTES)))
             .clone(),
-    )
+    );
+    sender.decode_limit = gmux_protocol::transport::MAX_DECODE_BYTES;
+    (sender, receiver)
 }
 
 #[cfg(test)]
@@ -89,11 +124,13 @@ pub(super) fn channel_with_pools(
     let budget = Arc::new(Budget {
         limit: bytes,
         ready: Arc::new(tokio::sync::Semaphore::new(bytes)),
+        image_reads: Default::default(),
     });
     (
         Sender {
             sender,
             budget: budget.clone(),
+            decode_limit: bytes,
             small,
             shared,
         },
@@ -104,12 +141,17 @@ pub(super) fn channel_with_pools(
     )
 }
 impl Sender {
+    pub(super) fn begin_image_read(&self) -> ImageRead<'_> {
+        self.budget.image_reads.lock().unwrap().started = Some(Instant::now());
+        ImageRead(&self.budget.image_reads)
+    }
+
     #[cfg(test)]
     pub fn send(&self, item: Result<Packet, String>) -> Result<(), SendError> {
         crate::runtime::block_on(self.send_async(item))
     }
     pub async fn reserve_decode(&self, bytes: usize) -> Result<OwnedSemaphorePermit, SendError> {
-        if bytes > self.budget.limit {
+        if bytes > self.decode_limit {
             return Err(SendError::TooLarge);
         }
         self.acquire_shared(bytes).await
@@ -184,6 +226,10 @@ impl Sender {
     }
 }
 impl Receiver {
+    pub(super) fn image_read_clock(&self) -> ImageReadClock {
+        ImageReadClock(self.budget.clone())
+    }
+
     pub fn pending(&self) -> bool {
         let receiver = self.receiver.borrow();
         !receiver.is_empty() || receiver.is_closed()

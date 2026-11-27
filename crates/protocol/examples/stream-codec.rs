@@ -173,6 +173,7 @@ fn main() -> anyhow::Result<()> {
             name: "probe".into(),
             granted: false,
             epoch: None,
+            paste_serial: None,
         },
     };
     let git = gmux_protocol::transport::GitMetadata {

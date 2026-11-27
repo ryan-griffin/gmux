@@ -34,8 +34,12 @@ adds owned deferred requests for asynchronous desktop access. The
 streaming checkpoint encoding without parser or image transfer continuation,
 a fresh-shell handoff, and filtering of control characters in decoded text cells. The
 [glyph patch](../scripts/patches/ghostty-glyphs.patch) exposes pane-local outlines
-and updates Glyph Protocol placement and responses. An external `GHOSTTY_PREFIX`
-must provide this exact revision with the integration patches.
+and updates Glyph Protocol placement and responses. The
+[PNG patch](../scripts/patches/ghostty-png.patch) enables the bundled Wuffs
+decoder with a 10 MB output limit in libghostty-vt. The
+[graphics patch](../scripts/patches/ghostty-kitty-graphics.patch) bounds
+transfer and storage resources and limits animation ticks to visible images. An external
+`GHOSTTY_PREFIX` must provide this exact revision with the integration patches.
 Ghostty implementation types stay inside the C bridge; Rust and frontend clients
 use Gmux's declarations.
 
@@ -113,7 +117,7 @@ follows Gmux's daemon-owned terminal and separate GTK/GSK frontend.
 | [2r63-vmw6-3m3c](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-2r63-vmw6-3m3c), shell directory escape injection | Applies to the vendored Bash/Zsh scripts. Release scripts strip control characters from directory and hostname reports; Zsh prints backslashes literally. |
 | [jqr7-69mm-v35h](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-jqr7-69mm-v35h), narrowing very wide pages | The native decoder and resize fix is included. Gmux already bounds live grids to 1,000 cells per axis and validates decoded dimensions before installing the terminal. |
 | [3r5j-c6rj-xq2v](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-3r5j-c6rj-xq2v), Kitty clipboard alias growth | Relevant when Gmux enables its clipboard-write callback for attached clients. Native Kitty transactions now have bounded alias storage; Gmux separately bounds its supported text, HTML, PNG, and clear offers. |
-| [mhff-mv4q-fp63](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-mhff-mv4q-fp63), Kitty graphics validation | Native parsing fixes are included. Gmux uses the library's direct-data loading defaults and does not enable file, temporary-file, or shared-memory loading. Its GTK renderer does not draw Kitty images. |
+| [mhff-mv4q-fp63](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-mhff-mv4q-fp63), Kitty graphics validation | Native parsing fixes are included. Gmux uses the library's direct-data loading defaults and does not enable file, temporary-file, or shared-memory loading. GTK draws the decoded images from viewport updates. |
 | [4hwh-wx3w-3fqg](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-4hwh-wx3w-3fqg), carriage-return paste checks | The native safety predicate is fixed. Gmux's explicit paste/send path allows unsafe text intentionally and has no Ghostty paste-confirmation UI, so this update does not add a confirmation policy. |
 | [hp9c-qp4q-cpw3](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-hp9c-qp4q-cpw3), [hcr9-7hcr-mjm8](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-hcr9-7hcr-mjm8), tmux control mode | Gmux does not use Ghostty's tmux control-mode client. Ordinary tmux output is parsed as terminal data. |
 | [v8cw-fg4j-jcc4](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-v8cw-fg4j-jcc4), [mxqx-236q-wrv7](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-mxqx-236q-wrv7), [mfw9-xcr3-7gfp](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-mfw9-xcr3-7gfp), [cw69-wm67-5pv8](https://github.com/ghostty-org/ghostty/security/advisories/GHSA-cw69-wm67-5pv8), macOS paste/file/URL handling | Gmux is Linux-only and does not use Ghostty's desktop drag/drop, file execution, URL opener, or renderer. These desktop fixes do not change Gmux's GTK behavior. |

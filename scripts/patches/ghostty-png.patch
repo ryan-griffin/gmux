@@ -1,0 +1,69 @@
+Enable bounded Wuffs PNG decoding in the VT library.
+
+--- a/src/terminal/sys.zig
++++ b/src/terminal/sys.zig
+@@ -15,10 +15,7 @@
+ /// Decode PNG data into RGBA pixels. If null, PNG decoding is unsupported
+ /// and the exact semantics are up to callers. For example, the Kitty Graphics
+ /// Protocol will work but cannot accept PNG images.
+-pub var decode_png: ?DecodePngFn = png: {
+-    if (build_options.artifact == .lib) break :png null;
+-    break :png &decodePngWuffs;
+-};
++pub var decode_png: ?DecodePngFn = if (build_options.kitty_graphics) &decodePngWuffs else null;
+
+ pub const DecodeError = Allocator.Error || error{InvalidData};
+ pub const DecodePngFn = *const fn (Allocator, []const u8) DecodeError!Image;
+@@ -37,10 +34,10 @@
+     data: []const u8,
+ ) DecodeError!Image {
+     const wuffs = @import("wuffs");
+-    const result = wuffs.png.decode(
+-        alloc,
+-        data,
+-    ) catch |err| switch (err) {
++    const result = (if (comptime build_options.artifact == .lib)
++        wuffs.png.decodeLimited(alloc, data, 10_000_000, 10_000)
++    else
++        wuffs.png.decode(alloc, data)) catch |err| switch (err) {
+         error.WuffsError => return error.InvalidData,
+         error.OutOfMemory => return error.OutOfMemory,
+         error.Overflow => return error.InvalidData,
+--- a/pkg/wuffs/src/png.zig
++++ b/pkg/wuffs/src/png.zig
+@@ -11,6 +11,15 @@
+
+ /// Decode a PNG image.
+ pub fn decode(alloc: Allocator, data: []const u8) Error!ImageData {
++    return decodeLimited(alloc, data, maximum_image_size, std.math.maxInt(u32));
++}
++
++pub fn decodeLimited(
++    alloc: Allocator,
++    data: []const u8,
++    max_bytes: usize,
++    max_dimension: u32,
++) Error!ImageData {
+     // Work around some weirdness in WUFFS/Zig, there are some structs that
+     // are defined as "extern" by the Zig compiler which means that Zig won't
+     // allocate them on the stack at compile time. WUFFS has functions for
+@@ -54,6 +63,9 @@
+
+     const width = c.wuffs_base__pixel_config__width(&image_config.pixcfg);
+     const height = c.wuffs_base__pixel_config__height(&image_config.pixcfg);
++    if (width == 0 or height == 0 or width > max_dimension or height > max_dimension) {
++        return error.Overflow;
++    }
+
+     c.wuffs_base__pixel_config__set(
+         &image_config.pixcfg,
+@@ -69,8 +81,8 @@
+         @sizeOf(c.wuffs_base__color_u32_argb_premul),
+     );
+
+-    if (size > maximum_image_size) {
+-        log.warn("image size {d} is larger than the maximum allowed ({d})", .{ size, maximum_image_size });
++    if (size > max_bytes) {
++        log.warn("image size {d} is larger than the maximum allowed ({d})", .{ size, max_bytes });
+         return error.Overflow;
+     }

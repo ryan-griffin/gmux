@@ -621,7 +621,6 @@ dependencies = [
  "pango",
  "serde",
  "serde_json",
- "unicode-bidi",
 ]
 
 [[package]]
@@ -647,6 +646,7 @@ dependencies = [
  "memchr",
  "serde",
  "serde_json",
+ "unicode-bidi",
 ]
 
 [[package]]

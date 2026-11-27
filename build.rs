@@ -45,7 +45,7 @@ fn generate_bridge_bindings(build: &cc::Build, out_dir: &Path) {
         .clang_arg(format!("--target={}", env::var("TARGET").unwrap()))
         .allowlist_type("Gmux.*")
         .allowlist_var(
-            "GMUX_(CELL|UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION|KEY_ACTION|CLIPBOARD|GRAPHEME|MAX_GRID)_.*",
+            "GMUX_(CELL|UNDERLINE|MOUSE_SHAPE|DECORATION|PROGRESS|LINK|COMPRESSION|KEY_ACTION|CLIPBOARD|GRAPHEME|MAX_GRID|GRAPHICS)_.*",
         )
         .allowlist_function("gmux_engine_.*")
         .use_core()

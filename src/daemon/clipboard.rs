@@ -57,6 +57,10 @@ pub(super) struct Broker {
 }
 
 impl Frontend {
+    fn clipboard_delivery_deadline(&self, now: Instant, timeout: Duration) -> Instant {
+        now.max(self.output.image_delivery_deadline().unwrap_or(now)) + timeout
+    }
+
     fn queue_read(&mut self, pane: u64, event: ReadEvent) -> anyhow::Result<()> {
         self.queue(Packet::ClipboardRead(
             gmux_protocol::transport::ClipboardRead { pane, event },
@@ -192,7 +196,7 @@ impl Daemon {
         let now = Instant::now();
         let frontend = &self.frontends[&frontend_id];
         if request.granted {
-            let valid = self.clipboard.leases.get(&pane).is_some_and(|p| {
+            let lease = self.clipboard.leases.get(&pane).filter(|p| {
                 p.rich
                     && p.frontend == frontend_id
                     && p.destination == request.destination
@@ -200,13 +204,13 @@ impl Daemon {
                     && p.epoch == frontend.clipboard_epochs[p.destination as usize]
             });
             // A native grant alone cannot authorize a different window or clipboard.
-            if !valid {
+            let Some(lease) = lease else {
                 self.reject_read(pane, request.id, ReadStatus::Denied);
                 return;
-            }
-            request.epoch = self.clipboard.leases.get(&pane).map(|p| p.epoch);
+            };
+            request.epoch = Some(lease.epoch);
+            request.paste_serial = Some(lease.serial);
             self.revoke_paste(pane);
-            request.granted = true;
         }
         if request.validate().is_err()
             || self.clipboard.pending.len() >= MAX_PENDING_READS
@@ -239,13 +243,9 @@ impl Daemon {
         let event = ReadEvent::Request {
             request: request.clone(),
         };
-        if self
-            .frontends
-            .get_mut(&frontend_id)
-            .unwrap()
-            .queue_read(pane, event)
-            .is_err()
-        {
+        let frontend = self.frontends.get_mut(&frontend_id).unwrap();
+        let deadline = frontend.clipboard_delivery_deadline(now, clipboard::READ_TIMEOUT);
+        if frontend.queue_read(pane, event).is_err() {
             self.reject_read(pane, request.id, ReadStatus::Busy);
             return;
         }
@@ -254,7 +254,7 @@ impl Daemon {
             Pending {
                 request,
                 frontend: frontend_id,
-                deadline: now + clipboard::READ_TIMEOUT,
+                deadline,
                 result: None,
                 data: vec![],
                 reserved: 0,
@@ -307,12 +307,18 @@ impl Daemon {
                 let session = self.sessions.get_mut(&pane).unwrap();
                 anyhow::ensure!(!session.exited(), "Session is closed");
                 let rich = session.mode(5522);
+                let now = Instant::now();
+                let expires = if rich {
+                    now + clipboard::TRANSFER_TIMEOUT
+                } else {
+                    frontend.clipboard_delivery_deadline(now, clipboard::TRANSFER_TIMEOUT)
+                };
                 let lease = PasteLease {
                     frontend: frontend_id,
                     destination: *destination,
                     epoch: *epoch,
                     serial: *serial,
-                    expires: Instant::now() + clipboard::TRANSFER_TIMEOUT,
+                    expires,
                     rich,
                 };
                 if rich {
@@ -330,15 +336,21 @@ impl Daemon {
                 self.clipboard.leases.insert(pane, lease);
             }
             StreamCommand::UserPasteBegin { serial, epoch, .. } => {
-                anyhow::ensure!(
-                    self.clipboard.leases.get(&pane).is_some_and(|p| !p.rich
-                        && p.frontend == frontend_id
-                        && p.serial == *serial
-                        && p.epoch == *epoch
-                        && p.expires > Instant::now()
-                        && *epoch == frontend.clipboard_epochs[p.destination as usize]),
-                    "Expired desktop paste"
-                );
+                let now = Instant::now();
+                let lease = self
+                    .clipboard
+                    .leases
+                    .get_mut(&pane)
+                    .filter(|p| {
+                        !p.rich
+                            && p.frontend == frontend_id
+                            && p.serial == *serial
+                            && p.epoch == *epoch
+                            && p.expires > now
+                            && *epoch == frontend.clipboard_epochs[p.destination as usize]
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("Expired desktop paste"))?;
+                lease.expires = lease.expires.min(now + clipboard::TRANSFER_TIMEOUT);
                 return Ok(false);
             }
             StreamCommand::UserPasteText {

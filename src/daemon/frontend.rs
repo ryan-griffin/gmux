@@ -1,7 +1,10 @@
 //! Frontend socket buffering, terminal input, and viewport updates.
 use super::*;
+use crate::engine::{GraphicsLayout, ImageSource};
 use gmux_protocol::glyphs::{GlyphUpdate, Glyphs};
+use gmux_protocol::graphics::{GraphicsUpdate, Image};
 use gmux_protocol::transport::{KeyAction, PasteOptions, StreamCommand, StreamRequest};
+use std::sync::{Arc, Weak};
 
 type TerminalSize = (u16, u16, u32, u32, u16, u16);
 const READ_CHUNK: usize = 16 * 1024;
@@ -66,6 +69,58 @@ impl SentGlyphs {
         update
     }
 }
+#[derive(Default)]
+struct SentGraphics {
+    known: bool,
+    snapshot: Option<Weak<GraphicsLayout>>,
+    keys: Vec<u64>,
+}
+
+impl SentGraphics {
+    fn update(
+        &mut self,
+        current: Option<&Arc<GraphicsLayout>>,
+        mut read_image: impl FnMut(ImageSource) -> Option<Arc<Image>>,
+    ) -> anyhow::Result<Option<GraphicsUpdate>> {
+        let same = match (&self.snapshot, current) {
+            (None, None) => self.known,
+            (Some(old), Some(current)) => std::ptr::eq(old.as_ptr(), Arc::as_ptr(current)),
+            _ => false,
+        };
+        if same {
+            return Ok(None);
+        }
+        let replace = !std::mem::replace(&mut self.known, true);
+        self.snapshot = current.map(Arc::downgrade);
+        let Some(current) = current else {
+            self.keys.clear();
+            return Ok(Some(GraphicsUpdate {
+                replace,
+                ..Default::default()
+            }));
+        };
+        let images = current
+            .images
+            .iter()
+            .filter(|image| self.keys.binary_search(&image.key).is_err())
+            .map(|source| {
+                read_image(*source).ok_or_else(|| anyhow::anyhow!("Missing terminal image pixels"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        self.keys.clear();
+        self.keys
+            .extend(current.images.iter().map(|image| image.key));
+        Ok(Some(GraphicsUpdate {
+            replace,
+            cell_pixels: current.cell_pixels,
+            unicode_cell_pixels: current.unicode_cell_pixels,
+            frozen_cell_pixels: current.frozen_cell_pixels,
+            placements: current.placements.clone(),
+            images,
+        }))
+    }
+}
+
 struct SentSelection {
     range: Option<gmux_protocol::selection::Selection>,
     serial: u64,
@@ -89,6 +144,7 @@ struct PaneViewState {
 struct PanePresentation {
     view: crate::engine::EngineView,
     screen: Option<Box<SentScreen>>,
+    graphics: SentGraphics,
     find: Option<gmux_protocol::search::FindStatus>,
     selection: Option<SentSelection>,
     scroll_serial: u64,
@@ -101,6 +157,7 @@ impl PanePresentation {
         Self {
             view,
             screen: None,
+            graphics: SentGraphics::default(),
             find: None,
             selection: None,
             scroll_serial: 0,
@@ -120,6 +177,7 @@ impl PaneViewState {
         if let Some(presentation) = &mut self.presentation {
             // Reattachment always needs a full viewport. Keep per-view state.
             presentation.screen = None;
+            presentation.graphics = SentGraphics::default();
             presentation.view.set_active(visible);
         }
     }
@@ -132,10 +190,21 @@ impl PaneViewState {
         if self.presentation.is_none() {
             let mut view = session.new_view_in(resources)?;
             view.set_active(self.visible);
+            view.set_graphics_viewport(self.graphics_viewport());
             self.presentation = Some(Box::new(PanePresentation::new(view)));
         }
         self.presentation.as_ref().unwrap().view.check_resources()?;
         Ok(self.presentation.as_mut().unwrap())
+    }
+
+    fn graphics_viewport(&self) -> crate::engine::GraphicsViewport {
+        self.size
+            .map_or_else(Default::default, |(_, _, cw, ch, width, height)| {
+                crate::engine::GraphicsViewport {
+                    cell_pixels: [cw, ch],
+                    canvas_pixels: [width, height],
+                }
+            })
     }
 
     fn screen(&self) -> Option<&SentScreen> {
@@ -239,6 +308,18 @@ impl Frontend {
         self.panes.entry(pane).or_default().error = Some(error);
     }
 
+    pub(super) fn redraw_graphics(&mut self, id: u64, images: &[u32]) {
+        if let Some(pane) = self.panes.get_mut(&id)
+            && pane.visible
+            && pane
+                .presentation
+                .as_ref()
+                .is_some_and(|p| p.view.shows_images(images))
+        {
+            pane.changed = true;
+        }
+    }
+
     /// Dropping the owner releases native views and every pane-local cache and
     /// subscription. Connection-level transfers need separate cancellation.
     pub(super) fn close_pane(&mut self, pane: u64) {
@@ -253,6 +334,7 @@ impl Frontend {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn retained_output(&self) -> usize {
         self.output.capacity()
     }
@@ -270,6 +352,7 @@ impl Frontend {
             .map(|p| {
                 size_of::<PanePresentation>() - size_of::<crate::engine::EngineView>()
                     + p.view.memory_size()
+                    + p.graphics.keys.capacity() * size_of::<u64>()
             })
             .sum()
     }
@@ -847,7 +930,14 @@ impl Daemon {
                 gmux_protocol::viewport::valid(cols.into(), rows.into()),
                 "Invalid terminal size"
             );
-            frontend.panes.entry(id).or_default().size = Some((cols, rows, cw, ch, width, height));
+            let pane = frontend.panes.entry(id).or_default();
+            let size = Some((cols, rows, cw, ch, width, height));
+            pane.changed |= pane.visible && pane.size != size;
+            pane.size = size;
+            let geometry = pane.graphics_viewport();
+            if let Some(presentation) = &mut pane.presentation {
+                presentation.view.set_graphics_viewport(geometry);
+            }
             self.resize_session(id, Some((frontend_id, frontend)));
             return Ok(());
         }
@@ -1151,7 +1241,7 @@ impl Daemon {
         let _cost = profile::scope(profile::Stage::NextUpdate, self.frontends.len());
         self.frontends
             .values()
-            .filter(|frontend| frontend.attached)
+            .filter(|frontend| frontend.attached && !frontend.output.graphics_pending())
             .filter_map(|frontend| {
                 if !frontend.frame_panes.is_empty() {
                     return Some(Instant::now());
@@ -1200,6 +1290,7 @@ impl Daemon {
             .filter(|id| {
                 let frontend = &self.frontends[id];
                 frontend.attached
+                    && !frontend.output.graphics_pending()
                     && (metadata_due
                         || !frontend.frame_panes.is_empty()
                         || Instant::now() >= frontend.next_frame)
@@ -1256,6 +1347,7 @@ impl Daemon {
             }
             let mut frontend = self.frontends.remove(&id).unwrap();
             if !frontend.attached
+                || frontend.output.graphics_pending()
                 || (frontend.frame_panes.is_empty()
                     && !metadata_due
                     && Instant::now() < frontend.next_frame)
@@ -1418,8 +1510,14 @@ impl Daemon {
                     screen.prefetch_at.is_some_and(|at| at <= Instant::now())
                 })
                 || pane.find_pending();
-            let first_frame = pane.visible && pane.screen().is_none();
-            let screen = first_frame || (pane.visible && changed);
+            let awaiting_first_frame = pane.visible && pane.screen().is_none();
+            let first_frame = awaiting_first_frame
+                && (!session.held_graphics()
+                    || pane
+                        .presentation(session, &self.view_resources)?
+                        .view
+                        .render_captured());
+            let screen = first_frame || (pane.visible && !awaiting_first_frame && changed);
             if !metadata_changed
                 && !changed
                 && !screen
@@ -1462,6 +1560,8 @@ impl Daemon {
             let mut cache_invalidated = false;
             let mut hyperlinks = None;
             let mut glyphs = None;
+            let mut graphics = None;
+            let mut newly_visible_images = false;
             let (frame, find, selection, selection_origin) = if screen
                 || pane.presentation.is_some()
             {
@@ -1490,6 +1590,11 @@ impl Daemon {
                         let old = presentation.screen.get_or_insert_with(Default::default);
                         let (revision, glossary) = active.glyphs();
                         glyphs = old.glyphs.update(revision, glossary);
+                        let (visible, newly_visible) = active.graphics();
+                        graphics = presentation
+                            .graphics
+                            .update(visible.as_ref(), |source| active.graphics_image(source))?;
+                        newly_visible_images = newly_visible;
                         let cells_snapshot = active.cells();
                         self.snapshots += 1;
                         let cols = frame.cols as usize;
@@ -1619,6 +1724,7 @@ impl Daemon {
                         }
                         let send = hyperlinks.is_some()
                             || glyphs.is_some()
+                            || graphics.is_some()
                             || full
                             || !rows.is_empty()
                             || old.frame != frame
@@ -1647,6 +1753,9 @@ impl Daemon {
                     None,
                 )
             };
+            if newly_visible_images {
+                session.resume_graphics();
+            }
             let presentation = pane.presentation.as_mut();
             // Highlights travel with viewport changes and completed rescans.
             // Retain only the scalar summary, not another highlight vector.
@@ -1699,6 +1808,7 @@ impl Daemon {
                     frame,
                     hyperlinks,
                     glyphs,
+                    graphics,
                     scroll_serial,
                     generation,
                     cache_origin,
@@ -1721,6 +1831,10 @@ impl Daemon {
                 cells,
             }))?;
             frame_activity |= viewport_changed || status_changed;
+            // Keep the latest pending pane changes while this image drains.
+            if frontend.output.graphics_pending() {
+                break;
+            }
         }
         frontend.frame_activity |= frame_activity;
         if frontend.frame_panes.is_empty() {
@@ -2188,6 +2302,11 @@ mod tests {
             let engine = crate::engine::Engine::new().unwrap();
             let mut presentation = PanePresentation::new(engine.new_view().unwrap());
             presentation.screen = Some(Box::new(screen));
+            presentation.graphics = SentGraphics {
+                known: true,
+                keys: vec![15],
+                ..SentGraphics::default()
+            };
             frontend.panes.entry(1).or_default().presentation = Some(Box::new(presentation));
         }
         let limit = focused.retained_screens();
@@ -2200,6 +2319,9 @@ mod tests {
         assert_eq!(screen.generation, 7);
         assert!(screen.cache_active);
         assert_eq!(screen.cached, 10..20);
+        let presentation = others[&2].panes[&1].presentation.as_ref().unwrap();
+        assert!(presentation.graphics.known);
+        assert_eq!(presentation.graphics.keys, [15]);
         trim_screen_caches(&mut focused, &mut others, 0);
         assert_eq!(focused.retained_screens(), 0);
         assert_eq!(focused.panes[&1].screen().unwrap().memory_size(), 0);
@@ -2366,6 +2488,80 @@ mod tests {
         frontend.close_pane(1);
         assert_eq!(daemon.view_resources.count(), 0);
         assert_eq!(daemon.view_resources.native_reserved(), 0);
+    }
+
+    #[test]
+    fn viewport_updates_coalesce_while_image_pixels_are_in_flight() {
+        use gmux_protocol::graphics::{Image, Layer, PixelFormat, Placement};
+
+        let mut daemon = Daemon::empty_for_test();
+        daemon.sessions.insert(1, session(1));
+        let (mut frontend, mut peer) = connection();
+        peer.set_nonblocking(true).unwrap();
+        frontend.attached = true;
+        frontend.state_revision = Some(daemon.revision);
+        frontend.panes.entry(1).or_default().set_visible(true);
+
+        let size = [512, 512];
+        frontend
+            .queue(Packet::Pane(transport::PaneUpdate {
+                header: PaneHeader {
+                    frame: Some(Frame {
+                        cols: 80,
+                        rows: 24,
+                        ..Frame::default()
+                    }),
+                    graphics: Some(GraphicsUpdate {
+                        replace: true,
+                        cell_pixels: [8, 16],
+                        unicode_cell_pixels: None,
+                        frozen_cell_pixels: None,
+                        placements: vec![Placement {
+                            image: 1,
+                            layer: Layer::AboveText,
+                            cell: [0, 0],
+                            offset: [0, 0],
+                            size,
+                            source: [0, 0, size[0], size[1]],
+                            source_subpixels: None,
+                            fit_rows: None,
+                            sizing: None,
+                        }],
+                        images: vec![Arc::new(Image {
+                            key: 1,
+                            width: size[0],
+                            height: size[1],
+                            format: PixelFormat::Rgba,
+                            pixels: vec![255; 512 * 512 * 4],
+                        })],
+                    }),
+                    ..PaneHeader::default()
+                },
+                cells: Vec::new(),
+            }))
+            .unwrap();
+        daemon.frontends.insert(1, frontend);
+        for _ in 0..3 {
+            daemon.changed.insert(1);
+            daemon.updates(false);
+            assert!(daemon.frontends[&1].output.graphics_pending());
+            assert!(daemon.frontends[&1].panes[&1].terminal_changed);
+            assert!(daemon.next_update().is_none());
+        }
+        assert_eq!(daemon.snapshots, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frontend = daemon.frontends.get_mut(&1).unwrap();
+        let mut bytes = [0; 64 * 1024];
+        while frontend.output.graphics_pending() {
+            assert!(Instant::now() < deadline);
+            while peer.read(&mut bytes).is_ok_and(|len| len != 0) {}
+            frontend.flush().unwrap();
+        }
+        assert!(daemon.next_update().is_some());
+        daemon.updates(false);
+        assert_eq!(daemon.snapshots, 1);
+        assert!(!daemon.frontends[&1].panes[&1].terminal_changed);
     }
 
     #[test]

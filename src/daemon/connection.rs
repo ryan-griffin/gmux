@@ -46,6 +46,12 @@ impl Write for Socket {
             Self::Remote(connection) => (&connection.socket).write(bytes),
         }
     }
+    fn write_vectored(&mut self, bytes: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Local(socket) => socket.write_vectored(bytes),
+            Self::Remote(connection) => (&connection.socket).write_vectored(bytes),
+        }
+    }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }

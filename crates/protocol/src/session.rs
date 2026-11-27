@@ -7,6 +7,8 @@ pub struct ScreenSnapshot<'a> {
     pub hyperlinks: &'a crate::hyperlinks::Hyperlinks,
     /// Opaque token that changes with the map, dimensions or prediction state.
     pub hyperlink_revision: u64,
+    /// Images captured with this frame.
+    pub graphics: Option<&'a crate::graphics::Graphics>,
     /// Pane-local glyph definitions used by both live and predicted rows.
     pub glyphs: &'a crate::glyphs::Glyphs,
     /// Bit zero marks a soft wrap to the next row.
@@ -24,6 +26,7 @@ pub struct SessionUpdate {
     pub git_changed: bool,
     pub progress_changed: bool,
     pub program_status_changed: bool,
+    pub graphics_changed: Vec<u32>,
     pub window_resize: Option<(u16, u16)>,
     pub unread: Option<bool>,
     pub error: Option<String>,

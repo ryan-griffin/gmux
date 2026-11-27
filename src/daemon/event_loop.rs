@@ -193,7 +193,12 @@ pub fn run() -> anyhow::Result<()> {
             daemon
                 .sessions
                 .values()
-                .filter_map(TerminalSession::progress_deadline)
+                .filter_map(|session| {
+                    [session.progress_deadline(), session.graphics_deadline()]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                })
                 .min(),
             held.then_some(next_held),
             daemon
@@ -410,12 +415,16 @@ pub fn run() -> anyhow::Result<()> {
                 ready.push(id);
             }
         }
-        let held_due = Instant::now() >= next_held;
+        let timer_now = Instant::now();
+        let held_due = timer_now >= next_held;
         for (&id, session) in &daemon.sessions {
             if (held_due && session.render_held())
                 || session
                     .progress_deadline()
-                    .is_some_and(|at| Instant::now() >= at)
+                    .is_some_and(|at| timer_now >= at)
+                || session
+                    .graphics_deadline()
+                    .is_some_and(|at| timer_now >= at)
                 || session.needs_output_poll()
             {
                 ready.push(id);
@@ -445,6 +454,10 @@ pub fn run() -> anyhow::Result<()> {
             daemon.git_dirty |= update.directory_changed && daemon.git.is_some();
             if update.changed {
                 daemon.changed.insert(id);
+            } else if !update.graphics_changed.is_empty() {
+                for frontend in daemon.frontends.values_mut().filter(|f| f.attached) {
+                    frontend.redraw_graphics(id, &update.graphics_changed);
+                }
             }
             if let Some(error) = update.error {
                 daemon.errors.insert(id, error);

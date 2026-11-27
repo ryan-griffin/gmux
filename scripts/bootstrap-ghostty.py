@@ -24,7 +24,9 @@ ZIG_SHA256 = {
 PATCHES = [ROOT / "scripts/patches/ghostty-media-keys.patch",
            ROOT / "scripts/patches/ghostty-clipboard-reads.patch",
            ROOT / "scripts/patches/ghostty-snapshot-state.patch",
-           ROOT / "scripts/patches/ghostty-glyphs.patch"]
+           ROOT / "scripts/patches/ghostty-glyphs.patch",
+           ROOT / "scripts/patches/ghostty-png.patch",
+           ROOT / "scripts/patches/ghostty-kitty-graphics.patch"]
 
 
 def download(url, destination, checksum):

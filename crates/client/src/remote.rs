@@ -7,7 +7,8 @@ use gmux_protocol::{
     session::{ScreenSnapshot, SessionUpdate},
     theme::Theme,
     transport::{
-        self, KeyAction, KeyLayout, Metadata, Packet, PasteOptions, StreamCommand, StreamRequest,
+        self, KeyAction, KeyLayout, Metadata, Packet, PasteOptions, RESPONSE_TIMEOUT,
+        StreamCommand, StreamRequest,
     },
 };
 #[cfg(test)]
@@ -31,7 +32,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default for tests that do not report a display interval.
 #[cfg(test)]
 const SCROLL_CADENCE: Duration = transport::DEFAULT_FRAME_INTERVAL;
@@ -464,7 +464,8 @@ async fn read_packets(
         .await?;
         let record = transport::Record::decode(framing)?;
         let reservation = sender.reserve_decode(record.decode_bytes()).await?;
-        let (packet, reservation, retained) = runtime::deadline(Instant::now() + timeout, async {
+        let deadline = Instant::now() + timeout;
+        let (header, reservation) = runtime::deadline(deadline, async {
             // read_buf initializes only bytes received. Avoid clearing large
             // header allocations immediately before the socket overwrites them.
             let mut bytes = Vec::with_capacity(record.header_size());
@@ -486,8 +487,18 @@ async fn read_packets(
             } else {
                 (record.parse_header(&bytes), reservation)
             };
+            Ok((decoded?, reservation))
+        })
+        .await?;
+        let image_bytes = header
+            .as_pane()
+            .and_then(|pane| pane.header.graphics.as_ref())
+            .map_or(Ok(0), |graphics| graphics.payload_len())?;
+        let deadline = deadline + transport::image_transfer_allowance(image_bytes);
+        let image_read = (image_bytes != 0).then(|| sender.begin_image_read());
+        let (packet, reservation, retained) = runtime::deadline(deadline, async {
             let packet =
-                Packet::read_body_async(&mut (&mut reader).compat(), record, decoded?).await?;
+                Packet::read_body_async(&mut (&mut reader).compat(), record, header).await?;
             let (result, packet, reservation) = if record.decode_bytes() > 64 * 1024 {
                 runtime::blocking(move || (record.validate_packet(&packet), packet, reservation))
                     .await
@@ -498,6 +509,7 @@ async fn read_packets(
         })
         .await?;
         sender.send_decoded(packet, reservation, retained).await?;
+        drop(image_read);
         wake.notify();
     }
 }
@@ -796,6 +808,11 @@ impl SessionManager {
                     panes: self.visible.clone(),
                 }))?;
             self.subscription_pending = false;
+            for (id, session) in &self.sessions {
+                if !self.visible.contains(id) {
+                    session.borrow_mut().viewport.suspend_graphics();
+                }
+            }
         }
         if self.git_subscription_pending {
             self.connection
@@ -836,6 +853,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Missing daemon metadata for pane {id}"))?;
         let handle = Rc::new(RefCell::new(RemoteSession {
             connection: self.connection.clone(),
+            image_reads: self.receiver.image_read_clock(),
             git: self.git.remove(&id),
             viewport: Viewport::new(meta, theme, self.frame_interval, self.focused.get()),
             wake: self.wake.clone(),
@@ -1004,7 +1022,9 @@ impl SessionManager {
     }
     pub fn close(&mut self, id: u64) {
         if let Some(session) = self.sessions.remove(&id) {
-            session.borrow_mut().viewport.clear_cache();
+            let mut session = session.borrow_mut();
+            session.viewport.clear_cache();
+            session.viewport.suspend_graphics();
         }
         self.metadata.remove(&id);
         self.git.remove(&id);
@@ -1016,6 +1036,7 @@ impl SessionManager {
             let mut session = session.borrow_mut();
             session.git = None;
             session.viewport.clear_cache();
+            session.viewport.suspend_graphics();
         }
         self.git.clear();
         self.git_panes.clear();
@@ -1031,6 +1052,7 @@ impl Drop for SessionManager {
 
 pub struct RemoteSession {
     connection: Rc<Connection>,
+    image_reads: incoming::ImageReadClock,
     viewport: Viewport,
     git: Option<transport::GitMetadata>,
     wake: gmux_platform::unix::ipc::Wake,
@@ -1093,6 +1115,10 @@ impl RemoteSession {
         epoch: u64,
     ) -> anyhow::Result<()> {
         self.connection.clipboard_changed(destination, epoch)
+    }
+    /// Monotonic time and time spent receiving image records on this connection.
+    pub fn clipboard_time(&self) -> (Instant, Duration) {
+        self.image_reads.now()
     }
     pub fn clipboard_command(&self, command: StreamCommand) -> anyhow::Result<()> {
         self.connection

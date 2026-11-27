@@ -4,6 +4,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import time
 from cargo_test_support import cargo_binary
@@ -76,7 +77,7 @@ with (artifacts / "clipboard-read-smoke.log").open("w") as log, AppFixture() as 
                         event = wait_for(lambda: b.bytes() if b"status=DONE" in b.bytes() else None)
                         password = event.split(b":pw=", 1)[1].split(b"\x1b", 1)[0].decode()
                         b.write(kitty(extra=":name=UGFzdGUgZXZlbnQ=:pw=" + password))
-                        granted = request(peer); assert granted["granted"]
+                        granted = request(peer); assert granted["granted"] and granted["paste_serial"] == serial
                         reply(peer, granted, [("text/plain", b"RICH_SPLIT_PASTE")])
                         wait_for(lambda: base64.b64encode(b"RICH_SPLIT_PASTE") in b.bytes())
                     else:
@@ -225,6 +226,31 @@ with (artifacts / "clipboard-read-smoke.log").open("w") as log, AppFixture() as 
                 other.write("\x1b]2;TRANSFER_FAIR\x07")
                 wait_for(lambda: fixture.rpc("_metadata", pane=other.pane)["meta"]["title"] == "TRANSFER_FAIR")
                 wait_for(lambda: b"status=EBUSY" in p.bytes(), timeout=8)
+
+            if remote:
+                with scenario("a clipboard read can complete after a large image drains over TCP"):
+                    p = Probe(fixture); peer = client(p)
+                    peer.send("resize", cols=12, rows=4, cw=8, ch=16)
+                    peer.barrier("image-size")
+                    pixel_bytes = p.write_large_image()
+                    while True:
+                        size, = struct.unpack("<I", peer.exact(4))
+                        if size >= pixel_bytes:
+                            break
+                        peer.exact(size)
+                    p.write("\x1b]2;CLIPBOARD_BEHIND_IMAGE\x07" + kitty())
+                    wait_for(lambda: fixture.rpc("_metadata", pane=p.pane)["meta"]["title"]
+                             == "CLIPBOARD_BEHIND_IMAGE")
+                    bytes_read = 0
+                    started = time.monotonic()
+                    while bytes_read < size:
+                        chunk = min(64 * 1024, size - bytes_read)
+                        bytes_read += chunk
+                        time.sleep(max(0, started + bytes_read / (512 * 1024) - time.monotonic()))
+                        peer.exact(chunk)
+                    req = request(peer)
+                    reply(peer, req, [("text/plain", b"AFTER_IMAGE")])
+                    wait_for(lambda: base64.b64encode(b"AFTER_IMAGE") in p.bytes())
         finally:
             for peer in peers: peer.close()
     (artifacts / "clipboard-read-measurements.json").write_text(json.dumps(measurements, indent=2) + "\n")
