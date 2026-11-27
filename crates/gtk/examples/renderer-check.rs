@@ -2489,6 +2489,83 @@ fn validate_kitty_graphics(
             assert_eq!(data[byte..byte + 4], [0, 0, if red { 255 } else { 0 }, 255]);
         }
     }
+
+    // Two overlapping crops can consume the cache using pixels from one image.
+    let mut source = vec![255; gmux_protocol::graphics::MAX_PIXEL_BYTES];
+    for y in 0..3 {
+        for x in 0..3 {
+            let start = ((y + 11) * 2000 + x + 11) * 4;
+            source[start..start + 4].copy_from_slice(&[x as u8 * 120, y as u8 * 100, 0, 150]);
+        }
+    }
+    let graphics = Graphics {
+        cell_pixels: [8, 16],
+        unicode_cell_pixels: None,
+        frozen_cell_pixels: None,
+        images: vec![Arc::new(Image {
+            key: 4,
+            width: 2000,
+            height: 1250,
+            format: PixelFormat::Rgba,
+            pixels: source,
+        })],
+        placements: [
+            [11, 11, 3, 3],
+            [12, 11, 1, 3],
+            [11, 12, 3, 1],
+            [12, 12, 1, 1],
+            [11, 11, 3, 3],
+        ]
+        .into_iter()
+        .zip([23, 23, 23, 23, 2])
+        .enumerate()
+        .map(|(i, (crop, width))| placement(4, Layer::AboveText, 4 + i as i32 * 4, width, crop))
+        .collect(),
+    };
+    tiled.metrics = (8.25, 16.25);
+    let full_cache = Graphics {
+        images: graphics.images.clone(),
+        placements: [
+            placement(4, Layer::AboveText, 0, 8, [0, 0, 1000, 1250]),
+            placement(4, Layer::AboveText, 1, 8, [500, 0, 1000, 1250]),
+        ]
+        .into_iter()
+        .chain(graphics.placements.iter().copied())
+        .collect(),
+        cell_pixels: graphics.cell_pixels,
+        ..Graphics::default()
+    };
+    let mut regular_renderer = Renderer::new();
+    let mut overflow_renderer = Renderer::new();
+    for (scale, origin) in [(1.0, (0.0, 0.0)), (1.25, (0.2, 0.4))] {
+        let paint = |renderer: &mut Renderer, graphics| {
+            let scene = Scene {
+                graphics: Some(graphics),
+                scale,
+                origin,
+                ..tiled
+            };
+            let drawn = node(renderer, &scene, font, context).0;
+            render(gpu, &drawn, &scene)
+        };
+        let reference = paint(&mut regular_renderer, &graphics);
+        let expected = pixels(&reference);
+        let actual = pixels(&paint(&mut overflow_renderer, &full_cache));
+        for y in 0..(26.0 * scale) as usize {
+            for x in (32.0 * scale) as usize..(170.0 * scale) as usize {
+                let offset = (y * reference.width() as usize + x) * 4;
+                let actual = &actual[offset..offset + 4];
+                let expected = &expected[offset..offset + 4];
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(&a, &b)| a.abs_diff(b) <= 1),
+                    "Crop filtering changed at scale {scale} at ({x}, {y}): {expected:?} vs {actual:?}"
+                );
+            }
+        }
+    }
 }
 
 fn validate_geometry(gpu: &gsk::Renderer, font: &pango::FontDescription, context: &pango::Context) {

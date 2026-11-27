@@ -1031,6 +1031,7 @@ impl Renderer {
             self.textures
                 .append(snapshot, scene, graphics, Layer::AboveText);
         }
+        self.textures.finish_frame();
         if cursor_visible && block_cursor.is_none() {
             let alpha = if scene.focused { 1.0 } else { 0.35 };
             let password = scene.frame.cursor_password_input;

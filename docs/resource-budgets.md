@@ -76,10 +76,12 @@ result are destroyed. Blocking JSON parsing cannot be interrupted once started.
 Terminal image pixels use the incoming packet allowance during decoding. The
 client retains up to 10 MB of source pixels for each subscribed pane and releases
 them when it unsubscribes. GTK caches up to 10 MB of cropped texture data per
-renderer and drops its image textures when the pane unmaps. Each daemon
-connection coalesces viewport updates until the previous image payload drains
-from its output queue. The daemon shares up to 128 MiB of staging storage
-for pixels captured at synchronized-output boundaries.
+renderer. When that cache fills, it draws from the original texture and shares
+one-pixel edge strips across crops. Distinct column strips can copy at most the
+size of the retained source pixels. GTK drops image textures when the pane
+unmaps. Each daemon connection coalesces viewport updates until the previous
+image payload drains from its output queue. The daemon shares up to 128 MiB of
+staging storage for pixels captured at synchronized-output boundaries.
 
 The prediction pool evicts whole row caches from unfocused windows first, then
 least recently used caches at the same priority. Hidden tabs release their rows

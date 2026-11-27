@@ -14,6 +14,27 @@ pub(super) struct Textures {
     full: HashMap<u64, CachedTexture>,
     crops: HashMap<(u64, [u32; 4]), CachedTexture>,
     crop_bytes: usize,
+    crop_edges: HashMap<(u64, [u32; 4]), CropEdge>,
+    crop_nodes: HashMap<CropKey, CachedCrop>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct CropKey {
+    image: u64,
+    source: [u32; 4],
+    rect: [u32; 4],
+    device: [u64; 3],
+}
+
+struct CachedCrop {
+    owner: Weak<Image>,
+    node: gsk::RenderNode,
+    painted: bool,
+}
+
+struct CropEdge {
+    owner: Weak<Image>,
+    texture: glib::WeakRef<gdk::MemoryTexture>,
 }
 
 struct CachedTexture {
@@ -95,11 +116,123 @@ fn append_clipped_texture(
     texture: &gdk::MemoryTexture,
     clip: &graphene::Rect,
     bounds: &graphene::Rect,
-    filter: gsk::ScalingFilter,
 ) {
     snapshot.push_clip(clip);
-    snapshot.append_scaled_texture(texture, filter, bounds);
+    snapshot.append_scaled_texture(texture, gsk::ScalingFilter::Linear, bounds);
     snapshot.pop();
+}
+
+fn append_crop_texture(
+    snapshot: &gtk::Snapshot,
+    scene: &Scene<'_>,
+    texture: &gdk::MemoryTexture,
+    bounds: &graphene::Rect,
+    clip: Option<&graphene::Rect>,
+) {
+    let scale = scene.scale as f32;
+    let phase_x = (scene.origin.0 * scene.scale).fract() as f32;
+    let phase_y = (scene.origin.1 * scene.scale).fract() as f32;
+    if scale == 1.0 && phase_x == 0.0 && phase_y == 0.0 {
+        if let Some(clip) = clip {
+            append_clipped_texture(snapshot, texture, clip, bounds);
+        } else {
+            snapshot.append_scaled_texture(texture, gsk::ScalingFilter::Linear, bounds);
+        }
+        return;
+    }
+
+    // Cairo rasterizes a scaled texture's intermediate in node coordinates.
+    // Use device pixels so adjacent crop pieces share the same sample grid.
+    let device = |rect: &graphene::Rect| {
+        graphene::Rect::new(
+            rect.x() * scale + phase_x,
+            rect.y() * scale + phase_y,
+            rect.width() * scale,
+            rect.height() * scale,
+        )
+    };
+    let node = gsk::TextureScaleNode::new(texture, &device(bounds), gsk::ScalingFilter::Linear);
+    let transform = gsk::Transform::new()
+        .translate(&graphene::Point::new(-phase_x / scale, -phase_y / scale))
+        .scale(1.0 / scale, 1.0 / scale);
+    if let Some(clip) = clip {
+        let node = gsk::ClipNode::new(&node, &device(clip));
+        snapshot.append_node(gsk::TransformNode::new(&node, Some(&transform)));
+    } else {
+        snapshot.append_node(gsk::TransformNode::new(&node, Some(&transform)));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CropSpan {
+    source: [u32; 2],
+    bounds: [f32; 2],
+    clip: [f32; 2],
+}
+
+impl CropSpan {
+    fn clip_limits(self) -> [f32; 2] {
+        let start = self.clip[0];
+        let end = start + self.clip[1];
+        // A clip coincident with the texture edge applies its coverage twice
+        // in Cairo. The texture bounds already cut off that side.
+        [
+            if start == self.bounds[0] {
+                start - 1.0
+            } else {
+                start
+            },
+            if end == self.bounds[0] + self.bounds[1] {
+                end + 1.0
+            } else {
+                end
+            },
+        ]
+    }
+}
+
+fn crop_spans(
+    start: f32,
+    size: f32,
+    [offset, count, total]: [u32; 3],
+    origin: f64,
+    device_scale: f64,
+) -> [CropSpan; 3] {
+    let start = f64::from(start);
+    let end = start + f64::from(size);
+    let scale = f64::from(size) / f64::from(count);
+    // Round the internal joins between sample centers so adjacent nodes
+    // cover whole output pixels even when the placement is translucent.
+    let snap = |value: f64| {
+        (((value + origin) * device_scale).round() / device_scale - origin).clamp(start, end)
+    };
+    let left = if offset == 0 {
+        start
+    } else {
+        snap(start + 0.5 * scale)
+    };
+    let right = if offset + count == total {
+        end
+    } else {
+        snap(end - 0.5 * scale)
+    };
+    let edge = |source, start, size| CropSpan {
+        source: [source, 1],
+        bounds: [start, size],
+        clip: [start, size],
+    };
+    [
+        edge(offset, start as f32, (left - start) as f32),
+        CropSpan {
+            source: [0, total],
+            bounds: [
+                (start - f64::from(offset) * scale) as f32,
+                (scale * f64::from(total)) as f32,
+            ],
+            clip: [left as f32, (right - left) as f32],
+        },
+        edge(offset + count - 1, right as f32, (end - right) as f32),
+    ]
 }
 
 fn append_unicode_texture(
@@ -114,7 +247,7 @@ fn append_unicode_texture(
         .ok()
         .and_then(|row| scene.bidi?.row(row))
     else {
-        append_clipped_texture(snapshot, texture, dest, bounds, gsk::ScalingFilter::Linear);
+        append_clipped_texture(snapshot, texture, dest, bounds);
         return;
     };
 
@@ -146,18 +279,19 @@ fn append_unicode_texture(
             bounds.width(),
             bounds.height(),
         );
-        append_clipped_texture(
-            snapshot,
-            texture,
-            &clip,
-            &translated,
-            gsk::ScalingFilter::Linear,
-        );
+        append_clipped_texture(snapshot, texture, &clip, &translated);
         column = next;
     }
 }
 
 impl Textures {
+    pub fn finish_frame(&mut self) {
+        self.crop_nodes
+            .retain(|_, crop| std::mem::take(&mut crop.painted));
+        self.crop_edges
+            .retain(|_, edge| edge.texture.upgrade().is_some());
+    }
+
     pub fn retain(&mut self, graphics: &Graphics) {
         if !self.full.is_empty() {
             self.full
@@ -170,6 +304,20 @@ impl Textures {
                     self.crop_bytes -= cached.bytes;
                 }
                 keep
+            });
+        }
+        if !self.crop_edges.is_empty() {
+            self.crop_edges.retain(|&(key, _), edge| {
+                graphics
+                    .image(key)
+                    .is_some_and(|image| edge.owner.as_ptr() == Arc::as_ptr(image))
+            });
+        }
+        if !self.crop_nodes.is_empty() {
+            self.crop_nodes.retain(|key, crop| {
+                graphics
+                    .image(key.image)
+                    .is_some_and(|image| crop.owner.as_ptr() == Arc::as_ptr(image))
             });
         }
     }
@@ -191,6 +339,89 @@ impl Textures {
             }
             used
         });
+    }
+
+    fn append_uncached_crop(
+        &mut self,
+        snapshot: &gtk::Snapshot,
+        scene: &Scene<'_>,
+        image: &Arc<Image>,
+        dest: &graphene::Rect,
+        source: [u32; 4],
+    ) {
+        let key = CropKey {
+            image: image.key,
+            source,
+            rect: [dest.x(), dest.y(), dest.width(), dest.height()].map(f32::to_bits),
+            device: [scene.scale, scene.origin.0, scene.origin.1].map(f64::to_bits),
+        };
+        if let Some(crop) = self.crop_nodes.get_mut(&key) {
+            crop.painted = true;
+            snapshot.append_node(&crop.node);
+            return;
+        }
+
+        let crop_snapshot = gtk::Snapshot::new();
+        let [left, top, width, height] = source;
+        let full = [0, 0, image.width, image.height];
+        let columns = crop_spans(
+            dest.x(),
+            dest.width(),
+            [left, width, image.width],
+            scene.origin.0,
+            scene.scale,
+        );
+        let rows = crop_spans(
+            dest.y(),
+            dest.height(),
+            [top, height, image.height],
+            scene.origin.1,
+            scene.scale,
+        );
+        // The interior can sample the original image. At a crop boundary,
+        // stretch the edge texel so linear filtering cannot sample outside it.
+        for y in rows.iter().filter(|y| y.clip[1] > 0.0) {
+            for x in columns.iter().filter(|x| x.clip[1] > 0.0) {
+                let source = [x.source[0], y.source[0], x.source[1], y.source[1]];
+                let texture = if source == full {
+                    self.full
+                        .entry(image.key)
+                        .or_insert_with(|| CachedTexture::new(image, full, 0))
+                        .texture
+                        .clone()
+                } else {
+                    let edge = self
+                        .crop_edges
+                        .entry((image.key, source))
+                        .or_insert_with(|| CropEdge {
+                            owner: Arc::downgrade(image),
+                            texture: glib::WeakRef::new(),
+                        });
+                    edge.texture.upgrade().unwrap_or_else(|| {
+                        let texture = texture(image, source);
+                        edge.texture.set(Some(&texture));
+                        texture
+                    })
+                };
+                let bounds =
+                    graphene::Rect::new(x.bounds[0], y.bounds[0], x.bounds[1], y.bounds[1]);
+                let [left, right] = x.clip_limits();
+                let [top, bottom] = y.clip_limits();
+                let clip = graphene::Rect::new(left, top, right - left, bottom - top);
+                append_crop_texture(&crop_snapshot, scene, &texture, &bounds, Some(&clip));
+            }
+        }
+        if let Some(node) = crop_snapshot.to_node() {
+            snapshot.append_node(&node);
+            self.crop_nodes.insert(
+                key,
+                CachedCrop {
+                    owner: Arc::downgrade(image),
+                    node,
+                    painted: true,
+                },
+            );
+        }
     }
 
     pub fn append(
@@ -271,26 +502,14 @@ impl Textures {
                     pruned = true;
                 }
                 if let Some(tex) = self.crops.get(&key) {
-                    snapshot.append_scaled_texture(&tex.texture, gsk::ScalingFilter::Linear, &dest);
+                    append_crop_texture(snapshot, scene, &tex.texture, &dest, None);
                 } else if self.crop_fits(bytes) {
                     let tex = CachedTexture::new(image, p.source, bytes);
-                    snapshot.append_scaled_texture(&tex.texture, gsk::ScalingFilter::Linear, &dest);
+                    append_crop_texture(snapshot, scene, &tex.texture, &dest, None);
                     self.crops.insert(key, tex);
                     self.crop_bytes += bytes;
                 } else {
-                    // Nearest sampling keeps texels outside the crop from bleeding into it.
-                    let tex = self
-                        .full
-                        .entry(image.key)
-                        .or_insert_with(|| CachedTexture::new(image, full, 0));
-                    let bounds = project_texture(image, &dest, p.source.map(f64::from));
-                    append_clipped_texture(
-                        snapshot,
-                        &tex.texture,
-                        &dest,
-                        &bounds,
-                        gsk::ScalingFilter::Nearest,
-                    );
+                    self.append_uncached_crop(snapshot, scene, image, &dest, p.source);
                 }
             }
             if clip.is_some() {

@@ -96,7 +96,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
      // Stream the snapshot through the callback adapter, batching the
      // encoder's writes into few callback invocations.
      var buffer: [io_c.WriterAdapter.recommended_buffer_len]u8 = undefined;
-@@ -719,10 +762,123 @@
+@@ -719,11 +762,155 @@
          native.gpa(),
          &adapter.interface,
          native,
@@ -105,7 +105,7 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
      ) catch |err| return mapEncodeError(err, &adapter);
      adapter.interface.flush() catch
          return mapEncodeError(error.WriteFailed, &adapter);
-+    return .success;
+     return .success;
 +}
 +
 +/// Start a fresh shell without erasing either screen or scrollback.
@@ -165,7 +165,8 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 +        primary.kitty_images.placements.count() > 0
 +    else
 +        false;
-+    var render: @import("../render.zig").RenderState = .empty;
++    const RenderState = @import("../render.zig").RenderState;
++    var render: RenderState = .empty;
 +    defer render.deinit(t.gpa());
 +    var image_bottom: i64 = -1;
 +    if (has_placements) {
@@ -200,27 +201,58 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 +
 +    if (comptime build_options.kitty_graphics) {
 +        if (has_placements) {
-+            // Images that extend into the new shell's row keep the part
-+            // above it. Cell metrics can differ between subscribers.
++            // A pinned image outside this viewport can still reach the
++            // shell's row when drawn with another viewer's cell metrics.
++            const shell = primary.pages.pointFromPin(.screen, primary.cursor.page_pin.*).?.screen;
++            const storage = &primary.kitty_images;
++            var changed = false;
++            var placements = storage.placements.iterator();
++            while (placements.next()) |entry| {
++                const placement = entry.value_ptr;
++                if (RenderState.imageLayerFromZ(placement.z) != .above_text) continue;
++                const anchor = switch (placement.location) {
++                    .pin => |pin| .{ pin, @as(i64, 0) },
++                    .virtual => continue,
++                    .relative => |relative| blk: {
++                        const chain = storage.resolveChain(relative) orelse continue;
++                        if (chain.root.location != .pin) continue;
++                        break :blk .{ chain.root.location.pin, @as(i64, chain.vertical_offset) };
++                    },
++                };
++                if (anchor[0].garbage) continue;
++                const origin = primary.pages.pointFromPin(.screen, anchor[0].*) orelse continue;
++                const available = @as(i64, shell.y) - origin.screen.y - anchor[1];
++                changed = clipImageRows(placement, available) or changed;
++            }
++
++            // Relative placements rooted at a Unicode cell have no pin.
 +            render.update(t.gpa(), t) catch return .out_of_memory;
 +            var images = render.imagePlacementIterator();
-+            var changed = false;
 +            while (images.next()) |image| {
-+                if (image.layer != .above_text or image.y > primary.cursor.y) continue;
++                if (image.layer != .above_text or image.virtual_anchor == null) continue;
 +                const key = image.storage_key orelse continue;
-+                const available: u32 = @intCast(@as(i64, primary.cursor.y) - image.y);
-+                if (image.sizing == .cells and image.rows <= available) continue;
-+                const placement = primary.kitty_images.placements.getPtr(key) orelse continue;
-+                if (placement.max_rows) |limit| if (limit <= available) continue;
-+                placement.max_rows = available;
-+                changed = true;
++                const placement = storage.placements.getPtr(key) orelse continue;
++                changed = clipImageRows(placement, @as(i64, primary.cursor.y) - image.y) or changed;
 +            }
-+            if (changed) primary.kitty_images.markMutated(terminal_c.Io.init.io());
++            if (changed) storage.markMutated(terminal_c.Io.init.io());
 +        }
 +    }
-     return .success;
++    return .success;
++}
++
++fn clipImageRows(
++    placement: *@import("../kitty/graphics_storage.zig").ImageStorage.Placement,
++    available: i64,
++) bool {
++    const limit: u32 = @intCast(std.math.clamp(available, 0, std.math.maxInt(u32)));
++    if (placement.max_rows) |previous| if (previous <= limit) return false;
++    if (placement.columns != 0 and placement.rows != 0 and
++        placement.rows -| placement.trim_top -| placement.trim_bottom <= limit) return false;
++    placement.max_rows = limit;
++    return true;
  }
 
+ /// Encode a terminal snapshot into a caller-provided fixed buffer.
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
 @@ -247,6 +247,8 @@
