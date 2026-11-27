@@ -970,7 +970,23 @@ Bound graphics storage and schedule animations for visible images.
          }
      };
 
-@@ -1950,6 +1956,7 @@
+@@ -806,6 +812,15 @@
+             .viewport_y_base = self.viewportY(range.start),
+             .placed = self.kitty.placed.items,
+         };
++    }
++
++    /// Reposition relative images anchored to captured Unicode cells without
++    /// discarding children that start or end outside the viewport.
++    pub fn unclippedVirtualChildren(self: *RenderState, alloc: Allocator) Allocator.Error![]const ImagePlacement {
++        if (comptime !build_options.kitty_graphics) return &.{};
++        if (self.kitty.virtual_anchors == 0) return &.{};
++        try Kitty.placeRoots(self, alloc, true);
++        return self.kitty.placed.items;
+     }
+
+     /// Returns a value that changes whenever an update changes the
+@@ -1950,6 +1965,7 @@
              source_y: u32,
              source_width: u32,
              source_height: u32,
@@ -978,7 +994,7 @@ Bound graphics storage and schedule animations for visible images.
          };
      };
 
-@@ -1972,6 +1979,8 @@
+@@ -1972,6 +1988,8 @@
          /// the screen. If it changed but the generation didn't, `placed`
          /// is built again from the same `roots`.
          dirty: u64 = 0,
@@ -987,7 +1003,7 @@ Bound graphics storage and schedule animations for visible images.
 
          /// True if the placeholder runs changed since the last update.
          /// The row builder sets it in two cases:
-@@ -2131,8 +2140,9 @@
+@@ -2131,8 +2149,9 @@
              // moves, when the storage says that they moved, or (for
              // placements positioned from placeholder cells) when rows
              // are rebuilt.
@@ -999,7 +1015,7 @@ Bound graphics storage and schedule animations for visible images.
                  !(any_dirty and state.kitty.virtual_anchors > 0)) return;
          }
 
-@@ -2166,33 +2176,46 @@
+@@ -2166,33 +2185,46 @@
          // the row builder added or dropped runs, or if the loop below
          // looks up any run again, since its result may differ.
          var runs_changed = state.kitty.stale;
@@ -1047,12 +1063,30 @@ Bound graphics storage and schedule animations for visible images.
              }
          }
 
-         try placeRoots(state, alloc);
+-        try placeRoots(state, alloc);
++        try placeRoots(state, alloc, false);
 +        state.kitty.viewer_cell_pixels = state.gmux_cell_pixels;
          state.kitty.dirty = storage.dirty;
 
          // Tell consumers to read the iterator again if anything it
-@@ -2253,33 +2276,42 @@
+@@ -2223,6 +2255,7 @@
+     fn placeRoots(
+         state: *RenderState,
+         alloc: Allocator,
++        comptime unclipped_virtual_only: bool,
+     ) Allocator.Error!void {
+         std.mem.swap(
+             std.ArrayList(RenderState.ImagePlacement),
+@@ -2240,7 +2273,7 @@
+         // Group the captured rows by page, for `rowIndexOfPin`. Only
+         // `pin` anchors need this.
+         state.kitty.chunks.clearRetainingCapacity();
+-        if (state.kitty.virtual_anchors < state.kitty.roots.items.len) {
++        if (!unclipped_virtual_only and state.kitty.virtual_anchors < state.kitty.roots.items.len) {
+             const captured_pins = state.row_data.items(.pin)[range.start..range.end];
+             try state.kitty.chunks.ensureTotalCapacity(alloc, captured_pins.len);
+             for (captured_pins, 0..) |pin, i| {
+@@ -2253,33 +2286,43 @@
              }
          }
 
@@ -1085,6 +1119,7 @@ Bound graphics storage and schedule animations for visible images.
 +            state.kitty.height_px / state.rows,
 +        };
          for (state.kitty.roots.items) |root| {
++            if (unclipped_virtual_only and root.anchor != .virtual) continue;
              const p = root.placement;
 +            const extent = viewerExtent(p, cell_pixels, state.gmux_cell_pixels);
 
@@ -1117,7 +1152,7 @@ Bound graphics storage and schedule animations for visible images.
 
                  // The pin's cell. A pin is marked garbage when its row
                  // is removed from the scrollback. It has no position
-@@ -2290,7 +2322,7 @@
+@@ -2290,7 +2333,7 @@
                          state.kitty.chunks.items,
                          pin.*,
                          captured_len,
@@ -1126,18 +1161,20 @@ Bound graphics storage and schedule animations for visible images.
                          root.vertical_offset,
                      ) orelse continue;
                      break :origin .{ .x = pin.x, .y = y };
-@@ -2302,14 +2334,63 @@
+@@ -2302,14 +2345,65 @@
              // keep any with at least one cell in the captured rows.
              const x: i64 = origin.x + root.horizontal_offset;
              const y: i64 = origin.y + root.vertical_offset;
 -            if (y + p.rows - 1 < 0 or y >= captured_len) continue;
 -            if (x + p.cols - 1 < 0 or x >= state.cols) continue;
-+            if (y + extent[1] - 1 < 0 or y >= captured_len) continue;
-+            // A Unicode anchor can move horizontally when its row is
-+            // reordered. Keep the child if any visual column would show it.
-+            const anchor_x = if (root.anchor == .virtual) origin.x else 0;
-+            const anchor_shift = if (root.anchor == .virtual) @as(i64, state.cols) - 1 - origin.x else 0;
-+            if (x + anchor_shift + extent[0] - 1 < 0 or x - anchor_x >= state.cols) continue;
++            if (!unclipped_virtual_only) {
++                if (y + extent[1] - 1 < 0 or y >= captured_len) continue;
++                // A Unicode anchor can move horizontally when its row is
++                // reordered. Keep the child if any visual column would show it.
++                const anchor_x = if (root.anchor == .virtual) origin.x else 0;
++                const anchor_shift = if (root.anchor == .virtual) @as(i64, state.cols) - 1 - origin.x else 0;
++                if (x + anchor_shift + extent[0] - 1 < 0 or x - anchor_x >= state.cols) continue;
++            }
 
              var positioned = p;
              positioned.x = std.math.cast(i32, x) orelse continue;
@@ -1192,7 +1229,7 @@ Bound graphics storage and schedule animations for visible images.
      }
 
      /// Returns the row of a pin, counted in captured rows where 0 is the
-@@ -2471,6 +2552,7 @@
+@@ -2471,6 +2565,7 @@
          if (dest.width == 0 or dest.height == 0) return null;
          const offset = p.cellOffset(t);
          const source = p.sourceRect(image);
@@ -1200,7 +1237,7 @@ Bound graphics storage and schedule animations for visible images.
 
          return .{
              .protocol = .{ .kitty = .{
-@@ -2492,6 +2574,19 @@
+@@ -2492,6 +2587,19 @@
              .offset_y = offset.y,
              .width = dest.width,
              .height = dest.height,
@@ -1220,7 +1257,7 @@ Bound graphics storage and schedule animations for visible images.
              .source_x = source.x,
              .source_y = source.y,
              .source_width = source.width,
-@@ -2499,10 +2594,29 @@
+@@ -2499,10 +2607,29 @@
          };
      }
 
@@ -1250,7 +1287,7 @@ Bound graphics storage and schedule animations for visible images.
          row_pin: PageList.Pin,
          run: *Placeholder,
          cell_width: u32,
-@@ -2514,11 +2628,16 @@
+@@ -2514,11 +2641,16 @@
          // Remember the virtual placement even if the image can't be
          // drawn. Relative placements attached to it still need the
          // position of these cells.
@@ -1272,7 +1309,7 @@ Bound graphics storage and schedule animations for visible images.
 
          // Nothing to draw until the displayed pixels arrive, as in
          // `template`.
-@@ -2540,7 +2659,7 @@
+@@ -2540,7 +2672,7 @@
              .height = 1,
          };
          const rp = vp.renderPlacement(
@@ -1281,7 +1318,7 @@ Bound graphics storage and schedule animations for visible images.
              &image,
              cell_width,
              cell_height,
-@@ -2560,6 +2679,7 @@
+@@ -2560,6 +2692,7 @@
              .source_y = rp.source_y,
              .source_width = rp.source_width,
              .source_height = rp.source_height,
@@ -1289,7 +1326,7 @@ Bound graphics storage and schedule animations for visible images.
          };
          run.state = .visible;
      }
-@@ -4943,8 +5063,6 @@
+@@ -4943,8 +5076,6 @@
          .placement_id = .{ .tag = .external, .id = 7 },
      }).?;
      const grid = sp.gridSize(image, &t);
@@ -1298,7 +1335,7 @@ Bound graphics storage and schedule animations for visible images.
      const source = sp.sourceRect(image);
      try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, p.protocol.kitty.kind);
      try testing.expectEqual(7, p.protocol.kitty.placement_id);
-@@ -4958,10 +5076,9 @@
+@@ -4958,10 +5089,9 @@
      try testing.expectEqual(grid.rows, p.rows);
      try testing.expectEqual(4, p.offset_x);
      try testing.expectEqual(3, p.offset_y);

@@ -2719,43 +2719,63 @@ mod tests {
 
     #[test]
     fn restored_history_images_cannot_cover_the_new_prompt_at_wider_cell_sizes() {
-        let mut old = Engine::new().unwrap();
-        old.resize(24, 5, 8, 16).unwrap();
-        old.write(b"\x1b_Ga=T,f=24,i=5,s=1,v=4,c=1,C=1,q=2;/wAA/wAA/wAA/wAA\x1b\\");
-        old.write(&b"\r\n".repeat(8));
-        old.write(b"\x1b[Hhistory");
-        let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
-        let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
-        fresh.prepare_shell((8, 16)).unwrap();
-        fresh.write(b"$ ");
+        use gmux_protocol::graphics::Layer;
 
-        let mut view = fresh.new_view().unwrap();
-        fresh
-            .with_view(&mut view, |active| {
-                active.snapshot().unwrap();
-                assert!(active.graphics().0.is_none());
-                assert_eq!(active.frame().cursor_y, 1);
-            })
-            .unwrap();
-        view.set_graphics_viewport(GraphicsViewport {
-            cell_pixels: [24, 16],
-            canvas_pixels: [576, 80],
-        });
-        fresh
-            .with_view(&mut view, |active| {
-                active.snapshot().unwrap();
-                assert_eq!(active.cells()[24].text(), "$");
-                let graphics = active.graphics().0.unwrap();
-                let [placement] = graphics.placements.as_slice() else {
-                    panic!("Expected the wider view to reveal the restored image");
-                };
-                assert_eq!(placement.cell, [0, -4]);
-                assert_eq!(
-                    placement.bounds([24.0, 16.0], graphics.cell_pixels).clip_y,
-                    Some([-64.0, 16.0])
+        for relative in [false, true] {
+            let mut old = Engine::new().unwrap();
+            old.resize(24, 5, 8, 16).unwrap();
+            if relative {
+                old.write(b"\x1b_Ga=T,U=1,f=24,i=5,p=1,s=1,v=1,c=1,r=1,q=2;AAD/\x1b\\");
+                old.write("\x1b[38;5;5m\u{10eeee}\u{0305}\u{0305}\x1b[39m".as_bytes());
+                old.write(
+                    b"\x1b_Ga=T,f=24,i=6,p=1,P=5,Q=1,V=-4,s=1,v=4,c=1,q=2;/wAA/wAA/wAA/wAA\x1b\\",
                 );
-            })
-            .unwrap();
+            } else {
+                old.write(b"\x1b_Ga=T,f=24,i=5,s=1,v=4,c=1,C=1,q=2;/wAA/wAA/wAA/wAA\x1b\\");
+                old.write(&b"\r\n".repeat(8));
+            }
+            old.write(b"\x1b[1;3Hhistory");
+            let checkpoint = old.checkpoint(MAX_PANE_BYTES).unwrap();
+            let mut fresh = Engine::restore(&checkpoint, Default::default()).unwrap();
+            fresh.prepare_shell((8, 16)).unwrap();
+            fresh.write(b"$ ");
+
+            let mut view = fresh.new_view().unwrap();
+            fresh
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert!(active.graphics().0.is_none_or(|graphics| {
+                        graphics
+                            .placements
+                            .iter()
+                            .all(|p| p.layer != Layer::AboveText)
+                    }));
+                    assert_eq!(active.frame().cursor_y, 1);
+                })
+                .unwrap();
+            view.set_graphics_viewport(GraphicsViewport {
+                cell_pixels: [24, 16],
+                canvas_pixels: [576, 80],
+            });
+            fresh
+                .with_view(&mut view, |active| {
+                    active.snapshot().unwrap();
+                    assert_eq!(active.cells()[24].text(), "$");
+                    let graphics = active.graphics().0.unwrap();
+                    let mut above = graphics
+                        .placements
+                        .iter()
+                        .filter(|p| p.layer == Layer::AboveText);
+                    let placement = above.next().expect("Restored image in wider viewport");
+                    assert!(above.next().is_none());
+                    assert_eq!(placement.cell, [0, -4]);
+                    assert_eq!(
+                        placement.bounds([24.0, 16.0], graphics.cell_pixels).clip_y,
+                        Some([-64.0, 16.0])
+                    );
+                })
+                .unwrap();
+        }
     }
 
     #[test]

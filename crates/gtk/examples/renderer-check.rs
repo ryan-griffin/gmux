@@ -2365,17 +2365,30 @@ fn validate_kitty_graphics(
             Placement {
                 offset: [0, 8],
                 size: [16, 16],
+                source_subpixels: Some([0, 0, 3 * unit, 3 * unit]),
                 ..placement(1, Layer::BelowText, 2, 16, [0, 0, 3, 3])
             },
         ],
     };
     tiled.graphics = Some(&graphics);
-    let drawn = node(&mut renderer, &tiled, font, context).0;
-    let data = pixels(&render(gpu, &drawn, &tiled));
-    for y in 8..24 {
-        let start = y * tiled.width as usize * 4;
-        let (tiles, reference) = data[start..start + 128].split_at(64);
-        assert_eq!(tiles, reference, "Unicode image seam on pixel row {y}");
+    for (scale, cell_height) in [(1.0, 16.0), (1.25, 10.0)] {
+        let scene = Scene {
+            metrics: (8.0, cell_height),
+            scale,
+            ..tiled
+        };
+        let drawn = node(&mut renderer, &scene, font, context).0;
+        let rendered = render(gpu, &drawn, &scene);
+        let data = pixels(&rendered);
+        let tile_width = (16.0 * scale) as usize * 4;
+        for y in 0..(2.0 * cell_height * scale) as usize {
+            let start = y * rendered.width() as usize * 4;
+            let (tiles, reference) = data[start..start + tile_width * 2].split_at(tile_width);
+            assert_eq!(
+                tiles, reference,
+                "Unicode image seam at scale {scale} on row {y}"
+            );
+        }
     }
 
     let mut bidi_cells = blank.clone();

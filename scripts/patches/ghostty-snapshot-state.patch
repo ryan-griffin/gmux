@@ -227,9 +227,9 @@ Upstream base: 0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec (vt-1.0.0)
 +
 +            // Relative placements rooted at a Unicode cell have no pin.
 +            render.update(t.gpa(), t) catch return .out_of_memory;
-+            var images = render.imagePlacementIterator();
-+            while (images.next()) |image| {
-+                if (image.layer != .above_text or image.virtual_anchor == null) continue;
++            const children = render.unclippedVirtualChildren(t.gpa()) catch return .out_of_memory;
++            for (children) |image| {
++                if (image.layer != .above_text) continue;
 +                const key = image.storage_key orelse continue;
 +                const placement = storage.placements.getPtr(key) orelse continue;
 +                changed = clipImageRows(placement, @as(i64, primary.cursor.y) - image.y) or changed;

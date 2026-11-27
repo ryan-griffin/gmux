@@ -561,7 +561,7 @@ while True:
         place = "a=T,U=1,f=24,i=66,p=1,s=1,v=1,c=1,r=1,q=2"
         exchange(b"\x1bc" + command(place, red) + b"\x1b[38;5;66m" + offscreen
                  + b"\x1b[100;1H" + tile.encode() + b"\x1b[39m")
-        assert len(graphics(local, lambda g: bool(g["images"]))["placements"]) == 4096
+        graphics(local, lambda g: len(g["placements"]) == 4096)
         visible = graphics(remote, lambda g: any(im["pixels"] == red for im in g["images"]))
         assert [p["cell"] for p in visible["placements"]] == [[0, 99]], visible
         exchange(command(place, blue) + b"\x1b[?2026h" + command("a=d,d=I,i=66,q=2"))

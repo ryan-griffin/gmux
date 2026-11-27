@@ -235,6 +235,30 @@ fn crop_spans(
     ]
 }
 
+fn append_unicode_clip(
+    snapshot: &gtk::Snapshot,
+    scene: &Scene<'_>,
+    texture: &gdk::MemoryTexture,
+    clip: &graphene::Rect,
+    bounds: &graphene::Rect,
+) {
+    // Neighboring tiles must cover whole device pixels at their shared edges.
+    let (x, y, width, height) = super::snapped_row_rect(
+        scene,
+        0.0,
+        (
+            f64::from(clip.x()),
+            f64::from(clip.y()),
+            f64::from(clip.width()),
+            f64::from(clip.height()),
+        ),
+    );
+    let clip = graphene::Rect::new(x as f32, y as f32, width as f32, height as f32);
+    snapshot.push_clip(&clip);
+    snapshot.append_texture(texture, bounds);
+    snapshot.pop();
+}
+
 fn append_unicode_texture(
     snapshot: &gtk::Snapshot,
     scene: &Scene<'_>,
@@ -247,7 +271,7 @@ fn append_unicode_texture(
         .ok()
         .and_then(|row| scene.bidi?.row(row))
     else {
-        append_clipped_texture(snapshot, texture, dest, bounds);
+        append_unicode_clip(snapshot, scene, texture, dest, bounds);
         return;
     };
 
@@ -279,7 +303,7 @@ fn append_unicode_texture(
             bounds.width(),
             bounds.height(),
         );
-        append_clipped_texture(snapshot, texture, &clip, &translated);
+        append_unicode_clip(snapshot, scene, texture, &clip, &translated);
         column = next;
     }
 }
